@@ -671,12 +671,9 @@ fn prove_path(
                 // pipeline for P-cores; utility class prefers the E-cores,
                 // whose memory-bound fault service is nearly as fast.
                 mark_thread_utility();
-                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
-                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
-                // num_wires; a drift just misses the stash harmlessly.
-                const BLOCK_WIRES_STORE_BYTES: u64 =
-                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
-                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // Wires LDE plus the first-bind staging/digest buffers and
+                // d18 FFT tables. Size drift misses the stash harmlessly.
+                plonky2::hash::poseidon2::prewarm_block_tail();
             })
             .ok();
     }

@@ -560,20 +560,33 @@ impl ColumnStorePool {
     }
 }
 
-/// One-slot stash for a pre-faulted large column store. The final block's
-/// wires store (larger than the pool's per-buffer cap, so never recycled)
-/// otherwise zero-faults its ~2 GiB inside the run's most serial window; the
-/// orchestrator fills this slot from a background thread while the pipeline
-/// still runs, so the block's fill starts on already-resident pages. A size
-/// mismatch simply misses and falls through to a fresh allocation.
-static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
+/// Stash of pre-faulted shared buffers for the final-block tail. The wires
+/// LDE store is larger than the pool cap, so it is never recycled; the first
+/// `build_from_values` / `build_from_coeffs` submissions also bind a matching
+/// value/coeff staging buffer and a d18 digest output that the recurring
+/// tx/chain pool never holds. The orchestrator fills this stash from a
+/// background thread while the light path still runs. A size miss falls
+/// through to a fresh allocation.
+static PREWARMED_STORES: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+
+/// Allocator rounding slack when matching a prewarmed buffer to a request
+/// that is *not* the oversized wires store. Keeps a 2 GiB stash from being
+/// consumed by a 272 MiB staging request if the large take has not run yet.
+const PREWARM_EXACT_SLACK_BYTES: u64 = 1 << 20;
+
+/// Final-block commitment shape (`CIRCUIT_CONFIG`: 136 wires, degree 2^18,
+/// rate 3, cap height 4). A drift misses the stash and allocates fresh.
+const BLOCK_TAIL_NUM_WIRES: u64 = 136;
+const BLOCK_TAIL_DEGREE: u64 = 1 << 18;
+const BLOCK_TAIL_LDE: u64 = 1 << 21;
+const BLOCK_TAIL_CAP: u64 = 16;
 
 /// Allocates a `bytes`-sized shared buffer, touches one word per page so the
 /// kernel's zero-fill happens here (off the critical path) rather than under
-/// the final block's LDE fill, and stashes it for the next oversized
-/// [`take_or_new_column_buffer`] request. Scheduling-only: buffer contents
-/// are fully written by the fill before any read, exactly as a fresh
-/// allocation's would be.
+/// the final block's first bind, and stashes it for the next matching
+/// [`take_or_new_column_buffer`] / staging request. Scheduling-only: buffer
+/// contents are fully written by the fill before any read, exactly as a
+/// fresh allocation's would be.
 pub fn prewarm_large_column_store(bytes: u64) {
     let Some(context) = shared_context() else {
         return;
@@ -590,8 +603,8 @@ pub fn prewarm_large_column_store(bytes: u64) {
     // Stash BEFORE walking: a final block arriving mid-walk takes a
     // partially-warmed buffer instead of missing the stash entirely; the
     // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
+    if let Ok(mut slot) = PREWARMED_STORES.lock() {
+        slot.push(buffer.clone());
     }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
@@ -600,6 +613,46 @@ pub fn prewarm_large_column_store(bytes: u64) {
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
     }
+}
+
+/// Pre-faults every shared buffer the final block's first GPU submissions
+/// bind, and uploads the d18 FFT tables those submissions read. Extends the
+/// existing wires-store prewarm; does not change routing, set count, or
+/// kernel math. Size misses are harmless.
+pub fn prewarm_block_tail() {
+    let wires = BLOCK_TAIL_NUM_WIRES * BLOCK_TAIL_LDE * 8;
+    let values = BLOCK_TAIL_NUM_WIRES * BLOCK_TAIL_DEGREE * 8;
+    let digest = (2 * BLOCK_TAIL_LDE - BLOCK_TAIL_CAP) * 4 * 8;
+    prewarm_large_column_store(wires);
+    // Input staging + the separate coeff scratch in `build_from_values`.
+    prewarm_large_column_store(values);
+    prewarm_large_column_store(values);
+    prewarm_large_column_store(digest);
+    if let Some(context) = shared_context() {
+        let _ = context.roots_for(BLOCK_TAIL_LDE.ilog2());
+        let _ = context.shift_powers_for(BLOCK_TAIL_DEGREE as usize);
+        let _ = context.ones_for(BLOCK_TAIL_DEGREE as usize);
+    }
+}
+
+fn take_prewarmed_store(bytes: u64, max_oversize: u64) -> Option<Buffer> {
+    let mut stores = PREWARMED_STORES.try_lock().ok()?;
+    let max_len = bytes.saturating_add(max_oversize);
+    let (index, _) = stores
+        .iter()
+        .enumerate()
+        .filter(|(_, buffer)| {
+            let length = buffer.length();
+            length >= bytes && length <= max_len
+        })
+        .min_by_key(|(_, buffer)| buffer.length())?;
+    Some(stores.swap_remove(index))
+}
+
+fn device_buffer_prewarmed_or_new(device: &Device, bytes: u64) -> Buffer {
+    take_prewarmed_store(bytes, PREWARM_EXACT_SLACK_BYTES).unwrap_or_else(|| {
+        autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
+    })
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
@@ -613,10 +666,8 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
                 return buffer;
             }
         }
-    } else if let Ok(mut slot) = PREWARMED_LARGE_STORE.try_lock() {
-        if slot.as_ref().is_some_and(|b| b.length() >= bytes) {
-            return slot.take().expect("checked above");
-        }
+    } else if let Some(buffer) = take_prewarmed_store(bytes, u64::MAX) {
+        return buffer;
     }
     autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
 }
@@ -3113,10 +3164,7 @@ impl MetalShared {
         let column_buffer = take_or_new_column_buffer(&self.device, column_bytes as u64);
         // Coefficients need their own buffer: the LDE prepare reads them while
         // writing the full column buffer.
-        let coeffs_buffer = autoreleasepool(|| {
-            self.device
-                .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
-        });
+        let coeffs_buffer = device_buffer_prewarmed_or_new(&self.device, value_bytes as u64);
 
         let mut set = self.acquire_set()?;
         let result = (|| -> Result<TreeReadback<'_, F>, String> {
@@ -3125,10 +3173,10 @@ impl MetalShared {
                 .as_ref()
                 .map_or(true, |buffer| buffer.length() < value_bytes as u64)
             {
-                set.input = Some(autoreleasepool(|| {
-                    self.device
-                        .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
-                }));
+                set.input = Some(device_buffer_prewarmed_or_new(
+                    &self.device,
+                    value_bytes as u64,
+                ));
             }
             let input_buffer = set.input.as_ref().unwrap();
             {
@@ -3151,10 +3199,10 @@ impl MetalShared {
                 .as_ref()
                 .map_or(true, |buffer| buffer.length() < output_bytes as u64)
             {
-                set.output = Some(autoreleasepool(|| {
-                    self.device
-                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-                }));
+                set.output = Some(device_buffer_prewarmed_or_new(
+                    &self.device,
+                    output_bytes as u64,
+                ));
             }
             let output_buffer = set.output.as_ref().unwrap();
 
@@ -3432,10 +3480,10 @@ impl MetalShared {
             .as_ref()
             .map_or(true, |buffer| buffer.length() < coeff_bytes as u64)
         {
-            set.input = Some(autoreleasepool(|| {
-                self.device
-                    .new_buffer(coeff_bytes as u64, MTLResourceOptions::StorageModeShared)
-            }));
+            set.input = Some(device_buffer_prewarmed_or_new(
+                &self.device,
+                coeff_bytes as u64,
+            ));
         }
         let input_buffer = set.input.as_ref().unwrap();
         {
@@ -3458,10 +3506,10 @@ impl MetalShared {
             .as_ref()
             .map_or(true, |buffer| buffer.length() < output_bytes as u64)
         {
-            set.output = Some(autoreleasepool(|| {
-                self.device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            }));
+            set.output = Some(device_buffer_prewarmed_or_new(
+                &self.device,
+                output_bytes as u64,
+            ));
         }
         let output_buffer = set.output.as_ref().unwrap();
 
@@ -6317,6 +6365,26 @@ kernel void goldilocks_mul_bench_native(
             assert_tree_eq(&gpu, &cpu, cols, cap_height);
             assert_all_paths_match_cpu(&gpu, &cpu, lde_size, cap_height);
         }
+    }
+
+    #[test]
+    fn prewarmed_store_matches_size_and_does_not_oversize_steal() {
+        assert!(shared_context().is_some(), "Metal context must initialize");
+        let bytes = 3 * (1 << 20);
+        prewarm_large_column_store(bytes);
+        let taken = take_prewarmed_store(bytes, PREWARM_EXACT_SLACK_BYTES)
+            .expect("matching prewarmed store");
+        assert!(taken.length() >= bytes);
+        assert!(
+            take_prewarmed_store(bytes, PREWARM_EXACT_SLACK_BYTES).is_none(),
+            "stash must be single-use"
+        );
+        prewarm_large_column_store(bytes);
+        assert!(
+            take_prewarmed_store(bytes * 4, PREWARM_EXACT_SLACK_BYTES).is_none(),
+            "exact-slack take must not steal a much larger leftover"
+        );
+        assert!(take_prewarmed_store(bytes, PREWARM_EXACT_SLACK_BYTES).is_some());
     }
 
     /// The readiness probe must be invisible once the context is up: for every
