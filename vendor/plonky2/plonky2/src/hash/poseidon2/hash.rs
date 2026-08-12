@@ -680,17 +680,44 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    /// Four independent permutations at once; bit-identical to four `permute`s.
+    fn permute_x4(
+        a: [Self; WIDTH],
+        b: [Self; WIDTH],
+        c: [Self; WIDTH],
+        d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]);
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
     }
+
+    #[inline]
+    fn permute_x4(
+        a: [Self; WIDTH],
+        b: [Self; WIDTH],
+        c: [Self; WIDTH],
+        d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        <F as Poseidon2>::poseidon2_x4(a, b, c, d)
+    }
 }
 
 impl Permuter for Target {
     fn permute(_input: [Self; WIDTH]) -> [Self; WIDTH] {
         panic!("Call `permute_swapped()` instead of `permute()`");
+    }
+
+    fn permute_x4(
+        _a: [Self; WIDTH],
+        _b: [Self; WIDTH],
+        _c: [Self; WIDTH],
+        _d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        panic!("Call `permute_swapped()` instead of `permute_x4()`");
     }
 }
 
@@ -726,6 +753,22 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    /// Interleaved four-state permutation. Bit-identical to four sequential
+    /// `permute` calls (`poseidon2_x4` carries that guarantee); it exists only
+    /// to fill the issue slots one permutation's dependency chains leave idle.
+    fn permute_x4(states: &mut [Self; 4]) {
+        let (a, b, c, d) = T::permute_x4(
+            states[0].state,
+            states[1].state,
+            states[2].state,
+            states[3].state,
+        );
+        states[0].state = a;
+        states[1].state = b;
+        states[2].state = c;
+        states[3].state = d;
     }
 
     fn squeeze(&self) -> &[T] {
