@@ -339,11 +339,11 @@ fn fri_prover_query_round<
     mut x_index: usize,
     fri_params: &FriParams,
 ) -> FriQueryRound<F, C::Hasher, D> {
-    let mut query_steps = Vec::new();
-    let initial_proof = initial_merkle_trees
-        .iter()
-        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
-        .collect::<Vec<_>>();
+    let mut initial_proof = Vec::with_capacity(initial_merkle_trees.len());
+    for tree in initial_merkle_trees {
+        initial_proof.push((tree.leaf_vec(x_index), tree.prove(x_index)));
+    }
+    let mut query_steps = Vec::with_capacity(trees.len());
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
         let evals = unflatten(tree.get(x_index >> arity_bits));
@@ -398,5 +398,103 @@ mod tests {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod query_capacity_tests {
+    use plonky2_field::types::Field;
+
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::fri::FriConfig;
+    use crate::hash::merkle_tree::MerkleTree;
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+    type C = PoseidonGoldilocksConfig;
+    type H = <C as GenericConfig<D>>::Hasher;
+
+    fn make_tree(
+        num_leaves: usize,
+        width: usize,
+        cap_height: usize,
+        seed: usize,
+    ) -> MerkleTree<F, H> {
+        let leaves = (0..num_leaves)
+            .map(|leaf| {
+                (0..width)
+                    .map(|column| F::from_canonical_usize(seed + leaf * width + column))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        MerkleTree::new(leaves, cap_height)
+    }
+
+    #[test]
+    fn query_round_preserves_exact_shape_and_order() {
+        let initial_0 = make_tree(16, 3, 1, 100);
+        let initial_1 = make_tree(16, 5, 1, 1_000);
+        let trees = vec![
+            make_tree(8, 2 * D, 1, 2_000),
+            make_tree(2, 4 * D, 1, 3_000),
+            make_tree(1, 2 * D, 0, 4_000),
+        ];
+        let reduction_arity_bits = vec![1, 2, 1];
+        let fri_params = FriParams {
+            config: FriConfig {
+                rate_bits: 1,
+                cap_height: 1,
+                proof_of_work_bits: 0,
+                reduction_strategy: FriReductionStrategy::Fixed(reduction_arity_bits.clone()),
+                num_query_rounds: 1,
+            },
+            hiding: false,
+            degree_bits: 4,
+            reduction_arity_bits,
+        };
+
+        let x_index = 13;
+        let initial_trees = [&initial_0, &initial_1];
+        let round = fri_prover_query_round::<F, C, D>(&initial_trees, &trees, x_index, &fri_params);
+
+        assert_eq!(
+            round.initial_trees_proof.evals_proofs.len(),
+            initial_trees.len()
+        );
+        assert_eq!(round.steps.len(), trees.len());
+        assert_eq!(
+            round.initial_trees_proof.evals_proofs[0].0,
+            initial_0.leaf_vec(x_index)
+        );
+        assert_eq!(
+            round.initial_trees_proof.evals_proofs[1].0,
+            initial_1.leaf_vec(x_index)
+        );
+        assert_eq!(round.steps[0].merkle_proof, trees[0].prove(x_index >> 1));
+        assert_eq!(round.steps[1].merkle_proof, trees[1].prove(x_index >> 3));
+        assert_eq!(round.steps[2].merkle_proof, trees[2].prove(x_index >> 4));
+    }
+
+    #[test]
+    fn query_round_handles_empty_output_shape() {
+        let fri_params = FriParams {
+            config: FriConfig {
+                rate_bits: 0,
+                cap_height: 0,
+                proof_of_work_bits: 0,
+                reduction_strategy: FriReductionStrategy::Fixed(Vec::new()),
+                num_query_rounds: 1,
+            },
+            hiding: false,
+            degree_bits: 0,
+            reduction_arity_bits: Vec::new(),
+        };
+
+        let round = fri_prover_query_round::<F, C, D>(&[], &[], 0, &fri_params);
+        assert!(round.initial_trees_proof.evals_proofs.is_empty());
+        assert!(round.steps.is_empty());
     }
 }

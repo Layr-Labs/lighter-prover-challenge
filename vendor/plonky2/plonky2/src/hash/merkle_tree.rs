@@ -721,25 +721,59 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
 
     // Mask out high bits to get the index within the sub-tree.
     let mut pair_index = leaf_index & ((1 << num_layers) - 1);
-    (0..num_layers)
-        .map(|i| {
-            let parity = pair_index & 1;
-            pair_index >>= 1;
+    let mut siblings = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        let parity = pair_index & 1;
+        pair_index >>= 1;
 
-            // The layers' data is interleaved as follows:
-            // [layer 0, layer 1, layer 0, layer 2, layer 0, layer 1, layer 0, layer 3, ...].
-            // Each of the above is a pair of siblings.
-            // `pair_index` is the index of the pair within layer `i`.
-            // The index of that the pair within `digests` is
-            // `pair_index * 2 ** (i + 1) + (2 ** i - 1)`.
-            let siblings_index = (pair_index << (i + 1)) + (1 << i) - 1;
-            // We have an index for the _pair_, but we want the index of the _sibling_.
-            // Double the pair index to get the index of the left sibling. Conditionally add `1`
-            // if we are to retrieve the right sibling.
-            let sibling_index = 2 * siblings_index + (1 - parity);
-            digest_tree[sibling_index]
-        })
-        .collect()
+        // The layers' data is interleaved as follows:
+        // [layer 0, layer 1, layer 0, layer 2, layer 0, layer 1, layer 0, layer 3, ...].
+        // Each of the above is a pair of siblings.
+        // `pair_index` is the index of the pair within layer `i`.
+        // The index of that the pair within `digests` is
+        // `pair_index * 2 ** (i + 1) + (2 ** i - 1)`.
+        let siblings_index = (pair_index << (i + 1)) + (1 << i) - 1;
+        // We have an index for the _pair_, but we want the index of the _sibling_.
+        // Double the pair index to get the index of the left sibling. Conditionally add `1`
+        // if we are to retrieve the right sibling.
+        let sibling_index = 2 * siblings_index + (1 - parity);
+        siblings.push(digest_tree[sibling_index]);
+    }
+    siblings
+}
+
+#[cfg(test)]
+mod proof_capacity_tests {
+    use plonky2_field::types::Field;
+
+    use super::*;
+    use crate::hash::merkle_proofs::verify_merkle_proof_to_cap;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+
+    #[test]
+    fn proof_sibling_count_matches_tree_levels() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        for &(log_n, cap_height) in &[(0usize, 0usize), (3, 0), (5, 2), (5, 5)] {
+            let n = 1usize << log_n;
+            let leaves = (0..n)
+                .map(|leaf| {
+                    (0..7)
+                        .map(|column| F::from_canonical_usize(leaf * 7 + column + 1))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let tree = MerkleTree::<F, H>::new(leaves.clone(), cap_height);
+            for (leaf_index, leaf) in leaves.into_iter().enumerate() {
+                let proof = tree.prove(leaf_index);
+                assert_eq!(proof.siblings.len(), log_n - cap_height);
+                verify_merkle_proof_to_cap(leaf, leaf_index, &tree.cap, &proof).unwrap();
+            }
+        }
+    }
 }
 
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
