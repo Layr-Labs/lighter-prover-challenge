@@ -3,6 +3,11 @@ use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::slice;
 
+#[cfg(feature = "std")]
+use std::collections::HashMap;
+#[cfg(feature = "std")]
+use std::sync::{Arc, Mutex, OnceLock};
+
 use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +166,30 @@ pub struct LevelOrderDigests<T> {
     pub level_offsets: Vec<usize>,
 }
 
+/// A fixed Merkle commitment whose upper tree is known ahead of time while
+/// small leaf subtrees are materialized only when an FRI query opens them.
+///
+/// The embedded roots authenticate every lazily built subtree. `cache` is not
+/// part of the mathematical value: clones share it, and equality compares only
+/// the immutable tree description.
+#[cfg(feature = "std")]
+#[derive(Clone, Debug)]
+pub struct SparseMerkleDigests<T> {
+    subtree_log: usize,
+    upper: LevelOrderDigests<T>,
+    cache: Arc<Mutex<HashMap<usize, Arc<OnceLock<LevelOrderDigests<T>>>>>>,
+}
+
+#[cfg(feature = "std")]
+impl<T: PartialEq> PartialEq for SparseMerkleDigests<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.subtree_log == other.subtree_log && self.upper == other.upper
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T: Eq> Eq for SparseMerkleDigests<T> {}
+
 impl<T: Copy> LevelOrderDigests<T> {
     /// Node `index` of level `level`.
     pub fn node(&self, level: usize, index: usize) -> T {
@@ -253,6 +282,12 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     /// and serialization materializes the interleaved layout on demand.
     pub level_digests: Option<LevelOrderDigests<H::Hash>>,
 
+    /// Build-time-authenticated upper levels plus query-driven lower
+    /// subtrees. Used only for fixed constants/sigmas commitments loaded from
+    /// compact circuit blobs.
+    #[cfg(feature = "std")]
+    pub sparse_digests: Option<SparseMerkleDigests<H::Hash>>,
+
     /// The Merkle cap.
     pub cap: MerkleCap<F, H>,
 }
@@ -267,6 +302,8 @@ impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
             num_leaves: 0,
             digests: Vec::new(),
             level_digests: None,
+            #[cfg(feature = "std")]
+            sparse_digests: None,
             cap: MerkleCap::default(),
         }
     }
@@ -742,6 +779,78 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
         .collect()
 }
 
+/// Builds level-order parent nodes from hashes that already represent level
+/// zero. This is the narrow parent-only half of Merkle construction and is
+/// shared by the embedded sparse tree and its lazily materialized subtrees.
+fn level_order_from_leaf_digests<F: RichField, H: Hasher<F>>(
+    leaf_digests: Vec<H::Hash>,
+    cap_height: usize,
+) -> (LevelOrderDigests<H::Hash>, Vec<H::Hash>) {
+    let leaf_count = leaf_digests.len();
+    assert!(leaf_count.is_power_of_two());
+    let cap_count = 1usize << cap_height;
+    assert!(cap_count <= leaf_count);
+
+    let node_count = 2 * leaf_count - cap_count;
+    let mut nodes = leaf_digests;
+    nodes.reserve_exact(node_count - leaf_count);
+    let mut level_offsets = Vec::with_capacity(log2_strict(leaf_count) - cap_height + 1);
+    let mut level_start = 0usize;
+    level_offsets.push(level_start);
+
+    while nodes.len() - level_start > cap_count {
+        let level_end = nodes.len();
+        let children = &nodes[level_start..level_end];
+        let parent_count = children.len() / 2;
+        let mut parents = Vec::with_capacity(parent_count);
+        let output = capacity_up_to_mut(&mut parents, parent_count);
+        if parent_count >= 4 {
+            output
+                .par_chunks_exact_mut(4)
+                .zip(children.par_chunks_exact(8))
+                .for_each(|(output, children)| {
+                    let hashes = H::two_to_one_quad([
+                        (children[0], children[1]),
+                        (children[2], children[3]),
+                        (children[4], children[5]),
+                        (children[6], children[7]),
+                    ]);
+                    output
+                        .iter_mut()
+                        .zip(hashes)
+                        .for_each(|(slot, hash)| {
+                            slot.write(hash);
+                        });
+                });
+        } else if parent_count == 2 {
+            let (left, right) =
+                H::two_to_one_pair(children[0], children[1], children[2], children[3]);
+            output[0].write(left);
+            output[1].write(right);
+        } else {
+            output[0].write(H::two_to_one(children[0], children[1]));
+        }
+        unsafe {
+            // SAFETY: every level has power-of-two length, and the selected
+            // branch writes each parent slot exactly once.
+            parents.set_len(parent_count);
+        }
+        level_start = level_end;
+        level_offsets.push(level_start);
+        nodes.extend(parents);
+    }
+
+    debug_assert_eq!(nodes.len(), node_count);
+    let cap = nodes[level_start..].to_vec();
+    (
+        LevelOrderDigests {
+            nodes: nodes.into(),
+            level_offsets,
+        },
+        cap,
+    )
+}
+
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Returns the natural-order, column-major Metal leaf storage when this
     /// commitment retained its LDE in a shared GPU-visible buffer.
@@ -808,6 +917,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 num_leaves,
                 digests: Vec::new(),
                 level_digests: Some(level_digests),
+                #[cfg(feature = "std")]
+                sparse_digests: None,
                 cap: MerkleCap(cap),
             };
         }
@@ -836,6 +947,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 num_leaves,
                 digests,
                 level_digests: None,
+                #[cfg(feature = "std")]
+                sparse_digests: None,
                 cap: MerkleCap(cap),
             };
         }
@@ -862,6 +975,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             num_leaves,
             digests,
             level_digests: None,
+            #[cfg(feature = "std")]
+            sparse_digests: None,
             cap: MerkleCap(cap),
         }
     }
@@ -881,7 +996,236 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             num_leaves,
             digests: Vec::new(),
             level_digests: Some(level_digests),
+            #[cfg(feature = "std")]
+            sparse_digests: None,
             cap: MerkleCap(cap),
+        }
+    }
+
+    /// Wraps reconstructed fixed LDE columns with one authenticated root per
+    /// `2^subtree_log` tree-order leaves. Only the much smaller upper tree is
+    /// built eagerly. Lower nodes are computed and cached when an FRI query
+    /// first touches their subtree.
+    #[cfg(feature = "std")]
+    pub fn from_prehashed_subtree_roots(
+        columns: ColumnStore<F>,
+        subtree_roots: Vec<H::Hash>,
+        subtree_log: usize,
+        cap_height: usize,
+    ) -> Self {
+        let num_leaves = columns.num_rows();
+        let log_rows = log2_strict(num_leaves);
+        assert!(subtree_log > 0);
+        assert!(subtree_log + cap_height <= log_rows);
+        assert_eq!(subtree_roots.len(), num_leaves >> subtree_log);
+
+        let (upper, cap) =
+            level_order_from_leaf_digests::<F, H>(subtree_roots, cap_height);
+        Self {
+            leaves: MerkleLeaves::Columns { columns, log_rows },
+            num_leaves,
+            digests: Vec::new(),
+            level_digests: None,
+            sparse_digests: Some(SparseMerkleDigests {
+                subtree_log,
+                upper,
+                cache: Arc::new(Mutex::new(HashMap::new())),
+            }),
+            cap: MerkleCap(cap),
+        }
+    }
+
+    /// Extracts one fixed digest per `2^subtree_log` leaves. The scored worker
+    /// never calls this; circuit embedding runs it in the untimed build job.
+    pub fn subtree_roots(&self, subtree_log: usize) -> Vec<H::Hash> {
+        assert!(subtree_log <= log2_strict(self.num_leaves) - self.cap.height());
+        if let Some(levels) = &self.level_digests {
+            let count = self.num_leaves >> subtree_log;
+            let start = levels.level_offsets[subtree_log];
+            return levels.nodes[start..start + count].to_vec();
+        }
+
+        let mut current = self.leaf_digests();
+        for _ in 0..subtree_log {
+            current = current
+                .par_chunks_exact(2)
+                .map(|pair| H::two_to_one(pair[0], pair[1]))
+                .collect();
+        }
+        current
+    }
+
+    /// Returns level-zero hashes in tree-leaf order without hashing the leaf
+    /// field elements again. Used only by the untimed embedding path.
+    pub fn leaf_digests(&self) -> Vec<H::Hash> {
+        if let Some(levels) = &self.level_digests {
+            return levels.nodes[..self.num_leaves].to_vec();
+        }
+        #[cfg(feature = "std")]
+        if self.sparse_digests.is_some() {
+            return self
+                .materialize_sparse_levels()
+                .nodes[..self.num_leaves]
+                .to_vec();
+        }
+
+        let cap_height = self.cap.height();
+        let num_layers = log2_strict(self.num_leaves) - cap_height;
+        if num_layers == 0 {
+            return self.cap.0.clone();
+        }
+        let subtree_leaves = self.num_leaves >> cap_height;
+        let subtree_digests = 2 * (subtree_leaves - 1);
+        (0..self.num_leaves)
+            .map(|leaf| {
+                let subtree = leaf / subtree_leaves;
+                let local = leaf % subtree_leaves;
+                self.digests[subtree * subtree_digests + 4 * (local / 2) + local % 2]
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "std")]
+    fn sparse_subtree_levels(
+        &self,
+        sparse: &SparseMerkleDigests<H::Hash>,
+        subtree_index: usize,
+    ) -> Arc<OnceLock<LevelOrderDigests<H::Hash>>> {
+        sparse
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(subtree_index)
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    }
+
+    #[cfg(feature = "std")]
+    fn build_sparse_subtree_levels(
+        &self,
+        sparse: &SparseMerkleDigests<H::Hash>,
+        subtree_index: usize,
+    ) -> LevelOrderDigests<H::Hash> {
+        let subtree_size = 1usize << sparse.subtree_log;
+        let first_leaf = subtree_index * subtree_size;
+        let leaf_width = self.leaf_width();
+        let mut flat = Vec::with_capacity(subtree_size * leaf_width);
+        match &self.leaves {
+            MerkleLeaves::Rows { data, width } => {
+                let start = first_leaf * width;
+                flat.extend_from_slice(&data[start..start + subtree_size * width]);
+            }
+            MerkleLeaves::Columns { columns, log_rows } => {
+                for leaf in first_leaf..first_leaf + subtree_size {
+                    let natural = crate::util::reverse_bits(leaf, *log_rows);
+                    for column in 0..columns.num_cols() {
+                        flat.push(columns.col(column)[natural]);
+                    }
+                }
+            }
+        }
+
+        let mut hashes = Vec::with_capacity(subtree_size);
+        let mut leaves = flat.chunks_exact(leaf_width);
+        while leaves.len() >= 4 {
+            let a = leaves.next().unwrap();
+            let b = leaves.next().unwrap();
+            let c = leaves.next().unwrap();
+            let d = leaves.next().unwrap();
+            let (ha, hb, hc, hd) = H::hash_or_noop_quad(a, b, c, d);
+            hashes.extend([ha, hb, hc, hd]);
+        }
+        let remainder: Vec<&[F]> = leaves.collect();
+        if remainder.len() == 2 {
+            let (left, right) = H::hash_or_noop_pair(remainder[0], remainder[1]);
+            hashes.extend([left, right]);
+        } else if remainder.len() == 1 {
+            hashes.push(H::hash_or_noop(remainder[0]));
+        }
+        debug_assert_eq!(hashes.len(), subtree_size);
+
+        let (levels, root) = level_order_from_leaf_digests::<F, H>(hashes, 0);
+        debug_assert_eq!(root.len(), 1);
+        assert_eq!(
+            root[0],
+            sparse.upper.node(0, subtree_index),
+            "embedded sparse Merkle subtree root mismatch"
+        );
+        levels
+    }
+
+    #[cfg(feature = "std")]
+    fn sparse_prove_siblings(
+        &self,
+        sparse: &SparseMerkleDigests<H::Hash>,
+        leaf_index: usize,
+    ) -> Vec<H::Hash> {
+        let subtree_index = leaf_index >> sparse.subtree_log;
+        let local_index = leaf_index & ((1usize << sparse.subtree_log) - 1);
+        let cell = self.sparse_subtree_levels(sparse, subtree_index);
+        let lower = cell.get_or_init(|| self.build_sparse_subtree_levels(sparse, subtree_index));
+        let mut siblings = lower.prove_siblings(local_index);
+        siblings.extend(sparse.upper.prove_siblings(subtree_index));
+        siblings
+    }
+
+    /// Cold serialization helper. Production proofs never call this: they
+    /// keep sparse storage and build only queried subtrees.
+    #[cfg(feature = "std")]
+    fn materialize_sparse_levels(&self) -> LevelOrderDigests<H::Hash> {
+        let sparse = self.sparse_digests.as_ref().expect("sparse tree");
+        let subtree_count = self.num_leaves >> sparse.subtree_log;
+        let subtrees: Vec<Arc<OnceLock<LevelOrderDigests<H::Hash>>>> =
+            (0..subtree_count)
+                .map(|index| self.sparse_subtree_levels(sparse, index))
+                .collect();
+        subtrees.par_iter().enumerate().for_each(|(index, cell)| {
+            cell.get_or_init(|| self.build_sparse_subtree_levels(sparse, index));
+        });
+
+        let cap_height = self.cap.height();
+        let node_count = 2 * self.num_leaves - (1 << cap_height);
+        let mut nodes = Vec::with_capacity(node_count);
+        let mut level_offsets = Vec::with_capacity(
+            log2_strict(self.num_leaves) - cap_height + 1,
+        );
+        for level in 0..sparse.subtree_log {
+            level_offsets.push(nodes.len());
+            for cell in &subtrees {
+                let levels = cell.get().expect("initialized sparse subtree");
+                let start = levels.level_offsets[level];
+                let len = (1usize << sparse.subtree_log) >> level;
+                nodes.extend_from_slice(&levels.nodes[start..start + len]);
+            }
+        }
+        for level in 0..sparse.upper.level_offsets.len() {
+            level_offsets.push(nodes.len());
+            let start = sparse.upper.level_offsets[level];
+            let end = sparse
+                .upper
+                .level_offsets
+                .get(level + 1)
+                .copied()
+                .unwrap_or(sparse.upper.nodes.len());
+            nodes.extend_from_slice(&sparse.upper.nodes[start..end]);
+        }
+        debug_assert_eq!(nodes.len(), node_count);
+        LevelOrderDigests {
+            nodes: nodes.into(),
+            level_offsets,
+        }
+    }
+
+    /// Canonical interleaved digest storage for the generic circuit-data wire
+    /// format, including sparse trees on the rare serialization path.
+    pub fn interleaved_digests(&self) -> Vec<H::Hash> {
+        #[cfg(feature = "std")]
+        if self.sparse_digests.is_some() {
+            return self.materialize_sparse_levels().to_interleaved();
+        }
+        match &self.level_digests {
+            Some(levels) => levels.to_interleaved(),
+            None => self.digests.clone(),
         }
     }
 
@@ -979,6 +1323,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 num_leaves,
                 digests: Vec::new(),
                 level_digests: Some(level_digests),
+                #[cfg(feature = "std")]
+                sparse_digests: None,
                 cap: MerkleCap(cap),
             };
         }
@@ -992,6 +1338,8 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             num_leaves,
             digests,
             level_digests: None,
+            #[cfg(feature = "std")]
+            sparse_digests: None,
             cap: MerkleCap(cap),
         }
     }
@@ -1030,6 +1378,15 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Create a Merkle proof from a leaf index.
     pub fn prove(&self, leaf_index: usize) -> MerkleProof<F, H> {
         let cap_height = log2_strict(self.cap.len());
+        #[cfg(feature = "std")]
+        if let Some(sparse) = &self.sparse_digests {
+            let siblings = self.sparse_prove_siblings(sparse, leaf_index);
+            debug_assert_eq!(
+                siblings.len(),
+                log2_strict(self.num_leaves) - cap_height
+            );
+            return MerkleProof { siblings };
+        }
         let siblings = match &self.level_digests {
             Some(levels) => {
                 debug_assert_eq!(
@@ -1051,7 +1408,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 pub(crate) mod tests {
     use anyhow::Result;
 
-    use plonky2_field::types::{PrimeField64, Sample};
+    use plonky2_field::types::{Field, PrimeField64, Sample};
 
     use super::*;
     use crate::field::extension::Extendable;
@@ -1262,6 +1619,8 @@ pub(crate) mod tests {
                     num_leaves: n,
                     digests: Vec::new(),
                     level_digests: Some(levels),
+                    #[cfg(feature = "std")]
+                    sparse_digests: None,
                     cap: MerkleCap(cap),
                 };
 
@@ -1278,6 +1637,55 @@ pub(crate) mod tests {
             }
         }
 
+        Ok(())
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn sparse_subtree_roots_match_full_tree() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        const N: usize = 256;
+        const WIDTH: usize = 13;
+        const CAP_HEIGHT: usize = 3;
+        const SUBTREE_LOG: usize = 3;
+        let leaves = random_data::<F>(N, WIDTH);
+        let full = MerkleTree::<F, H>::new(leaves.clone(), CAP_HEIGHT);
+        let roots = full.subtree_roots(SUBTREE_LOG);
+
+        let mut columns = vec![vec![F::ZERO; N]; WIDTH];
+        let log_n = log2_strict(N);
+        for (leaf_index, leaf) in leaves.iter().enumerate() {
+            let natural = crate::util::reverse_bits(leaf_index, log_n);
+            for (column, &value) in leaf.iter().enumerate() {
+                columns[column][natural] = value;
+            }
+        }
+        let sparse = MerkleTree::<F, H>::from_prehashed_subtree_roots(
+            ColumnStore::Owned(columns),
+            roots,
+            SUBTREE_LOG,
+            CAP_HEIGHT,
+        );
+        assert_eq!(sparse.cap, full.cap);
+
+        // Cross subtree boundaries and repeat one query to exercise the
+        // shared OnceLock cache.
+        for &leaf_index in &[0usize, 1, 7, 8, 63, 127, 255, 8] {
+            let expected = full.prove(leaf_index);
+            let actual = sparse.prove(leaf_index);
+            assert_eq!(actual, expected, "leaf {leaf_index}");
+            verify_merkle_proof_to_cap(
+                leaves[leaf_index].clone(),
+                leaf_index,
+                &sparse.cap,
+                &actual,
+            )?;
+        }
+        assert_eq!(sparse.interleaved_digests(), full.digests);
         Ok(())
     }
 }
