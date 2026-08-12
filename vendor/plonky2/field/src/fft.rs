@@ -269,7 +269,7 @@ pub fn ifft_with_options<F: Field>(
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
 ) -> PolynomialCoeffs<F> {
-    ifft_with_options_and_postscale(poly, zero_factor, root_table, None)
+    ifft_with_options_and_postscale(poly, zero_factor, root_table, None, false)
 }
 
 pub(crate) fn ifft_with_options_and_postscale<F: Field>(
@@ -277,6 +277,7 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     zero_factor: Option<usize>,
     root_table: Option<&FftRootTable<F>>,
     postscale: Option<&[F]>,
+    scales_include_n_inv: bool,
 ) -> PolynomialCoeffs<F> {
     let n = poly.len();
     let lg_n = log2_strict(n);
@@ -299,22 +300,37 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
         }
         Some(scales) => {
             assert_eq!(scales.len(), n);
-            // Fuse the caller's coefficient scaling into the same writes as
-            // IFFT reversal and normalization, preserving multiplication order.
-            buffer[0] *= n_inv;
-            buffer[n / 2] *= n_inv;
-            buffer[0] *= scales[0];
-            if n > 1 {
-                buffer[n / 2] *= scales[n / 2];
-            }
-            for i in 1..(n / 2) {
-                let j = n - i;
-                let mut coeffs_i = buffer[j] * n_inv;
-                let mut coeffs_j = buffer[i] * n_inv;
-                coeffs_i *= scales[i];
-                coeffs_j *= scales[j];
-                buffer[i] = coeffs_i;
-                buffer[j] = coeffs_j;
+            if scales_include_n_inv {
+                // Scales already fold `n^-1`; one multiply per coefficient.
+                buffer[0] *= scales[0];
+                if n > 1 {
+                    buffer[n / 2] *= scales[n / 2];
+                }
+                for i in 1..(n / 2) {
+                    let j = n - i;
+                    let coeffs_i = buffer[j] * scales[i];
+                    let coeffs_j = buffer[i] * scales[j];
+                    buffer[i] = coeffs_i;
+                    buffer[j] = coeffs_j;
+                }
+            } else {
+                // Fuse the caller's coefficient scaling into the same writes as
+                // IFFT reversal and normalization, preserving multiplication order.
+                buffer[0] *= n_inv;
+                buffer[n / 2] *= n_inv;
+                buffer[0] *= scales[0];
+                if n > 1 {
+                    buffer[n / 2] *= scales[n / 2];
+                }
+                for i in 1..(n / 2) {
+                    let j = n - i;
+                    let mut coeffs_i = buffer[j] * n_inv;
+                    let mut coeffs_j = buffer[i] * n_inv;
+                    coeffs_i *= scales[i];
+                    coeffs_j *= scales[j];
+                    buffer[i] = coeffs_i;
+                    buffer[j] = coeffs_j;
+                }
             }
         }
     }
