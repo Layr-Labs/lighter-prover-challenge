@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::{Hash, Hasher};
 use core::iter::{Product, Sum};
@@ -219,6 +220,123 @@ impl Field for GoldilocksField {
         } else {
             n as u64
         })
+    }
+
+    #[inline(always)]
+    fn multiply_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+            (NeonGoldilocksField(lhs) * NeonGoldilocksField(rhs)).0
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            [lhs[0] * rhs[0], lhs[1] * rhs[1]]
+        }
+    }
+
+    fn batch_multiplicative_inverse_pair_into(
+        x0: &[Self],
+        x1: &[Self],
+        buf0: &mut Vec<Self>,
+        buf1: &mut Vec<Self>,
+    ) {
+        assert_eq!(x0.len(), x1.len());
+
+        // The hot permutation batches are much larger than WIDTH. Keep the
+        // small cases on the established path, both for compactness and to
+        // preserve their exact special-case behavior.
+        const WIDTH: usize = 4;
+        let n = x0.len();
+        if n < WIDTH {
+            Self::batch_multiplicative_inverse_into(x0, buf0);
+            Self::batch_multiplicative_inverse_into(x1, buf1);
+            return;
+        }
+
+        buf0.clear();
+        buf1.clear();
+        buf0.reserve(n);
+        buf1.reserve(n);
+
+        let mut cumul0: [Self; WIDTH] = x0[..WIDTH].try_into().unwrap();
+        let mut cumul1: [Self; WIDTH] = x1[..WIDTH].try_into().unwrap();
+        buf0.extend(cumul0);
+        buf1.extend(cumul1);
+        for i in WIDTH..n {
+            let lane = i % WIDTH;
+            let next = Self::multiply_pair(
+                [cumul0[lane], cumul1[lane]],
+                [x0[i], x1[i]],
+            );
+            cumul0[lane] = next[0];
+            cumul1[lane] = next[1];
+            buf0.push(next[0]);
+            buf1.push(next[1]);
+        }
+
+        // Montgomery's trick normally spends one inverse per batch. Combine
+        // the two terminal products first, spend one inverse total, then split
+        // it back into the two challenge-lane inverses with two products.
+        let c01 = Self::multiply_pair(
+            [cumul0[0], cumul1[0]],
+            [cumul0[1], cumul1[1]],
+        );
+        let c23 = Self::multiply_pair(
+            [cumul0[2], cumul1[2]],
+            [cumul0[3], cumul1[3]],
+        );
+        let totals = Self::multiply_pair(c01, c23);
+        let combined_inverse = (totals[0] * totals[1]).inverse();
+        let total_inverses = Self::multiply_pair(
+            [combined_inverse; 2],
+            [totals[1], totals[0]],
+        );
+
+        let c01_inverses = Self::multiply_pair(total_inverses, c23);
+        let c23_inverses = Self::multiply_pair(total_inverses, c01);
+        let inv0 = Self::multiply_pair(
+            c01_inverses,
+            [cumul0[1], cumul1[1]],
+        );
+        let inv1 = Self::multiply_pair(
+            c01_inverses,
+            [cumul0[0], cumul1[0]],
+        );
+        let inv2 = Self::multiply_pair(
+            c23_inverses,
+            [cumul0[3], cumul1[3]],
+        );
+        let inv3 = Self::multiply_pair(
+            c23_inverses,
+            [cumul0[2], cumul1[2]],
+        );
+        let mut a_inv0 = [inv0[0], inv1[0], inv2[0], inv3[0]];
+        let mut a_inv1 = [inv0[1], inv1[1], inv2[1], inv3[1]];
+
+        for i in (WIDTH..n).rev() {
+            let lane = i % WIDTH;
+            let inverse = Self::multiply_pair(
+                [buf0[i - WIDTH], buf1[i - WIDTH]],
+                [a_inv0[lane], a_inv1[lane]],
+            );
+            buf0[i] = inverse[0];
+            buf1[i] = inverse[1];
+            let previous = Self::multiply_pair(
+                [a_inv0[lane], a_inv1[lane]],
+                [x0[i], x1[i]],
+            );
+            a_inv0[lane] = previous[0];
+            a_inv1[lane] = previous[1];
+        }
+        for i in (0..WIDTH).rev() {
+            buf0[i] = a_inv0[i];
+            buf1[i] = a_inv1[i];
+        }
+
+        debug_assert!(buf0.iter().zip(x0).all(|(&inv, &x)| inv * x == Self::ONE));
+        debug_assert!(buf1.iter().zip(x1).all(|(&inv, &x)| inv * x == Self::ONE));
     }
 
     #[inline]
@@ -630,11 +748,81 @@ fn fermat_inverse_chain(base: GoldilocksField) -> GoldilocksField {
 
 #[cfg(test)]
 mod tests {
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::{Field, PrimeField64};
     use crate::{test_field_arithmetic, test_prime_field_arithmetic};
-
     test_prime_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
     test_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
 
+    /// The challenge-lane hook must preserve the exact scalar representative,
+    /// including inputs in Goldilocks' small non-canonical alias range.
+    #[test]
+    fn multiply_pair_matches_scalar_raw_representative() {
+        let edges = [
+            0u64,
+            1,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0001,
+            u64::MAX,
+        ];
+        for &a0 in &edges {
+            for &a1 in &edges {
+                for &b0 in &edges {
+                    for &b1 in &edges {
+                        let lhs = [GoldilocksField(a0), GoldilocksField(a1)];
+                        let rhs = [GoldilocksField(b0), GoldilocksField(b1)];
+                        let actual = GoldilocksField::multiply_pair(lhs, rhs);
+                        let expected = [lhs[0] * rhs[0], lhs[1] * rhs[1]];
+                        assert_eq!(actual[0].0, expected[0].0);
+                        assert_eq!(actual[1].0, expected[1].0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paired_batch_inverse_matches_independent_batches() {
+        let values = [
+            1u64,
+            2,
+            3,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            u64::MAX,
+        ];
+        for n in 0..65 {
+            let x0: Vec<_> = (0..n)
+                .map(|i| GoldilocksField(values[i % values.len()]))
+                .collect();
+            let x1: Vec<_> = (0..n)
+                .map(|i| GoldilocksField(values[(i * 3 + 2) % values.len()]))
+                .collect();
+            let expected0 = GoldilocksField::batch_multiplicative_inverse(&x0);
+            let expected1 = GoldilocksField::batch_multiplicative_inverse(&x1);
+            let mut actual0 = Vec::new();
+            let mut actual1 = Vec::new();
+            GoldilocksField::batch_multiplicative_inverse_pair_into(
+                &x0,
+                &x1,
+                &mut actual0,
+                &mut actual1,
+            );
+            assert_eq!(actual0.len(), n);
+            assert_eq!(actual1.len(), n);
+            for i in 0..n {
+                assert_eq!(actual0[i].0, expected0[i].0);
+                assert_eq!(actual1[i].0, expected1[i].0);
+                assert_eq!(actual0[i].to_canonical_u64(), expected0[i].to_canonical_u64());
+                assert_eq!(actual1[i].to_canonical_u64(), expected1[i].to_canonical_u64());
+                assert_eq!(actual0[i] * x0[i], GoldilocksField::ONE);
+                assert_eq!(actual1[i] * x1[i], GoldilocksField::ONE);
+            }
+        }
+    }
     /// Differential test for the AArch64 `multiply_accumulate` inline assembly
     /// against the portable expression it replaces.
     ///
