@@ -89,6 +89,24 @@ pub trait PlonkyPermutation<T: Copy + Default>:
     /// Apply permutation to internal state
     fn permute(&mut self);
 
+    /// Permute four *independent* states together.
+    ///
+    /// The default is four sequential `permute` calls, so every existing
+    /// implementation keeps its exact semantics. Implementations whose
+    /// permutation is issue-bound rather than latency-bound may override this
+    /// with an interleaved form to reclaim the idle issue slots; the override
+    /// must be bit-identical to four sequential `permute` calls.
+    ///
+    /// Only callers that genuinely have four independent states may use this
+    /// (FRI proof-of-work candidates, independent Merkle siblings) — a sponge
+    /// absorb chain has a per-call data dependency and cannot.
+    #[inline]
+    fn permute_x4(states: &mut [Self; 4]) {
+        for s in states.iter_mut() {
+            s.permute();
+        }
+    }
+
     /// Return a slice of `RATE` elements
     fn squeeze(&self) -> &[T];
 }

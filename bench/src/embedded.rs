@@ -17,7 +17,7 @@
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
-use circuit::embed::deserialize_embedded;
+use circuit::embed::{deserialize_embedded, deserialize_embedded_with};
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
@@ -68,7 +68,7 @@ impl RemainingEmbeddedCircuits {
     }
 }
 
-fn load_blob<T: serde::de::DeserializeOwned>(
+fn load_blob<T: serde::de::DeserializeOwned + Sync>(
     name: &'static str,
     blob: &[u8],
 ) -> anyhow::Result<(T, CircuitData<F, C, D>)> {
@@ -78,6 +78,31 @@ fn load_blob<T: serde::de::DeserializeOwned>(
     );
     deserialize_embedded::<T>(blob)
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
+}
+
+/// [`load_blob`] with a hook that runs against the decoded circuit while this
+/// blob's constants/sigmas commitment is still being rebuilt. See
+/// [`deserialize_embedded_with`] for what the hook may and may not read.
+fn load_blob_with<T, R, H>(
+    name: &'static str,
+    blob: &[u8],
+    on_decoded: H,
+) -> anyhow::Result<((T, CircuitData<F, C, D>), R)>
+where
+    T: serde::de::DeserializeOwned + Sync,
+    R: Send,
+    H: FnOnce(&T, &CircuitData<F, C, D>) -> R + Send,
+{
+    anyhow::ensure!(
+        !blob.is_empty(),
+        "embedded circuit blob {name} is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
+    );
+    let (target, data, hooked) = deserialize_embedded_with::<T, R, H>(blob, Some(on_decoded))
+        .map_err(|error| error.context(format!("loading embedded circuit {name}")))?;
+    Ok((
+        (target, data),
+        hooked.expect("embedded circuit decode hook must have run"),
+    ))
 }
 
 impl Circuits {
@@ -92,22 +117,59 @@ impl Circuits {
     /// the worker startup path only; normal callers should keep using
     /// [`Self::load`].
     pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingEmbeddedCircuits> {
+        let (remaining, (), ()) = Self::load_remaining_embedded_with(|_, _| (), |_, _| ())?;
+        Ok(remaining)
+    }
+
+    /// [`Self::load_remaining_embedded`] with a hook per transaction blob, each
+    /// running against its decoded circuit while that blob's constants/sigmas
+    /// commitment is still being rebuilt.
+    ///
+    /// The two transaction blobs are this load's long poles — ~200-210 ms of
+    /// serial decode followed by ~110-170 ms of GPU-bound commitment rebuild,
+    /// against ~40 ms + ~30-80 ms for the two chain blobs — and the tail of
+    /// that rebuild is the startup window's only GPU-saturated stretch. A hook
+    /// here therefore runs on a nearly idle CPU inside a window the startup
+    /// already owns. The chain blobs get no hook: nothing needs one, and they
+    /// are long finished by the time the transaction blobs are.
+    pub(crate) fn load_remaining_embedded_with<H, L, RH, RL>(
+        on_heavy_tx: H,
+        on_light_tx: L,
+    ) -> anyhow::Result<(RemainingEmbeddedCircuits, RH, RL)>
+    where
+        H: FnOnce(&BlockTxTarget, &CircuitData<F, C, D>) -> RH + Send,
+        L: FnOnce(&BlockTxTarget, &CircuitData<F, C, D>) -> RL + Send,
+        RH: Send,
+        RL: Send,
+    {
         let (heavy, light) = rayon::join(
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
+                    || {
+                        load_blob_with::<BlockTxTarget, RH, H>(
+                            "heavy_tx",
+                            HEAVY_TX_BLOB,
+                            on_heavy_tx,
+                        )
+                    },
                     || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
                 )
             },
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+                    || {
+                        load_blob_with::<BlockTxTarget, RL, L>(
+                            "light_tx",
+                            LIGHT_TX_BLOB,
+                            on_light_tx,
+                        )
+                    },
                     || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
                 )
             },
         );
-        let (heavy_tx, heavy_chain) = (heavy.0?, heavy.1?);
-        let (light_tx, light_chain) = (light.0?, light.1?);
+        let ((heavy_tx, heavy_hooked), heavy_chain) = (heavy.0?, heavy.1?);
+        let ((light_tx, light_hooked), light_chain) = (light.0?, light.1?);
 
         let dummy_heavy_proof: Proof =
             bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
@@ -116,14 +178,18 @@ impl Circuits {
             bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
                 .expect("embedded light chain dummy proof is invalid");
 
-        Ok(RemainingEmbeddedCircuits {
-            heavy_tx,
-            heavy_chain,
-            light_tx,
-            light_chain,
-            dummy_heavy_proof,
-            dummy_light_proof,
-        })
+        Ok((
+            RemainingEmbeddedCircuits {
+                heavy_tx,
+                heavy_chain,
+                light_tx,
+                light_chain,
+                dummy_heavy_proof,
+                dummy_light_proof,
+            },
+            heavy_hooked,
+            light_hooked,
+        ))
     }
 
     /// Reconstructs all five startup circuits from the blobs embedded at

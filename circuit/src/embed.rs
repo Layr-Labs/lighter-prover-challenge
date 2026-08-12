@@ -136,7 +136,7 @@ fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
     // section directly with zstd avoids the former runtime double decode
     // (whole-blob zstd followed by per-section LZ4) while retaining bounded
     // per-section peak memory during parallel circuit loading.
-    let compressed = zstd::bulk::compress(raw, 19)
+    let compressed = zstd::bulk::compress(raw, 1)
         .expect("zstd-compressing embedded circuit section");
     out.extend_from_slice(&(raw.len() as u64).to_le_bytes());
     write_section(out, &compressed);
@@ -303,7 +303,49 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 /// constants/sigmas commitment) is derived by the same code paths the builder
 /// itself runs, from the same inputs. The recomputed commitment cap is checked
 /// against the embedded verifier data before returning.
-pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+pub fn deserialize_embedded<T: DeserializeOwned + Sync>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>)> {
+    let (target, data, _) =
+        deserialize_embedded_with::<T, (), fn(&T, &CircuitData<F, C, D>)>(bytes, None)?;
+    Ok((target, data))
+}
+
+/// Stack for the decode hook thread, matching the prover threads' stack: the
+/// hook's only production caller generates a transaction witness, which
+/// recurses exactly as deeply there as it does on a prover thread.
+const DECODE_HOOK_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// [`deserialize_embedded`] with a hook that runs **concurrently with the
+/// constants/sigmas commitment rebuild**, against the circuit data as it exists
+/// the instant decoding finishes.
+///
+/// The rebuild is this load's tail — for the two 2^19-row transaction blobs it
+/// is ~110-170 ms of IFFT + LDE + Merkle work that saturates the GPU while the
+/// CPU sits nearly idle — and nothing in witness generation reads it:
+/// `PendingPartitionWitness::start_seeded` and `run_generator_worklist` touch
+/// only `generators`, `representative_map`, `generator_indices_by_watches` and
+/// `generator_watch_counts`. So a caller that needs a witness from this circuit
+/// can have it built inside the load window rather than after it.
+///
+/// The `CircuitData` handed to the hook therefore carries an **empty**
+/// `constants_sigmas_commitment` and a `None` quotient cache; both are
+/// installed after the hook returns. A hook that reads either is reading a
+/// placeholder — witness generation is the only supported use.
+///
+/// Value-exactness: the hook observes decoded and derived state that is
+/// bit-identical to what the unhooked path produces, and it returns before the
+/// commitment is installed, so the finished `CircuitData` is unchanged in every
+/// field. Only the instant at which the hook's work happens moves.
+pub fn deserialize_embedded_with<T, R, H>(
+    bytes: &[u8],
+    on_decoded: Option<H>,
+) -> Result<(T, CircuitData<F, C, D>, Option<R>)>
+where
+    T: DeserializeOwned + Sync,
+    R: Send,
+    H: FnOnce(&T, &CircuitData<F, C, D>) -> R + Send,
+{
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -512,20 +554,6 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
-    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
-        bail!(
-            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
-             (stale or corrupt embedded circuit blob)"
-        );
-    }
 
     let circuit_digest = verifier_only.circuit_digest;
 
@@ -547,62 +575,113 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // costs one extra full-LDE allocation plus copy per circuit and holds that
     // duplicate resident for the rest of the process.
     let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
-    let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
-        let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
-        let domain = 1 << (common.degree_bits() + quotient_degree_bits);
-        let cols = common.constants_range().len() + common.sigmas_range().len();
-        if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+    let constants_sigmas_quotient_step = 1 << (rate_bits - quotient_degree_bits);
+    let constants_sigmas_quotient_domain = 1 << (degree_bits + quotient_degree_bits);
+
+    // Everything except the constants/sigmas commitment and its quotient-domain
+    // cache is now final, so the circuit data is assembled here, with those two
+    // fields empty, and handed to `on_decoded` while the commitment is rebuilt
+    // alongside it. Both are installed below, before this function returns, so
+    // no caller ever observes the placeholder state.
+    let mut data = CircuitData {
+        prover_only: ProverOnlyCircuitData::<F, C, D> {
+            constants_sigmas_quotient_cache: None,
+            constants_sigmas_quotient_step,
+            constants_sigmas_quotient_domain,
+            generators,
+            generator_indices_by_watches,
+            generator_watch_counts,
+            constants_sigmas_commitment: PolynomialBatch::default(),
+            sigmas,
+            subgroup,
+            public_inputs,
+            representative_map,
+            fixed_routed_wires,
+            fft_root_table: Some(root_table),
+            circuit_digest,
+            lookup_rows,
+            lut_to_lookups,
+        },
+        verifier_only,
+        common,
+    };
+
+    // The commitment stays on the calling thread — it owns this load's place in
+    // the GPU submission order — and the hook gets a thread of its own rather
+    // than a `rayon::join` arm, so a hook that blocks (the production one waits
+    // for the pre-execution proof's public inputs) can never occupy a pool
+    // worker the commitment's own parallel work needs.
+    let (constants_sigmas_commitment, hooked) = {
+        let target_ref = &target;
+        let data_ref = &data;
+        let commit = || {
+            PolynomialBatch::<F, C, D>::from_values(
+                constants_sigmas_vecs,
+                rate_bits,
+                false,
+                cap_height,
+                &mut TimingTree::default(),
+                data_ref.prover_only.fft_root_table.as_ref(),
+            )
+        };
+        match on_decoded {
+            None => (commit(), None),
+            Some(on_decoded) => std::thread::scope(|scope| {
+                let hook = std::thread::Builder::new()
+                    .name("embed-decode-hook".into())
+                    .stack_size(DECODE_HOOK_STACK_BYTES)
+                    .spawn_scoped(scope, move || on_decoded(target_ref, data_ref))
+                    .expect("embedded circuit decode hook thread must start");
+                let commitment = commit();
+                let hooked = hook
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (commitment, Some(hooked))
+            }),
+        }
+    };
+
+    if constants_sigmas_commitment.merkle_tree.cap != data.verifier_only.constants_sigmas_cap {
+        bail!(
+            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
+             (stale or corrupt embedded circuit blob)"
+        );
+    }
+    data.prover_only.constants_sigmas_commitment = constants_sigmas_commitment;
+
+    let quotient_cache = {
+        let commitment = &data.prover_only.constants_sigmas_commitment;
+        let cols = data.common.constants_range().len() + data.common.sigmas_range().len();
+        if constants_sigmas_quotient_step != 1
+            && cols.saturating_mul(constants_sigmas_quotient_domain) * core::mem::size_of::<F>()
+                <= 1 << 30
+        {
             match (
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.constants_range(),
-                    domain,
+                commitment.extract_lde_batch_columns(
+                    constants_sigmas_quotient_step,
+                    data.common.constants_range(),
+                    constants_sigmas_quotient_domain,
                 ),
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.sigmas_range(),
-                    domain,
+                commitment.extract_lde_batch_columns(
+                    constants_sigmas_quotient_step,
+                    data.common.sigmas_range(),
+                    constants_sigmas_quotient_domain,
                 ),
             ) {
                 (Some(constants), Some(sigmas_cache)) => {
                     let mut cache: Vec<F> = constants;
                     cache.extend(sigmas_cache);
-                    (Some(cache), step, domain)
+                    Some(cache)
                 }
-                _ => (None, step, domain),
+                _ => None,
             }
         } else {
-            (None, step, domain)
+            None
         }
     };
+    data.prover_only.constants_sigmas_quotient_cache = quotient_cache;
 
-    let prover_only = ProverOnlyCircuitData::<F, C, D> {
-        constants_sigmas_quotient_cache,
-        constants_sigmas_quotient_step,
-        constants_sigmas_quotient_domain,
-        generators,
-        generator_indices_by_watches,
-        generator_watch_counts,
-        constants_sigmas_commitment,
-        sigmas,
-        subgroup,
-        public_inputs,
-        representative_map,
-        fixed_routed_wires,
-        fft_root_table: Some(root_table),
-        circuit_digest,
-        lookup_rows,
-        lut_to_lookups,
-    };
-
-    Ok((
-        target,
-        CircuitData {
-            prover_only,
-            verifier_only,
-            common,
-        },
-    ))
+    Ok((target, data, hooked))
 }
 
 #[cfg(test)]
