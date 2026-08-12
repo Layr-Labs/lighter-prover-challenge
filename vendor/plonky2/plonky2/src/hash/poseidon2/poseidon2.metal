@@ -740,7 +740,7 @@ inline ulong alpha_acc_materialize(alpha_acc_t acc) {
 
 inline void range_check_gate_emit(
     ulong constraint,
-    constant ulong* alpha_powers,
+    threadgroup ulong* alpha_powers,
     uint alpha_stride,
     thread alpha_acc_t accumulators[2],
     uint constraint_index) {
@@ -762,7 +762,7 @@ inline void range_check_gate_emit(
 // result back to the shared tail, so the merge below is kind-agnostic.
 inline void range_check_gate_emit_strict(
     ulong constraint,
-    constant ulong* alpha_powers,
+    threadgroup ulong* alpha_powers,
     uint alpha_stride,
     thread ulong accumulators[2],
     uint constraint_index) {
@@ -839,15 +839,35 @@ kernel void range_check_gate_quotient(
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
     constant uint& u32_count [[buffer(10)]],
-    uint gid [[thread_position_in_grid]]) {
-    if (gid >= quotient_rows) {
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]) {
+    // TG-shared alpha + metadata only (~2–3 KB). Dispatch TG width unchanged
+    // (tip occupancy). No wire tile (closed: 18–19 tps).
+    threadgroup ulong tg_alpha[272];
+    threadgroup uint tg_meta[640];
+    uint alpha_n = alpha_stride * 2u;
+    uint meta_n = (range_count + u32_count) * 10u;
+    if (alpha_n <= 272u) {
+        for (uint i = lid; i < alpha_n; i += tg_size) {
+            tg_alpha[i] = alpha_powers[i];
+        }
+    }
+    if (meta_n <= 640u) {
+        for (uint i = lid; i < meta_n; i += tg_size) {
+            tg_meta[i] = metadata[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (gid >= quotient_rows || alpha_n > 272u || meta_n > 640u) {
         return;
     }
 
     uint source_row = gid * step;
     ulong total[2] = { 0, 0 };
     for (uint range_index = 0; range_index < range_count; ++range_index) {
-        constant uint* spec = metadata + range_index * 10u;
+        threadgroup uint* spec = tg_meta + range_index * 10u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -884,7 +904,7 @@ kernel void range_check_gate_quotient(
             }
             range_check_gate_emit(
                 gl_sub(computed, input),
-                alpha_powers,
+                tg_alpha,
                 alpha_stride,
                 gate_accumulators,
                 constraint_index++);
@@ -902,7 +922,7 @@ kernel void range_check_gate_quotient(
                 }
                 range_check_gate_emit(
                     constraint,
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -915,9 +935,9 @@ kernel void range_check_gate_quotient(
             filter, alpha_acc_materialize(gate_accumulators[1]), total[1]);
     }
 
-    constant uint* u32_metadata = metadata + range_count * 10u;
+    threadgroup uint* u32_base = tg_meta + range_count * 10u;
     for (uint u32_index = 0; u32_index < u32_count; ++u32_index) {
-        constant uint* spec = u32_metadata + u32_index * 10u;
+        threadgroup uint* spec = u32_base + u32_index * 10u;
         uint selector_column = spec[0];
         uint gate_index = spec[1];
         uint group_start = spec[2];
@@ -963,7 +983,7 @@ kernel void range_check_gate_quotient(
                 ulong high_not_max = gl_sub(gl_mul(inverse, high_diff), 1);
                 range_check_gate_emit(
                     gl_mul(high_not_max, output_low),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -972,7 +992,7 @@ kernel void range_check_gate_quotient(
                 ulong combined = gl_add(gl_mul(output_high, 4294967296UL), output_low);
                 range_check_gate_emit(
                     gl_sub(combined, computed),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -986,7 +1006,7 @@ kernel void range_check_gate_quotient(
                     ulong y = gl_mul(x, gl_sub(x, 3));
                     range_check_gate_emit(
                         gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
+                        tg_alpha,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
@@ -998,13 +1018,13 @@ kernel void range_check_gate_quotient(
                 }
                 range_check_gate_emit(
                     gl_sub(combined_low, output_low),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(combined_high, output_high),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1025,7 +1045,7 @@ kernel void range_check_gate_quotient(
                     gl_mul(word_base, output_borrow));
                 range_check_gate_emit(
                     gl_sub(output_result, borrowed),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1038,7 +1058,7 @@ kernel void range_check_gate_quotient(
                     ulong y = gl_mul(x, gl_sub(x, 3));
                     range_check_gate_emit(
                         gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
+                        tg_alpha,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
@@ -1046,13 +1066,13 @@ kernel void range_check_gate_quotient(
                 }
                 range_check_gate_emit(
                     gl_sub(recomposed, output_result),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_mul(output_borrow, gl_sub(1, output_borrow)),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1077,7 +1097,7 @@ kernel void range_check_gate_quotient(
                 ulong combined = gl_add(gl_mul(output_carry, word_base), output_result);
                 range_check_gate_emit(
                     gl_sub(combined, computed),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1093,7 +1113,7 @@ kernel void range_check_gate_quotient(
                     ulong y = gl_mul(x, gl_sub(x, 3));
                     range_check_gate_emit(
                         gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
+                        tg_alpha,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
@@ -1105,20 +1125,20 @@ kernel void range_check_gate_quotient(
                 }
                 range_check_gate_emit(
                     gl_sub(combined_result, output_result),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(combined_carry, output_carry),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
             }
         } else if (kind == 3u) {
             // ByteDecompositionGate: per operation, one routed sum wire and
-            // `num_addends` routed byte wires (the metadata word carries the
+            // `num_addends` routed byte wires (the tg_meta word carries the
             // byte count for this kind), then four base-4 aux limbs per
             // byte. Constraint order matches the CPU gate exactly: aux range
             // products in ascending wire order, one base-4 recomposition per
@@ -1135,7 +1155,7 @@ kernel void range_check_gate_quotient(
                     ulong y = gl_mul(x, gl_sub(x, 3));
                     range_check_gate_emit(
                         gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
+                        tg_alpha,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
@@ -1153,7 +1173,7 @@ kernel void range_check_gate_quotient(
                         wires[(routed_base + 1u + byte_index) * lde_rows + source_row];
                     range_check_gate_emit(
                         gl_sub(recomposed, byte_value),
-                        alpha_powers,
+                        tg_alpha,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
@@ -1169,7 +1189,7 @@ kernel void range_check_gate_quotient(
                 ulong expected_sum = wires[routed_base * lde_rows + source_row];
                 range_check_gate_emit(
                     gl_sub(recomposed_sum, expected_sum),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1202,7 +1222,7 @@ kernel void range_check_gate_quotient(
                     ulong c = wires[(routed_base + 10u + k) * lde_rows + source_row];
                     range_check_gate_emit_strict(
                         gl_sub(term, c),
-                        alpha_powers,
+                        tg_alpha,
                         alpha_stride,
                         strict_accumulators,
                         constraint_index++);
@@ -1234,71 +1254,71 @@ kernel void range_check_gate_quotient(
                 // c[0]
                 range_check_gate_emit_strict(
                     gl_sub(gl_mul(a[0], a[0]), extra[0]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[1]), a[4]), extra[0]), extra[1]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[3]), extra[1]), c[0]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[1]
                 range_check_gate_emit_strict(
                     gl_sub(gl_mul(gl_mul(3, a[3]), a[3]), extra[2]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[1]), extra[2]), extra[3]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[4]), extra[3]), c[1]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[2]
                 range_check_gate_emit_strict(
                     gl_sub(gl_mul(a[1], a[1]), extra[4]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[2]), extra[4]), extra[5]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[3]), a[4]), extra[5]), c[2]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[3]
                 range_check_gate_emit_strict(
                     gl_sub(gl_mul(gl_mul(3, a[4]), a[4]), extra[6]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[3]), extra[6]), extra[7]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[2]), extra[7]), c[3]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[4]
                 range_check_gate_emit_strict(
                     gl_sub(gl_mul(a[2], a[2]), extra[8]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[4]), extra[8]), extra[9]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
                 range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]),
-                    alpha_powers, alpha_stride, strict_accumulators,
+                    tg_alpha, alpha_stride, strict_accumulators,
                     constraint_index++);
             }
             gate_accumulators[0] = alpha_acc_of(strict_accumulators[0]);
@@ -1322,7 +1342,7 @@ kernel void range_check_gate_quotient(
                         * lde_rows + source_row];
                     range_check_gate_emit(
                         gl_mul(b, gl_sub(b, 1)),
-                        alpha_powers,
+                        tg_alpha,
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
@@ -1341,7 +1361,7 @@ kernel void range_check_gate_quotient(
                 ulong access_index = wires[copy_base * lde_rows + source_row];
                 range_check_gate_emit(
                     gl_sub(reconstructed_index, access_index),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1369,7 +1389,7 @@ kernel void range_check_gate_quotient(
                 ulong claimed_element = wires[(copy_base + 1u) * lde_rows + source_row];
                 range_check_gate_emit(
                     gl_sub(block_results[0], claimed_element),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1383,7 +1403,7 @@ kernel void range_check_gate_quotient(
                     (extra_wire_base + i) * lde_rows + source_row];
                 range_check_gate_emit(
                     gl_sub(local_constant, extra_wire),
-                    alpha_powers,
+                    tg_alpha,
                     alpha_stride,
                     gate_accumulators,
                     constraint_index++);
@@ -1413,7 +1433,7 @@ kernel void range_check_gate_quotient(
                     wires[((ulong)2u + num_power_bits + i) * lde_rows + source_row];
                 range_check_gate_emit(
                     gl_sub(gl_mul(previous, multiplier), intermediate),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
             ulong output_value = wires[((ulong)1u + num_power_bits) * lde_rows + source_row];
@@ -1421,7 +1441,7 @@ kernel void range_check_gate_quotient(
                 wires[((ulong)1u + 2u * num_power_bits) * lde_rows + source_row];
             range_check_gate_emit(
                 gl_sub(output_value, final_intermediate),
-                alpha_powers, alpha_stride, gate_accumulators,
+                tg_alpha, alpha_stride, gate_accumulators,
                 constraint_index++);
         } else if (kind == 8u) {
             // EqualityGate: three routed words per operation (x, y, equal)
@@ -1442,19 +1462,19 @@ kernel void range_check_gate_quotient(
 
                 range_check_gate_emit(
                     gl_sub(gl_sub(x, y), difference),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_mul(difference, inverse), product),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_mul(product, difference), difference),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_sub(const_0, product), equal),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
         } else if (kind == 9u) {
@@ -1494,11 +1514,11 @@ kernel void range_check_gate_quotient(
                     gl_mul(acc_1, alpha_0));
                 range_check_gate_emit(
                     gl_sub(gl_add(product_0, coeff_0), next_0),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_add(product_1, coeff_1), next_1),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
 
                 acc_0 = next_0;
@@ -1521,7 +1541,7 @@ kernel void range_check_gate_quotient(
                     gl_mul(addend_1, const_1));
                 range_check_gate_emit(
                     gl_sub(output_value, computed),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
         } else if (kind == 11u) {
@@ -1549,7 +1569,7 @@ kernel void range_check_gate_quotient(
             }
             range_check_gate_emit(
                 gl_sub(computed, wires[source_row]),
-                alpha_powers, alpha_stride, gate_accumulators,
+                tg_alpha, alpha_stride, gate_accumulators,
                 constraint_index++);
             for (uint limb = 0; limb < num_ops; ++limb) {
                 ulong x = wires[((ulong)1u + limb) * lde_rows + source_row];
@@ -1562,7 +1582,7 @@ kernel void range_check_gate_quotient(
                 }
                 range_check_gate_emit(
                     constraint,
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
         } else if (kind == 12u) {
@@ -1577,18 +1597,18 @@ kernel void range_check_gate_quotient(
                     ((ulong)(4u * num_ops + op)) * lde_rows + source_row];
                 range_check_gate_emit(
                     gl_sub(gl_sub(gl_mul(b, y), y), temp),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
                 range_check_gate_emit(
                     gl_sub(gl_sub(gl_mul(b, x), temp), result),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    tg_alpha, alpha_stride, gate_accumulators,
                     constraint_index++);
             }
         } else {
             // The Rust encoder rejects unknown discriminants; if a malformed
             // record reaches the shader, make its selected row unsatisfiable.
             range_check_gate_emit(
-                1, alpha_powers, alpha_stride, gate_accumulators,
+                1, tg_alpha, alpha_stride, gate_accumulators,
                 constraint_index++);
         }
 
