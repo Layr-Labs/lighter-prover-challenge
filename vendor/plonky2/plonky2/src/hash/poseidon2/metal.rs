@@ -192,7 +192,11 @@ struct MetalShared {
     /// Buffers backing live level-order digest stores return here after the
     /// proof has extracted its sparse Merkle paths.
     digest_output_pool: Arc<Mutex<DigestOutputPool>>,
+    /// Ordinary builders and serial-critical spine builders wait on separate
+    /// condition variables. This preserves strict spine priority without
+    /// waking every parked proof thread whenever the single set is released.
     available: Condvar,
+    spine_available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
     ntt_roots: Mutex<HashMap<u32, NttRoots>>,
@@ -2544,6 +2548,7 @@ impl MetalShared {
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
+                spine_available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
@@ -2840,7 +2845,12 @@ impl MetalShared {
             if spine {
                 pool.spine_waiters += 1;
             }
-            match self.available.wait(pool) {
+            let awakened = if spine {
+                self.spine_available.wait(pool)
+            } else {
+                self.available.wait(pool)
+            };
+            match awakened {
                 Ok(mut next) => {
                     next.waiters -= 1;
                     if spine {
@@ -2866,11 +2876,13 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // Wake every waiter: with a spine waiter queued, whichever non-spine
-        // waiter the OS would hand a `notify_one` to would just re-block, so
-        // the wake must reach the spine thread. Waiter counts here are tiny
-        // (window depth + one spine), so the thundering herd is a few threads.
-        self.available.notify_all();
+        // Separate wait channels make the priority decision deterministic and
+        // avoid a wake/re-lock/re-block herd at every Merkle-tree boundary.
+        if pool.spine_waiters != 0 {
+            self.spine_available.notify_one();
+        } else {
+            self.available.notify_one();
+        }
     }
 
     fn try_detach_completed_output(
