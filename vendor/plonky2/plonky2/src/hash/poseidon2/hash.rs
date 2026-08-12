@@ -88,10 +88,7 @@ pub trait Poseidon2: PrimeField64 {
         let mut c = input_c;
         let mut d = input_d;
 
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
-        Self::external_linear_layer(&mut c);
-        Self::external_linear_layer(&mut d);
+        Self::external_linear_layer_x4(&mut a, &mut b, &mut c, &mut d);
 
         Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, 0);
         Self::partial_rounds_x4(&mut a, &mut b, &mut c, &mut d);
@@ -118,10 +115,7 @@ pub trait Poseidon2: PrimeField64 {
             Self::sbox(b);
             Self::sbox(c);
             Self::sbox(d);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
-            Self::external_linear_layer(c);
-            Self::external_linear_layer(d);
+            Self::external_linear_layer_x4(a, b, c, d);
         }
     }
 
@@ -177,6 +171,22 @@ pub trait Poseidon2: PrimeField64 {
         for i in 0..WIDTH {
             state[i] = Self::from_noncanonical_u128_with_96_bits(state_u128[i]);
         }
+    }
+
+    /// Four independent external layers. Default is four sequential calls;
+    /// Goldilocks overrides with a fused convert/apply/reduce over all 48
+    /// limbs. Bit-identical to four `external_linear_layer` calls.
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        Self::external_linear_layer(a);
+        Self::external_linear_layer(b);
+        Self::external_linear_layer(c);
+        Self::external_linear_layer(d);
     }
 
     #[inline]
@@ -601,6 +611,38 @@ impl Poseidon2 for F {
         b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
         c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
         d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
+    }
+
+    /// Fused four-state external layer: convert all 48 limbs to u128 once,
+    /// apply the four independent M4+circulant chains, reduce once at the
+    /// end. Bit-identical to four `external_linear_layer` calls.
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        let mut ua = [0u128; WIDTH];
+        let mut ub = [0u128; WIDTH];
+        let mut uc = [0u128; WIDTH];
+        let mut ud = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            ua[i] = a[i].to_noncanonical_u64() as u128;
+            ub[i] = b[i].to_noncanonical_u64() as u128;
+            uc[i] = c[i].to_noncanonical_u64() as u128;
+            ud[i] = d[i].to_noncanonical_u64() as u128;
+        }
+        external_linear_layer_u128(&mut ua);
+        external_linear_layer_u128(&mut ub);
+        external_linear_layer_u128(&mut uc);
+        external_linear_layer_u128(&mut ud);
+        for i in 0..WIDTH {
+            a[i] = Self::from_noncanonical_u128_with_96_bits(ua[i]);
+            b[i] = Self::from_noncanonical_u128_with_96_bits(ub[i]);
+            c[i] = Self::from_noncanonical_u128_with_96_bits(uc[i]);
+            d[i] = Self::from_noncanonical_u128_with_96_bits(ud[i]);
+        }
     }
 
     #[inline]
