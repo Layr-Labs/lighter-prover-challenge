@@ -952,6 +952,8 @@ pub trait Read {
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,
+            // Runtime-only startup overlap handle; never serialized.
+            constants_sigmas_deferred: None,
             sigmas,
             subgroup,
             public_inputs,
@@ -1934,6 +1936,10 @@ pub trait Write {
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
             constants_sigmas_quotient_domain: _,
+            // Runtime-only startup overlap handle: contributes no bytes. The
+            // eager `constants_sigmas_commitment` below is what serializes, so
+            // a deferred prover data must be resolved before writing.
+            constants_sigmas_deferred: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

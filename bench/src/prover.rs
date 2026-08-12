@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
-    BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
+    BlockPreExecutionCircuit, BlockPreExecutionTarget,
 };
 use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
@@ -707,10 +707,33 @@ fn prove_path(
 /// the loads it hides behind, so the join waits on the loads, not on it.
 /// Enabling the switch only spends that slack (median 187 ms -> 126 ms) and put
 /// the proof on the critical path in 1 of the 5 runs that had it enabled.
-pub(crate) fn prove_pre_execution_parallel(
-    pre_data: &CircuitData<F, C, D>,
+pub(crate) fn pre_execution_partition<'a>(
+    pre_data: &'a CircuitData<F, C, D>,
     pre_target: &BlockPreExecutionTarget,
     pre_exec: &BlockPreExec<F>,
+) -> PartitionWitness<'a, F> {
+    let pending = PendingPartitionWitness::start_seeded(
+        &pre_data.prover_only,
+        &pre_data.common,
+        |seeder| BlockPreExecutionCircuit::seed_witness_into(pre_exec, pre_target, seeder),
+    )
+    .expect("block pre-execution witness seed failed");
+    pending
+        .finish()
+        .expect("block pre-execution witness generation failed")
+}
+
+pub(crate) fn pre_output_from_partition(
+    pre_data: &CircuitData<F, C, D>,
+    partition: &PartitionWitness<F>,
+) -> BlockPreExecWitness<F> {
+    let public_inputs = partition.get_targets(&pre_data.prover_only.public_inputs);
+    BlockPreExecWitness::from_public_inputs(&public_inputs)
+}
+
+pub(crate) fn prove_pre_execution_from_partition(
+    pre_data: &CircuitData<F, C, D>,
+    partition_witness: PartitionWitness<F>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
@@ -720,8 +743,22 @@ pub(crate) fn prove_pre_execution_parallel(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "pre_execution_proof");
-    BlockPreExecutionCircuit::prove(pre_data, pre_exec, pre_target)
-        .expect("block pre-execution proof failed")
+    prove_with_partition_witness::<F, C, D>(
+        &pre_data.prover_only,
+        &pre_data.common,
+        partition_witness,
+        &mut TimingTree::new("BlockPreExecutionCircuit::prove", log::Level::Debug),
+    )
+    .expect("block pre-execution proof failed")
+}
+
+pub(crate) fn prove_pre_execution_parallel(
+    pre_data: &CircuitData<F, C, D>,
+    pre_target: &BlockPreExecutionTarget,
+    pre_exec: &BlockPreExec<F>,
+) -> Proof {
+    let partition = pre_execution_partition(pre_data, pre_target, pre_exec);
+    prove_pre_execution_from_partition(pre_data, partition)
 }
 
 /// The fully serial entry point: pre-execution proof first, then the pipeline.
@@ -741,28 +778,33 @@ pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
     // trees to the GPU for just this phase.
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
     let pre_proof = prove_pre_execution_parallel(
-        &circuits.pre_data,
-        &circuits.pre_target,
+        circuits.pre_data.get().expect("test pre data"),
+        circuits.pre_target.get().expect("test pre target"),
         &BlockPreExec::from_block(&block),
     );
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    prove_block_after_pre(block, circuits, pre_proof)
+    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+    prove_block_after_pre(block, circuits, pre_output, |_| pre_proof)
 }
 
 /// The pipeline after the pre-execution proof. The startup-overlap path calls
 /// this once both the pre-execution proof and the remaining circuit loads have
 /// completed.
+/// The pipeline after pre-execution public inputs exist. `join_pre_proof` must
+/// return the pre-execution proof and, on the scored overlap path, install
+/// `pre_data` before this function's block-circuit lane calls
+/// [`Circuits::build_block_circuit`]. Transaction paths only need `pre_output`.
 pub(crate) fn prove_block_after_pre(
     mut block: Block<F>,
     mut circuits: Circuits,
-    pre_proof: Proof,
+    pre_output: BlockPreExecWitness<F>,
+    join_pre_proof: impl FnOnce(&Circuits) -> Proof + Send,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
         plonky2::util::profile::enter_context("block_pipeline", block.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_block_after_pre");
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
@@ -827,7 +869,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -841,6 +882,12 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    let pre_proof = {
+                        #[cfg(feature = "diagnostic_profile")]
+                        let _span =
+                            plonky2::util::profile::span("wait", "pre_execution_join");
+                        join_pre_proof(circuits)
+                    };
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -852,7 +899,7 @@ pub(crate) fn prove_block_after_pre(
                     let early = BlockCircuit::witness_inputs_early(
                         &block_target,
                         block_ref,
-                        pre_proof_ref,
+                        &pre_proof,
                     )
                     .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(

@@ -13,10 +13,14 @@
 //! This is useful to allow even small devices to verify plonky2 proofs.
 
 #[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
+#[cfg(not(feature = "std"))]
 use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::ops::{Range, RangeFrom};
 #[cfg(feature = "std")]
 use std::collections::BTreeMap;
+#[cfg(feature = "std")]
+use std::sync::Arc;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -561,6 +565,121 @@ impl GeneratorWatchIndex {
     }
 }
 
+/// A constants/sigmas commitment whose numeric construction (IFFT, rate-8 LDE
+/// and Merkle tree) is running on a background thread while the owner of the
+/// [`ProverOnlyCircuitData`] already proves. The builder thread delivers the
+/// finished [`PolynomialBatch`] through a channel; the first reader blocks
+/// until it lands, memoizes it, and every later reader returns it directly.
+///
+/// This exists purely to overlap startup work with proving. The delivered
+/// commitment is value-identical to the one an eager load would have stored in
+/// [`ProverOnlyCircuitData::constants_sigmas_commitment`], and the builder
+/// checks its Merkle cap against the circuit's verifier data before sending,
+/// so no proof byte can depend on *when* it resolved.
+pub struct DeferredConstantsSigmas<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    #[cfg(feature = "std")]
+    cell: std::sync::OnceLock<PolynomialBatch<F, C, D>>,
+    #[cfg(feature = "std")]
+    source: std::sync::Mutex<
+        Option<std::sync::mpsc::Receiver<core::result::Result<PolynomialBatch<F, C, D>, String>>>,
+    >,
+    #[cfg(not(feature = "std"))]
+    _uninhabited: core::convert::Infallible,
+    _phantom: core::marker::PhantomData<(F, C)>,
+}
+
+#[cfg(feature = "std")]
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    DeferredConstantsSigmas<F, C, D>
+{
+    /// Creates the handle plus the sender the background builder thread must
+    /// use to deliver the finished (and cap-checked) commitment exactly once.
+    pub fn channel() -> (
+        std::sync::mpsc::SyncSender<core::result::Result<PolynomialBatch<F, C, D>, String>>,
+        Arc<Self>,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        (
+            sender,
+            Arc::new(Self {
+                cell: std::sync::OnceLock::new(),
+                source: std::sync::Mutex::new(Some(receiver)),
+                _phantom: core::marker::PhantomData,
+            }),
+        )
+    }
+
+    /// Returns the commitment, blocking until the background builder delivers
+    /// it. Panics if the builder thread failed: the deferred path is only used
+    /// by the scored worker on blobs compiled from the same source revision,
+    /// where a cap mismatch is a build defect, not a runtime condition.
+    ///
+    /// Must be first called from a non-worker-pool thread (the prover resolves
+    /// it in serial sections); later calls are lock-free reads.
+    pub fn wait(&self) -> &PolynomialBatch<F, C, D> {
+        if let Some(ready) = self.cell.get() {
+            return ready;
+        }
+        let mut source = self
+            .source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(receiver) = source.take() {
+            let delivered = receiver
+                .recv()
+                .expect("deferred constants/sigmas builder thread disappeared")
+                .unwrap_or_else(|error| {
+                    panic!("deferred constants/sigmas commitment failed: {error}")
+                });
+            self.cell
+                .set(delivered)
+                .ok()
+                .expect("deferred constants/sigmas commitment delivered twice");
+        }
+        drop(source);
+        self.cell
+            .get()
+            .expect("deferred constants/sigmas commitment must be resolved")
+    }
+}
+
+/// The handle is deliberately opaque to equality: two prover data values that
+/// differ only in *when* their commitment resolves are the same circuit.
+/// Value equality is carried by the resolved commitment itself, which the
+/// deferred builder cap-checks against the verifier data.
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> PartialEq
+    for DeferredConstantsSigmas<F, C, D>
+{
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Eq
+    for DeferredConstantsSigmas<F, C, D>
+{
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> core::fmt::Debug
+    for DeferredConstantsSigmas<F, C, D>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        #[cfg(feature = "std")]
+        let state = if self.cell.get().is_some() {
+            "resolved"
+        } else {
+            "pending"
+        };
+        #[cfg(not(feature = "std"))]
+        let state = "unreachable";
+        write!(f, "DeferredConstantsSigmas({state})")
+    }
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -584,6 +703,12 @@ pub struct ProverOnlyCircuitData<
     pub generator_watch_counts: Vec<usize>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
+    /// When present, the constants/sigmas commitment is being built on a
+    /// background thread and [`Self::constants_sigmas`] blocks on first use;
+    /// `constants_sigmas_commitment` above then holds the empty default.
+    /// Runtime-only: never serialized, ignored by equality, and `None` on
+    /// every eager construction path.
+    pub constants_sigmas_deferred: Option<Arc<DeferredConstantsSigmas<F, C, D>>>,
     /// The transpose of the list of sigma polynomials.
     pub sigmas: Vec<Vec<F>>,
     /// Subgroup of order `degree`.
@@ -634,6 +759,24 @@ pub struct ProverOnlyCircuitData<
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ProverOnlyCircuitData<F, C, D>
 {
+    /// The constants/sigmas commitment, resolving a deferred background build
+    /// on first use. Callers on worker-pool threads must not be the first
+    /// resolver (the prover resolves in serial sections before its parallel
+    /// quotient loop), because blocking every pool thread on the channel would
+    /// starve the builder's own parallel work.
+    #[cfg(feature = "std")]
+    pub fn constants_sigmas(&self) -> &PolynomialBatch<F, C, D> {
+        match &self.constants_sigmas_deferred {
+            Some(deferred) => deferred.wait(),
+            None => &self.constants_sigmas_commitment,
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    pub fn constants_sigmas(&self) -> &PolynomialBatch<F, C, D> {
+        &self.constants_sigmas_commitment
+    }
+
     pub fn to_bytes(
         &self,
         generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,

@@ -198,7 +198,7 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
 impl BlockPreExecutionCircuit {
     /// Seeded form of [`Circuit::generate_witness`]: writes the same targets directly
     /// through `pw` (any partition seeder or map).
-    fn seed_witness_into<W: Witness<F> + WitnessWrite<F>>(
+    pub fn seed_witness_into<W: Witness<F> + WitnessWrite<F>>(
         block: &BlockPreExec<F>,
         target: &BlockPreExecutionTarget,
         pw: &mut W,
