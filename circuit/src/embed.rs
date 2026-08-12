@@ -136,7 +136,10 @@ fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
     // section directly with zstd avoids the former runtime double decode
     // (whole-blob zstd followed by per-section LZ4) while retaining bounded
     // per-section peak memory during parallel circuit loading.
-    let compressed = zstd::bulk::compress(raw, 19)
+    // Startup is dominated by decoding these embedded blobs, not by the
+    // untimed build-time compression ratio. Favor the encoder's fast level so
+    // the retained section layout has the least expensive cold decode path.
+    let compressed = zstd::bulk::compress(raw, 1)
         .expect("zstd-compressing embedded circuit section");
     out.extend_from_slice(&(raw.len() as u64).to_le_bytes());
     write_section(out, &compressed);
