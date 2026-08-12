@@ -1801,6 +1801,108 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+#[derive(Clone, Copy)]
+struct GpuQuotientContributions<'a, F> {
+    poseidon: Option<&'a [F]>,
+    range: Option<&'a [F]>,
+    permutation: Option<&'a [F]>,
+}
+
+impl<F> Default for GpuQuotientContributions<'_, F> {
+    fn default() -> Self {
+        Self {
+            poseidon: None,
+            range: None,
+            permutation: None,
+        }
+    }
+}
+
+fn scatter_quotient_values<F: Field>(
+    quotient_values: &[F],
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+    gpu: GpuQuotientContributions<'_, F>,
+) -> Vec<Vec<F>> {
+    assert!(num_challenges > 0, "quotient scatter needs a challenge");
+    assert_eq!(
+        quotient_values.len() % num_challenges,
+        0,
+        "interleaved quotient length must divide by its challenge count"
+    );
+    for values in [gpu.poseidon, gpu.range, gpu.permutation]
+        .into_iter()
+        .flatten()
+    {
+        assert_eq!(
+            values.len(),
+            quotient_values.len(),
+            "GPU quotient length must match the CPU quotient length"
+        );
+    }
+
+    struct ColPtr<T>(*mut T);
+    unsafe impl<T> Send for ColPtr<T> {}
+    unsafe impl<T> Sync for ColPtr<T> {}
+
+    let point_count = quotient_values.len() / num_challenges;
+    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+        // Keep each length at zero during the raw-pointer fill. If a worker
+        // panics, unwinding therefore never drops uninitialized elements.
+        .map(|_| Vec::with_capacity(point_count))
+        .collect();
+    let column_ptrs = challenge_columns
+        .iter_mut()
+        .map(|column| ColPtr(column.as_mut_ptr()))
+        .collect::<Vec<_>>();
+    let column_ptrs = &column_ptrs;
+    let has_gpu = gpu.poseidon.is_some() || gpu.range.is_some() || gpu.permutation.is_some();
+
+    quotient_values
+        .par_chunks(BATCH_SIZE * num_challenges)
+        .enumerate()
+        .for_each(|(chunk_i, chunk)| {
+            let base = BATCH_SIZE * chunk_i;
+            if has_gpu {
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    let point = base + k;
+                    let offset = point * num_challenges;
+                    let denominator_inv = z_h_on_coset.eval_inverse(point);
+                    for (challenge, (column, &cpu_value)) in
+                        column_ptrs.iter().zip(point_values).enumerate()
+                    {
+                        let mut value = cpu_value;
+                        if let Some(values) = gpu.poseidon {
+                            value += values[offset + challenge] * denominator_inv;
+                        }
+                        if let Some(values) = gpu.range {
+                            value += values[offset + challenge] * denominator_inv;
+                        }
+                        if let Some(values) = gpu.permutation {
+                            value += values[offset + challenge] * denominator_inv;
+                        }
+                        // SAFETY: `point` lies in this chunk's disjoint range.
+                        unsafe { column.0.add(point).write(value) };
+                    }
+                }
+            } else {
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    let point = base + k;
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `point` lies in this chunk's disjoint range.
+                        unsafe { column.0.add(point).write(value) };
+                    }
+                }
+            }
+        });
+    for column in &mut challenge_columns {
+        // SAFETY: the parallel iteration completed successfully and wrote each
+        // position in `0..point_count` exactly once for every column.
+        unsafe { column.set_len(point_count) };
+    }
+    challenge_columns
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2346,6 +2448,8 @@ fn compute_quotient_polys<
             },
         );
 
+    let mut gpu_contributions = GpuQuotientContributions::default();
+
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
         let gpu_values = match job.finish() {
@@ -2380,16 +2484,7 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_contributions.poseidon = Some(gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2429,16 +2524,7 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_contributions.range = Some(gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2466,56 +2552,18 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_contributions.permutation = Some(gpu_values);
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
-    struct ColPtr<T>(*mut T);
-    unsafe impl<T> Send for ColPtr<T> {}
-    unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
-        .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
-                }
-            }
-        });
+    // Finish successful GPU families in the legacy arithmetic order while
+    // doing the already-required point-major to challenge-column scatter.
+    let challenge_columns = scatter_quotient_values(
+        &quotient_values,
+        num_challenges,
+        &z_h_on_coset,
+        gpu_contributions,
+    );
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -2658,11 +2706,14 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        precomputed, scatter_quotient_values, BatchLayout, GpuQuotientContributions, BATCH_SIZE,
+        COMPARE_QUOTIENT_LAYOUTS,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2679,6 +2730,96 @@ mod quotient_layout_tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn fused_gpu_quotient_scatter_matches_legacy_for_every_presence_mask() {
+        const NUM_CHALLENGES: usize = 2;
+        const POINTS: usize = BATCH_SIZE + 17;
+
+        let z_h_on_coset = crate::field::zero_poly_coset::ZeroPolyOnCoset::<F>::new(12, 3);
+        let quotient_values = (0..POINTS * NUM_CHALLENGES)
+            .map(|i| GoldilocksField(F::ORDER + 1 + i as u64))
+            .collect::<Vec<_>>();
+        let poseidon = (0..quotient_values.len())
+            .map(|i| F::from_canonical_usize(11 + i))
+            .collect::<Vec<_>>();
+        let range = (0..quotient_values.len())
+            .map(|i| F::from_canonical_usize(211 + i))
+            .collect::<Vec<_>>();
+        let permutation = (0..quotient_values.len())
+            .map(|i| F::from_canonical_usize(421 + i))
+            .collect::<Vec<_>>();
+
+        for mask in 0usize..8 {
+            let gpu: GpuQuotientContributions<'_, F> = GpuQuotientContributions {
+                poseidon: (mask & 1 != 0).then_some(poseidon.as_slice()),
+                range: (mask & 2 != 0).then_some(range.as_slice()),
+                permutation: (mask & 4 != 0).then_some(permutation.as_slice()),
+            };
+
+            let mut legacy = quotient_values.clone();
+            for values in [gpu.poseidon, gpu.range, gpu.permutation]
+                .into_iter()
+                .flatten()
+            {
+                for (point, (cpu_values, gpu_values)) in legacy
+                    .chunks_exact_mut(NUM_CHALLENGES)
+                    .zip(values.chunks_exact(NUM_CHALLENGES))
+                    .enumerate()
+                {
+                    let denominator_inv = z_h_on_coset.eval_inverse(point);
+                    for (cpu, &value) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += value * denominator_inv;
+                    }
+                }
+            }
+            let expected = (0..NUM_CHALLENGES)
+                .map(|challenge| {
+                    legacy
+                        .iter()
+                        .skip(challenge)
+                        .step_by(NUM_CHALLENGES)
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let actual = scatter_quotient_values(
+                &quotient_values,
+                NUM_CHALLENGES,
+                &z_h_on_coset,
+                gpu,
+            );
+
+            for challenge in 0..NUM_CHALLENGES {
+                for point in 0..POINTS {
+                    assert_eq!(
+                        actual[challenge][point].to_noncanonical_u64(),
+                        expected[challenge][point].to_noncanonical_u64(),
+                        "mask={mask:03b} challenge={challenge} point={point}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "GPU quotient length must match the CPU quotient length")]
+    fn fused_gpu_quotient_scatter_rejects_mismatched_gpu_length() {
+        let z_h_on_coset =
+            crate::field::zero_poly_coset::ZeroPolyOnCoset::<F>::new(12, 3);
+        let quotient_values = [F::ONE, F::TWO];
+        let poseidon = [F::ONE];
+        let _ = scatter_quotient_values(
+            &quotient_values,
+            2,
+            &z_h_on_coset,
+            GpuQuotientContributions {
+                poseidon: Some(&poseidon),
+                range: None,
+                permutation: None,
+            },
+        );
+    }
 
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
