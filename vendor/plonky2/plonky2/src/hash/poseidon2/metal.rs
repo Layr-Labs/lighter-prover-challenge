@@ -107,6 +107,13 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Build-host-compiled portable AIR containing only the optional 16-column
+/// streamed-absorb specialization. Empty on non-Mac builders or when the
+/// optional Metal toolchain is unavailable. All established pipelines remain
+/// sourced from the checked-in metallib above.
+const SHADER_ABSORB16_METALLIB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_absorb16.metallib"));
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
@@ -1089,6 +1096,7 @@ static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB16_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1104,6 +1112,10 @@ fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+fn absorb16_pipeline() -> Option<&'static ComputePipelineState> {
+    ABSORB16_PIPELINE.get()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1153,6 +1165,46 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+}
+
+/// Lowers the auxiliary absorb specialization off every readiness-critical
+/// path. It is first needed only by the wide final wire tree, long after the
+/// ordinary context and gate-quotient pipelines have become usable. Failure
+/// settles the slot to `None`, restoring the promoted eight-column schedule.
+fn spawn_optional_absorb16_pipeline(device: &Device, library: Option<metal::Library>) {
+    let Some(library) = library else {
+        let _ = ABSORB16_PIPELINE.built.set(None);
+        return;
+    };
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-absorb16".to_owned())
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                library
+                    .get_function("poseidon2_absorb16", None)
+                    .ok()
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+            });
+            if pipeline.is_none() {
+                log::debug!("16-column absorb pipeline unavailable; using promoted schedule");
+            }
+            let _ = ABSORB16_PIPELINE.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = ABSORB16_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = ABSORB16_PIPELINE.built.set(None);
         }
     }
 }
@@ -2028,9 +2080,9 @@ static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
+/// the GPU absorbs each prepared span while the CPU fills the next. Only used
+/// inside exclusive proving phases (nothing else contends for the GPU stream)
+/// and for large wide trees, where the overlap converts the previously serial
 /// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
@@ -2075,6 +2127,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let context = ready_context(leaf_width, leaf_count)?;
     let pipeline = absorb_pass_pipeline()?;
+    let fused_pipeline = (leaf_count >= 1 << 20 && leaf_width >= 64)
+        .then(absorb16_pipeline)
+        .flatten();
     log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
 
     let cap_count = 1usize << cap_height;
@@ -2104,15 +2159,19 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
+    // Group-wise fill + absorb. When the optional specialization is available,
+    // only the wide final wire tree prepares two sponge groups together:
+    // sixteen FFT columns occupy all P-cores, then one kernel performs both
+    // permutations with its state resident in registers. Narrow trees and all
+    // fallback builds retain the promoted eight-column overlap schedule.
     let groups = leaf_width.div_ceil(8);
+    let groups_per_fill = if fused_pipeline.is_some() { 2 } else { 1 };
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
+    let mut absorb_commands: Vec<CommandBuffer> =
+        Vec::with_capacity(groups.div_ceil(groups_per_fill));
+    for group_start in (0..groups).step_by(groups_per_fill) {
+        let col_start = group_start * 8;
+        let chunk = (leaf_width - col_start).min(8 * groups_per_fill);
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
@@ -2125,24 +2184,46 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     )
                 })
                 .collect();
-            fill_group(group, &mut slices);
+            fill_group(group_start, &mut slices);
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
-            encoder.end_encoding();
+            if chunk > 8 {
+                let fused = fused_pipeline.expect("two-group fill requires absorb16 pipeline");
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(fused);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 8, (group_start == 0) as u32);
+                set_u32(
+                    encoder,
+                    9,
+                    (group_start + chunk.div_ceil(8) == groups) as u32,
+                );
+                dispatch(encoder, fused, leaf_count);
+                encoder.end_encoding();
+            } else {
+                let group = group_start;
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, chunk as u32);
+                set_u32(encoder, 8, (group == 0) as u32);
+                set_u32(encoder, 9, (group == groups - 1) as u32);
+                dispatch(encoder, pipeline, leaf_count);
+                encoder.end_encoding();
+            }
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
             command_buffer.commit();
@@ -2393,6 +2474,13 @@ impl MetalShared {
             //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
             // and `metallib_matches_shader_source` fails the test run if you
             // forget.
+            // The generated library is auxiliary: only the new absorb16
+            // function is ever resolved from it. This avoids regenerating or
+            // replacing any established pipeline with build-host codegen.
+            let absorb16_library = (!SHADER_ABSORB16_METALLIB.is_empty())
+                .then(|| device.new_library_with_data(SHADER_ABSORB16_METALLIB).ok())
+                .flatten()
+                .filter(|library| library.get_function("poseidon2_absorb16", None).is_ok());
             let library = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
@@ -2511,6 +2599,7 @@ impl MetalShared {
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
             spawn_optional_pipelines(&device, &library);
+            spawn_optional_absorb16_pipeline(&device, absorb16_library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
