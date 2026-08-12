@@ -35,6 +35,19 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_with_subgroup_scales(
+        extension_values: &[QuadraticExtension<Self>],
+        base_coefficients: &[Self],
+        subgroup_scales: &[Self],
+    ) -> QuadraticExtension<Self> {
+        ext2_base_scalar_dot_product_scaled(
+            extension_values,
+            base_coefficients,
+            subgroup_scales,
+        )
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -274,6 +287,78 @@ fn ext2_base_scalar_dot_product(
     while start < len {
         let end = len.min(start + MAX_TERMS_PER_REDUCTION);
         result += reduce_chunk(&extension_values[start..end], &base_scalars[start..end]);
+        start = end;
+    }
+    result
+}
+
+/// Fused shifted-opening dot product:
+/// `sum_i extension_values[i].scalar_mul(base_coefficients[i] *
+/// subgroup_scales[i])` in GF(p^2). Used to evaluate a base polynomial at
+/// `g * zeta` from the existing `zeta` powers and the natural-order subgroup
+/// powers without materializing a second quadratic-extension table.
+///
+/// The base product `coefficient * scale` is a normal Goldilocks
+/// multiplication, so every widened limb product is `(2^64-1)^2` at most and
+/// the same `reduce160` bound as [`ext2_base_scalar_dot_product`] applies
+/// (up to `2^32 - 1` terms per chunk). The returned representative may
+/// differ from the generic reduce-per-term path, but the field element is
+/// identical.
+#[inline]
+fn ext2_base_scalar_dot_product_scaled(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_coefficients: &[GoldilocksField],
+    subgroup_scales: &[GoldilocksField],
+) -> QuadraticExtension<GoldilocksField> {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len = extension_values
+        .len()
+        .min(base_coefficients.len())
+        .min(subgroup_scales.len());
+    if len == 0 {
+        return QuadraticExtension::ZERO;
+    }
+
+    let reduce_chunk = |values: &[QuadraticExtension<GoldilocksField>],
+                        coefficients: &[GoldilocksField],
+                        scales: &[GoldilocksField]| {
+        debug_assert_eq!(values.len(), coefficients.len());
+        debug_assert_eq!(values.len(), scales.len());
+        debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
+        let (mut lo0, mut hi0) = (0u128, 0u32);
+        let (mut lo1, mut hi1) = (0u128, 0u32);
+        for ((&QuadraticExtension([a0, a1]), &coefficient), &scale) in values
+            .iter()
+            .zip(coefficients)
+            .zip(scales)
+        {
+            let scalar = coefficient * scale;
+            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
+            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        }
+        // SAFETY: the same exact worst-case bound as
+        // `ext2_base_scalar_dot_product` covers arbitrary u64 representatives
+        // for every term in this chunk.
+        QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
+            reduce160(lo1, hi1)
+        }])
+    };
+
+    let first_end = len.min(MAX_TERMS_PER_REDUCTION);
+    let mut result = reduce_chunk(
+        &extension_values[..first_end],
+        &base_coefficients[..first_end],
+        &subgroup_scales[..first_end],
+    );
+    let mut start = first_end;
+    while start < len {
+        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
+        result += reduce_chunk(
+            &extension_values[start..end],
+            &base_coefficients[start..end],
+            &subgroup_scales[start..end],
+        );
         start = end;
     }
     result
@@ -897,6 +982,100 @@ mod tests {
         let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
+    }
+
+    #[test]
+    fn ext2_scaled_dot_product_matches_materialized_shifted_table() {
+        let p = GF::ORDER;
+        let raw_specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
+        let lengths = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (15, 15),
+            (16, 16),
+            (17, 17),
+            (63, 64),
+            (64, 63),
+            (65, 65),
+            (255, 255),
+            (256, 256),
+            (257, 257),
+            (2047, 2047),
+            (2048, 2048),
+            (2049, 2049),
+            (4095, 4096),
+            (4096, 4095),
+            (4097, 4097),
+        ];
+
+        let mut state = 0x5DEE_CE66_D65C_2A63u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (values_len, coefficients_len) in lengths {
+            let scales_len = coefficients_len;
+            let values: Vec<Q2> = (0..values_len)
+                .map(|i| {
+                    let a0 = if i < raw_specials.len() {
+                        raw_specials[i]
+                    } else {
+                        next()
+                    };
+                    let a1 = if i < raw_specials.len() {
+                        raw_specials[raw_specials.len() - 1 - i]
+                    } else {
+                        next()
+                    };
+                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
+                })
+                .collect();
+            let coefficients: Vec<GF> = (0..coefficients_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 3) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+            let scales: Vec<GF> = (0..scales_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5 + 1) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+
+            let materialized = values
+                .iter()
+                .zip(&scales)
+                .map(|(&value, &scale)| {
+                    <Q2 as FieldExtension<2>>::scalar_mul(&value, scale)
+                })
+                .collect::<Vec<_>>();
+            let expected = generic_extension_base_dot_product(&materialized, &coefficients);
+            let actual = <GF as Extendable<2>>::extension_base_dot_product_with_subgroup_scales(
+                &values,
+                &coefficients,
+                &scales,
+            );
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].to_canonical_u64(),
+                    expected.0[limb].to_canonical_u64(),
+                    "canonical limb {limb} mismatch at ({values_len}, {coefficients_len}, {scales_len})"
+                );
+            }
+        }
     }
 
     #[test]
