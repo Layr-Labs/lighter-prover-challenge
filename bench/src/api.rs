@@ -1,4 +1,4 @@
-// Redraw marker top1-50-1786515495
+// Redraw marker 181: proof-valid fused quotient final scatter.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
