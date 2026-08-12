@@ -622,7 +622,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
+        for (batch_index, FriBatchInfo { point, polynomials }) in
+            instance.batches.iter().enumerate()
+        {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -632,6 +634,23 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // here — so the `String` is allocated, written and dropped without
             // ever being read. A static label costs nothing and reads the same
             // in a timing build.
+            // The first opening batch needs the ordinary wide reduction. The
+            // later `g * zeta` opening batch is small, however, and its
+            // composition polynomial is consumed immediately by the quotient
+            // recurrence. Stream that one through a bounded scratch block so
+            // it does not allocate, write and reread a full-degree temporary.
+            if batch_index > 0 && polynomials.len() <= 16 {
+                timed!(
+                    timing,
+                    "reduce and accumulate small opening batch",
+                    alpha.accumulate_small_polys_base_linear_quotient(
+                        polys_coeff,
+                        &mut final_poly,
+                        *point,
+                    )
+                );
+                continue;
+            }
             let composition_poly = timed!(
                 timing,
                 "reduce batch of polynomials",

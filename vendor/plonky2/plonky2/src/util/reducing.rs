@@ -193,6 +193,109 @@ impl<F: Field> ReducingFactor<F> {
         PolynomialCoeffs::new(acc)
     }
 
+    /// Fold a small base-field opening batch straight into the running linear
+    /// quotient. The ordinary path materializes a full extension composition
+    /// vector solely to consume it backwards in synthetic division; this path
+    /// keeps only one bounded coefficient block at a time.
+    pub fn accumulate_small_polys_base_linear_quotient<
+        BF: Extendable<D, Extension = F>,
+        const D: usize,
+    >(
+        &mut self,
+        polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>> + Sync>,
+        final_poly: &mut PolynomialCoeffs<F>,
+        z: F,
+    ) where
+        F: FieldExtension<D, BaseField = BF>,
+    {
+        let polys: Vec<_> = polys.into_iter().collect();
+        debug_assert!(polys.len() <= 16);
+        let max_len = polys
+            .iter()
+            .map(|p| p.borrow().coeffs.len())
+            .max()
+            .unwrap_or(0);
+        let base_powers: Vec<F> = self.base.powers().take(polys.len()).collect();
+        self.count += polys.len() as u64;
+        let shift = self.shift_factor();
+
+        let buf = &mut final_poly.coeffs;
+        for coefficient in buf.iter_mut().skip(max_len) {
+            *coefficient *= shift;
+        }
+        if buf.len() < max_len {
+            buf.resize(max_len, F::ZERO);
+        }
+        if max_len == 0 {
+            return;
+        }
+        // The padded quotient's highest coefficient is zero.
+        buf[max_len - 1] *= shift;
+
+        const SLOT_BLOCK: usize = 2048;
+        let mut scratch = vec![F::ZERO; SLOT_BLOCK.min(max_len.saturating_sub(1))];
+        let mut end = max_len;
+        let mut acc = F::ZERO;
+        while end > 1 {
+            let start = 1.max(end.saturating_sub(SLOT_BLOCK));
+            let out = &mut scratch[..end - start];
+            if TypeId::of::<BF>() == TypeId::of::<GoldilocksField>()
+                && TypeId::of::<F>() == TypeId::of::<QuadraticExtension<GoldilocksField>>()
+            {
+                // SAFETY: the exact TypeId checks establish both casts.
+                let slices: Vec<&[GoldilocksField]> = polys
+                    .iter()
+                    .map(|p| {
+                        let coeffs = p.borrow().coeffs.as_slice();
+                        unsafe {
+                            core::slice::from_raw_parts(
+                                coeffs.as_ptr().cast::<GoldilocksField>(),
+                                coeffs.len(),
+                            )
+                        }
+                    })
+                    .collect();
+                let powers = unsafe {
+                    core::slice::from_raw_parts(
+                        base_powers
+                            .as_ptr()
+                            .cast::<QuadraticExtension<GoldilocksField>>(),
+                        base_powers.len(),
+                    )
+                };
+                let out = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        out.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                        out.len(),
+                    )
+                };
+                ext2_base_scalar_dot_slots(out, start, &slices, powers);
+            } else {
+                out.fill(F::ZERO);
+                for (base_power, poly) in base_powers.iter().zip(&polys) {
+                    let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
+                    if coeffs.coeffs.len() <= start {
+                        continue;
+                    }
+                    let live = (coeffs.coeffs.len() - start).min(out.len());
+                    for (reduced, &coefficient) in out[..live]
+                        .iter_mut()
+                        .zip(&coeffs.coeffs[start..start + live])
+                    {
+                        *reduced +=
+                            <F as FieldExtension<D>>::scalar_mul(base_power, coefficient);
+                    }
+                }
+            }
+            for (offset, &coefficient) in out.iter().enumerate().rev() {
+                acc = acc * z + coefficient;
+                let quotient_index = start + offset - 1;
+                buf[quotient_index] = buf[quotient_index] * shift + acc;
+            }
+            end = start;
+        }
+    }
+
     pub fn shift(&mut self, x: F) -> F {
         let tmp = self.base.exp_u64(self.count) * x;
         self.count = 0;
