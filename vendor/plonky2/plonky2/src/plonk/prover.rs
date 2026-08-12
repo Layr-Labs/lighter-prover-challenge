@@ -761,10 +761,25 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // Transaction and chain proofs run in a window and already compete for the
+    // global Rayon pool, so keep their recurring d16-and-smaller path exactly
+    // serial. The d18 final-block proof starts only after every transaction and
+    // chain thread has joined, so its much larger independent scans can safely
+    // use two pool workers on that otherwise-serial tail. The gate is based on
+    // the fixed circuit shape, not timing-sensitive queue/load observations.
+    const FINAL_BLOCK_Z_CHAIN_POINTS: usize = 1 << 18;
+    let (challenge_0, challenge_1) = if subgroup.len() == FINAL_BLOCK_Z_CHAIN_POINTS {
+        rayon::join(
+            || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+            || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+        )
+    } else {
+        (
+            z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+            z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+        )
+    };
+    vec![challenge_0, challenge_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
