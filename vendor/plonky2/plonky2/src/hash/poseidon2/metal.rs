@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "1b8d9bb76668c5511018dafff3fd90f56bc0f1e6ab295d94fee61c9f966dbcf3";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -2697,7 +2697,8 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            // TG=32 matches RANGE_TILE_ROWS in poseidon2.metal (tile v2b).
+            dispatch_threadgroups(encoder, pipeline, quotient_rows, 32);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3855,6 +3856,29 @@ fn dispatch(
         },
         MTLSize {
             width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Explicit threadgroup width for range/U32 tile path (RANGE_TILE_ROWS=32).
+fn dispatch_threadgroups(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    group_width: usize,
+) {
+    let max_width = pipeline.max_total_threads_per_threadgroup() as usize;
+    let group_width = group_width.min(max_width).max(1);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width as NSUInteger,
             height: 1,
             depth: 1,
         },
