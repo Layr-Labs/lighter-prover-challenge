@@ -662,6 +662,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+    let row_aligned_mask = num_routed_wires % 8 == 0
+        && prover_data.fixed_routed_wires.len() == subgroup.len() * (num_routed_wires / 8);
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
@@ -702,6 +704,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
                         let routed_base = i * num_routed_wires;
+                        let row_mask = row_aligned_mask.then(|| {
+                            &prover_data.fixed_routed_wires
+                                [(routed_base >> 3)..((routed_base + num_routed_wires) >> 3)]
+                        });
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
@@ -715,10 +721,15 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 // therefore identical for both challenges and cancel symbolically,
                                 // including when that common factor evaluates to zero. Check the
                                 // circuit-fixed bit before touching witness, sigma, x, or shifts.
-                                if fixed_routed_wire(
-                                    &prover_data.fixed_routed_wires,
-                                    routed_base + j,
-                                ) {
+                                let fixed = if let Some(row_mask) = row_mask {
+                                    row_mask[j >> 3] & (1 << (j & 7)) != 0
+                                } else {
+                                    fixed_routed_wire(
+                                        &prover_data.fixed_routed_wires,
+                                        routed_base + j,
+                                    )
+                                };
+                                if fixed {
                                     continue;
                                 }
                                 let wire_value = witness.get_wire(i, j);
@@ -3399,6 +3410,72 @@ mod permutation_pairing_tests {
             .collect()
     }
 
+    fn row_mask_fixed(mask: &[u8], num_routed_wires: usize, row: usize, column: usize) -> bool {
+        let routed_base = row * num_routed_wires;
+        let row_mask = &mask[(routed_base >> 3)..((routed_base + num_routed_wires) >> 3)];
+        row_mask[column >> 3] & (1 << (column & 7)) != 0
+    }
+
+    #[test]
+    fn row_aligned_fixed_mask_bytes_match_flat_indexing() {
+        for (num_routed_wires, rows) in [(8, 19), (80, 257)] {
+            let mut mask = vec![0u8; rows * (num_routed_wires / 8)];
+            for (byte_index, byte) in mask.iter_mut().enumerate() {
+                *byte = (byte_index as u8)
+                    .wrapping_mul(0x9d)
+                    .rotate_left((byte_index & 7) as u32)
+                    ^ 0xa5;
+            }
+            assert_eq!(
+                mask.len(),
+                rows * (num_routed_wires / 8),
+                "aligned-shape predicate"
+            );
+            for row in 0..rows {
+                for column in 0..num_routed_wires {
+                    assert_eq!(
+                        row_mask_fixed(&mask, num_routed_wires, row, column),
+                        fixed_routed_wire(&mask, row * num_routed_wires + column),
+                        "width={num_routed_wires}, row={row}, column={column}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_unaligned_fixed_masks_use_flat_fallback() {
+        for (num_routed_wires, rows, mask_len) in [
+            (7usize, 11usize, 10usize),
+            (9, 13, 15),
+            (80, 17, 17 * 10 - 1),
+            (80, 17, 17 * 10 + 1),
+        ] {
+            let mask = (0..mask_len)
+                .map(|i| (i as u8).wrapping_mul(0x6d) ^ 0x96)
+                .collect::<Vec<_>>();
+            let row_aligned_mask =
+                num_routed_wires % 8 == 0 && mask.len() == rows * (num_routed_wires / 8);
+            assert!(!row_aligned_mask);
+            for index in 0..=rows * num_routed_wires + 9 {
+                let fallback = if row_aligned_mask {
+                    let row = index / num_routed_wires;
+                    let column = index % num_routed_wires;
+                    row_mask_fixed(&mask, num_routed_wires, row, column)
+                } else {
+                    fixed_routed_wire(&mask, index)
+                };
+                let expected = mask
+                    .get(index >> 3)
+                    .is_some_and(|byte| byte & (1 << (index & 7)) != 0);
+                assert_eq!(
+                    fallback, expected,
+                    "width={num_routed_wires}, index={index}"
+                );
+            }
+        }
+    }
+
     /// Independent, deliberately naive reference: per-point chunk ratios with a
     /// *per-element* inverse (not Montgomery batch inversion) and the Z chain
     /// written out longhand. Compared by field value rather than by limb —
@@ -3470,10 +3547,9 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // PolynomialValues requires a power-of-two row count. Span a single
+        // point, short batches, and the inversion boundary (INV_BATCH = 128).
+        for &n_points in &[1usize, 8, 64, 128, 256] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
