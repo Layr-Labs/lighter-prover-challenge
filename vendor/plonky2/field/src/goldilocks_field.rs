@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use core::fmt::{self, Debug, Display, Formatter};
 use core::hash::{Hash, Hasher};
 use core::iter::{Product, Sum};
@@ -23,6 +24,175 @@ const EPSILON: u64 = (1 << 32) - 1;
 #[derive(Copy, Clone, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct GoldilocksField(pub u64);
+
+/// Build four independent stride-four prefix products directly into an
+/// already-reserved output allocation. The caller keeps the `Vec` length at
+/// zero until this function and its tail have initialized every element, so
+/// the hot loop has no capacity, length, or slice-bound checks.
+///
+/// # Safety
+///
+/// `x` must point to `full_end` readable elements, `out` must point to
+/// `full_end` writable elements, and `full_end` must be a positive multiple of
+/// four.
+#[inline(never)]
+unsafe fn prefix_products_quad(
+    x: *const GoldilocksField,
+    out: *mut GoldilocksField,
+    full_end: usize,
+) -> [GoldilocksField; 4] {
+    debug_assert!(full_end >= 4 && full_end % 4 == 0);
+
+    let mut cumul = unsafe { [*x, *x.add(1), *x.add(2), *x.add(3)] };
+    unsafe { core::ptr::copy_nonoverlapping(cumul.as_ptr(), out, 4) };
+
+    let mut i = 4;
+    while i < full_end {
+        let factors = unsafe {
+            [*x.add(i), *x.add(i + 1), *x.add(i + 2), *x.add(i + 3)]
+        };
+        cumul = GoldilocksField::multiply_quad(cumul, factors);
+        unsafe { core::ptr::copy_nonoverlapping(cumul.as_ptr(), out.add(i), 4) };
+        i += 4;
+    }
+    cumul
+}
+
+/// Turn the stride-four prefixes in `out` into elementwise inverses, walking
+/// backwards without slice-bound checks. This is one challenge lane; keeping
+/// the two calls separate gives the AArch64 allocator a small, spill-free
+/// kernel instead of one giant parent function.
+///
+/// # Safety
+///
+/// `x` and `out` must point to `full_end` initialized elements,
+/// `full_end >= 4` must be divisible by four, and `a_inv` must contain the
+/// inverses of the four terminal prefix products.
+#[inline(never)]
+unsafe fn reverse_products_quad(
+    x: *const GoldilocksField,
+    out: *mut GoldilocksField,
+    full_end: usize,
+    mut a_inv: [GoldilocksField; 4],
+) {
+    debug_assert!(full_end >= 4 && full_end % 4 == 0);
+
+    let mut end = full_end;
+    while end > 4 {
+        let base = end - 4;
+        let prefixes = unsafe {
+            [
+                *out.add(base - 4),
+                *out.add(base - 3),
+                *out.add(base - 2),
+                *out.add(base - 1),
+            ]
+        };
+        let inverses = GoldilocksField::multiply_quad(prefixes, a_inv);
+        unsafe { core::ptr::copy_nonoverlapping(inverses.as_ptr(), out.add(base), 4) };
+
+        let factors = unsafe {
+            [
+                *x.add(base),
+                *x.add(base + 1),
+                *x.add(base + 2),
+                *x.add(base + 3),
+            ]
+        };
+        a_inv = GoldilocksField::multiply_quad(a_inv, factors);
+        end = base;
+    }
+    unsafe { core::ptr::copy_nonoverlapping(a_inv.as_ptr(), out, 4) };
+}
+
+/// Consume one challenge lane's stride-four prefixes while multiplying each
+/// recovered inverse directly into its final quotient-product slot. The
+/// prefix allocation remains scratch: unlike `reverse_products_quad`, this
+/// kernel never writes an inverse array that the caller would immediately
+/// read back.
+///
+/// # Safety
+///
+/// `x` and `prefixes` must point to `full_end` initialized elements,
+/// `outputs` must point to `full_end` valid indices into `products`, and
+/// `full_end >= 4` must be divisible by four. `a_inv` must contain the
+/// inverses of the four terminal prefix products.
+#[inline(never)]
+unsafe fn reverse_products_quad_multiply_scatter(
+    x: *const GoldilocksField,
+    prefixes: *const GoldilocksField,
+    products: *mut GoldilocksField,
+    outputs: *const usize,
+    full_end: usize,
+    mut a_inv: [GoldilocksField; 4],
+) {
+    debug_assert!(full_end >= 4 && full_end % 4 == 0);
+
+    let mut end = full_end;
+    while end > 4 {
+        let base = end - 4;
+        let previous_prefixes = unsafe {
+            [
+                *prefixes.add(base - 4),
+                *prefixes.add(base - 3),
+                *prefixes.add(base - 2),
+                *prefixes.add(base - 1),
+            ]
+        };
+        let inverses = GoldilocksField::multiply_quad(previous_prefixes, a_inv);
+        let indices = unsafe {
+            [
+                *outputs.add(base),
+                *outputs.add(base + 1),
+                *outputs.add(base + 2),
+                *outputs.add(base + 3),
+            ]
+        };
+        let numerators = unsafe {
+            [
+                *products.add(indices[0]),
+                *products.add(indices[1]),
+                *products.add(indices[2]),
+                *products.add(indices[3]),
+            ]
+        };
+        let quotients = GoldilocksField::multiply_quad(numerators, inverses);
+        unsafe {
+            products.add(indices[0]).write(quotients[0]);
+            products.add(indices[1]).write(quotients[1]);
+            products.add(indices[2]).write(quotients[2]);
+            products.add(indices[3]).write(quotients[3]);
+        }
+
+        let factors = unsafe {
+            [
+                *x.add(base),
+                *x.add(base + 1),
+                *x.add(base + 2),
+                *x.add(base + 3),
+            ]
+        };
+        a_inv = GoldilocksField::multiply_quad(a_inv, factors);
+        end = base;
+    }
+
+    let indices = unsafe { [*outputs, *outputs.add(1), *outputs.add(2), *outputs.add(3)] };
+    let numerators = unsafe {
+        [
+            *products.add(indices[0]),
+            *products.add(indices[1]),
+            *products.add(indices[2]),
+            *products.add(indices[3]),
+        ]
+    };
+    let quotients = GoldilocksField::multiply_quad(numerators, a_inv);
+    unsafe {
+        products.add(indices[0]).write(quotients[0]);
+        products.add(indices[1]).write(quotients[1]);
+        products.add(indices[2]).write(quotients[2]);
+        products.add(indices[3]).write(quotients[3]);
+    }
+}
 
 impl Default for GoldilocksField {
     fn default() -> Self {
@@ -219,6 +389,334 @@ impl Field for GoldilocksField {
         } else {
             n as u64
         })
+    }
+
+    #[inline(always)]
+    fn multiply_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+            (NeonGoldilocksField(lhs) * NeonGoldilocksField(rhs)).0
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            [lhs[0] * rhs[0], lhs[1] * rhs[1]]
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_quad(lhs: [Self; 4], rhs: [Self; 4]) -> [Self; 4] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let lanes = mul_reduce_quad(
+                lhs.map(|value| value.0),
+                rhs.map(|value| value.0),
+            );
+            lanes.map(Self)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            [
+                lhs[0] * rhs[0],
+                lhs[1] * rhs[1],
+                lhs[2] * rhs[2],
+                lhs[3] * rhs[3],
+            ]
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_accumulate_pair(acc: [Self; 2], x: [Self; 2], y: [Self; 2]) -> [Self; 2] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+            use crate::packed::PackedField;
+
+            NeonGoldilocksField(acc)
+                .multiply_accumulate(NeonGoldilocksField(x), NeonGoldilocksField(y))
+                .0
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            [
+                acc[0].multiply_accumulate(x[0], y[0]),
+                acc[1].multiply_accumulate(x[1], y[1]),
+            ]
+        }
+    }
+
+    #[inline(always)]
+    fn multiply_accumulate_quad(acc: [Self; 4], x: [Self; 4], y: [Self; 4]) -> [Self; 4] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let lanes = mul_acc_reduce_quad(
+                acc.map(|value| value.0),
+                x.map(|value| value.0),
+                y.map(|value| value.0),
+            );
+            lanes.map(Self)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            [
+                acc[0].multiply_accumulate(x[0], y[0]),
+                acc[1].multiply_accumulate(x[1], y[1]),
+                acc[2].multiply_accumulate(x[2], y[2]),
+                acc[3].multiply_accumulate(x[3], y[3]),
+            ]
+        }
+    }
+
+    fn batch_multiplicative_inverse_pair_into(
+        x0: &[Self],
+        x1: &[Self],
+        buf0: &mut Vec<Self>,
+        buf1: &mut Vec<Self>,
+    ) {
+        assert_eq!(x0.len(), x1.len());
+
+        // The hot permutation batches are much larger than WIDTH. Keep the
+        // small cases on the established path, both for compactness and to
+        // preserve their exact special-case behavior.
+        const WIDTH: usize = 4;
+        let n = x0.len();
+        if n < WIDTH {
+            Self::batch_multiplicative_inverse_into(x0, buf0);
+            Self::batch_multiplicative_inverse_into(x1, buf1);
+            return;
+        }
+
+        buf0.clear();
+        buf1.clear();
+        buf0.reserve(n);
+        buf1.reserve(n);
+
+        let full_end = n - n % WIDTH;
+        let mut cumul0 = unsafe {
+            prefix_products_quad(x0.as_ptr(), buf0.as_mut_ptr(), full_end)
+        };
+        let mut cumul1 = unsafe {
+            prefix_products_quad(x1.as_ptr(), buf1.as_mut_ptr(), full_end)
+        };
+        for i in full_end..n {
+            let lane = i % WIDTH;
+            let next = Self::multiply_pair(
+                [cumul0[lane], cumul1[lane]],
+                [x0[i], x1[i]],
+            );
+            cumul0[lane] = next[0];
+            cumul1[lane] = next[1];
+            unsafe {
+                buf0.as_mut_ptr().add(i).write(next[0]);
+                buf1.as_mut_ptr().add(i).write(next[1]);
+            }
+        }
+        // Every element has now been initialized through the reserved raw
+        // pointers. Publish the lengths once, outside both hot loops.
+        unsafe {
+            buf0.set_len(n);
+            buf1.set_len(n);
+        }
+
+        // Montgomery's trick normally spends one inverse per batch. Combine
+        // the two terminal products first, spend one inverse total, then split
+        // it back into the two challenge-lane inverses with two products.
+        let c01 = Self::multiply_pair(
+            [cumul0[0], cumul1[0]],
+            [cumul0[1], cumul1[1]],
+        );
+        let c23 = Self::multiply_pair(
+            [cumul0[2], cumul1[2]],
+            [cumul0[3], cumul1[3]],
+        );
+        let totals = Self::multiply_pair(c01, c23);
+        let combined_inverse = (totals[0] * totals[1]).inverse();
+        let total_inverses = Self::multiply_pair(
+            [combined_inverse; 2],
+            [totals[1], totals[0]],
+        );
+
+        let c01_inverses = Self::multiply_pair(total_inverses, c23);
+        let c23_inverses = Self::multiply_pair(total_inverses, c01);
+        let inv0 = Self::multiply_pair(
+            c01_inverses,
+            [cumul0[1], cumul1[1]],
+        );
+        let inv1 = Self::multiply_pair(
+            c01_inverses,
+            [cumul0[0], cumul1[0]],
+        );
+        let inv2 = Self::multiply_pair(
+            c23_inverses,
+            [cumul0[3], cumul1[3]],
+        );
+        let inv3 = Self::multiply_pair(
+            c23_inverses,
+            [cumul0[2], cumul1[2]],
+        );
+        let mut a_inv0 = [inv0[0], inv1[0], inv2[0], inv3[0]];
+        let mut a_inv1 = [inv0[1], inv1[1], inv2[1], inv3[1]];
+
+        for i in (full_end..n).rev() {
+            let lane = i % WIDTH;
+            let inverse = Self::multiply_pair(
+                [buf0[i - WIDTH], buf1[i - WIDTH]],
+                [a_inv0[lane], a_inv1[lane]],
+            );
+            buf0[i] = inverse[0];
+            buf1[i] = inverse[1];
+            let previous = Self::multiply_pair(
+                [a_inv0[lane], a_inv1[lane]],
+                [x0[i], x1[i]],
+            );
+            a_inv0[lane] = previous[0];
+            a_inv1[lane] = previous[1];
+        }
+        unsafe {
+            reverse_products_quad(x0.as_ptr(), buf0.as_mut_ptr(), full_end, a_inv0);
+            reverse_products_quad(x1.as_ptr(), buf1.as_mut_ptr(), full_end, a_inv1);
+        }
+
+        debug_assert!(buf0.iter().zip(x0).all(|(&inv, &x)| inv * x == Self::ONE));
+        debug_assert!(buf1.iter().zip(x1).all(|(&inv, &x)| inv * x == Self::ONE));
+    }
+
+    unsafe fn batch_multiplicative_inverse_pair_multiply_scatter(
+        x0: &[Self],
+        x1: &[Self],
+        scratch0: &mut Vec<Self>,
+        scratch1: &mut Vec<Self>,
+        products0: &mut [Self],
+        products1: &mut [Self],
+        outputs: &[usize],
+    ) {
+        assert_eq!(x0.len(), x1.len());
+        assert_eq!(x0.len(), outputs.len());
+
+        const WIDTH: usize = 4;
+        // The fused reverse scatter amortizes its indexed-store helper on the
+        // transaction-density batches, while the compact chain shape sits on
+        // the portable crossover. Retain the materialized v30 path below 512.
+        const FUSED_SCATTER_MIN: usize = 512;
+        let n = x0.len();
+        if n < FUSED_SCATTER_MIN {
+            Self::batch_multiplicative_inverse_pair_into(x0, x1, scratch0, scratch1);
+            for (packed, &output) in outputs.iter().enumerate() {
+                let quotients = Self::multiply_pair(
+                    [products0[output], products1[output]],
+                    [scratch0[packed], scratch1[packed]],
+                );
+                products0[output] = quotients[0];
+                products1[output] = quotients[1];
+            }
+            return;
+        }
+
+        scratch0.clear();
+        scratch1.clear();
+        scratch0.reserve(n);
+        scratch1.reserve(n);
+
+        let full_end = n - n % WIDTH;
+        let mut cumul0 = unsafe {
+            prefix_products_quad(x0.as_ptr(), scratch0.as_mut_ptr(), full_end)
+        };
+        let mut cumul1 = unsafe {
+            prefix_products_quad(x1.as_ptr(), scratch1.as_mut_ptr(), full_end)
+        };
+        for i in full_end..n {
+            let lane = i % WIDTH;
+            let next = Self::multiply_pair(
+                [cumul0[lane], cumul1[lane]],
+                [x0[i], x1[i]],
+            );
+            cumul0[lane] = next[0];
+            cumul1[lane] = next[1];
+            unsafe {
+                scratch0.as_mut_ptr().add(i).write(next[0]);
+                scratch1.as_mut_ptr().add(i).write(next[1]);
+            }
+        }
+        unsafe {
+            scratch0.set_len(n);
+            scratch1.set_len(n);
+        }
+
+        let c01 = Self::multiply_pair(
+            [cumul0[0], cumul1[0]],
+            [cumul0[1], cumul1[1]],
+        );
+        let c23 = Self::multiply_pair(
+            [cumul0[2], cumul1[2]],
+            [cumul0[3], cumul1[3]],
+        );
+        let totals = Self::multiply_pair(c01, c23);
+        let combined_inverse = (totals[0] * totals[1]).inverse();
+        let total_inverses = Self::multiply_pair(
+            [combined_inverse; 2],
+            [totals[1], totals[0]],
+        );
+        let c01_inverses = Self::multiply_pair(total_inverses, c23);
+        let c23_inverses = Self::multiply_pair(total_inverses, c01);
+        let inv0 = Self::multiply_pair(
+            c01_inverses,
+            [cumul0[1], cumul1[1]],
+        );
+        let inv1 = Self::multiply_pair(
+            c01_inverses,
+            [cumul0[0], cumul1[0]],
+        );
+        let inv2 = Self::multiply_pair(
+            c23_inverses,
+            [cumul0[3], cumul1[3]],
+        );
+        let inv3 = Self::multiply_pair(
+            c23_inverses,
+            [cumul0[2], cumul1[2]],
+        );
+        let mut a_inv0 = [inv0[0], inv1[0], inv2[0], inv3[0]];
+        let mut a_inv1 = [inv0[1], inv1[1], inv2[1], inv3[1]];
+
+        for i in (full_end..n).rev() {
+            let lane = i % WIDTH;
+            let inverses = Self::multiply_pair(
+                [scratch0[i - WIDTH], scratch1[i - WIDTH]],
+                [a_inv0[lane], a_inv1[lane]],
+            );
+            let output = outputs[i];
+            let quotients = Self::multiply_pair(
+                [products0[output], products1[output]],
+                inverses,
+            );
+            products0[output] = quotients[0];
+            products1[output] = quotients[1];
+            let previous = Self::multiply_pair(
+                [a_inv0[lane], a_inv1[lane]],
+                [x0[i], x1[i]],
+            );
+            a_inv0[lane] = previous[0];
+            a_inv1[lane] = previous[1];
+        }
+
+        unsafe {
+            reverse_products_quad_multiply_scatter(
+                x0.as_ptr(),
+                scratch0.as_ptr(),
+                products0.as_mut_ptr(),
+                outputs.as_ptr(),
+                full_end,
+                a_inv0,
+            );
+            reverse_products_quad_multiply_scatter(
+                x1.as_ptr(),
+                scratch1.as_ptr(),
+                products1.as_mut_ptr(),
+                outputs.as_ptr(),
+                full_end,
+                a_inv1,
+            );
+        }
     }
 
     #[inline]
@@ -504,6 +1002,166 @@ fn mul_acc_reduce(acc: u64, a: u64, b: u64) -> u64 {
     result
 }
 
+/// Four independent Goldilocks products in one AArch64 scheduling region.
+/// The flag-producing correction pairs remain adjacent, while widening
+/// multiplies and flag-free reduction instructions from all four lanes can
+/// overlap. Each lane follows `reduce128`'s exact operation order.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn mul_reduce_quad(lhs: [u64; 4], rhs: [u64; 4]) -> [u64; 4] {
+    let mut result0 = lhs[0];
+    let mut result1 = lhs[1];
+    let mut result2 = lhs[2];
+    let mut result3 = lhs[3];
+    let scratch0 = rhs[0];
+    let scratch1 = rhs[1];
+    let scratch2 = rhs[2];
+    let scratch3 = rhs[3];
+
+    unsafe {
+        core::arch::asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "umulh {hi2}, {result2}, {scratch2}",
+            "umulh {hi3}, {result3}, {scratch3}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "mul   {result2}, {result2}, {scratch2}",
+            "mul   {result3}, {result3}, {scratch3}",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "umull {scratch2}, {hi2:w}, {epsilon:w}",
+            "umull {scratch3}, {hi3:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "subs  {result2}, {result2}, {hi2}, lsr #32",
+            "csetm {hi2:w}, cc",
+            "subs  {result3}, {result3}, {hi3}, lsr #32",
+            "csetm {hi3:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "sub   {result2}, {result2}, {hi2}",
+            "sub   {result3}, {result3}, {hi3}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "adds  {result2}, {result2}, {scratch2}",
+            "csetm {scratch2:w}, cs",
+            "adds  {result3}, {result3}, {scratch3}",
+            "csetm {scratch3:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            "add   {result2}, {result2}, {scratch2}",
+            "add   {result3}, {result3}, {scratch3}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            result2 = inout(reg) result2,
+            result3 = inout(reg) result3,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            scratch2 = inout(reg) scratch2 => _,
+            scratch3 = inout(reg) scratch3 => _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            hi2 = out(reg) _,
+            hi3 = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    [result0, result1, result2, result3]
+}
+
+/// Four independent `reduce128(acc + a * b)` operations in one AArch64
+/// scheduling region. This removes the artificial barrier between the
+/// numerator and denominator challenge pairs without changing any lane's raw
+/// representative.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn mul_acc_reduce_quad(acc: [u64; 4], x: [u64; 4], y: [u64; 4]) -> [u64; 4] {
+    let mut result0 = x[0];
+    let mut result1 = x[1];
+    let mut result2 = x[2];
+    let mut result3 = x[3];
+    let scratch0 = y[0];
+    let scratch1 = y[1];
+    let scratch2 = y[2];
+    let scratch3 = y[3];
+
+    unsafe {
+        core::arch::asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "umulh {hi2}, {result2}, {scratch2}",
+            "umulh {hi3}, {result3}, {scratch3}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "mul   {result2}, {result2}, {scratch2}",
+            "mul   {result3}, {result3}, {scratch3}",
+            "adds  {result0}, {result0}, {acc0}",
+            "adc   {hi0}, {hi0}, xzr",
+            "adds  {result1}, {result1}, {acc1}",
+            "adc   {hi1}, {hi1}, xzr",
+            "adds  {result2}, {result2}, {acc2}",
+            "adc   {hi2}, {hi2}, xzr",
+            "adds  {result3}, {result3}, {acc3}",
+            "adc   {hi3}, {hi3}, xzr",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "umull {scratch2}, {hi2:w}, {epsilon:w}",
+            "umull {scratch3}, {hi3:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "subs  {result2}, {result2}, {hi2}, lsr #32",
+            "csetm {hi2:w}, cc",
+            "subs  {result3}, {result3}, {hi3}, lsr #32",
+            "csetm {hi3:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "sub   {result2}, {result2}, {hi2}",
+            "sub   {result3}, {result3}, {hi3}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "adds  {result2}, {result2}, {scratch2}",
+            "csetm {scratch2:w}, cs",
+            "adds  {result3}, {result3}, {scratch3}",
+            "csetm {scratch3:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            "add   {result2}, {result2}, {scratch2}",
+            "add   {result3}, {result3}, {scratch3}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            result2 = inout(reg) result2,
+            result3 = inout(reg) result3,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            scratch2 = inout(reg) scratch2 => _,
+            scratch3 = inout(reg) scratch3 => _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            hi2 = out(reg) _,
+            hi3 = out(reg) _,
+            acc0 = in(reg) acc[0],
+            acc1 = in(reg) acc[1],
+            acc2 = in(reg) acc[2],
+            acc3 = in(reg) acc[3],
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    [result0, result1, result2, result3]
+}
+
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
 #[inline]
@@ -630,11 +1288,247 @@ fn fermat_inverse_chain(base: GoldilocksField) -> GoldilocksField {
 
 #[cfg(test)]
 mod tests {
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::{Field, PrimeField64};
     use crate::{test_field_arithmetic, test_prime_field_arithmetic};
-
     test_prime_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
     test_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
 
+    /// The challenge-lane hook must preserve the exact scalar representative,
+    /// including inputs in Goldilocks' small non-canonical alias range.
+    #[test]
+    fn multiply_pair_matches_scalar_raw_representative() {
+        let edges = [
+            0u64,
+            1,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0001,
+            u64::MAX,
+        ];
+        for &a0 in &edges {
+            for &a1 in &edges {
+                for &b0 in &edges {
+                    for &b1 in &edges {
+                        let lhs = [GoldilocksField(a0), GoldilocksField(a1)];
+                        let rhs = [GoldilocksField(b0), GoldilocksField(b1)];
+                        let actual = GoldilocksField::multiply_pair(lhs, rhs);
+                        let expected = [lhs[0] * rhs[0], lhs[1] * rhs[1]];
+                        assert_eq!(actual[0].0, expected[0].0);
+                        assert_eq!(actual[1].0, expected[1].0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiply_accumulate_pair_matches_scalar_raw_representative() {
+        let edges = [
+            0u64,
+            1,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0001,
+            u64::MAX,
+        ];
+        for (i, &acc0) in edges.iter().enumerate() {
+            for (j, &x0) in edges.iter().enumerate() {
+                for (k, &y0) in edges.iter().enumerate() {
+                    let acc = [GoldilocksField(acc0), GoldilocksField(edges[(i + 3) % 7])];
+                    let x = [GoldilocksField(x0), GoldilocksField(edges[(j + 5) % 7])];
+                    let y = [GoldilocksField(y0), GoldilocksField(edges[(k + 2) % 7])];
+                    let actual = GoldilocksField::multiply_accumulate_pair(acc, x, y);
+                    let expected = [
+                        acc[0].multiply_accumulate(x[0], y[0]),
+                        acc[1].multiply_accumulate(x[1], y[1]),
+                    ];
+                    assert_eq!([actual[0].0, actual[1].0], [expected[0].0, expected[1].0]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quad_hooks_match_scalar_raw_representative() {
+        let edges = [
+            0u64,
+            1,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0001,
+            u64::MAX,
+        ];
+        let check = |acc: [u64; 4], x: [u64; 4], y: [u64; 4]| {
+            let acc = acc.map(GoldilocksField);
+            let x = x.map(GoldilocksField);
+            let y = y.map(GoldilocksField);
+            let actual_mul = GoldilocksField::multiply_quad(x, y);
+            let expected_mul = core::array::from_fn::<_, 4, _>(|lane| x[lane] * y[lane]);
+            assert_eq!(
+                actual_mul.map(|value| value.0),
+                expected_mul.map(|value| value.0)
+            );
+
+            let actual_fma = GoldilocksField::multiply_accumulate_quad(acc, x, y);
+            let expected_fma = core::array::from_fn::<_, 4, _>(|lane| {
+                acc[lane].multiply_accumulate(x[lane], y[lane])
+            });
+            assert_eq!(
+                actual_fma.map(|value| value.0),
+                expected_fma.map(|value| value.0)
+            );
+        };
+
+        for i in 0..edges.len() {
+            for j in 0..edges.len() {
+                for k in 0..edges.len() {
+                    check(
+                        core::array::from_fn(|lane| edges[(i + lane) % edges.len()]),
+                        core::array::from_fn(|lane| edges[(j + 2 * lane) % edges.len()]),
+                        core::array::from_fn(|lane| edges[(k + 3 * lane) % edges.len()]),
+                    );
+                }
+            }
+        }
+
+        let mut state = 0xA24B_AED4_963E_E407u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200_000 {
+            check(
+                core::array::from_fn(|_| next()),
+                core::array::from_fn(|_| next()),
+                core::array::from_fn(|_| next()),
+            );
+        }
+    }
+
+    #[test]
+    fn paired_batch_inverse_matches_independent_batches() {
+        let values = [
+            1u64,
+            2,
+            3,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            u64::MAX,
+        ];
+        let lengths = (0..65).chain([
+            127usize, 128, 129, 457, 458, 459, 867, 868, 869, 1279, 1280,
+        ]);
+        for n in lengths {
+            let x0: Vec<_> = (0..n)
+                .map(|i| GoldilocksField(values[i % values.len()]))
+                .collect();
+            let x1: Vec<_> = (0..n)
+                .map(|i| GoldilocksField(values[(i * 3 + 2) % values.len()]))
+                .collect();
+            let expected0 = GoldilocksField::batch_multiplicative_inverse(&x0);
+            let expected1 = GoldilocksField::batch_multiplicative_inverse(&x1);
+            let mut actual0 = Vec::new();
+            let mut actual1 = Vec::new();
+            GoldilocksField::batch_multiplicative_inverse_pair_into(
+                &x0,
+                &x1,
+                &mut actual0,
+                &mut actual1,
+            );
+            assert_eq!(actual0.len(), n);
+            assert_eq!(actual1.len(), n);
+            for i in 0..n {
+                assert_eq!(actual0[i].0, expected0[i].0);
+                assert_eq!(actual1[i].0, expected1[i].0);
+                assert_eq!(actual0[i].to_canonical_u64(), expected0[i].to_canonical_u64());
+                assert_eq!(actual1[i].to_canonical_u64(), expected1[i].to_canonical_u64());
+                assert_eq!(actual0[i] * x0[i], GoldilocksField::ONE);
+                assert_eq!(actual1[i] * x1[i], GoldilocksField::ONE);
+            }
+        }
+    }
+
+    #[test]
+    fn fused_paired_inverse_scatter_matches_materialized_path() {
+        let values = [
+            1u64,
+            2,
+            3,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            u64::MAX,
+        ];
+        let lengths = (0..65).chain([
+            127usize, 128, 129, 457, 458, 459, 867, 868, 869, 1279, 1280,
+        ]);
+        for n in lengths {
+            let x0: Vec<_> = (0..n)
+                .map(|i| GoldilocksField(values[i % values.len()]))
+                .collect();
+            let x1: Vec<_> = (0..n)
+                .map(|i| GoldilocksField(values[(i * 3 + 2) % values.len()]))
+                .collect();
+            let outputs: Vec<_> = (0..n).map(|i| 2 * i + 1).collect();
+            let product_len = 2 * n + 3;
+            let products0: Vec<_> = (0..product_len)
+                .map(|i| GoldilocksField(values[(i * 5 + 1) % values.len()]))
+                .collect();
+            let products1: Vec<_> = (0..product_len)
+                .map(|i| GoldilocksField(values[(i * 2 + 4) % values.len()]))
+                .collect();
+
+            let mut expected0 = products0.clone();
+            let mut expected1 = products1.clone();
+            let mut inverses0 = Vec::new();
+            let mut inverses1 = Vec::new();
+            GoldilocksField::batch_multiplicative_inverse_pair_into(
+                &x0,
+                &x1,
+                &mut inverses0,
+                &mut inverses1,
+            );
+            for (packed, &output) in outputs.iter().enumerate() {
+                let quotients = GoldilocksField::multiply_pair(
+                    [expected0[output], expected1[output]],
+                    [inverses0[packed], inverses1[packed]],
+                );
+                expected0[output] = quotients[0];
+                expected1[output] = quotients[1];
+            }
+
+            let mut actual0 = products0;
+            let mut actual1 = products1;
+            let mut scratch0 = Vec::new();
+            let mut scratch1 = Vec::new();
+            unsafe {
+                GoldilocksField::batch_multiplicative_inverse_pair_multiply_scatter(
+                    &x0,
+                    &x1,
+                    &mut scratch0,
+                    &mut scratch1,
+                    &mut actual0,
+                    &mut actual1,
+                    &outputs,
+                );
+            }
+            assert_eq!(
+                actual0.iter().map(|x| x.0).collect::<Vec<_>>(),
+                expected0.iter().map(|x| x.0).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                actual1.iter().map(|x| x.0).collect::<Vec<_>>(),
+                expected1.iter().map(|x| x.0).collect::<Vec<_>>()
+            );
+        }
+    }
     /// Differential test for the AArch64 `multiply_accumulate` inline assembly
     /// against the portable expression it replaces.
     ///
