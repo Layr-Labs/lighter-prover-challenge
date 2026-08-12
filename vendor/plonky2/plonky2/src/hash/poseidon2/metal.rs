@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -313,6 +313,14 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
     }
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
+    /// Whether `finish` can return immediately without waiting for Metal.
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(
+            self.command_buffer.status(),
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        )
+    }
+
     pub(crate) fn finish(&self) -> Result<&[F], String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -329,6 +337,14 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 }
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
+    /// Whether `finish` can return immediately without waiting for Metal.
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(
+            self.command_buffer.status(),
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        )
+    }
+
     pub(crate) fn finish(&self) -> Result<&[F], String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -361,6 +377,14 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 }
 
 impl<F: RichField> PermutationQuotientJob<F> {
+    /// Whether `finish` can return immediately without waiting for Metal.
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(
+            self.command_buffer.status(),
+            MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+        )
+    }
+
     pub(crate) fn finish(&self) -> Result<&[F], String> {
         self.command_buffer.wait_until_completed();
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
@@ -583,22 +607,19 @@ pub fn prewarm_large_column_store(bytes: u64) {
             .device
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
     });
+    const PAGE: isize = 16 * 1024;
     let base = buffer.contents().cast::<u8>();
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
-    const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
