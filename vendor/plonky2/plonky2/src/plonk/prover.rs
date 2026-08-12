@@ -761,10 +761,17 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // The quotient-product pass above computes both production challenges in
+    // parallel, but the two independent sequential Z scans used to run back
+    // to back here.  Keep each scan's exact multiplication order while
+    // letting Rayon execute the challenge-local chains concurrently.  Their
+    // inputs and output allocations are disjoint, so this is a pure schedule
+    // change and preserves every field representative produced by each scan.
+    let (challenge_0, challenge_1) = rayon::join(
+        || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![challenge_0, challenge_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
