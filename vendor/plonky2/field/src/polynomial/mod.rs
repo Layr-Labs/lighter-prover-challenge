@@ -77,7 +77,13 @@ impl<F: Field> PolynomialValues<F> {
     /// Returns the polynomial evaluated by `self` on a coset when the caller
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
-        ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+        ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers), false)
+    }
+
+    /// Like `coset_ifft_with_powers`, but `scaled_powers[i]` must already equal
+    /// `n^-1 * coset_shift^-i` so the IFFT post-pass needs one multiply per slot.
+    pub fn coset_ifft_with_scaled_powers(self, scaled_powers: &[F]) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_postscale(self, None, None, Some(scaled_powers), true)
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -205,7 +211,23 @@ impl<F: Field> PolynomialCoeffs<F> {
     }
 
     pub fn lde(&self, rate_bits: usize) -> Self {
-        self.padded(self.len() << rate_bits)
+        let new_len = self.len() << rate_bits;
+        let mut coeffs = Vec::with_capacity(new_len);
+        coeffs.extend_from_slice(&self.coeffs);
+        if rate_bits == 0 || self.len() < 2 {
+            coeffs.resize(new_len, F::ZERO);
+        } else {
+            // SAFETY: capacity is exactly `new_len`. The zero-padded FFT
+            // reads only the first `self.len()` coefficients and writes every
+            // tail element before reading it (all expansion paths fill
+            // back-to-front), so the tail never needs the memset. The
+            // `self.len() < 2` case is excluded: the first-layer block writes
+            // nothing for a single live coefficient. Garbage-tail vs
+            // zero-tail padded FFTs are bit-identical (differential gate,
+            // 18 lg_n x rate configs).
+            unsafe { coeffs.set_len(new_len) };
+        }
+        Self { coeffs }
     }
 
     pub fn pad(&mut self, new_len: usize) -> Result<()> {
