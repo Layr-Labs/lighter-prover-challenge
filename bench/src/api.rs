@@ -148,11 +148,13 @@ impl Circuits {
     ///
     /// Those five extensions are `2 * 2^19 * 88 + 3 * 2^17 * 86` field elements
     /// = 1.01 GB, and on this host they are resident in CPU-visible Metal
-    /// shared buffers whose release returns the pages to the OS immediately.
+    /// shared buffers. Their owners are released here; reusable stores may
+    /// first enter the bounded column pool, which the final-phase transition
+    /// trims to the two shapes the final proof can still consume.
     /// The final block proof is the process's peak-RSS moment — it stacks its
     /// own `2^21`-row wires, Z and quotient extensions (2.89 GB) on top of
-    /// every retained extension — so releasing these first takes 1.01 GB
-    /// straight off the high-water mark.
+    /// every retained extension — so retiring these first makes 1.01 GB
+    /// eligible for the final-phase pool trim before the high-water mark.
     ///
     /// Nothing else is released here. Generators, representative maps and
     /// witness buffers are CPU-heap objects whose recursive drop is not free.
@@ -193,11 +195,10 @@ impl Circuits {
     /// The heavy path proves three chunks; the light path proves forty-nine.
     /// The heavy pair therefore stops being read after a small fraction of the
     /// process lifetime, but until now its two extensions — `2^19 * 88 + 2^17 *
-    /// 86` field elements = 438 MiB of CPU-visible Metal shared buffers whose
-    /// release returns the pages to the OS immediately — stayed resident until
-    /// the pipeline joined, i.e. across the whole light phase, which is exactly
-    /// the window in which five concurrent workers contend for the machine's
-    /// memory.
+    /// 86` field elements = 438 MiB of CPU-visible Metal shared buffers — stayed
+    /// resident until the pipeline joined, i.e. across the whole light phase,
+    /// increasing this sequential worker's unified-memory pressure throughout
+    /// its longest phase.
     ///
     /// The `RwLock` is what makes the release provable rather than merely
     /// plausible: acquiring the exclusive guard *is* the proof that no reader
@@ -232,7 +233,7 @@ impl Circuits {
     /// before the light path), and the caller joins the light thread before
     /// acquiring the exclusive guard, so the acquisition is uncontended. The
     /// extensions are `2^19 * 88 + 2^17 * 86` field elements = 438 MiB of
-    /// CPU-visible Metal shared buffers released seconds before
+    /// CPU-visible Metal shared buffers retired seconds before
     /// [`Self::release_finished_circuit_extensions`] would.
     pub fn release_light_circuit_extensions(&self) {
         for lock in [&self.light_tx_data, &self.light_chain_data] {

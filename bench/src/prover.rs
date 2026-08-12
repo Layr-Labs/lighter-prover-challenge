@@ -61,6 +61,12 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // for experiments.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
+// The heavy path starts exactly one final-wires prewarm for a block. Keep its
+// handle so the final phase can require completion without delaying the heavy
+// proof's return or holding its circuit extensions across the page walk.
+static BLOCK_STORE_PREWARM: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
 /// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
@@ -189,6 +195,45 @@ fn mark_thread_utility() {
 
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_utility() {}
+
+fn start_block_store_prewarm() {
+    let Ok(handle) = std::thread::Builder::new()
+        .name("block-store-prewarm".to_owned())
+        .spawn(|| {
+            mark_thread_utility();
+            // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one u64
+            // per wire column. Kept in sync with CIRCUIT_CONFIG's num_wires;
+            // a drift just misses the stash harmlessly.
+            const BLOCK_WIRES_STORE_BYTES: u64 =
+                (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
+            plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+        })
+    else {
+        // Allocation remains correct if the helper cannot start; the final
+        // proof simply falls back to allocating its wires store on demand.
+        return;
+    };
+
+    let mut slot = BLOCK_STORE_PREWARM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    debug_assert!(slot.is_none(), "only one block prewarm may be active");
+    if slot.is_none() {
+        *slot = Some(handle);
+    }
+}
+
+fn finish_block_store_prewarm() {
+    let handle = BLOCK_STORE_PREWARM
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        // A failed helper leaves the stash empty and is performance-only; the
+        // final allocation has an unchanged fresh-buffer fallback.
+        let _ = handle.join();
+    }
+}
 
 enum ChainState<'scope> {
     Ready(Proof),
@@ -662,23 +707,10 @@ fn prove_path(
         // The heavy path retires far ahead of the light path; use the slack
         // to pre-fault the final block's wires column store (larger than the
         // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
-        // run's most serial window). Detached: only populates a stash the
-        // block's allocation consults; a size miss falls through unchanged.
-        std::thread::Builder::new()
-            .name("block-store-prewarm".to_owned())
-            .spawn(|| {
-                // Page-walking ~2 GiB at default QoS competes with the light
-                // pipeline for P-cores; utility class prefers the E-cores,
-                // whose memory-bound fault service is nearly as fast.
-                mark_thread_utility();
-                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
-                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
-                // num_wires; a drift just misses the stash harmlessly.
-                const BLOCK_WIRES_STORE_BYTES: u64 =
-                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
-                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
-            })
-            .ok();
+        // run's most serial window). The helper overlaps the long light path;
+        // its handle is joined only at the final-phase boundary, so returning
+        // the heavy proof and releasing its 438 MiB are not delayed.
+        start_block_store_prewarm();
     }
     chain_proof
 }
@@ -875,8 +907,9 @@ pub(crate) fn prove_block_after_pre(
                     // block proof uses only `block_data`, the three finished
                     // proofs and the block. Retire their preprocessed
                     // extensions here — 438 MiB of Metal shared buffers whose
-                    // release returns the pages to the OS immediately — instead
-                    // of holding them across the whole light phase.
+                    // owners are retired now and whose free stores are trimmed
+                    // at the final-phase boundary below — instead of holding
+                    // them across the whole light phase.
                     circuits.release_heavy_circuit_extensions();
                     pending
                         .feed(
@@ -929,9 +962,9 @@ pub(crate) fn prove_block_after_pre(
             // returned long ago. Nothing reads the light pair again: the final
             // block proof uses only `block_data`, the three finished proofs and
             // the block. Retire their preprocessed extensions here — 438 MiB of
-            // Metal shared buffers whose release returns the pages to the OS
-            // immediately — instead of holding them through the final witness
-            // setup until the backstop below.
+            // Metal shared buffers whose owners are retired here and whose free
+            // stores are phase-trimmed below — instead of holding them through
+            // the final witness setup until the backstop below.
             circuits.release_light_circuit_extensions();
             (
                 light_chain_proof,
@@ -948,6 +981,31 @@ pub(crate) fn prove_block_after_pre(
     // before the final block proof — the process's peak-RSS moment — stacks its
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
+
+    // Releasing a Metal-backed commitment can return its column store to the
+    // recurring-proof pool rather than to the OS. At this fixed phase boundary
+    // no transaction or chain proof can reuse that cache. Retain only best-fit
+    // buffers for the two final commitments still to be allocated (Z/partial
+    // products/lookups and quotient), and release every other free store before
+    // the final proof reaches its peak-RSS window.
+    let final_lde_rows = block_data.common.lde_size() as u64;
+    let field_bytes = core::mem::size_of::<F>() as u64;
+    let final_zs_columns = block_data.common.config.num_challenges
+        * (1 + block_data.common.num_partial_products + block_data.common.num_lookup_polys);
+    let final_quotient_columns =
+        block_data.common.config.num_challenges * block_data.common.quotient_degree_factor;
+    let final_store_bytes = [
+        final_lde_rows * final_zs_columns as u64 * field_bytes,
+        final_lde_rows * final_quotient_columns as u64 * field_bytes,
+    ];
+    plonky2::hash::poseidon2::prepare_final_block_column_stores(&final_store_bytes);
+
+    // Usually the long light path has already hidden this whole page walk.
+    // Join after trimming the recurring pool so that, even at an unusually
+    // short tail, stale free stores do not remain resident while we wait.
+    // Completion guarantees that the final fill neither races the prewarm's
+    // zero writes nor misses the stash and allocates a second ~2 GiB store.
+    finish_block_store_prewarm();
 
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =

@@ -558,12 +558,54 @@ impl ColumnStorePool {
             self.free.push(buffer);
         }
     }
+
+    /// Retain only the smallest currently-free buffer that can serve each
+    /// requested final-phase store. Every other recurring-phase buffer is dead
+    /// weight once transaction and chain proving has joined.
+    fn retain_best_fits(&mut self, requested_bytes: &[u64]) -> Vec<Buffer> {
+        let mut retained = Vec::with_capacity(requested_bytes.len());
+        for &bytes in requested_bytes {
+            let Some(index) = self
+                .free
+                .iter()
+                .enumerate()
+                .filter(|(_, buffer)| buffer.length() >= bytes)
+                .min_by_key(|(_, buffer)| buffer.length())
+                .map(|(index, _)| index)
+            else {
+                continue;
+            };
+            retained.push(self.free.swap_remove(index));
+        }
+        let released = core::mem::take(&mut self.free);
+        self.total_bytes = retained.iter().map(|buffer| buffer.length()).sum();
+        self.free = retained;
+        released
+    }
 }
 
-/// One-slot stash for a pre-faulted large column store. The final block's
-/// wires store (larger than the pool's per-buffer cap, so never recycled)
-/// otherwise zero-faults its ~2 GiB inside the run's most serial window; the
-/// orchestrator fills this slot from a background thread while the pipeline
+/// Shrink the recurring column-store cache at the fixed transition from the
+/// transaction/chain pipeline to the final block proof.
+///
+/// The caller supplies the final proof's remaining store sizes in allocation
+/// order. We keep at most one best-fit free buffer for each and release all
+/// others outside the pool lock. This preserves useful warm-page reuse for the
+/// final Z/partial-product and quotient commitments without carrying the whole
+/// 2.5 GiB recurring-proof cache into the process's peak-RSS phase.
+pub fn prepare_final_block_column_stores(requested_bytes: &[u64]) {
+    let released = {
+        let mut pool = COLUMN_STORE_POOL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pool.retain_best_fits(requested_bytes)
+    };
+    drop(released);
+}
+
+/// One-slot stash for a completely pre-faulted large column store. The final
+/// block's wires store (larger than the pool's per-buffer cap, so never recycled)
+/// otherwise zero-faults its ~2 GiB inside the run's most serial window. The
+/// heavy path starts a tracked background page walk while the light pipeline
 /// still runs, so the block's fill starts on already-resident pages. A size
 /// mismatch simply misses and falls through to a fresh allocation.
 static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
@@ -587,18 +629,18 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    // Publish only after the page walk completes. The orchestrator joins this
+    // tracked helper before the final phase, so the final fill can never race
+    // this zeroing pass.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
