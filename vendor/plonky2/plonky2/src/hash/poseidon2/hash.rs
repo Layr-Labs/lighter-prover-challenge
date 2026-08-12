@@ -69,8 +69,9 @@ pub trait Poseidon2: PrimeField64 {
         for r in 0..ROUNDS_P {
             a[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
+            let (sa, sb) = Self::sbox_p_x2(&a[0], &b[0]);
+            a[0] = sa;
+            b[0] = sb;
             Self::internal_linear_layer_x2(a, b);
         }
     }
@@ -138,10 +139,12 @@ pub trait Poseidon2: PrimeField64 {
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             c[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             d[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
-            c[0] = Self::sbox_p(&c[0]);
-            d[0] = Self::sbox_p(&d[0]);
+            let (sa, sb) = Self::sbox_p_x2(&a[0], &b[0]);
+            let (sc, sd) = Self::sbox_p_x2(&c[0], &d[0]);
+            a[0] = sa;
+            b[0] = sb;
+            c[0] = sc;
+            d[0] = sd;
             Self::internal_linear_layer_x4(a, b, c, d);
         }
     }
@@ -278,6 +281,16 @@ pub trait Poseidon2: PrimeField64 {
     }
 
     fn sbox_p(a: &Self) -> Self;
+
+    /// `(sbox_p(a), sbox_p(b))` for two independent inputs.
+    ///
+    /// The partial rounds of `poseidon2_x2` and `poseidon2_x4` have several
+    /// S-boxes in flight at once, so an implementation can schedule the two
+    /// power chains against each other. The default just runs them in sequence.
+    #[inline]
+    fn sbox_p_x2(a: &Self, b: &Self) -> (Self, Self) {
+        (Self::sbox_p(a), Self::sbox_p(b))
+    }
 
     fn sbox_p_extension<F: FieldExtension<D, BaseField = Self>, const D: usize>(a: &F) -> F;
 
@@ -484,6 +497,30 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 }
 
 impl Poseidon2 for F {
+    /// The scalar path below runs the whole `M_E` add graph in `u128`, which
+    /// needs twenty-four general-purpose registers for the state and pays an
+    /// `adds`/`adcs` pair per add. On AArch64 the same graph runs in twelve
+    /// NEON registers holding `[lo, hi]` 32-bit halves, one `vaddq_u64` per
+    /// add. Both produce the same non-canonical `u64` representatives.
+    #[inline]
+    fn external_linear_layer(state: &mut [Self; WIDTH]) {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        unsafe {
+            crate::hash::arch::aarch64::poseidon2_goldilocks_neon::external_linear_layer(state);
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        {
+            let mut state_u128: [u128; WIDTH] = [0u128; WIDTH];
+            for i in 0..WIDTH {
+                state_u128[i] = state[i].to_noncanonical_u64() as u128;
+            }
+            external_linear_layer_u128(&mut state_u128);
+            for i in 0..WIDTH {
+                state[i] = Self::from_noncanonical_u128_with_96_bits(state_u128[i]);
+            }
+        }
+    }
+
     #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
         // AArch64 NEON has no native widening 64x64 multiply. The packed
@@ -604,11 +641,57 @@ impl Poseidon2 for F {
     }
 
     #[inline]
+    #[cfg(not(target_arch = "aarch64"))]
     fn sbox_p(a: &Self) -> Self {
         let a2 = a.square();
         let a4 = a2.square();
         let a3 = *a * a2;
         a3 * a4
+    }
+
+    /// `a^7` through the same four products as the generic body, with the two
+    /// that are independent of each other issued together.
+    ///
+    /// Once `a^2` is known, `a^3 = a * a^2` and `a^4 = a^2 * a^2` depend on
+    /// nothing else, so they go through one `NeonGoldilocksField` multiply.
+    /// That is `mul_reduce_pair`: nine instructions per product against the
+    /// twelve the `Mul` impl's `reduce128` costs, and no borrow branch. The
+    /// arithmetic is unchanged — the paired assembly computes the same
+    /// intermediates and yields the same `u64` representative per product as
+    /// `reduce128`, so `a^3`, `a^4` and the final `a^3 * a^4` are bit-identical
+    /// to the generic body's.
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    fn sbox_p(a: &Self) -> Self {
+        use crate::field::NeonGoldilocksField;
+
+        let a2 = a.square();
+        let a34 = NeonGoldilocksField([*a, a2]) * NeonGoldilocksField([a2, a2]);
+        a34.0[0] * a34.0[1]
+    }
+
+    /// Two `a^7` chains sharing every multiply with a partner.
+    ///
+    /// Eight products in four paired multiplies, three deep: the two squarings
+    /// pair across the inputs, the `a^3`/`a^4` step pairs within each input
+    /// (the arrangement that keeps the chain at three), and the closing
+    /// `a^3 * a^4` pairs across again. Each product is the same `u64` the
+    /// scalar `sbox_p` would produce for that input.
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    fn sbox_p_x2(a: &Self, b: &Self) -> (Self, Self) {
+        use crate::field::NeonGoldilocksField;
+
+        let ab = NeonGoldilocksField([*a, *b]);
+        let ab2 = ab * ab;
+        let (a2, b2) = (ab2.0[0], ab2.0[1]);
+
+        let a34 = NeonGoldilocksField([*a, a2]) * NeonGoldilocksField([a2, a2]);
+        let b34 = NeonGoldilocksField([*b, b2]) * NeonGoldilocksField([b2, b2]);
+
+        let ab7 =
+            NeonGoldilocksField([a34.0[0], b34.0[0]]) * NeonGoldilocksField([a34.0[1], b34.0[1]]);
+        (ab7.0[0], ab7.0[1])
     }
 
     #[inline]
@@ -1107,12 +1190,86 @@ mod test {
     use rand::{RngCore, thread_rng};
 
     use super::*;
-    use crate::field::types::PrimeField64;
+    use crate::field::types::{Field64, PrimeField64};
     use crate::hash::hashing::hash_n_to_m_no_pad;
     use crate::hash::poseidon2::p3::p3_poseidon2_hash_n_to_m_no_pad;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    /// The portable `M_E` path, kept verbatim so the architecture-specific
+    /// override has something to be checked against.
+    fn external_linear_layer_reference(state: &mut [F; WIDTH]) {
+        let mut state_u128: [u128; WIDTH] = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            state_u128[i] = state[i].to_noncanonical_u64() as u128;
+        }
+        external_linear_layer_u128(&mut state_u128);
+        for i in 0..WIDTH {
+            state[i] = F::from_noncanonical_u128_with_96_bits(state_u128[i]);
+        }
+    }
+
+    /// `GoldilocksField` is compared and hashed raw, so the override has to
+    /// return the same non-canonical `u64` representative, not just a congruent
+    /// field element. Compare the raw words.
+    #[test]
+    fn external_linear_layer_matches_reference() {
+        use plonky2_field::types::Field64;
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0x243f_6a88_85a3_08d3);
+
+        let mut fixed: Vec<[u64; WIDTH]> = vec![
+            [0; WIDTH],
+            [u64::MAX; WIDTH],
+            [F::ORDER; WIDTH],
+            [F::ORDER - 1; WIDTH],
+            [u64::MAX - F::ORDER; WIDTH],
+            core::array::from_fn(|i| if i % 2 == 0 { 0 } else { u64::MAX }),
+            core::array::from_fn(|i| u64::MAX - i as u64),
+            core::array::from_fn(|i| (i as u64) << 32),
+        ];
+        // One word extreme, the rest zero: isolates each column of `M_E`.
+        for i in 0..WIDTH {
+            let mut s = [0u64; WIDTH];
+            s[i] = u64::MAX;
+            fixed.push(s);
+        }
+
+        let random = (0..20_000).map(|_| {
+            let mut s = [0u64; WIDTH];
+            for w in s.iter_mut() {
+                // Mix uniform words with words just below 2**64 and just below
+                // ORDER, where the reduction's conditional folds live.
+                *w = match rng.gen_range(0..4u32) {
+                    0 => rng.next_u64(),
+                    1 => u64::MAX - rng.gen_range(0..1u64 << 20),
+                    2 => F::ORDER.wrapping_sub(rng.gen_range(0..1u64 << 20)),
+                    _ => rng.gen_range(0..1u64 << 20),
+                };
+            }
+            s
+        });
+
+        let mut checked = 0usize;
+        for words in fixed.into_iter().chain(random) {
+            let mut actual: [F; WIDTH] = core::array::from_fn(|i| F(words[i]));
+            let mut expected = actual;
+            F::external_linear_layer(&mut actual);
+            external_linear_layer_reference(&mut expected);
+            for i in 0..WIDTH {
+                assert_eq!(
+                    actual[i].to_noncanonical_u64(),
+                    expected[i].to_noncanonical_u64(),
+                    "lane {i} of input {words:?}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked >= 10_000, "only {checked} cases");
+    }
 
     #[test]
     fn test_poseidon2_with_plonky3() {
@@ -1137,6 +1294,92 @@ mod test {
                 expected_output_f[i].to_canonical_u64(),
                 expected_output_f3[i].as_canonical_u64()
             );
+        }
+    }
+
+    /// The partial-round S-box raised to a seventh power, written the way the
+    /// generic body writes it. Both `sbox_p` and `sbox_p_x2` have to reproduce
+    /// this on the raw `u64`, not merely on the field value: `GoldilocksField`
+    /// is compared and hashed in whatever non-canonical representative it
+    /// happens to hold, so a different representative is a different state.
+    fn scalar_sbox_p(a: F) -> F {
+        let a2 = a.square();
+        let a4 = a2.square();
+        let a3 = a * a2;
+        a3 * a4
+    }
+
+    /// Inputs that exercise both conditional folds of the reduction: the rare
+    /// borrow in `x_lo - x_hi_hi` and the carry out of the `EPSILON` add.
+    fn sbox_p_test_values() -> Vec<F> {
+        let mut rng = thread_rng();
+        let mut values = vec![
+            F(0),
+            F(1),
+            F(2),
+            F(F::ORDER - 1),
+            F(F::ORDER),
+            F(F::ORDER + 1),
+            F(u32::MAX as u64),
+            F(1 << 32),
+            F(u64::MAX),
+            F(u64::MAX - 1),
+            F(0xffff_ffff_0000_0001),
+            F(0x0000_0000_ffff_ffff),
+        ];
+        values.extend((0..64).map(|_| F(rng.next_u64())));
+        values
+    }
+
+    #[test]
+    fn sbox_p_matches_scalar_power_chain() {
+        for a in sbox_p_test_values() {
+            assert_eq!(
+                F::sbox_p(&a).0,
+                scalar_sbox_p(a).0,
+                "sbox_p({:#x}) changed representative",
+                a.0
+            );
+            assert_eq!(F::sbox_p(&a), a.exp_u64(7), "sbox_p({:#x}) is not a^7", a.0);
+        }
+    }
+
+    #[test]
+    fn sbox_p_x2_matches_two_scalar_chains() {
+        let values = sbox_p_test_values();
+        // Every ordered pair, including a value with itself, so a lane mix-up
+        // in either direction shows up.
+        for &a in &values {
+            for &b in &values {
+                let (x, y) = F::sbox_p_x2(&a, &b);
+                assert_eq!(x.0, scalar_sbox_p(a).0, "lane 0 for {:#x}", a.0);
+                assert_eq!(y.0, scalar_sbox_p(b).0, "lane 1 for {:#x}", b.0);
+            }
+        }
+    }
+
+    /// `poseidon2_x2` and `poseidon2_x4` now reach their partial-round S-boxes
+    /// through `sbox_p_x2`; each state must still come out equal to the
+    /// single-state permutation, element for element and bit for bit.
+    #[test]
+    fn poseidon2_batched_matches_single_state() {
+        let mut rng = thread_rng();
+        for _ in 0..64 {
+            let states: [[F; WIDTH]; 4] =
+                core::array::from_fn(|_| core::array::from_fn(|_| F(rng.next_u64())));
+            let expected = states.map(F::poseidon2);
+
+            let (a, b) = F::poseidon2_x2(states[0], states[1]);
+            let (c, d, e, f) = F::poseidon2_x4(states[0], states[1], states[2], states[3]);
+
+            for i in 0..WIDTH {
+                assert_eq!(a[i].0, expected[0][i].0);
+                assert_eq!(b[i].0, expected[1][i].0);
+                assert_eq!(c[i].0, expected[0][i].0);
+                assert_eq!(d[i].0, expected[1][i].0);
+                assert_eq!(e[i].0, expected[2][i].0);
+                assert_eq!(f[i].0, expected[3][i].0);
+            }
         }
     }
 
