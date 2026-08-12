@@ -53,7 +53,10 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
+// Series draw marker: fr1 (frontier redraw, sample 1) — pure 612ea7a content.
+// The committed-archive line (v14/v15) is CLOSED: canary f47b425 failed =
+// the M4 Pro-recorded MTLBinaryArchive does not serve on the ranked host.
+// Archive withdrawn; successor (record-on-first-run) in development.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
