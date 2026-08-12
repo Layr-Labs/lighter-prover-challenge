@@ -478,6 +478,17 @@ kernel void poseidon2_gate_quotient(
         filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
     }
 
+    // The filter is the only witness-independent factor of this row's
+    // contribution. Rows where it vanishes (every row that is not this
+    // gate family) contribute exactly zero to both quotient challenges;
+    // skip the full constraint evaluation and write the canonical zeros
+    // explicitly so the pooled output buffer is well-defined everywhere.
+    if (filter == 0) {
+        output[(ulong)gid * 2] = 0;
+        output[(ulong)gid * 2 + 1] = 0;
+        return;
+    }
+
     // parameters buffer kept for ABI; RCs from compile-time tables.
     ulong accumulators[2] = { 0, 0 };
     uint constraint_index = 0;
@@ -785,6 +796,7 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
+        if (filter != 0u) {
         ulong gate_accumulators[2] = { 0, 0 };
         uint constraint_index = 0;
         for (uint op = 0; op < num_ops; ++op) {
@@ -825,6 +837,7 @@ kernel void range_check_gate_quotient(
 
         total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
         total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        }
     }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
@@ -854,6 +867,7 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
+        if (filter != 0u) {
         ulong gate_accumulators[2] = { 0, 0 };
         uint constraint_index = 0;
         if (kind == 0u) {
@@ -1485,6 +1499,7 @@ kernel void range_check_gate_quotient(
 
         total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
         total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        }
     }
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
