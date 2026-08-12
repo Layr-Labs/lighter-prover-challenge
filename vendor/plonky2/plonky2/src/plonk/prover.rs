@@ -623,6 +623,64 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+/// Lockstep form of [`z_polynomials_from_quotient_chunk_products`] for the
+/// production two-challenge path. Each lane retains the scalar helper's exact
+/// multiply and push order; interleaving the independent chains exposes their
+/// field multiplications to instruction-level parallelism without adding a
+/// Rayon fork/join to the steady transaction and chain-proof pipeline.
+fn paired_z_polynomials_from_quotient_chunk_products<F: Field>(
+    quotient_products_0: Vec<F>,
+    quotient_products_1: Vec<F>,
+    num_prods: usize,
+) -> (Vec<PolynomialValues<F>>, Vec<PolynomialValues<F>>) {
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(quotient_products_0.len(), quotient_products_1.len());
+    debug_assert_eq!(quotient_products_0.len() % num_chunks, 0);
+    let n_points = quotient_products_0.len() / num_chunks;
+    let mut columns_0: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut columns_1: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut z_x_0 = F::ONE;
+    let mut z_x_1 = F::ONE;
+
+    for (row_0, row_1) in quotient_products_0
+        .chunks_exact(num_chunks)
+        .zip(quotient_products_1.chunks_exact(num_chunks))
+    {
+        let mut acc_0 = z_x_0;
+        let mut acc_1 = z_x_1;
+        for (k, (&quotient_product_0, &quotient_product_1)) in
+            row_0.iter().zip(row_1).enumerate()
+        {
+            acc_0 *= quotient_product_0;
+            acc_1 *= quotient_product_1;
+            if k == num_prods {
+                columns_0[k].push(z_x_0);
+                columns_1[k].push(z_x_1);
+                z_x_0 = acc_0;
+                z_x_1 = acc_1;
+            } else {
+                columns_0[k].push(acc_0);
+                columns_1[k].push(acc_1);
+            }
+        }
+    }
+
+    (
+        columns_0
+            .into_iter()
+            .map(PolynomialValues::new)
+            .collect(),
+        columns_1
+            .into_iter()
+            .map(PolynomialValues::new)
+            .collect(),
+    )
+}
+
 /// Compute both production permutation challenges in one pass over the witness
 /// and sigma rows.
 ///
@@ -663,7 +721,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
 
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     let product_count = subgroup.len() * num_chunks;
     // Same uninitialised-capacity handling as the per-challenge path: every
     // slot is written below before anything reads it, so zero-filling first is
@@ -688,16 +746,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (denominators, denominator_inverses) = scratch;
+                    denominators.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -731,8 +787,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            denominators.push(denominator_0);
+                            denominators.push(denominator_1);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,8 +803,20 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    // Montgomery's trick pays for one ordinary inverse per
+                    // call. Interleave both challenges so this chunk pays it
+                    // once, while retaining each challenge's denominator and
+                    // quotient-product order.
+                    F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
+                    debug_assert_eq!(denominator_inverses.len(), 2 * products_0.len());
+                    for ((product_0, product_1), inverses) in products_0
+                        .iter_mut()
+                        .zip(products_1.iter_mut())
+                        .zip(denominator_inverses.chunks_exact(2))
+                    {
+                        *product_0 *= inverses[0];
+                        *product_1 *= inverses[1];
+                    }
                 },
             );
     }
@@ -761,10 +829,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    let (columns_0, columns_1) = paired_z_polynomials_from_quotient_chunk_products(
+        quotient_products_0,
+        quotient_products_1,
+        num_prods,
+    );
+    vec![columns_0, columns_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -793,7 +863,7 @@ fn wires_permutation_partial_products_and_zs<
     // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     // Every slot of this buffer is assigned below before anything reads it —
     // the inner loop writes `quotient_products[t * num_chunks + chunk]` for
     // every `t` in the batch and every `chunk`, which covers each sub-slice
@@ -3309,8 +3379,10 @@ mod permutation_pairing_tests {
 
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
+        paired_z_polynomials_from_quotient_chunk_products,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
+        z_polynomials_from_quotient_chunk_products,
     };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
@@ -3399,6 +3471,50 @@ mod permutation_pairing_tests {
             .collect()
     }
 
+    #[test]
+    fn paired_z_chains_are_limb_identical_to_independent_chains() {
+        for &num_prods in &[0usize, 1, 3, 9] {
+            let num_chunks = num_prods + 1;
+            for &n_points in &[1usize, 2, 32, 128] {
+                let mut rng = Rng::new(
+                    0x7a31_c6d4_95e2_b80f
+                        ^ ((num_prods as u64) << 32)
+                        ^ n_points as u64,
+                );
+                let products_0 = (0..n_points * num_chunks)
+                    .map(|_| rng.next_field())
+                    .collect::<Vec<_>>();
+                let products_1 = (0..n_points * num_chunks)
+                    .map(|_| rng.next_field())
+                    .collect::<Vec<_>>();
+
+                let expected = vec![
+                    z_polynomials_from_quotient_chunk_products(
+                        products_0.clone(),
+                        num_prods,
+                    ),
+                    z_polynomials_from_quotient_chunk_products(
+                        products_1.clone(),
+                        num_prods,
+                    ),
+                ];
+                let (actual_0, actual_1) =
+                    paired_z_polynomials_from_quotient_chunk_products(
+                        products_0,
+                        products_1,
+                        num_prods,
+                    );
+                let actual = vec![actual_0, actual_1];
+
+                assert_eq!(
+                    raw_limbs(&actual),
+                    raw_limbs(&expected),
+                    "paired Z chains diverged at {n_points} points and {num_chunks} chunks"
+                );
+            }
+        }
+    }
+
     /// Independent, deliberately naive reference: per-point chunk ratios with a
     /// *per-element* inverse (not Montgomery batch inversion) and the Z chain
     /// written out longhand. Compared by field value rather than by limb —
@@ -3470,10 +3586,10 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // PolynomialValues requires power-of-two domains. Span a single
+        // point, short batches, the inversion boundary (INV_BATCH = 128),
+        // and several complete batches.
+        for &n_points in &[1usize, 2, 64, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
