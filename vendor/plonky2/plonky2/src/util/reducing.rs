@@ -261,7 +261,11 @@ where
         )
     };
 
-    let mut acc = vec![F::ZERO; max_len];
+    let mut acc: Vec<F> = Vec::new();
+    acc.reserve_exact(max_len);
+    // SAFETY: both branches cover every slot, and the delayed-reduction kernel
+    // assigns each slot (including the final short parallel block) before read.
+    unsafe { acc.set_len(max_len) };
     // Same shape split as the generic path: small batches stay serial, large
     // batches partition the coefficient slots so each worker visits all
     // polynomials for one cache-sized output range.
