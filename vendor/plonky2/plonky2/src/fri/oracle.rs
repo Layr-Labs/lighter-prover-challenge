@@ -3,6 +3,10 @@ use alloc::{format, vec::Vec};
 
 use itertools::Itertools;
 use plonky2_field::types::Field;
+use plonky2_field::extension::quadratic::QuadraticExtension;
+use plonky2_field::goldilocks_extensions::ext2_mul_add_qe;
+use plonky2_field::goldilocks_field::GoldilocksField;
+use core::any::TypeId;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
@@ -797,6 +801,30 @@ fn accumulate_linear_quotient<F: Field>(
     // Synthetic division, highest coefficient first: the quotient's
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
     let mut acc = F::ZERO;
+    if TypeId::of::<F>() == TypeId::of::<QuadraticExtension<GoldilocksField>>() {
+        // SAFETY: TypeId proves F is QuadraticExtension<GoldilocksField>.
+        let z = unsafe { core::mem::transmute_copy::<F, QuadraticExtension<GoldilocksField>>(&z) };
+        let shift =
+            unsafe { core::mem::transmute_copy::<F, QuadraticExtension<GoldilocksField>>(&shift) };
+        let coeffs = unsafe {
+            core::slice::from_raw_parts(
+                coeffs.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                coeffs.len(),
+            )
+        };
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                buf.len(),
+            )
+        };
+        let mut acc_e = QuadraticExtension::<GoldilocksField>::ZERO;
+        for i in (0..d - 1).rev() {
+            acc_e = ext2_mul_add_qe(acc_e, z, coeffs[i + 1]);
+            buf[i] = ext2_mul_add_qe(buf[i], shift, acc_e);
+        }
+        return;
+    }
     for i in (0..d - 1).rev() {
         acc = acc * z + coeffs[i + 1];
         buf[i] = buf[i] * shift + acc;
