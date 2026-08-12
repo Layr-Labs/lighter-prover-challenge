@@ -179,9 +179,11 @@ pub fn flatten<F, const D: usize>(l: &[F::Extension]) -> Vec<F>
 where
     F: Field + Extendable<D>,
 {
-    l.iter()
-        .flat_map(|x| x.to_basefield_array().to_vec())
-        .collect()
+    let mut flattened = Vec::with_capacity(l.len() * D);
+    for x in l {
+        flattened.extend_from_slice(&x.to_basefield_array());
+    }
+    flattened
 }
 
 /// Batch every D-sized chunks into extension field elements.
@@ -193,4 +195,60 @@ where
     l.chunks_exact(D)
         .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flatten, Extendable, FieldExtension};
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::extension::quartic::QuarticExtension;
+    use crate::extension::quintic::QuinticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Field64;
+
+    fn assert_matches_reference<const D: usize>(
+        values: &[<GoldilocksField as Extendable<D>>::Extension],
+    ) where
+        GoldilocksField: Extendable<D>,
+    {
+        let reference: Vec<GoldilocksField> = values
+            .iter()
+            .flat_map(|x| x.to_basefield_array().to_vec())
+            .collect();
+        let actual = flatten::<GoldilocksField, D>(values);
+
+        assert_eq!(actual.len(), values.len() * D);
+        assert_eq!(
+            actual.iter().map(|x| x.0).collect::<Vec<_>>(),
+            reference.iter().map(|x| x.0).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn flatten_empty_is_empty_for_supported_degrees() {
+        assert_matches_reference::<1>(&[]);
+        assert_matches_reference::<2>(&[]);
+        assert_matches_reference::<4>(&[]);
+        assert_matches_reference::<5>(&[]);
+    }
+
+    #[test]
+    fn flatten_matches_reference_for_noncanonical_limbs() {
+        let p = GoldilocksField::ORDER;
+        let raw = GoldilocksField;
+
+        assert_matches_reference::<1>(&[raw(p), raw(u64::MAX), raw(7)]);
+        assert_matches_reference::<2>(&[
+            QuadraticExtension([raw(p), raw(p + 1)]),
+            QuadraticExtension([raw(u64::MAX), raw(11)]),
+        ]);
+        assert_matches_reference::<4>(&[
+            QuarticExtension([raw(p), raw(1), raw(p + 2), raw(3)]),
+            QuarticExtension([raw(u64::MAX), raw(5), raw(p + 6), raw(7)]),
+        ]);
+        assert_matches_reference::<5>(&[
+            QuinticExtension([raw(p), raw(1), raw(p + 2), raw(3), raw(p + 4)]),
+            QuinticExtension([raw(u64::MAX), raw(6), raw(p + 7), raw(8), raw(p + 9)]),
+        ]);
+    }
 }
