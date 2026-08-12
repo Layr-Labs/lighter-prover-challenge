@@ -826,6 +826,28 @@ pub(crate) fn prove_block_after_pre(
                     )
                 })
                 .expect("heavy transaction chain thread must start");
+            // The light chain is the terminal latency-critical spine. Start
+            // it immediately after the heavy lane, then launch the final-block
+            // preparation lane whose work has heavy-path slack.
+            let light_chunks = std::mem::take(&mut light_chunks);
+            let light_handle = std::thread::Builder::new()
+                .name("light-tx-chain".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, || {
+                    mark_spine_thread_latency_critical();
+                    prove_path(
+                        TxPath::Light,
+                        light_chunks,
+                        circuits,
+                        block.block_number,
+                        block.created_at,
+                        block.old_account_delta_tree_root,
+                        &pre_output,
+                        state_metadata_hash,
+                        active_paths,
+                    )
+                })
+                .expect("light transaction chain thread must start");
             let block_ref = &block;
             let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
@@ -890,25 +912,6 @@ pub(crate) fn prove_block_after_pre(
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
                 .expect("block circuit build thread must start");
-            let light_chunks = std::mem::take(&mut light_chunks);
-            let light_handle = std::thread::Builder::new()
-                .name("light-tx-chain".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
-                    mark_spine_thread_latency_critical();
-                    prove_path(
-                        TxPath::Light,
-                        light_chunks,
-                        circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
-                        state_metadata_hash,
-                        active_paths,
-                    )
-                })
-                .expect("light transaction chain thread must start");
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
