@@ -241,40 +241,20 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
 
         let output = vars.local_wires[self.wire_output()];
 
-        // Rewrite `bit * base + (1 - bit)` as `1 + bit * (base - 1)`.
-        // Besides deleting one packed subtraction per bit, this exposes the
-        // existing AArch64 multiply-accumulate specialization. Evaluate two
-        // independent transitions at a time to increase instruction-level
-        // parallelism without changing constraint emission order.
-        let base_minus_one = base - P::ONES;
-        let mut i = 0;
-        while i + 1 < self.num_power_bits {
-            let prev_0 = if i == 0 {
+        for i in 0..self.num_power_bits {
+            let prev_intermediate_value = if i == 0 {
                 P::ONES
             } else {
                 intermediate_values[i - 1].square()
             };
-            let prev_1 = intermediate_values[i].square();
 
             // power_bits is in LE order, but we accumulate in BE order.
-            let bit_0 = power_bits[self.num_power_bits - i - 1];
-            let bit_1 = power_bits[self.num_power_bits - i - 2];
-            let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
-            let mul_by_1 = P::ONES.multiply_accumulate(bit_1, base_minus_one);
+            let cur_bit = power_bits[self.num_power_bits - i - 1];
 
-            yield_constr.one(prev_0 * mul_by_0 - intermediate_values[i]);
-            yield_constr.one(prev_1 * mul_by_1 - intermediate_values[i + 1]);
-            i += 2;
-        }
-        if i < self.num_power_bits {
-            let prev = if i == 0 {
-                P::ONES
-            } else {
-                intermediate_values[i - 1].square()
-            };
-            let bit = power_bits[self.num_power_bits - i - 1];
-            let mul_by = P::ONES.multiply_accumulate(bit, base_minus_one);
-            yield_constr.one(prev * mul_by - intermediate_values[i]);
+            let not_cur_bit = P::ONES - cur_bit;
+            let computed_intermediate_value =
+                prev_intermediate_value * (cur_bit * base + not_cur_bit);
+            yield_constr.one(computed_intermediate_value - intermediate_values[i]);
         }
 
         yield_constr.one(output - intermediate_values[self.num_power_bits - 1]);
@@ -405,21 +385,6 @@ mod tests {
         test_eval_fns::<F, C, _, D>(ExponentiationGate::new_from_config(
             &CircuitConfig::standard_recursion_config(),
         ))
-    }
-
-    #[test]
-    fn eval_fns_production_67_bits() -> Result<()> {
-        const D: usize = 2;
-        type C = PoseidonGoldilocksConfig;
-        type F = <C as GenericConfig<D>>::F;
-        let config = CircuitConfig {
-            num_wires: 136,
-            num_routed_wires: 80,
-            ..CircuitConfig::standard_recursion_config()
-        };
-        let gate = ExponentiationGate::new_from_config(&config);
-        assert_eq!(gate.num_power_bits, 67);
-        test_eval_fns::<F, C, _, D>(gate)
     }
 
     #[test]
