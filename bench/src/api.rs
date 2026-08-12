@@ -2,6 +2,11 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
+// Redraw marker: the ranked fleet is bimodal and a slow-class draw carries no
+// information about a mechanism, so the same bytes are re-drawn until a
+// fast-class host is sampled. Dead constant; a comment-only diff is deduped.
+const REDRAW_TOKEN_EXPONENTIATION_OFFLOAD: u64 = 0x4558_504f_5f30_3031;
+
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
