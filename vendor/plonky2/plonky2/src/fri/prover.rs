@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -287,16 +287,25 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let last_block = max_candidate / POW_BATCH;
+    let pow_witness = (0..=last_block)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .filter_map(|block| {
+            let candidates = pow_batch_candidates(max_candidate, block);
+            let mut states = [duplex_intermediate_state; POW_BATCH as usize];
+            for (state, &candidate) in states.iter_mut().zip(&candidates) {
+                state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+            }
+            <C::Hasher as Hasher<F>>::Permutation::permute_x4(&mut states);
+
+            states.iter().zip(candidates).find_map(|(state, candidate)| {
+                let response = state.squeeze().iter().last().unwrap();
+                (response.to_canonical_u64().leading_zeros() >= min_leading_zeros)
+                    .then_some(candidate)
+            })
         })
+        .find_any(|_| true)
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 
@@ -306,6 +315,26 @@ pub(crate) fn fri_proof_of_work<
     let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
     assert!(leading_zeros >= min_leading_zeros);
     pow_witness
+}
+
+const POW_BATCH: u64 = 4;
+
+/// Return one bounded batch from the inclusive candidate domain `0..=max`.
+///
+/// The final partial batch repeats `max` in lanes that would exceed the
+/// domain. Repetition is harmless because each lane is an independent search
+/// candidate, and it avoids ever constructing a noncanonical field element.
+#[inline]
+fn pow_batch_candidates(max: u64, block: u64) -> [u64; POW_BATCH as usize] {
+    let first = block
+        .checked_mul(POW_BATCH)
+        .expect("PoW batch index must not overflow");
+    core::array::from_fn(|lane| {
+        first
+            .checked_add(lane as u64)
+            .filter(|&candidate| candidate <= max)
+            .unwrap_or(max)
+    })
 }
 
 fn fri_prover_query_rounds<
@@ -366,10 +395,89 @@ fn fri_prover_query_round<
 
 #[cfg(test)]
 mod tests {
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{Field64, Sample};
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::plonk::config::{GenericConfig, Hasher};
+
+    /// Four-way permutation dispatch must preserve every raw Goldilocks limb.
+    #[test]
+    fn permute_x4_matches_four_sequential_permutes() {
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+        type F = GoldilocksField;
+        type P = <<Poseidon2GoldilocksConfig as GenericConfig<2>>::Hasher as Hasher<F>>::Permutation;
+
+        let mut corners = vec![
+            0u64,
+            1,
+            2,
+            u32::MAX as u64,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        corners.extend((0..63).map(|bit| 1u64 << bit));
+
+        let mut raw = 0x9e37_79b9_7f4a_7c15u64;
+        let mut quads: Vec<[P; 4]> = (0..500)
+            .map(|_| {
+                core::array::from_fn(|_| {
+                    P::new((0..P::WIDTH).map(|_| {
+                        raw = raw
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1_442_695_040_888_963_407);
+                        GoldilocksField(raw)
+                    }))
+                })
+            })
+            .collect();
+        quads.extend(corners.chunks_exact(4).map(|corner| {
+            core::array::from_fn(|lane| {
+                P::new((0..P::WIDTH).map(|_| GoldilocksField(corner[lane])))
+            })
+        }));
+
+        for quad in quads {
+            let mut expected = quad;
+            expected.iter_mut().for_each(PlonkyPermutation::permute);
+
+            let mut actual = quad;
+            P::permute_x4(&mut actual);
+
+            for lane in 0..4 {
+                let expected_raw: Vec<u64> =
+                    expected[lane].as_ref().iter().map(|element| element.0).collect();
+                let actual_raw: Vec<u64> =
+                    actual[lane].as_ref().iter().map(|element| element.0).collect();
+                assert_eq!(expected_raw, actual_raw, "raw-word mismatch in lane {lane}");
+            }
+        }
+    }
+
+    /// The final batch must cover the field maximum without constructing a
+    /// value outside the canonical domain, including all four tail shapes.
+    #[test]
+    fn pow_batch_candidates_bounds_final_partial_batch() {
+        for max in [4u64, 5, 6, 7, GoldilocksField::ORDER - 1, u64::MAX] {
+            let block = max / POW_BATCH;
+            let candidates = pow_batch_candidates(max, block);
+            let first = block * POW_BATCH;
+
+            assert_eq!(candidates[0], first);
+            assert!(candidates.iter().all(|&candidate| candidate <= max));
+            for candidate in first..=max {
+                assert!(
+                    candidates.contains(&candidate),
+                    "final batch omitted {candidate} from 0..={max}"
+                );
+            }
+        }
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
