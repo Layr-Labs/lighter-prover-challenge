@@ -210,6 +210,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         },
                     )
                 };
+                #[cfg(feature = "diagnostic_profile")]
+                crate::util::profile::counter(
+                    "commitment",
+                    if streamed.is_some() {
+                        "streamed_ok"
+                    } else {
+                        "streamed_declined"
+                    },
+                    ((polynomials.len() as u64) << 32) | lde_len as u64,
+                );
                 if let Some((level_digests, cap)) = streamed {
                     let merkle_tree = timed!(
                         timing,
