@@ -535,10 +535,10 @@ fn prove_path(
                 } else if path == TxPath::Light {
                     // Ramp: while the heavy path's three chunks run, the old
                     // depth-1 throttle left the GPU 38% idle and the buffer
-                    // set held only 50% (measured). Depth 2 fills that idle
-                    // without exceeding the single set's capacity; the full
-                    // window still waits for the heavy path's step-3 horizon.
-                    2
+                    // set held only 50% (measured). Depth 3 remains inside
+                    // the single set's capacity; the full window still waits
+                    // for the heavy path's step-3 horizon.
+                    3
                 } else {
                     1
                 };
