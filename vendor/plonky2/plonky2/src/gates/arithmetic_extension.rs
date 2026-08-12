@@ -128,9 +128,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
 
         let wires = vars_base.local_wires;
-        let constants = vars_base.local_constants;
-        let const_0 = &constants[..n];
-        let const_1 = &constants[n..2 * n];
+        let const_0 = vars_base.constant_column(0);
+        let const_1 = vars_base.constant_column(1);
         let ext = |start: usize, p: usize| {
             let mut arr = [F::ZERO; D];
             for (d, a) in arr.iter_mut().enumerate() {

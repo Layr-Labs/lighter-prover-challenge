@@ -291,7 +291,7 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
     let batch_size = vars_batch.len();
     debug_assert_eq!(output.len(), batch_size);
     let selector_index = common_data.selectors_info.selector_indices[gate_index];
-    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+    let selector_col = vars_batch.constant_column(selector_index);
     let mut factors = common_data.selectors_info.groups[selector_index]
         .clone()
         .filter(|&index| index != gate_index)

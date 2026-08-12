@@ -259,7 +259,7 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         // column once and accumulate the same product terms, in the same
         // order, as the per-point `compute_filter` — identical field values
         // without the per-point strided views.
-        let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+        let selector_col = vars_batch.constant_column(selector_index);
         let mut factors = group_range
             .filter(|&i| i != row)
             .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));

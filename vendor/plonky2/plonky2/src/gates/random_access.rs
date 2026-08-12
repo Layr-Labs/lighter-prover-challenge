@@ -241,7 +241,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
     fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
         let n = vars_base.len();
         let wires = vars_base.local_wires;
-        let constants = vars_base.local_constants;
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
         let mut res = vec![F::ZERO; n * self.num_constraints()];
@@ -301,7 +300,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         }
 
         for i in 0..self.num_extra_constants {
-            let constant = &constants[i * n..][..n];
+            let constant = vars_base.constant_column(i);
             let wire = col(self.wire_extra_constant(i));
             let out = chunks.next().unwrap();
             for p in 0..n {
@@ -325,7 +324,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
 
         let wires = vars_base.local_wires;
-        let constants = vars_base.local_constants;
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
         let mut row = 0;
@@ -424,7 +422,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         }
 
         for i in 0..self.num_extra_constants {
-            let constant = &constants[i * n..][..n];
+            let constant = vars_base.constant_column(i);
             let wire = col(self.wire_extra_constant(i));
             accumulate_constraint_direct(
                 &mut combined_gate_constraints[row * n..][..n],

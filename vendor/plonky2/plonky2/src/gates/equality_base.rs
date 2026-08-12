@@ -130,7 +130,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EqualityGate {
         let wires = vars_base.local_wires;
         let col = |w: usize| &wires[w * n..][..n];
         // First (and only) constant column: the "one" value.
-        let const_0 = &vars_base.local_constants[..n];
+        let const_0 = vars_base.constant_column(0);
 
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.

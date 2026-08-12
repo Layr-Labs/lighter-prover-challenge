@@ -2126,8 +2126,9 @@ fn compute_quotient_polys<
 
                 // The constants and sigma columns are circuit-fixed, so their
                 // quotient-domain values were extracted once at circuit build
-                // time; copy them per batch instead of re-walking the strided
-                // LDE (which amplifies cache-line traffic 8x at step 8).
+                // time. In the column-major path, constants keep that column
+                // layout through gate evaluation rather than being compacted
+                // into every worker's batch scratch.
                 let cache_start = BATCH_SIZE * batch_i;
                 // The cache is column-major (`PolyMajor`); the per-point
                 // (`PointMajor`) path with lookups keeps the original gathers.
@@ -2136,19 +2137,31 @@ fn compute_quotient_polys<
                 } else {
                     None
                 };
-                if let Some(cache) = constants_cache {
-                    debug_assert_eq!(
+                let constant_window = if let Some(cache) = constants_cache {
+                    assert_eq!(
                         prover_data.constants_sigmas_quotient_step, step,
                         "quotient gather step must match the cache extraction step"
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
-                    for ci in 0..cc {
-                        scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[ci * q + cache_start..ci * q + cache_start + n],
-                        );
-                    }
+                    let constant_len = cc
+                        .checked_mul(q)
+                        .expect("constants cache length overflow");
+                    assert!(
+                        cache_start
+                            .checked_add(n)
+                            .is_some_and(|end| end <= q),
+                        "constant cache batch window exceeds the quotient domain"
+                    );
+                    assert!(
+                        cache.len() >= constant_len,
+                        "constants cache does not contain every constants column"
+                    );
+                    // The cache is already a full-domain PolyMajor backing.
+                    // Retain its column stride through CPU gate evaluation
+                    // rather than copying every constants column into this
+                    // worker's 32-point scratch window.
+                    let constant_window = Some((&cache[..constant_len], q, cache_start));
                     if permutation_products_offloaded {
                         scratch.s_sigmas_flat.clear();
                     } else {
@@ -2161,6 +2174,7 @@ fn compute_quotient_polys<
                             );
                         }
                     }
+                    constant_window
                 } else {
                     prover_data.constants_sigmas_commitment.fill_lde_batch(
                         &scratch.indices,
@@ -2190,7 +2204,8 @@ fn compute_quotient_polys<
                             &mut scratch.s_sigmas_flat,
                         );
                     }
-                }
+                    None
+                };
                 // Layout seam: the no-lookup column evaluator consumes the
                 // PolyMajor gathers as-is (and the "next" gather narrows to
                 // the Z columns, the only ones it reads); the per-point path
@@ -2302,12 +2317,22 @@ fn compute_quotient_polys<
                     }
                 };
 
-                let vars_batch = EvaluationVarsBaseBatch::new(
-                    n,
-                    &scratch.local_constants,
-                    &scratch.local_wires,
-                    public_inputs_hash,
-                );
+                let vars_batch = match constant_window {
+                    Some((cache, q, offset)) => EvaluationVarsBaseBatch::new_with_constant_stride(
+                        n,
+                        cache,
+                        q,
+                        offset,
+                        &scratch.local_wires,
+                        public_inputs_hash,
+                    ),
+                    None => EvaluationVarsBaseBatch::new(
+                        n,
+                        &scratch.local_constants,
+                        &scratch.local_wires,
+                        public_inputs_hash,
+                    ),
+                };
 
                 let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
                 eval_vanishing_poly_base_batch::<F, D>(
