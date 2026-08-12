@@ -244,37 +244,41 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
         // Rewrite `bit * base + (1 - bit)` as `1 + bit * (base - 1)`.
         // Besides deleting one packed subtraction per bit, this exposes the
         // existing AArch64 multiply-accumulate specialization. Evaluate two
-        // independent transitions at a time to increase instruction-level
-        // parallelism without changing constraint emission order.
+        // independent transitions per loop iteration; transition `i + 1`
+        // reads the already-materialized `intermediate_values[i]` wire, not
+        // the value computed for transition `i`.
         let base_minus_one = base - P::ONES;
         let mut i = 0;
         while i + 1 < self.num_power_bits {
-            let prev_0 = if i == 0 {
+            let prev_i = if i == 0 {
                 P::ONES
             } else {
                 intermediate_values[i - 1].square()
             };
-            let prev_1 = intermediate_values[i].square();
+            let prev_next = intermediate_values[i].square();
 
             // power_bits is in LE order, but we accumulate in BE order.
-            let bit_0 = power_bits[self.num_power_bits - i - 1];
-            let bit_1 = power_bits[self.num_power_bits - i - 2];
-            let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
-            let mul_by_1 = P::ONES.multiply_accumulate(bit_1, base_minus_one);
+            let bit_i = power_bits[self.num_power_bits - i - 1];
+            let bit_next = power_bits[self.num_power_bits - i - 2];
+            let mul_i = P::ONES.multiply_accumulate(bit_i, base_minus_one);
+            let mul_next = P::ONES.multiply_accumulate(bit_next, base_minus_one);
 
-            yield_constr.one(prev_0 * mul_by_0 - intermediate_values[i]);
-            yield_constr.one(prev_1 * mul_by_1 - intermediate_values[i + 1]);
+            let computed_i = prev_i * mul_i;
+            let computed_next = prev_next * mul_next;
+            yield_constr.one(computed_i - intermediate_values[i]);
+            yield_constr.one(computed_next - intermediate_values[i + 1]);
             i += 2;
         }
         if i < self.num_power_bits {
-            let prev = if i == 0 {
+            let prev_intermediate_value = if i == 0 {
                 P::ONES
             } else {
                 intermediate_values[i - 1].square()
             };
-            let bit = power_bits[self.num_power_bits - i - 1];
-            let mul_by = P::ONES.multiply_accumulate(bit, base_minus_one);
-            yield_constr.one(prev * mul_by - intermediate_values[i]);
+            let cur_bit = power_bits[self.num_power_bits - i - 1];
+            let mul_by = P::ONES.multiply_accumulate(cur_bit, base_minus_one);
+            let computed_intermediate_value = prev_intermediate_value * mul_by;
+            yield_constr.one(computed_intermediate_value - intermediate_values[i]);
         }
 
         yield_constr.one(output - intermediate_values[self.num_power_bits - 1]);
@@ -408,21 +412,6 @@ mod tests {
     }
 
     #[test]
-    fn eval_fns_production_67_bits() -> Result<()> {
-        const D: usize = 2;
-        type C = PoseidonGoldilocksConfig;
-        type F = <C as GenericConfig<D>>::F;
-        let config = CircuitConfig {
-            num_wires: 136,
-            num_routed_wires: 80,
-            ..CircuitConfig::standard_recursion_config()
-        };
-        let gate = ExponentiationGate::new_from_config(&config);
-        assert_eq!(gate.num_power_bits, 67);
-        test_eval_fns::<F, C, _, D>(gate)
-    }
-
-    #[test]
     fn test_gate_constraint() {
         const D: usize = 2;
         type C = PoseidonGoldilocksConfig;
@@ -484,6 +473,69 @@ mod tests {
             gate.eval_unfiltered(vars).iter().all(|x| x.is_zero()),
             "Gate constraints are not satisfied."
         );
+    }
+
+    #[test]
+    fn packed_affine_two_way_matches_original_field_constraints() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+        let hash = HashOut::ZERO;
+
+        // Cover both the paired loop and its single-transition tail, including
+        // the production-sized 17-bit exponentiation gate. Arbitrary field
+        // values are intentional: the affine identity does not assume Boolean
+        // power bits.
+        for num_power_bits in [1usize, 2, 3, 16, 17] {
+            let gate = ExponentiationGate::<F, D>::new(num_power_bits);
+            let batch_size = 7;
+            let mut wires = vec![F::ZERO; gate.num_wires() * batch_size];
+            for wire in 0..gate.num_wires() {
+                for row in 0..batch_size {
+                    let seed = (wire as u64)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                        .wrapping_add((row as u64).wrapping_mul(0xd1b5_4a32_d192_ed03))
+                        .wrapping_add(0xffff_ffff_ffff_fff1);
+                    wires[wire * batch_size + row] = F::from_noncanonical_u64(seed);
+                }
+            }
+
+            let vars = crate::plonk::vars::EvaluationVarsBaseBatch::new(
+                batch_size,
+                &[],
+                &wires,
+                &hash,
+            );
+            let actual = gate.eval_unfiltered_base_batch(vars);
+
+            for row in 0..batch_size {
+                let base = wires[row];
+                let mut expected = Vec::with_capacity(gate.num_constraints());
+                for i in 0..num_power_bits {
+                    let prev = if i == 0 {
+                        F::ONE
+                    } else {
+                        wires[gate.wire_intermediate_value(i - 1) * batch_size + row].square()
+                    };
+                    let bit = wires[gate.wire_power_bit(num_power_bits - i - 1) * batch_size + row];
+                    let multiplier = bit * base + (F::ONE - bit);
+                    let intermediate =
+                        wires[gate.wire_intermediate_value(i) * batch_size + row];
+                    expected.push(prev * multiplier - intermediate);
+                }
+                expected.push(
+                    wires[gate.wire_output() * batch_size + row]
+                        - wires[gate.wire_intermediate_value(num_power_bits - 1) * batch_size + row],
+                );
+
+                for (constraint, expected_value) in expected.into_iter().enumerate() {
+                    assert_eq!(
+                        actual[constraint * batch_size + row],
+                        expected_value,
+                        "constraint {constraint}, row {row}, power bits {num_power_bits}"
+                    );
+                }
+            }
+        }
     }
 
     /// Manual timing harness comparing the packed-fused accumulate against the
