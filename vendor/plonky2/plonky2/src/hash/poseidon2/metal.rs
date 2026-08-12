@@ -107,6 +107,14 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Build-host-compiled portable AIR containing a full-SIMDgroup Range/U32
+/// kernel whose first 64 wire columns are resident in 16 KiB of threadgroup
+/// memory. Empty on non-Mac builders or when the optional Metal toolchain is
+/// unavailable. Every established pipeline remains sourced from the checked-in
+/// metallib above.
+const SHADER_RANGE_TILE_METALLIB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_range_tile.metallib"));
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
@@ -1089,6 +1097,8 @@ static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static RANGE_CHECK_GATE_QUOTIENT_IS_TILED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1115,13 +1125,13 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
+fn spawn_optional_pipelines(
+    device: &Device,
+    library: &metal::Library,
+    range_tiled_library: Option<metal::Library>,
+) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
-        (
-            "range_check_gate_quotient",
-            &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
-        ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
@@ -1153,6 +1163,59 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+
+    // Lower exactly one Range/U32 pipeline. Prefer the build-time portable
+    // tiled kernel; if that library or its function is incompatible with the
+    // benchmark host, immediately restore the checked-in kernel in the same
+    // builder thread. This avoids compiling two versions on every cold worker.
+    let device = device.clone();
+    let fallback_library = library.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-range-u32-tiled".to_owned())
+        .spawn(move || {
+            let (pipeline, tiled) = autoreleasepool(|| {
+                let tiled = range_tiled_library.as_ref().and_then(|library| {
+                    library
+                        .get_function("range_check_gate_quotient_tiled", None)
+                        .ok()
+                        .and_then(|function| {
+                            device
+                                .new_compute_pipeline_state_with_function(&function)
+                                .ok()
+                        })
+                });
+                if let Some(pipeline) = tiled {
+                    return (Some(pipeline), true);
+                }
+                let fallback = fallback_library
+                    .get_function("range_check_gate_quotient", None)
+                    .ok()
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    });
+                (fallback, false)
+            });
+            RANGE_CHECK_GATE_QUOTIENT_IS_TILED.store(
+                tiled && pipeline.is_some(),
+                core::sync::atomic::Ordering::Release,
+            );
+            if pipeline.is_none() {
+                log::debug!("Range/U32 pipeline unavailable; evaluating those gates on the CPU");
+            }
+            let _ = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.built.set(None);
         }
     }
 }
@@ -2409,6 +2472,14 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
+            let range_tiled_library = (!SHADER_RANGE_TILE_METALLIB.is_empty())
+                .then(|| device.new_library_with_data(SHADER_RANGE_TILE_METALLIB).ok())
+                .flatten()
+                .filter(|library| {
+                    library
+                        .get_function("range_check_gate_quotient_tiled", None)
+                        .is_ok()
+                });
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -2510,7 +2581,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library);
+            spawn_optional_pipelines(&device, &library, range_tiled_library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -2661,6 +2732,14 @@ impl MetalShared {
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
+        let tiled = RANGE_CHECK_GATE_QUOTIENT_IS_TILED
+            .load(core::sync::atomic::Ordering::Acquire);
+        if tiled && quotient_rows % 32 != 0 {
+            // A partial threadgroup cannot return before the tile barrier.
+            // Production quotient domains are powers of two and always take
+            // the tiled path; tiny synthetic shapes retain the CPU fallback.
+            return Err("tiled Range/U32 quotient rows must be divisible by 32".to_owned());
+        }
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
@@ -2697,7 +2776,11 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            if tiled {
+                dispatch_range_tiled(encoder, quotient_rows);
+            } else {
+                dispatch(encoder, pipeline, quotient_rows);
+            }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3855,6 +3938,25 @@ fn dispatch(
         },
         MTLSize {
             width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// The tiled Range/U32 kernel's static 64-column allocation is indexed by one
+/// complete Apple SIMD-group. Keep the dispatch shape identical to the Metal
+/// source rather than allowing the generic helper to select 64 or 128 threads.
+fn dispatch_range_tiled(encoder: &metal::ComputeCommandEncoderRef, thread_count: usize) {
+    debug_assert_eq!(thread_count % 32, 0);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: 32,
             height: 1,
             depth: 1,
         },
