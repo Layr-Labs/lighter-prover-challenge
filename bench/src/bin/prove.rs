@@ -42,25 +42,45 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
 // Keep the promoted writer path while exercising a second submission from that baseline.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// The serialized proof measures ~196 KB at the ranked circuit shapes, so the
+// prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
+// a single write(2) with ~2.6x headroom over the measured size, while cutting
+// the per-worker buffer allocation 4x. Value-exact: buffer capacity changes
+// only syscall batching, never the serialized bytes.
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
 
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let profile_process = plonky2::util::profile::span("process", "prove_worker");
-    // First statement in the process: the Metal shader compile and pipeline
+    // First statements in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
     // cache, which disables it entirely — so every scored worker pays the full
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
+    //
+    // Before submitting the prewarm, register the proof-output directory as the
+    // staging area for the prebuilt pipeline archive: `MTLBinaryArchive` opens
+    // from a file URL only, and that directory is the one path the ranked
+    // Seatbelt profile lets this process write. An archive hit lets the prewarm
+    // skip the AIR->ISA lowering outright. Reading argv here — and asserting its
+    // shape only after the prewarm is in flight — keeps the lowering off the
+    // critical path even by the few microseconds argument handling costs.
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    if let Some(dir) = std::path::Path::new(&output).parent() {
+        plonky2::hash::poseidon2::set_pipeline_archive_dir(dir);
+    }
     {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("startup", "metal_prewarm_submit");
         plonky2::hash::poseidon2::prewarm_gpu();
     }
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
@@ -75,10 +95,25 @@ fn main() {
         rayon::current_num_threads() as u64,
     );
 
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+    // Every embedded circuit blob is independent: of the fixture, of the
+    // pre-execution circuit, and of each other. The four non-pre blobs are also
+    // by far the longest startup item, so they are launched here, as the first
+    // thing after the thread pool exists, and decode underneath everything
+    // below. Previously they were spawned only after `rayon::join(parse,
+    // load_pre)` had *completed*, which left them idle for the whole
+    // pre-execution circuit load while the block pipeline waited on them at the
+    // end. Pure scheduling: the same five blobs are decoded by the same code,
+    // only earlier.
+    let remaining_handle = std::thread::Builder::new()
+        .name("embedded-loads".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(|| {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
+            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
+                .then(Circuits::load_remaining_embedded)
+        })
+        .expect("embedded circuit load thread must start");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
@@ -113,18 +148,12 @@ fn main() {
     );
     // The pre-execution witness is pure block-derived data (no circuit
     // dependency), and the remaining four circuit blobs take ~5x longer to
-    // load than it takes to compute. Load the blobs on a scoped thread while
-    // the main thread derives the pre-execution witness, then start the pre
-    // proof the moment its witness exists — the pre proof runs underneath the
-    // tail of the blob loads instead of waiting for them to finish first.
+    // load than it takes to compute. The blobs are already decoding (above)
+    // while the main thread derives the pre-execution witness; the pre proof
+    // starts the moment its witness exists and runs underneath the tail of the
+    // blob loads instead of waiting for them to finish first.
     // Value-exact: no quantity is computed differently, only in parallel.
-    let (pre_handle, remaining) = std::thread::scope(|scope| {
-        let remaining_handle = scope.spawn(|| {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
-            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-                .then(Circuits::load_remaining_embedded)
-        });
+    let (pre_handle, remaining) = {
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
@@ -168,9 +197,9 @@ fn main() {
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         (pre_handle, remaining)
-    });
+    };
     // The pre circuit is owned by the startup proof until it completes; only
-    // the other four blobs are loaded above (loading all five here would
+    // the other four blobs are loaded above (loading all five there would
     // deserialize the same pre circuit twice on the scored critical path).
     // Keep the forced-build mode's established behavior unchanged.
     #[cfg(feature = "diagnostic_profile")]
@@ -252,6 +281,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// arithmetic-on-promoted-frontier-1786506400
-
-// p90-fire-top1-50-1786515495
+// zarar-arc-1
