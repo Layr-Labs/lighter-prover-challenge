@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
+use core::mem::MaybeUninit;
 
 use anyhow::{ensure, Result};
 use hashbrown::HashMap;
@@ -398,9 +399,9 @@ where
 
     // Differential gate for the layout seam: recompute the quotient through
     // the per-point reference path on the same witness, commitments and
-    // challenges, and require value-identical polynomials.
+    // challenges, and require raw-representation-identical polynomials.
     #[cfg(test)]
-    if !has_lookup && COMPARE_QUOTIENT_LAYOUTS.load(core::sync::atomic::Ordering::Relaxed) {
+    if !has_lookup && COMPARE_QUOTIENT_LAYOUTS.with(core::cell::Cell::get) {
         let reference = compute_quotient_polys::<F, C, D>(
             common_data,
             prover_data,
@@ -420,8 +421,8 @@ where
             assert_eq!(a.coeffs.len(), b.coeffs.len());
             for (i, (x, y)) in a.coeffs.iter().zip(b.coeffs.iter()).enumerate() {
                 assert_eq!(
-                    x.to_canonical_u64(),
-                    y.to_canonical_u64(),
+                    x.to_noncanonical_u64(),
+                    y.to_noncanonical_u64(),
                     "quotient layout divergence: poly {p}, coeff {i}"
                 );
             }
@@ -1020,6 +1021,47 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// Scatter one point-major two-challenge batch into its final challenge columns.
+fn write_two_challenge_quotient_batch<F: Field>(
+    point_major: &[F],
+    challenge_0: &mut [MaybeUninit<F>],
+    challenge_1: &mut [MaybeUninit<F>],
+) {
+    assert_eq!(point_major.len(), challenge_0.len() * 2);
+    assert_eq!(challenge_1.len(), challenge_0.len());
+    for ((values, out_0), out_1) in point_major
+        .chunks_exact(2)
+        .zip(challenge_0)
+        .zip(challenge_1)
+    {
+        out_0.write(values[0]);
+        out_1.write(values[1]);
+    }
+}
+
+/// Convert a completely initialized `Vec<MaybeUninit<T>>` without copying.
+///
+/// # Safety
+/// Every element of `values` must have been initialized.
+unsafe fn assume_init_vec<T>(mut values: Vec<MaybeUninit<T>>) -> Vec<T> {
+    let ptr = values.as_mut_ptr().cast::<T>();
+    let len = values.len();
+    let capacity = values.capacity();
+    core::mem::forget(values);
+    // SAFETY: guaranteed by the caller; `MaybeUninit<T>` has `T`'s layout.
+    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static COMPARE_QUOTIENT_LAYOUTS: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+    static FORCE_INTERLEAVED_QUOTIENT_LAYOUT: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
 /// lookups, two challenges, the 135-wire/123-constraint Poseidon2 gate, and
@@ -1129,17 +1171,12 @@ fn gpu_poseidon_quotient_differential_enabled() -> bool {
 pub(crate) static COMPARE_GPU_QUOTIENT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
+/// Test-only thread-local switch: when set, `compute_quotient_polys` evaluates the quotient
 /// values twice — once through the default column-major (`PolyMajor`)
 /// permutation path and once through the per-point (`PointMajor`) reference
 /// path — over the same witness, commitments and challenges, and asserts the
-/// two are value-identical. (Cross-run proof-byte comparison is not a usable
-/// oracle in this fork: unused wire slots carry nondeterministic padding, so
-/// two proofs of the same witness legitimately differ byte-wise.)
-#[cfg(test)]
-pub(crate) static COMPARE_QUOTIENT_LAYOUTS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
+/// two are raw-representation-identical. The separate output-layout test pins
+/// FRI grinding to one worker before comparing complete proof bytes.
 /// Diagnostics-only gate census: prints, once per distinct circuit shape, the
 /// full gate list with the wire span / constraint count / degree that decide
 /// both the CPU constraint cost and the `cpu_num_wires` gather floor. Gated on
@@ -2001,7 +2038,6 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
     struct QuotientScratch<F: RichField> {
@@ -2013,6 +2049,15 @@ fn compute_quotient_polys<
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
         vanishing: VanishingScratch<F>,
+        two_challenge_values: [F; BATCH_SIZE * 2],
+    }
+
+    enum QuotientBatchMut<'a, F> {
+        Interleaved(&'a mut [F]),
+        DirectTwo {
+            challenge_0: &'a mut [MaybeUninit<F>],
+            challenge_1: &'a mut [MaybeUninit<F>],
+        },
     }
 
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
@@ -2065,286 +2110,355 @@ fn compute_quotient_polys<
         gate_census_once(common_data, &excluded_gate_indices, cpu_num_wires);
     }
 
-    // The zero-fill this used to do existed only to seed the Horner chain in
-    // `reduce_gate_constraints_base_batch`, which is the first thing every
-    // batch does. That chain now *assigns* its first reversed row instead of
-    // accumulating into zeros (a raw-limb-identical change: the old first pass
-    // computed `reduce128(term as u128)`, which returns `term` unchanged), so
-    // every slot of this buffer is stored before it is read and the memset is
-    // dead. `par_chunks_mut` partitions the whole buffer and each batch writes
-    // all of its own slice, including a short final batch.
-    //
-    // `F` has no `IsZero` specialization, so the old `vec![F::ZERO; n]` was a
-    // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
-    // 2 MiB per chain-step proof, on the per-proof spine between the Zs
-    // commitment and the quotient commitment.
+    // The production shape writes each batch through bounded interleaved
+    // scratch into the two final challenge columns. Generic shapes retain the
+    // old domain-sized point-major allocation and final scatter.
+    #[cfg(test)]
+    let direct_two_challenges =
+        num_challenges == 2 && !FORCE_INTERLEAVED_QUOTIENT_LAYOUT.with(core::cell::Cell::get);
+    #[cfg(not(test))]
+    let direct_two_challenges = num_challenges == 2;
+    #[cfg(test)]
+    if direct_two_challenges {
+        DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS.with(|count| count.set(count.get() + 1));
+    }
+    let mut direct_columns = direct_two_challenges.then(|| {
+        [
+            Vec::<MaybeUninit<F>>::with_capacity(points.len()),
+            Vec::<MaybeUninit<F>>::with_capacity(points.len()),
+        ]
+    });
+    if let Some(columns) = direct_columns.as_mut() {
+        // SAFETY: disjoint parallel chunks initialize every full/tail element.
+        unsafe {
+            columns[0].set_len(points.len());
+            columns[1].set_len(points.len());
+        }
+    }
     let quotient_len = points.len() * num_challenges;
-    let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
-    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
-    // writes every element before any is read (see above). Same idiom as the
-    // promoted zero-tail fast path in `fri/oracle.rs`.
-    unsafe { quotient_values.set_len(quotient_len) };
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
-        .enumerate()
-        .for_each_init(
-            || QuotientScratch::<F> {
-                indices: Vec::with_capacity(BATCH_SIZE),
-                indices_next: Vec::with_capacity(BATCH_SIZE),
-                local_constants: Vec::new(),
-                local_wires: Vec::new(),
-                s_sigmas_flat: Vec::new(),
-                zs_local_flat: Vec::new(),
-                zs_next_flat: Vec::new(),
-                vanishing: VanishingScratch::default(),
-            },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
-                // Each batch must be the same size, except the last one, which may be smaller.
-                debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
-                );
-
-                let n = xs_batch.len();
-                scratch.indices.clear();
-                scratch
-                    .indices
-                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
-                scratch.indices_next.clear();
-                scratch
-                    .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
-
-                let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
-                debug_assert!(
-                    shifted_xs_batch
-                        .iter()
-                        .zip(xs_batch)
-                        .all(|(&sx, &x)| sx == F::coset_shift() * x)
-                );
-
-                // The constants and sigma columns are circuit-fixed, so their
-                // quotient-domain values were extracted once at circuit build
-                // time; copy them per batch instead of re-walking the strided
-                // LDE (which amplifies cache-line traffic 8x at step 8).
-                let cache_start = BATCH_SIZE * batch_i;
-                // The cache is column-major (`PolyMajor`); the per-point
-                // (`PointMajor`) path with lookups keeps the original gathers.
-                let constants_cache = if col_major_perm {
-                    prover_data.constants_sigmas_quotient_cache.as_ref()
-                } else {
-                    None
-                };
-                if let Some(cache) = constants_cache {
-                    debug_assert_eq!(
-                        prover_data.constants_sigmas_quotient_step, step,
-                        "quotient gather step must match the cache extraction step"
-                    );
-                    let cc = common_data.constants_range().len();
-                    let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
-                    for ci in 0..cc {
-                        scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[ci * q + cache_start..ci * q + cache_start + n],
-                        );
-                    }
-                    if permutation_products_offloaded {
-                        scratch.s_sigmas_flat.clear();
-                    } else {
-                        let sc = common_data.sigmas_range().len();
-                        scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
-                        for ci in 0..sc {
-                            scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
-                                &cache[(cc + ci) * q + cache_start
-                                    ..(cc + ci) * q + cache_start + n],
-                            );
-                        }
-                    }
-                } else {
-                    prover_data.constants_sigmas_commitment.fill_lde_batch(
-                        &scratch.indices,
-                        step,
-                        common_data.constants_range(),
-                        BatchLayout::PolyMajor,
-                        &mut scratch.local_constants,
-                    );
-                    // Layout seam: the no-lookup column evaluator consumes the
-                    // PolyMajor gathers as-is (and the "next" gather narrows to
-                    // the Z columns, the only ones it reads); the per-point path
-                    // keeps the full-width PointMajor gathers and row views.
-                    let (batch_layout, _zs_local_range, _zs_next_range) = if col_major_perm {
-                        (BatchLayout::PolyMajor, 0..0, 0..0)
-                    } else {
-                        (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
-                    };
-
-                    if permutation_products_offloaded {
-                        scratch.s_sigmas_flat.clear();
-                    } else {
-                        prover_data.constants_sigmas_commitment.fill_lde_batch(
-                            &scratch.indices,
-                            step,
-                            common_data.sigmas_range(),
-                            batch_layout,
-                            &mut scratch.s_sigmas_flat,
-                        );
-                    }
-                }
-                // Layout seam: the no-lookup column evaluator consumes the
-                // PolyMajor gathers as-is (and the "next" gather narrows to
-                // the Z columns, the only ones it reads); the per-point path
-                // keeps the full-width PointMajor gathers and row views.
-                let (batch_layout, zs_local_range, zs_next_range) = if col_major_perm {
-                    if permutation_products_offloaded {
-                        (BatchLayout::PolyMajor, common_data.zs_range(), 0..0)
-                    } else {
-                        (
-                            BatchLayout::PolyMajor,
-                            0..common_data.partial_products_range().end,
-                            common_data.zs_range(),
-                        )
-                    }
-                } else {
-                    (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
-                };
-                wires_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    0..cpu_num_wires,
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_wires,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    zs_local_range,
-                    batch_layout,
-                    &mut scratch.zs_local_flat,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
-                    step,
-                    zs_next_range,
-                    batch_layout,
-                    &mut scratch.zs_next_flat,
-                );
-
-                let indices_batch = &scratch.indices;
-                // Per-point row views over the PointMajor gathers, built only
-                // for the per-point path; the column path passes the flat
-                // buffers straight through, so these four allocations vanish
-                // from the hot (no-lookup) path entirely.
-                type RowViews<'v, F> = (Vec<&'v [F]>, Vec<&'v [F]>, Vec<&'v [F]>, Vec<&'v [F]>);
-                let (local_zs_batch, next_zs_batch, partial_products_batch, s_sigmas_batch): RowViews<'_, F> =
-                    if col_major_perm {
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                    } else {
-                        (
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.zs_local_flat[k * zs_row_width..]
-                                        [common_data.zs_range()]
-                                })
-                                .collect(),
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.zs_next_flat[k * zs_row_width..]
-                                        [common_data.zs_range()]
-                                })
-                                .collect(),
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.zs_local_flat[k * zs_row_width..]
-                                        [common_data.partial_products_range()]
-                                })
-                                .collect(),
-                            (0..n)
-                                .map(|k| {
-                                    &scratch.s_sigmas_flat
-                                        [k * num_routed_wires..(k + 1) * num_routed_wires]
-                                })
-                                .collect(),
-                        )
-                    };
-                let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup
-                {
-                    (
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_local_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                        (0..n)
-                            .map(|k| {
-                                &scratch.zs_next_flat[k * zs_row_width..]
-                                    [common_data.lookup_range()]
-                            })
-                            .collect(),
-                    )
-                } else {
-                    (Vec::new(), Vec::new())
-                };
-
-                let perm = if col_major_perm {
-                    PermutationBatch::Cols {
-                        zs_partial_products_cols: &scratch.zs_local_flat,
-                        zs_next_cols: &scratch.zs_next_flat,
-                        s_sigmas_cols: &scratch.s_sigmas_flat,
-                    }
-                } else {
-                    PermutationBatch::Rows {
-                        local_zs_batch: &local_zs_batch,
-                        next_zs_batch: &next_zs_batch,
-                        partial_products_batch: &partial_products_batch,
-                        s_sigmas_batch: &s_sigmas_batch,
-                    }
-                };
-
-                let vars_batch = EvaluationVarsBaseBatch::new(
-                    n,
-                    &scratch.local_constants,
-                    &scratch.local_wires,
-                    public_inputs_hash,
-                );
-
-                let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
-                eval_vanishing_poly_base_batch::<F, D>(
-                    common_data,
-                    indices_batch,
-                    shifted_xs_batch,
-                    vars_batch,
-                    perm,
-                    &local_lookup_batch,
-                    &next_lookup_batch,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    &cpu_gate_indices,
-                    cpu_num_gate_constraints,
-                    interleave_pair.as_ref(),
-                    permutation_products_offloaded,
-                    &permutation_gate_scales,
-                    &z_h_on_coset,
-                    &lut_re_poly_evals_refs,
-                    &mut scratch.vanishing,
-                    quotient_values_batch,
-                );
-
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
-            },
+    let mut quotient_values = if direct_two_challenges {
+        Vec::new()
+    } else {
+        let mut values = Vec::with_capacity(quotient_len);
+        // SAFETY: the generic evaluator overwrites every element before read.
+        unsafe { values.set_len(quotient_len) };
+        values
+    };
+    let init_scratch = || QuotientScratch::<F> {
+        indices: Vec::with_capacity(BATCH_SIZE),
+        indices_next: Vec::with_capacity(BATCH_SIZE),
+        local_constants: Vec::new(),
+        local_wires: Vec::new(),
+        s_sigmas_flat: Vec::new(),
+        zs_local_flat: Vec::new(),
+        zs_next_flat: Vec::new(),
+        vanishing: VanishingScratch::default(),
+        two_challenge_values: [F::ZERO; BATCH_SIZE * 2],
+    };
+    let process_batch = |scratch: &mut QuotientScratch<F>,
+                         (batch_i, (mut output, xs_batch)): (
+        usize,
+        (QuotientBatchMut<'_, F>, &[F]),
+    )| {
+        // Each batch must be the same size, except the last one, which may be smaller.
+        debug_assert!(
+            xs_batch.len() == BATCH_SIZE
+                || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
         );
+
+        let n = xs_batch.len();
+        scratch.indices.clear();
+        scratch
+            .indices
+            .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
+        scratch.indices_next.clear();
+        scratch
+            .indices_next
+            .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+
+        let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
+        debug_assert!(shifted_xs_batch
+            .iter()
+            .zip(xs_batch)
+            .all(|(&sx, &x)| sx == F::coset_shift() * x));
+
+        // The constants and sigma columns are circuit-fixed, so their
+        // quotient-domain values were extracted once at circuit build
+        // time; copy them per batch instead of re-walking the strided
+        // LDE (which amplifies cache-line traffic 8x at step 8).
+        let cache_start = BATCH_SIZE * batch_i;
+        // The cache is column-major (`PolyMajor`); the per-point
+        // (`PointMajor`) path with lookups keeps the original gathers.
+        let constants_cache = if col_major_perm {
+            prover_data.constants_sigmas_quotient_cache.as_ref()
+        } else {
+            None
+        };
+        if let Some(cache) = constants_cache {
+            debug_assert_eq!(
+                prover_data.constants_sigmas_quotient_step, step,
+                "quotient gather step must match the cache extraction step"
+            );
+            let cc = common_data.constants_range().len();
+            let q = prover_data.constants_sigmas_quotient_domain;
+            scratch.local_constants.resize(cc * n, F::ZERO);
+            for ci in 0..cc {
+                scratch.local_constants[ci * n..(ci + 1) * n]
+                    .copy_from_slice(&cache[ci * q + cache_start..ci * q + cache_start + n]);
+            }
+            if permutation_products_offloaded {
+                scratch.s_sigmas_flat.clear();
+            } else {
+                let sc = common_data.sigmas_range().len();
+                scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
+                for ci in 0..sc {
+                    scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
+                        &cache[(cc + ci) * q + cache_start..(cc + ci) * q + cache_start + n],
+                    );
+                }
+            }
+        } else {
+            prover_data.constants_sigmas_commitment.fill_lde_batch(
+                &scratch.indices,
+                step,
+                common_data.constants_range(),
+                BatchLayout::PolyMajor,
+                &mut scratch.local_constants,
+            );
+            // Layout seam: the no-lookup column evaluator consumes the
+            // PolyMajor gathers as-is (and the "next" gather narrows to
+            // the Z columns, the only ones it reads); the per-point path
+            // keeps the full-width PointMajor gathers and row views.
+            let (batch_layout, _zs_local_range, _zs_next_range) = if col_major_perm {
+                (BatchLayout::PolyMajor, 0..0, 0..0)
+            } else {
+                (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
+            };
+
+            if permutation_products_offloaded {
+                scratch.s_sigmas_flat.clear();
+            } else {
+                prover_data.constants_sigmas_commitment.fill_lde_batch(
+                    &scratch.indices,
+                    step,
+                    common_data.sigmas_range(),
+                    batch_layout,
+                    &mut scratch.s_sigmas_flat,
+                );
+            }
+        }
+        // Layout seam: the no-lookup column evaluator consumes the
+        // PolyMajor gathers as-is (and the "next" gather narrows to
+        // the Z columns, the only ones it reads); the per-point path
+        // keeps the full-width PointMajor gathers and row views.
+        let (batch_layout, zs_local_range, zs_next_range) = if col_major_perm {
+            if permutation_products_offloaded {
+                (BatchLayout::PolyMajor, common_data.zs_range(), 0..0)
+            } else {
+                (
+                    BatchLayout::PolyMajor,
+                    0..common_data.partial_products_range().end,
+                    common_data.zs_range(),
+                )
+            }
+        } else {
+            (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
+        };
+        wires_commitment.fill_lde_batch(
+            &scratch.indices,
+            step,
+            0..cpu_num_wires,
+            BatchLayout::PolyMajor,
+            &mut scratch.local_wires,
+        );
+        zs_partial_products_and_lookup_commitment.fill_lde_batch(
+            &scratch.indices,
+            step,
+            zs_local_range,
+            batch_layout,
+            &mut scratch.zs_local_flat,
+        );
+        zs_partial_products_and_lookup_commitment.fill_lde_batch(
+            &scratch.indices_next,
+            step,
+            zs_next_range,
+            batch_layout,
+            &mut scratch.zs_next_flat,
+        );
+
+        let indices_batch = &scratch.indices;
+        // Per-point row views over the PointMajor gathers, built only
+        // for the per-point path; the column path passes the flat
+        // buffers straight through, so these four allocations vanish
+        // from the hot (no-lookup) path entirely.
+        type RowViews<'v, F> = (Vec<&'v [F]>, Vec<&'v [F]>, Vec<&'v [F]>, Vec<&'v [F]>);
+        let (local_zs_batch, next_zs_batch, partial_products_batch, s_sigmas_batch): RowViews<
+            '_,
+            F,
+        > = if col_major_perm {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        } else {
+            (
+                (0..n)
+                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.zs_range()])
+                    .collect(),
+                (0..n)
+                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.zs_range()])
+                    .collect(),
+                (0..n)
+                    .map(|k| {
+                        &scratch.zs_local_flat[k * zs_row_width..]
+                            [common_data.partial_products_range()]
+                    })
+                    .collect(),
+                (0..n)
+                    .map(|k| {
+                        &scratch.s_sigmas_flat[k * num_routed_wires..(k + 1) * num_routed_wires]
+                    })
+                    .collect(),
+            )
+        };
+        let (local_lookup_batch, next_lookup_batch): (Vec<&[F]>, Vec<&[F]>) = if has_lookup {
+            (
+                (0..n)
+                    .map(|k| &scratch.zs_local_flat[k * zs_row_width..][common_data.lookup_range()])
+                    .collect(),
+                (0..n)
+                    .map(|k| &scratch.zs_next_flat[k * zs_row_width..][common_data.lookup_range()])
+                    .collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        let perm = if col_major_perm {
+            PermutationBatch::Cols {
+                zs_partial_products_cols: &scratch.zs_local_flat,
+                zs_next_cols: &scratch.zs_next_flat,
+                s_sigmas_cols: &scratch.s_sigmas_flat,
+            }
+        } else {
+            PermutationBatch::Rows {
+                local_zs_batch: &local_zs_batch,
+                next_zs_batch: &next_zs_batch,
+                partial_products_batch: &partial_products_batch,
+                s_sigmas_batch: &s_sigmas_batch,
+            }
+        };
+
+        let vars_batch = EvaluationVarsBaseBatch::new(
+            n,
+            &scratch.local_constants,
+            &scratch.local_wires,
+            public_inputs_hash,
+        );
+
+        let quotient_values_batch = match &mut output {
+            QuotientBatchMut::Interleaved(values) => &mut values[..n * num_challenges],
+            QuotientBatchMut::DirectTwo { .. } => {
+                debug_assert_eq!(num_challenges, 2);
+                &mut scratch.two_challenge_values[..n * 2]
+            }
+        };
+        eval_vanishing_poly_base_batch::<F, D>(
+            common_data,
+            indices_batch,
+            shifted_xs_batch,
+            vars_batch,
+            perm,
+            &local_lookup_batch,
+            &next_lookup_batch,
+            betas,
+            gammas,
+            beta_k_is,
+            deltas,
+            alphas,
+            &cpu_gate_indices,
+            cpu_num_gate_constraints,
+            interleave_pair.as_ref(),
+            permutation_products_offloaded,
+            &permutation_gate_scales,
+            &z_h_on_coset,
+            &lut_re_poly_evals_refs,
+            &mut scratch.vanishing,
+            quotient_values_batch,
+        );
+
+        for (&i, quotient_values) in indices_batch
+            .iter()
+            .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+        {
+            let denominator_inv = z_h_on_coset.eval_inverse(i);
+            quotient_values
+                .iter_mut()
+                .for_each(|v| *v *= denominator_inv);
+        }
+        if let QuotientBatchMut::DirectTwo {
+            challenge_0,
+            challenge_1,
+        } = output
+        {
+            write_two_challenge_quotient_batch(
+                &scratch.two_challenge_values[..n * 2],
+                challenge_0,
+                challenge_1,
+            );
+        }
+    };
+    if let Some(columns) = direct_columns.as_mut() {
+        let [challenge_0, challenge_1] = columns;
+        challenge_0
+            .par_chunks_mut(BATCH_SIZE)
+            .zip(challenge_1.par_chunks_mut(BATCH_SIZE))
+            .map(|(challenge_0, challenge_1)| QuotientBatchMut::DirectTwo {
+                challenge_0,
+                challenge_1,
+            })
+            .zip(points.par_chunks(BATCH_SIZE))
+            .enumerate()
+            .for_each_init(&init_scratch, &process_batch);
+    } else {
+        quotient_values
+            .par_chunks_mut(BATCH_SIZE * num_challenges)
+            .map(QuotientBatchMut::Interleaved)
+            .zip(points.par_chunks(BATCH_SIZE))
+            .enumerate()
+            .for_each_init(&init_scratch, &process_batch);
+    }
+    let mut direct_columns = direct_columns.map(|[challenge_0, challenge_1]| {
+        // SAFETY: both parallel chunk iterators cover every column element.
+        unsafe { [assume_init_vec(challenge_0), assume_init_vec(challenge_1)] }
+    });
+
+    let add_gpu_values =
+        |gpu_values: &[F], quotient_values: &mut [F], direct: &mut Option<[Vec<F>; 2]>| {
+            debug_assert_eq!(gpu_values.len(), quotient_len);
+            if let Some([challenge_0, challenge_1]) = direct.as_mut() {
+                debug_assert_eq!(num_challenges, 2);
+                challenge_0
+                    .par_iter_mut()
+                    .zip(challenge_1.par_iter_mut())
+                    .zip(gpu_values.par_chunks_exact(2))
+                    .enumerate()
+                    .for_each(|(i, ((cpu_0, cpu_1), gpu))| {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        *cpu_0 += gpu[0] * denominator_inv;
+                        *cpu_1 += gpu[1] * denominator_inv;
+                    });
+            } else {
+                debug_assert_eq!(quotient_values.len(), quotient_len);
+                quotient_values
+                    .par_chunks_exact_mut(num_challenges)
+                    .zip(gpu_values.par_chunks_exact(num_challenges))
+                    .enumerate()
+                    .for_each(|(i, (cpu, gpu))| {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        for (cpu, &gpu) in cpu.iter_mut().zip(gpu) {
+                            *cpu += gpu * denominator_inv;
+                        }
+                    });
+            }
+        };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
@@ -2379,17 +2493,7 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        add_gpu_values(&gpu_values, &mut quotient_values, &mut direct_columns);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2405,9 +2509,7 @@ fn compute_quotient_polys<
                     "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
                 if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
+                    eprintln!("[gpu-range-quotient] runtime failure; falling back to CPU: {error}");
                 }
                 let result = compute_quotient_polys(
                     common_data,
@@ -2428,17 +2530,7 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        add_gpu_values(&gpu_values, &mut quotient_values, &mut direct_columns);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2465,57 +2557,43 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        add_gpu_values(&gpu_values, &mut quotient_values, &mut direct_columns);
     }
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
-    struct ColPtr<T>(*mut T);
-    unsafe impl<T> Send for ColPtr<T> {}
-    unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
-        .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+    debug_assert!(direct_columns.is_some() || quotient_values.len() == quotient_len);
+    let challenge_columns = if let Some(columns) = direct_columns {
+        Vec::from(columns)
+    } else {
+        struct ColPtr<T>(*mut T);
+        unsafe impl<T> Send for ColPtr<T> {}
+        unsafe impl<T> Sync for ColPtr<T> {}
+        let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+            .map(|_| {
+                let mut column = Vec::with_capacity(points.len());
+                // SAFETY: disjoint chunks write every generic fallback cell.
+                unsafe { column.set_len(points.len()) };
+                column
+            })
+            .collect();
+        let column_ptrs: Vec<ColPtr<F>> = challenge_columns
+            .iter_mut()
+            .map(|column| ColPtr(column.as_mut_ptr()))
+            .collect();
+        let column_ptrs = &column_ptrs;
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` is in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
                 }
-            }
-        });
+            });
+        challenge_columns
+    };
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -2654,11 +2732,17 @@ pub(crate) mod precomputed {
 
 #[cfg(test)]
 mod quotient_layout_tests {
+    use core::mem::MaybeUninit;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use core::sync::atomic::Ordering;
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        assume_init_vec, precomputed, write_two_challenge_quotient_batch, BatchLayout,
+        COMPARE_QUOTIENT_LAYOUTS, DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS,
+        FORCE_INTERLEAVED_QUOTIENT_LAYOUT,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
@@ -2672,9 +2756,9 @@ mod quotient_layout_tests {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -2721,12 +2805,117 @@ mod quotient_layout_tests {
     fn quotient_layout_paths_agree() -> Result<()> {
         let (data, pw) = small_circuit();
         assert!(data.common.luts.is_empty());
+        assert_eq!(data.common.config.num_challenges, 2);
 
-        COMPARE_QUOTIENT_LAYOUTS.store(true, Ordering::SeqCst);
+        let before = DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS.with(core::cell::Cell::get);
+        COMPARE_QUOTIENT_LAYOUTS.with(|enabled| enabled.set(true));
         let proof = data.prove(pw);
-        COMPARE_QUOTIENT_LAYOUTS.store(false, Ordering::SeqCst);
+        COMPARE_QUOTIENT_LAYOUTS.with(|enabled| enabled.set(false));
+        let after = DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS.with(core::cell::Cell::get);
 
         data.verify(proof?)?;
+        // The main proof plus the in-call PointMajor reference recomputation
+        // must both take the default-active two-column path.
+        assert_eq!(after, before + 2);
+        Ok(())
+    }
+
+    /// Exact end-to-end baseline differential: force the retained pre-change
+    /// interleaved allocation/scatter for one proof, then use the default
+    /// direct-column path for an otherwise identical proof. The transcript is
+    /// deterministic, so byte identity covers commitments, openings and FRI.
+    #[test]
+    fn direct_two_challenge_proof_bytes_match_interleaved_baseline() -> Result<()> {
+        let (data, pw) = small_circuit();
+        assert_eq!(data.common.config.num_challenges, 2);
+
+        let prove_pair = || {
+            let before = DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS.with(core::cell::Cell::get);
+            FORCE_INTERLEAVED_QUOTIENT_LAYOUT.with(|forced| forced.set(true));
+            let baseline_proof = data.prove(pw.clone());
+            FORCE_INTERLEAVED_QUOTIENT_LAYOUT.with(|forced| forced.set(false));
+            let candidate_proof = data.prove(pw);
+            let after = DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS.with(core::cell::Cell::get);
+            (baseline_proof, candidate_proof, before, after)
+        };
+        // FRI grinding deliberately uses `find_any`; pinning these two proofs
+        // to one worker makes the valid PoW nonce (and therefore all query
+        // challenges after it) deterministic for an exact byte comparison.
+        #[cfg(feature = "parallel")]
+        let (baseline_proof, candidate_proof, before, after) =
+            plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap()
+                .install(prove_pair);
+        #[cfg(not(feature = "parallel"))]
+        let (baseline_proof, candidate_proof, before, after) = prove_pair();
+
+        let baseline_proof = baseline_proof?;
+        let candidate_proof = candidate_proof?;
+        data.verify(baseline_proof.clone())?;
+        data.verify(candidate_proof.clone())?;
+        assert_eq!(
+            after,
+            before + 1,
+            "default proof did not use direct columns"
+        );
+        let baseline_bytes = baseline_proof.to_bytes();
+        let candidate_bytes = candidate_proof.to_bytes();
+        assert_eq!(candidate_bytes.len(), baseline_bytes.len());
+        if let Some(offset) = candidate_bytes
+            .iter()
+            .zip(&baseline_bytes)
+            .position(|(candidate, baseline)| candidate != baseline)
+        {
+            panic!("candidate and interleaved baseline proofs first differ at byte {offset}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_two_challenge_batches_match_interleaved_reference() {
+        for n in [1usize, 31, 32] {
+            let order = GoldilocksField::ORDER;
+            let point_major = (0..n * 2)
+                .map(|i| {
+                    GoldilocksField::from_noncanonical_u64(match i % 5 {
+                        0 => order,
+                        1 => order + 1,
+                        2 => u64::MAX,
+                        _ => 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut challenge_0 = Vec::<MaybeUninit<F>>::with_capacity(n);
+            let mut challenge_1 = Vec::<MaybeUninit<F>>::with_capacity(n);
+            // SAFETY: the helper below writes exactly all `n` cells.
+            unsafe {
+                challenge_0.set_len(n);
+                challenge_1.set_len(n);
+            }
+            write_two_challenge_quotient_batch(&point_major, &mut challenge_0, &mut challenge_1);
+            // SAFETY: every element was initialized by the helper.
+            let [challenge_0, challenge_1] =
+                unsafe { [assume_init_vec(challenge_0), assume_init_vec(challenge_1)] };
+            for i in 0..n {
+                assert_eq!(challenge_0[i].0, point_major[2 * i].0);
+                assert_eq!(challenge_1[i].0, point_major[2 * i + 1].0);
+            }
+        }
+    }
+
+    #[test]
+    fn generic_three_challenge_layout_remains_value_exact() -> Result<()> {
+        let (mut data, pw) = small_circuit();
+        data.common.config.num_challenges = 3;
+        let before = DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS.with(core::cell::Cell::get);
+        COMPARE_QUOTIENT_LAYOUTS.with(|enabled| enabled.set(true));
+        let proof = data.prove(pw);
+        COMPARE_QUOTIENT_LAYOUTS.with(|enabled| enabled.set(false));
+        let after = DIRECT_TWO_CHALLENGE_QUOTIENT_CALLS.with(core::cell::Cell::get);
+        data.verify(proof?)?;
+        assert_eq!(after, before, "three challenges entered the direct path");
         Ok(())
     }
 
