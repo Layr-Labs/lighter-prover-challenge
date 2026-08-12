@@ -83,16 +83,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
         if GPU_NTT_COMMITMENTS && !blinding {
-            let value_columns: Vec<&[F]> =
-                values.iter().map(|v| v.values.as_slice()).collect();
+            let value_columns: Vec<&[F]> = values.iter().map(|v| v.values.as_slice()).collect();
             if let Some((columns, digests, cap, coeff_columns)) = timed!(
                 timing,
                 "build Merkle tree",
-                C::Hasher::try_build_commitment_from_values(
-                    &value_columns,
-                    rate_bits,
-                    cap_height,
-                )
+                C::Hasher::try_build_commitment_from_values(&value_columns, rate_bits, cap_height,)
             ) {
                 let degree = values[0].len();
                 let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
@@ -125,6 +120,69 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         )
     }
 
+    /// Commits the two quotient challenge columns while they are still
+    /// evaluations on the shifted quotient domain. The Metal backend fuses
+    /// coset-IFFT, degree-n chunking, chunk LDE and Merkle construction; the
+    /// fallback performs the same operations through the ordinary CPU path.
+    pub fn from_quotient_coset_values(
+        values: Vec<Vec<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        assert_eq!(values.len(), 2, "quotient must have two challenge columns");
+        let quotient_degree = values[0].len();
+        assert!(quotient_degree.is_power_of_two());
+        assert!(values.iter().all(|column| column.len() == quotient_degree));
+        let degree = quotient_degree >> rate_bits;
+
+        if !blinding {
+            let value_columns = values.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            if let Some((columns, digests, cap, coeff_columns)) = timed!(
+                timing,
+                "build Merkle tree",
+                C::Hasher::try_build_quotient_commitment_from_coset_values(
+                    &value_columns,
+                    rate_bits,
+                    cap_height,
+                )
+            ) {
+                let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
+                return Self {
+                    polynomials: coeff_columns
+                        .into_iter()
+                        .map(PolynomialCoeffs::new)
+                        .collect(),
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding,
+                };
+            }
+        }
+
+        let inverse_coset_shift_powers =
+            crate::plonk::prover::precomputed::inverse_coset_shift_powers::<F>(quotient_degree);
+        let chunks = values
+            .into_par_iter()
+            .flat_map(|column| {
+                PolynomialValues::new(column)
+                    .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                    .chunks(degree)
+            })
+            .collect();
+        Self::from_coeffs(
+            chunks,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        )
+    }
+
     /// Creates a list polynomial commitment for the polynomials `polynomials`.
     pub fn from_coeffs(
         polynomials: Vec<PolynomialCoeffs<F>>,
@@ -137,18 +195,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let degree = polynomials[0].len();
 
         if GPU_NTT_COMMITMENTS && !blinding {
-            let coeff_columns: Vec<&[F]> = polynomials
-                .iter()
-                .map(|p| p.coeffs.as_slice())
-                .collect();
+            let coeff_columns: Vec<&[F]> =
+                polynomials.iter().map(|p| p.coeffs.as_slice()).collect();
             if let Some((columns, digests, cap)) = timed!(
                 timing,
                 "build Merkle tree",
-                C::Hasher::try_build_commitment_from_coeffs(
-                    &coeff_columns,
-                    rate_bits,
-                    cap_height,
-                )
+                C::Hasher::try_build_commitment_from_coeffs(&coeff_columns, rate_bits, cap_height,)
             ) {
                 let merkle_tree = MerkleTree::from_prebuilt_columns(columns, digests, cap);
                 return Self {
@@ -184,8 +236,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &columns,
                         cap_height,
                         &|group, destinations: &mut [&mut [F]]| {
-                            destinations.par_iter_mut().enumerate().for_each(
-                                |(k, destination)| {
+                            destinations
+                                .par_iter_mut()
+                                .enumerate()
+                                .for_each(|(k, destination)| {
                                     let polynomial = &polys[group * 8 + k];
                                     assert_eq!(
                                         polynomial.len(),
@@ -205,8 +259,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                },
-                            );
+                                });
                         },
                     )
                 };
@@ -622,7 +675,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
+        // Ranked A/B isolation keeps the FRI streaming change while measuring
+        // it without the paired permutation optimization. Redraw 3 retries
+        // after redraw 2 failed in validator infrastructure before metrics;
+        // execution semantics remain unchanged.
+        for (batch_index, FriBatchInfo { point, polynomials }) in
+            instance.batches.iter().enumerate()
+        {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -632,6 +691,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // here — so the `String` is allocated, written and dropped without
             // ever being read. A static label costs nothing and reads the same
             // in a timing build.
+            // The first (and widest) batch can donate its composition buffer
+            // to the quotient without changing the wide reduction's schedule:
+            // there is no prior `final_poly` to preserve.
+            // Later tiny batches stream fixed-size cache blocks directly
+            // into the running quotient, avoiding another full-degree
+            // composition allocation and write/read pass.
+            if batch_index > 0 && polynomials.len() <= 16 {
+                timed!(
+                    timing,
+                    "reduce and accumulate small opening batch",
+                    alpha.accumulate_small_polys_base_linear_quotient(
+                        polys_coeff,
+                        &mut final_poly,
+                        *point,
+                    )
+                );
+                continue;
+            }
             let composition_poly = timed!(
                 timing,
                 "reduce batch of polynomials",
@@ -645,8 +722,18 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // Horner recurrence and leaves its top slot as the power-of-two
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
-            let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            if final_poly.coeffs.is_empty() {
+                // Multiplying the empty accumulator by `shift` is a no-op.
+                // Reuse the wide composition allocation as the quotient and
+                // remove the equally large zero-fill/output pass. Resetting
+                // the reducing factor also avoids exponentiating alpha for a
+                // factor that would only multiply the empty accumulator.
+                alpha.reset();
+                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
+            } else {
+                let shift = alpha.shift_factor();
+                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            }
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -1005,10 +1092,8 @@ mod tests {
                         coeffs.resize(n, F::ZERO);
                         let poly = PolynomialCoeffs::new(coeffs);
                         let shift = F::rand();
-                        let expected =
-                            poly.coset_fft_with_options(shift, Some(rate_bits), None);
-                        let actual =
-                            coset_fft_zero_tail(&poly, shift, live, Some(rate_bits), None);
+                        let expected = poly.coset_fft_with_options(shift, Some(rate_bits), None);
+                        let actual = coset_fft_zero_tail(&poly, shift, live, Some(rate_bits), None);
                         assert_eq!(actual.values, expected.values);
                     }
                 }
@@ -1072,9 +1157,7 @@ mod tests {
             // This tree's exact pre-fusion sequence: the consuming in-place
             // division (top slot already the pad) + shift_poly + add.
             let mut expected_in_place = initial.clone();
-            let quotient_in_place = composition_poly
-                .clone()
-                .divide_by_linear_padded_in_place(z);
+            let quotient_in_place = composition_poly.clone().divide_by_linear_padded_in_place(z);
             expected_in_place *= shift; // shift_poly
             expected_in_place += quotient_in_place;
 
@@ -1083,6 +1166,59 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+        }
+    }
+
+    /// Streaming a small opening batch must preserve the complete reduction,
+    /// alpha-power shift and synthetic-division recurrence. In particular,
+    /// block boundaries run in descending order, because Horner's accumulator
+    /// carries from the high block into the next lower block.
+    #[test]
+    fn streamed_small_opening_batch_matches_materialized_path() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::PrimeField64;
+
+        type BF = GoldilocksField;
+        type F = <BF as Extendable<2>>::Extension;
+
+        fn raw(values: &[F]) -> Vec<u64> {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: BF| c.to_noncanonical_u64())
+                .collect()
+        }
+
+        for &(num_polys, degree, old_len) in &[
+            (1usize, 1usize, 0usize),
+            (2, 8, 8),
+            (2, 2048, 2048),
+            (2, 2049, 2049),
+            (2, 4097, 4097),
+            (16, 257, 300),
+        ] {
+            let polys = (0..num_polys)
+                .map(|_| PolynomialCoeffs::new(BF::rand_vec(degree)))
+                .collect::<Vec<_>>();
+            let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
+            let base = F::rand();
+            let z = F::rand();
+
+            let mut reference_factor = ReducingFactor::new(base);
+            let composition = reference_factor.reduce_polys_base::<BF, 2>(polys.iter());
+            let shift = reference_factor.shift_factor();
+            let mut expected = initial.clone();
+            accumulate_linear_quotient(&mut expected, &composition, z, shift);
+
+            let mut streamed_factor = ReducingFactor::new(base);
+            let mut actual = initial;
+            streamed_factor.accumulate_small_polys_base_linear_quotient::<BF, 2>(
+                polys.iter(),
+                &mut actual,
+                z,
+            );
+
+            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
         }
     }
 
@@ -1230,7 +1366,11 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             };
-            assert_eq!(raw(&by_ref), raw(&consumed), "width={width} degree={degree}");
+            assert_eq!(
+                raw(&by_ref),
+                raw(&consumed),
+                "width={width} degree={degree}"
+            );
         }
     }
 }

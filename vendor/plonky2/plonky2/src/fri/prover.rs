@@ -137,11 +137,10 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
+        // Keep the random bit-reversal gather outside the Merkle hash loop.
+        // The resulting tree input is contiguous row-major data; folding the
+        // gather into `new_columns` made CPU FRI rounds issue scattered reads
+        // between every Poseidon permutation and regressed the full pipeline.
         let flat_values = bitrev_flatten::<F, D>(&values.values);
         let tree = MerkleTree::<F, C::Hasher>::new_flat(
             flat_values,

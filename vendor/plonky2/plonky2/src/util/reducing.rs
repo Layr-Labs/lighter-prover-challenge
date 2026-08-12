@@ -193,6 +193,86 @@ impl<F: Field> ReducingFactor<F> {
         PolynomialCoeffs::new(acc)
     }
 
+    /// Reduce a small batch of base-field polynomials and immediately fold
+    /// its linear quotient into `final_poly`.
+    ///
+    /// The regular path materializes the full extension-field composition
+    /// polynomial, then reads it backwards while writing the quotient into
+    /// `final_poly`. Opening batches after the first one are tiny (normally
+    /// the two `g * zeta` polynomials), so preserving that full-degree
+    /// intermediate only adds an allocation and a write/read pass. Compute a
+    /// cache-sized range of composition coefficients at a time instead and
+    /// feed it straight into the same descending Horner recurrence.
+    pub fn accumulate_small_polys_base_linear_quotient<
+        BF: Extendable<D, Extension = F>,
+        const D: usize,
+    >(
+        &mut self,
+        polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>> + Sync>,
+        final_poly: &mut PolynomialCoeffs<F>,
+        z: F,
+    ) where
+        F: FieldExtension<D, BaseField = BF>,
+    {
+        let polys: Vec<_> = polys.into_iter().collect();
+        debug_assert!(polys.len() <= 16);
+        let max_len = polys
+            .iter()
+            .map(|p| p.borrow().coeffs.len())
+            .max()
+            .unwrap_or(0);
+        let base_powers: Vec<F> = self.base.powers().take(polys.len()).collect();
+        self.count += polys.len() as u64;
+        let shift = self.shift_factor();
+
+        let buf = &mut final_poly.coeffs;
+        for coefficient in buf.iter_mut().skip(max_len) {
+            *coefficient *= shift;
+        }
+        if buf.len() < max_len {
+            buf.resize(max_len, F::ZERO);
+        }
+        if max_len == 0 {
+            return;
+        }
+
+        // The padded quotient's highest coefficient is zero.
+        buf[max_len - 1] *= shift;
+
+        const SLOT_BLOCK: usize = 2048;
+        // This fixed block size is independent of runtime queue state.
+        let mut scratch = vec![F::ZERO; SLOT_BLOCK.min(max_len.saturating_sub(1))];
+        let mut end = max_len;
+        let mut acc = F::ZERO;
+        while end > 1 {
+            let start = 1.max(end.saturating_sub(SLOT_BLOCK));
+            let out = &mut scratch[..end - start];
+            if !goldilocks_ext2_reduce_polys_base_into(&polys, &base_powers, start, out) {
+                out.fill(F::ZERO);
+                for (base_power, poly) in base_powers.iter().zip(&polys) {
+                    let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
+                    if coeffs.coeffs.len() <= start {
+                        continue;
+                    }
+                    let live = (coeffs.coeffs.len() - start).min(out.len());
+                    for (reduced, &coefficient) in out[..live]
+                        .iter_mut()
+                        .zip(&coeffs.coeffs[start..start + live])
+                    {
+                        *reduced +=
+                            <F as FieldExtension<D>>::scalar_mul(base_power, coefficient);
+                    }
+                }
+            }
+            for (offset, &coefficient) in out.iter().enumerate().rev() {
+                acc = acc * z + coefficient;
+                let quotient_index = start + offset - 1;
+                buf[quotient_index] = buf[quotient_index] * shift + acc;
+            }
+            end = start;
+        }
+    }
+
     pub fn shift(&mut self, x: F) -> F {
         let tmp = self.base.exp_u64(self.count) * x;
         self.count = 0;
@@ -230,10 +310,30 @@ where
     BF: Extendable<D, Extension = F>,
     F: FieldExtension<D, BaseField = BF>,
 {
+    let mut acc = vec![F::ZERO; max_len];
+    if !goldilocks_ext2_reduce_polys_base_into(polys, base_powers, 0, &mut acc) {
+        return None;
+    }
+    Some(acc)
+}
+
+/// Fill one contiguous coefficient range of the Goldilocks extension fast
+/// path. Keeping the destination caller-owned lets the opening path reuse a
+/// small cache buffer instead of materializing the whole composition vector.
+fn goldilocks_ext2_reduce_polys_base_into<BF, F, const D: usize>(
+    polys: &[impl Borrow<PolynomialCoeffs<BF>> + Sync],
+    base_powers: &[F],
+    start: usize,
+    out: &mut [F],
+) -> bool
+where
+    BF: Extendable<D, Extension = F>,
+    F: FieldExtension<D, BaseField = BF>,
+{
     if TypeId::of::<BF>() != TypeId::of::<GoldilocksField>()
         || TypeId::of::<F>() != TypeId::of::<QuadraticExtension<GoldilocksField>>()
     {
-        return None;
+        return false;
     }
     // SAFETY (all casts below): the `TypeId` compares prove `BF` is exactly
     // `GoldilocksField` and `F` is exactly
@@ -261,7 +361,6 @@ where
         )
     };
 
-    let mut acc = vec![F::ZERO; max_len];
     // Same shape split as the generic path: small batches stay serial, large
     // batches partition the coefficient slots so each worker visits all
     // polynomials for one cache-sized output range.
@@ -270,26 +369,26 @@ where
     if slices.len() <= PARALLEL_CHUNK {
         let out = unsafe {
             core::slice::from_raw_parts_mut(
-                acc.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
-                acc.len(),
+                out.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                out.len(),
             )
         };
-        ext2_base_scalar_dot_slots(out, 0, &slices, powers);
+        ext2_base_scalar_dot_slots(out, start, &slices, powers);
     } else {
-        acc.par_chunks_mut(SLOT_BLOCK)
+        out.par_chunks_mut(SLOT_BLOCK)
             .enumerate()
             .for_each(|(block, out)| {
-                let start = block * SLOT_BLOCK;
+                let block_start = start + block * SLOT_BLOCK;
                 let out = unsafe {
                     core::slice::from_raw_parts_mut(
                         out.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
                         out.len(),
                     )
                 };
-                ext2_base_scalar_dot_slots(out, start, &slices, powers);
+                ext2_base_scalar_dot_slots(out, block_start, &slices, powers);
             });
     }
-    Some(acc)
+    true
 }
 
 #[derive(Debug, Clone)]

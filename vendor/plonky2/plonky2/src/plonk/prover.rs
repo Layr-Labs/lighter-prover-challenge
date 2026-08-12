@@ -4,7 +4,7 @@
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use hashbrown::HashMap;
 use plonky2_maybe_rayon::*;
 
@@ -27,17 +27,17 @@ use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witne
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
-use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
+use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
-    VanishingScratch,
+    PermutationBatch, VanishingScratch, eval_vanishing_poly_base_batch, get_lut_poly,
+    interleave_pair_plan,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
+use crate::util::log2_ceil;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -181,10 +181,7 @@ where
         count("degree_rows", degree);
         count("lde_rows", common_data.lde_size());
         count("wire_values", degree * config.num_wires);
-        count(
-            "routed_wire_values",
-            degree * config.num_routed_wires,
-        );
+        count("routed_wire_values", degree * config.num_routed_wires);
         count(
             "quotient_domain_points",
             degree * common_data.quotient_degree_factor,
@@ -376,8 +373,14 @@ where
             true,
             false,
         );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (actual, expected)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+        let actual_coeffs = quotient_polys.to_coeffs();
+        let reference_coeffs = reference.to_coeffs();
+        assert_eq!(actual_coeffs.len(), reference_coeffs.len());
+        for (p, (actual, expected)) in actual_coeffs
+            .iter()
+            .zip(reference_coeffs.iter())
+            .enumerate()
+        {
             assert_eq!(actual.coeffs.len(), expected.coeffs.len());
             for (i, (actual, expected)) in
                 actual.coeffs.iter().zip(expected.coeffs.iter()).enumerate()
@@ -415,8 +418,14 @@ where
             false,
             false,
         );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+        let actual_coeffs = quotient_polys.to_coeffs();
+        let reference_coeffs = reference.to_coeffs();
+        assert_eq!(actual_coeffs.len(), reference_coeffs.len());
+        for (p, (a, b)) in actual_coeffs
+            .iter()
+            .zip(reference_coeffs.iter())
+            .enumerate()
+        {
             assert_eq!(a.coeffs.len(), b.coeffs.len());
             for (i, (x, y)) in a.coeffs.iter().zip(b.coeffs.iter()).enumerate() {
                 assert_eq!(
@@ -428,32 +437,39 @@ where
         }
     }
 
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "split up quotient polys",
-        quotient_polys
-            .into_par_iter()
-            .flat_map(|mut quotient_poly| {
-                quotient_poly.trim_to_len(quotient_degree).expect(
-                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
-            })
-            .collect()
-    );
-
     let quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            all_quotient_poly_chunks,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        )
+        match quotient_polys {
+            QuotientPolys::CosetValues(values) =>
+                PolynomialBatch::<F, C, D>::from_quotient_coset_values(
+                    values,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                ),
+            QuotientPolys::Coeffs(quotient_polys) => {
+                let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = quotient_polys
+                    .into_par_iter()
+                    .flat_map(|mut quotient_poly| {
+                        quotient_poly.trim_to_len(quotient_degree).expect(
+                            "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                        );
+                        quotient_poly.chunks(degree)
+                    })
+                    .collect();
+                PolynomialBatch::<F, C, D>::from_coeffs(
+                    all_quotient_poly_chunks,
+                    config.fri_config.rate_bits,
+                    config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+                    config.fri_config.cap_height,
+                    timing,
+                    prover_data.fft_root_table.as_ref(),
+                )
+            }
+        }
     );
 
     challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
@@ -672,14 +688,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
     let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
     {
-        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_0,
-            product_count,
-        );
-        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_1,
-            product_count,
-        );
+        let product_slots_0 =
+            crate::hash::merkle_tree::capacity_up_to_mut(&mut quotient_products_0, product_count);
+        let product_slots_1 =
+            crate::hash::merkle_tree::capacity_up_to_mut(&mut quotient_products_1, product_count);
         product_slots_0
             .par_chunks_mut(INV_BATCH * num_chunks)
             .zip(product_slots_1.par_chunks_mut(INV_BATCH * num_chunks))
@@ -804,8 +816,10 @@ fn wires_permutation_partial_products_and_zs<
     // witness generation and the Zs/partial-products commitment.
     let product_count = subgroup.len() * num_chunks;
     let mut all_quotient_chunk_products: Vec<F> = Vec::with_capacity(product_count);
-    let product_slots =
-        crate::hash::merkle_tree::capacity_up_to_mut(&mut all_quotient_chunk_products, product_count);
+    let product_slots = crate::hash::merkle_tree::capacity_up_to_mut(
+        &mut all_quotient_chunk_products,
+        product_count,
+    );
     product_slots
         .par_chunks_mut(INV_BATCH * num_chunks)
         .zip(subgroup.par_chunks(INV_BATCH))
@@ -1291,14 +1305,13 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
-    use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
-    };
+    use crate::hash::poseidon2::metal::{RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec};
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     // `EqualityGate` reads a gate-local constant, whose commitment column is
@@ -1336,9 +1349,7 @@ fn start_gpu_range_check_gate_quotient<
         let u32_gate = gate.0.u32_quotient_gate();
         if range.is_some() && u32_gate.is_some() {
             if gpu_poseidon_quotient_diagnostics_enabled() {
-                eprintln!(
-                    "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
-                );
+                eprintln!("[gpu-range-quotient] gate {gate_index} advertised conflicting layouts");
             }
             return None;
         }
@@ -1394,10 +1405,7 @@ fn start_gpu_range_check_gate_quotient<
                 // Every width shares one layout: five routed words per
                 // operation followed by `base_bits / 2` base-4 result limbs,
                 // so the wire and constraint counts are linear in the width.
-                U32QuotientGate::Subtraction {
-                    num_ops,
-                    base_bits,
-                } => {
+                U32QuotientGate::Subtraction { num_ops, base_bits } => {
                     let Some(result_limbs) = supported_quotient_result_limbs(base_bits) else {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
                             eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
@@ -1425,9 +1433,7 @@ fn start_gpu_range_check_gate_quotient<
                     };
                     if num_addends == 0 || num_addends > 16 || num_carry_limbs == 0 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
                         }
                         return None;
                     }
@@ -1446,9 +1452,7 @@ fn start_gpu_range_check_gate_quotient<
                 U32QuotientGate::ByteDecomposition { num_ops, num_limbs } => {
                     if num_limbs == 0 || num_limbs > 24 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid byte metadata: {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid byte metadata: {u32_gate:?}");
                         }
                         return None;
                     }
@@ -1626,9 +1630,7 @@ fn start_gpu_range_check_gate_quotient<
                     reducing.num_coeffs.checked_mul(2)?,
                 ))
             }
-        } else if let Some(reducing) =
-            gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
-        {
+        } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>() {
             if D != 2 {
                 None
             } else {
@@ -1794,11 +1796,33 @@ fn start_gpu_permutation_quotient<
         eprintln!(
             "[gpu-permutation-quotient] active rows={quotient_rows} step={step} \
              routed={} partials={} shared_columns=true",
-            common_data.config.num_routed_wires,
-            common_data.num_partial_products,
+            common_data.config.num_routed_wires, common_data.num_partial_products,
         );
     }
     Some(job)
+}
+
+enum QuotientPolys<F: Field> {
+    Coeffs(Vec<PolynomialCoeffs<F>>),
+    CosetValues(Vec<Vec<F>>),
+}
+
+impl<F: RichField> QuotientPolys<F> {
+    fn to_coeffs(&self) -> Vec<PolynomialCoeffs<F>> {
+        match self {
+            Self::Coeffs(coeffs) => coeffs.clone(),
+            Self::CosetValues(values) => {
+                let inverse_powers = precomputed::inverse_coset_shift_powers::<F>(values[0].len());
+                values
+                    .par_iter()
+                    .map(|column| {
+                        PolynomialValues::new(column.clone())
+                            .coset_ifft_with_powers(inverse_powers.as_slice())
+                    })
+                    .collect()
+            }
+        }
+    }
 }
 
 fn compute_quotient_polys<
@@ -1819,7 +1843,7 @@ fn compute_quotient_polys<
     alphas: &[F],
     col_major_perm: bool,
     allow_gpu_poseidon: bool,
-) -> Vec<PolynomialCoeffs<F>> {
+) -> QuotientPolys<F> {
     let num_challenges = common_data.config.num_challenges;
 
     let has_lookup = common_data.num_lookup_polys != 0;
@@ -1958,12 +1982,11 @@ fn compute_quotient_polys<
     // computed once per circuit shape for the process and shared across proofs. Each cached
     // entry is bit-identical to the per-point inversion it replaces.
     #[cfg(feature = "std")]
-    let z_h_on_coset = z_h_on_coset.with_l_0_denominator_inverses(
-        l_0_table_cache::l_0_denominator_inverses::<F>(
+    let z_h_on_coset =
+        z_h_on_coset.with_l_0_denominator_inverses(l_0_table_cache::l_0_denominator_inverses::<F>(
             common_data.degree_bits(),
             quotient_degree_bits,
-        ),
-    );
+        ));
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -2056,8 +2079,7 @@ fn compute_quotient_polys<
         eprintln!(
             "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; \
              constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}",
-            common_data.config.num_wires,
-            common_data.num_gate_constraints,
+            common_data.config.num_wires, common_data.num_gate_constraints,
         );
     }
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2380,16 +2402,6 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2405,9 +2417,7 @@ fn compute_quotient_polys<
                     "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
                 if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
+                    eprintln!("[gpu-range-quotient] runtime failure; falling back to CPU: {error}");
                 }
                 let result = compute_quotient_polys(
                     common_data,
@@ -2429,16 +2439,6 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2466,17 +2466,49 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
     }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_challenge_columns =
+        if gpu_poseidon.is_some() || gpu_range.is_some() || gpu_permutation.is_some() {
+            debug_assert_eq!(num_challenges, 2);
+            let poseidon_values = gpu_poseidon
+                .as_ref()
+                .map(|(_, job)| job.finish().expect("completion was checked above"));
+            let range_values = gpu_range
+                .as_ref()
+                .map(|(_, job)| job.finish().expect("completion was checked above"));
+            let permutation_values = gpu_permutation
+                .as_ref()
+                .map(|job| job.finish().expect("completion was checked above"));
+            let mut columns = vec![vec![F::ZERO; points.len()]; 2];
+            let (column_0, column_1) = columns.split_at_mut(1);
+            column_0[0]
+                .par_iter_mut()
+                .zip(column_1[0].par_iter_mut())
+                .enumerate()
+                .for_each(|(i, (out_0, out_1))| {
+                    let base = i * 2;
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    let mut value_0 = quotient_values[base];
+                    let mut value_1 = quotient_values[base + 1];
+                    for contribution in
+                        [poseidon_values, range_values, permutation_values]
+                            .into_iter()
+                            .flatten()
+                    {
+                        value_0 += contribution[base] * denominator_inv;
+                        value_1 += contribution[base + 1] * denominator_inv;
+                    }
+                    *out_0 = value_0;
+                    *out_1 = value_1;
+                });
+            Some(columns)
+        } else {
+            None
+        };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let gpu_challenge_columns: Option<Vec<Vec<F>>> = None;
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
@@ -2489,44 +2521,55 @@ fn compute_quotient_polys<
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
-        .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+    let used_gpu_accumulator = gpu_challenge_columns.is_some();
+    let mut challenge_columns: Vec<Vec<F>> = gpu_challenge_columns.unwrap_or_else(|| {
+        (0..num_challenges)
+            .map(|_| {
+                let mut column = Vec::with_capacity(points.len());
+                // SAFETY: the disjoint parallel scatter below writes every element
+                // exactly once before any read; `F` is plain data. Same idiom as
+                // the zero-tail fast path in `fri/oracle.rs`.
+                unsafe { column.set_len(points.len()) };
+                column
+            })
+            .collect()
+    });
+    if !used_gpu_accumulator {
+        let column_ptrs: Vec<ColPtr<F>> = challenge_columns
+            .iter_mut()
+            .map(|column| ColPtr(column.as_mut_ptr()))
+            .collect();
+        let column_ptrs = &column_ptrs;
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
                 }
-            }
-        });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
-    challenge_columns
-        .into_par_iter()
-        .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
-            PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
-        })
-        .collect()
+            });
+    }
+    if used_gpu_accumulator {
+        QuotientPolys::CosetValues(challenge_columns)
+    } else {
+        let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
+        QuotientPolys::Coeffs(
+            challenge_columns
+                .into_par_iter()
+                .map(|column| {
+                    // Fuse the coset post-scaling into the IFFT instead of walking the
+                    // whole coefficient vector again afterwards, reusing a
+                    // process-global inverse-shift power chain.
+                    PolynomialValues::new(column)
+                        .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Process-global caches for deterministic per-degree precomputations that
@@ -2599,7 +2642,10 @@ pub(crate) mod precomputed {
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             get_or_compute(&SHIFTED_SUBGROUPS, n_log, || {
                 let shift = F::coset_shift();
-                two_adic_subgroup::<F>(n_log).iter().map(|&x| shift * x).collect()
+                two_adic_subgroup::<F>(n_log)
+                    .iter()
+                    .map(|&x| shift * x)
+                    .collect()
             })
         }
 
@@ -2632,7 +2678,12 @@ pub(crate) mod precomputed {
 
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             let shift = F::coset_shift();
-            Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
+            Arc::new(
+                F::two_adic_subgroup(n_log)
+                    .into_iter()
+                    .map(|x| shift * x)
+                    .collect::<Vec<F>>(),
+            )
         }
 
         pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
@@ -2658,9 +2709,9 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{BatchLayout, COMPARE_QUOTIENT_LAYOUTS, precomputed};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{COMPARE_GPU_QUOTIENT, gpu_poseidon_quotient_stats};
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2672,9 +2723,9 @@ mod quotient_layout_tests {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -3079,9 +3130,8 @@ mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
     use plonky2_field::types::{Field, PrimeField64};
 
-    use crate::util::partial_products::quotient_chunk_products_into;
-
     use super::divide_chunk_products;
+    use crate::util::partial_products::quotient_chunk_products_into;
 
     type F = GoldilocksField;
 
@@ -3300,18 +3350,17 @@ mod l_0_table_tests {
 /// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
+    use super::{
+        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        two_challenge_wires_permutation_partial_products_and_zs,
+        wires_permutation_partial_products_and_zs,
+    };
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::iop::witness::MatrixWitness;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
-
-    use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
-        two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
-    };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
     const D: usize = 2;
@@ -3654,7 +3703,10 @@ mod permutation_pairing_tests {
         let fixed_positions = (0..n * num_routed_wires)
             .filter(|&index| fixed_routed_wire(&data.prover_only.fixed_routed_wires, index))
             .collect::<Vec<_>>();
-        assert!(!fixed_positions.is_empty(), "test circuit has no fixed routed positions");
+        assert!(
+            !fixed_positions.is_empty(),
+            "test circuit has no fixed routed positions"
+        );
         assert_eq!(
             data.prover_only.fixed_routed_wires.len(),
             (n * num_routed_wires).div_ceil(8)
@@ -3664,7 +3716,10 @@ mod permutation_pairing_tests {
         assert_eq!(data.prover_only.subgroup[0], F::ONE);
         data.prover_only.subgroup[0] = F::from_noncanonical_u64(F::ORDER + 1);
         assert_eq!(data.prover_only.subgroup[0], F::ONE);
-        assert_eq!(data.prover_only.subgroup[0].to_noncanonical_u64(), F::ORDER + 1);
+        assert_eq!(
+            data.prover_only.subgroup[0].to_noncanonical_u64(),
+            F::ORDER + 1
+        );
 
         let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
         let gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
@@ -3682,8 +3737,10 @@ mod permutation_pairing_tests {
         // Keep every non-cancelled denominator invertible for the independent reference.
         for i in 0..n {
             for j in 0..num_routed_wires {
-                if fixed_routed_wire(&data.prover_only.fixed_routed_wires, i * num_routed_wires + j)
-                {
+                if fixed_routed_wire(
+                    &data.prover_only.fixed_routed_wires,
+                    i * num_routed_wires + j,
+                ) {
                     continue;
                 }
                 while betas.iter().zip(gammas).any(|(&beta, gamma)| {
@@ -3701,9 +3758,8 @@ mod permutation_pairing_tests {
         witness.wire_values[zero_column][zero_row] =
             -(betas[0] * data.prover_only.sigmas[zero_row][zero_column] + gammas[0]);
         let x = data.prover_only.subgroup[zero_row];
-        let numerator = witness.get_wire(zero_row, zero_column)
-            + beta_k_is[zero_column] * x
-            + gammas[0];
+        let numerator =
+            witness.get_wire(zero_row, zero_column) + beta_k_is[zero_column] * x + gammas[0];
         let denominator = witness.get_wire(zero_row, zero_column)
             + betas[0] * data.prover_only.sigmas[zero_row][zero_column]
             + gammas[0];
@@ -3724,8 +3780,7 @@ mod permutation_pairing_tests {
                 &data.prover_only.sigmas,
                 Some(&data.prover_only.fixed_routed_wires),
                 betas[challenge],
-                &beta_k_is
-                    [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
+                &beta_k_is[challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
                 gammas[challenge],
                 degree,
                 num_routed_wires,
