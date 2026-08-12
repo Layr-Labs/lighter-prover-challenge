@@ -81,7 +81,7 @@ fn main() {
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
+    let (mut block, pre_circuits) = rayon::join(
         || {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
@@ -111,6 +111,19 @@ fn main() {
             }
         },
     );
+    // Split the block's chunks into the two transaction paths now rather than
+    // inside the pipeline: the split is pure block-derived data available from
+    // the first millisecond, and the first chunk of each path is an input to
+    // the hoisted first witnesses below.
+    let (mut heavy_chunks, mut light_chunks) = prover::split_tx_chunks(&mut block);
+    let created_at = block.created_at;
+    let old_account_delta_tree_root = block.old_account_delta_tree_root;
+    // Cloned rather than removed: a chunk is a `Vec<Arc<Tx>>`, so this clones a
+    // handful of refcounts, and it means the chunk lists stay intact on every
+    // path where the hoist does not happen (forced rebuild, blob error).
+    let heavy_first_chunk = heavy_chunks.first().cloned();
+    let light_first_chunk = light_chunks.first().cloned();
+
     // The pre-execution witness is pure block-derived data (no circuit
     // dependency), and the remaining four circuit blobs take ~5x longer to
     // load than it takes to compute. Load the blobs on a scoped thread while
@@ -118,12 +131,54 @@ fn main() {
     // proof the moment its witness exists — the pre proof runs underneath the
     // tail of the blob loads instead of waiting for them to finish first.
     // Value-exact: no quantity is computed differently, only in parallel.
+    //
+    // Each transaction blob also carries a hook that generates its path's first
+    // transaction witness the instant that blob finishes *decoding*, i.e. while
+    // its constants/sigmas commitment is still rebuilding on the GPU. Measured
+    // (v14 diagnostic trace), that first witness otherwise runs at
+    // 506.9 -> 576.6 ms — strictly after the load gate, on a GPU that is 0.0%
+    // busy for the whole 69.7 ms slice (waterfall row #3b) — although its
+    // inputs are ready far earlier: the pre-execution proof's public inputs at
+    // 319.3 ms and the transaction circuits' decode at 339.6 / 349.6 ms. The
+    // window it moves into, [394.4, 507.1] ms, is 99.8% GPU-busy and has a
+    // nearly free CPU. The two channels below carry the pre-execution outputs
+    // to the hooks; `mpsc` has a single receiver, hence one channel each.
+    let (heavy_pre_sender, heavy_pre_receiver) = std::sync::mpsc::channel();
+    let (light_pre_sender, light_pre_receiver) = std::sync::mpsc::channel();
     let (pre_handle, remaining) = std::thread::scope(|scope| {
         let remaining_handle = scope.spawn(|| {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
-            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-                .then(Circuits::load_remaining_embedded)
+            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1")).then(|| {
+                Circuits::load_remaining_embedded_with(
+                    move |target, data| {
+                        let chunk = heavy_first_chunk?;
+                        let hoist: std::sync::Arc<_> = heavy_pre_receiver.recv().ok()?;
+                        Some(prover::hoist_first_tx_witness(
+                            prover::TxPath::Heavy,
+                            chunk,
+                            data,
+                            target,
+                            created_at,
+                            old_account_delta_tree_root,
+                            &hoist,
+                        ))
+                    },
+                    move |target, data| {
+                        let chunk = light_first_chunk?;
+                        let hoist: std::sync::Arc<_> = light_pre_receiver.recv().ok()?;
+                        Some(prover::hoist_first_tx_witness(
+                            prover::TxPath::Light,
+                            chunk,
+                            data,
+                            target,
+                            created_at,
+                            old_account_delta_tree_root,
+                            &hoist,
+                        ))
+                    },
+                )
+            })
         });
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
@@ -137,6 +192,14 @@ fn main() {
                 let (pre_target, mut pre_data) = pre_circuits;
                 let pre_proof =
                     prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+                // Publish the two pre-execution outputs the hoisted first
+                // witnesses need before this thread does anything else: the
+                // hooks are already waiting by now (decode ends ~20 ms after
+                // this proof does), and a dropped sender simply cancels the
+                // hoist, leaving `prove_path` to generate the witness itself.
+                let hoist = std::sync::Arc::new(prover::hoist_inputs(&pre_proof));
+                let _ = heavy_pre_sender.send(std::sync::Arc::clone(&hoist));
+                let _ = light_pre_sender.send(hoist);
                 // The pre-execution circuit is proven exactly once, here, and this
                 // is that proof's last instruction. Its rate-2^3 constants/sigmas
                 // low-degree extension — 2^17 rows x 86 columns = 86 MiB, held in a
@@ -180,20 +243,43 @@ fn main() {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     #[cfg(feature = "diagnostic_profile")]
     drop(_pre_wait);
-    let circuits = match remaining {
-        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
+    let (circuits, heavy_first, light_first) = match remaining {
+        Some(Ok((remaining, heavy_first, light_first))) => (
+            remaining.into_circuits((pre_target, pre_data)),
+            heavy_first,
+            light_first,
+        ),
         Some(Err(error)) => {
             log::warn!(
                 "embedded remaining circuits unavailable ({error:#}); building from scratch"
             );
-            Circuits::load()
+            (Circuits::load(), None, None)
         }
-        None => Circuits::load(),
+        None => (Circuits::load(), None, None),
     };
+    // A hoisted witness carries its path's first chunk, so drop that chunk from
+    // the list the pipeline still has to prove. Where no witness was hoisted the
+    // list is untouched and `prove_path` generates it as before.
+    if heavy_first.is_some() {
+        heavy_chunks.remove(0);
+    }
+    if light_first.is_some() {
+        light_chunks.remove(0);
+    }
     let proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
-        prover::prove_block_after_pre(block, circuits, pre_proof)
+        prover::prove_block_after_pre(
+            block,
+            circuits,
+            pre_proof,
+            prover::PipelineInputs {
+                heavy_chunks,
+                light_chunks,
+                heavy_first,
+                light_first,
+            },
+        )
     };
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
@@ -253,5 +339,3 @@ fn main() {
 }
 
 // arithmetic-on-promoted-frontier-1786506400
-
-// p90-fire-top1-50-1786515495
