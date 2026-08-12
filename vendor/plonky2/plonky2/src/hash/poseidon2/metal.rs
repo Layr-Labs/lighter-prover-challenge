@@ -2866,11 +2866,23 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // Wake every waiter: with a spine waiter queued, whichever non-spine
-        // waiter the OS would hand a `notify_one` to would just re-block, so
-        // the wake must reach the spine thread. Waiter counts here are tiny
-        // (window depth + one spine), so the thundering herd is a few threads.
-        self.available.notify_all();
+        // With a spine waiter queued, whichever non-spine waiter the OS would
+        // hand a `notify_one` to would just re-block, so the wake must reach
+        // the spine thread. Otherwise, a released singleton set can satisfy
+        // only one waiter and broadcasting just creates mutex contention.
+        if pool.waiters == 0 {
+            return;
+        }
+        if pool.spine_waiters == 0 {
+            // All sleepers are interchangeable non-spine jobs. One released
+            // set can satisfy exactly one of them, so waking the rest only
+            // makes them contend for the mutex and go back to sleep. Keep the
+            // broadcast solely for the priority case below, where the OS may
+            // otherwise wake a non-spine waiter ahead of the chain spine.
+            self.available.notify_one();
+        } else {
+            self.available.notify_all();
+        }
     }
 
     fn try_detach_completed_output(
