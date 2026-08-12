@@ -98,7 +98,7 @@ fn main() {
         || {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_circuit_load");
-            match Circuits::load_pre() {
+            match Circuits::load_pre_deferred() {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
@@ -111,32 +111,37 @@ fn main() {
             }
         },
     );
-    // The pre-execution witness is pure block-derived data (no circuit
-    // dependency), and the remaining four circuit blobs take ~5x longer to
-    // load than it takes to compute. Load the blobs on a scoped thread while
-    // the main thread derives the pre-execution witness, then start the pre
-    // proof the moment its witness exists — the pre proof runs underneath the
-    // tail of the blob loads instead of waiting for them to finish first.
-    // Value-exact: no quantity is computed differently, only in parallel.
-    let (pre_handle, remaining) = std::thread::scope(|scope| {
+    // The pre-execution *input* witness is pure block-derived data. Public
+    // outputs (new roots / metadata) come from running that circuit's
+    // generators, which is fast; the SNARK itself is not needed until the
+    // final block circuit's early witness. Load the other four blobs while
+    // the pre witness runs, ship public inputs to the transaction paths as
+    // soon as they exist, and leave the pre-proof running under the pipeline.
+    let (pre_handle, remaining, pre_output) = std::thread::scope(|scope| {
         let remaining_handle = scope.spawn(|| {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
             (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-                .then(Circuits::load_remaining_embedded)
+                .then(Circuits::load_remaining_embedded_deferred)
         });
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
             circuit::block_pre_execution::BlockPreExec::from_block(&block)
         };
+        let (pi_tx, pi_rx) = std::sync::mpsc::sync_channel(1);
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
             .spawn(move || {
                 let (pre_target, mut pre_data) = pre_circuits;
+                let partition =
+                    prover::pre_execution_partition(&pre_data, &pre_target, &pre_exec);
+                let pre_output =
+                    prover::pre_output_from_partition(&pre_data, &partition);
+                let _ = pi_tx.send(pre_output);
                 let pre_proof =
-                    prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+                    prover::prove_pre_execution_from_partition(&pre_data, partition);
                 // The pre-execution circuit is proven exactly once, here, and this
                 // is that proof's last instruction. Its rate-2^3 constants/sigmas
                 // low-degree extension — 2^17 rows x 86 columns = 86 MiB, held in a
@@ -150,14 +155,8 @@ fn main() {
                 // `verify_proof(.., &..common)`), and
                 // `release_finished_circuit_extensions`, which assigns the same
                 // empty value again.
-                //
-                // Without this the buffer stays resident from the first second of
-                // the process until the pipeline joins, i.e. across the entire
-                // transaction/chain phase, which is where five concurrent workers
-                // contend for the machine's memory. Value-exact and free: no
-                // quantity is computed differently and no work is added — storage
-                // that no subsequent read can reach is returned earlier.
                 pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+                pre_data.prover_only.constants_sigmas_deferred = None;
                 (pre_target, pre_data, pre_proof)
             })
             .expect("pre-execution startup thread must start");
@@ -167,21 +166,18 @@ fn main() {
         let remaining = remaining_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (pre_handle, remaining)
+        #[cfg(feature = "diagnostic_profile")]
+        let _pi_wait = plonky2::util::profile::span("wait", "pre_execution_public_inputs");
+        let pre_output = pi_rx
+            .recv()
+            .expect("pre-execution public inputs must arrive from the startup thread");
+        (pre_handle, remaining, pre_output)
     });
-    // The pre circuit is owned by the startup proof until it completes; only
-    // the other four blobs are loaded above (loading all five here would
-    // deserialize the same pre circuit twice on the scored critical path).
-    // Keep the forced-build mode's established behavior unchanged.
-    #[cfg(feature = "diagnostic_profile")]
-    let _pre_wait = plonky2::util::profile::span("wait", "pre_execution_join");
-    let (pre_target, pre_data, pre_proof) = pre_handle
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    #[cfg(feature = "diagnostic_profile")]
-    drop(_pre_wait);
+    // Transaction paths only need pre-execution public inputs. The pre circuit
+    // stays with the startup proof until that proof finishes; the block-circuit
+    // lane installs it immediately before `build_block_circuit`.
     let circuits = match remaining {
-        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
+        Some(Ok(remaining)) => remaining.into_circuits_without_pre(),
         Some(Err(error)) => {
             log::warn!(
                 "embedded remaining circuits unavailable ({error:#}); building from scratch"
@@ -193,7 +189,13 @@ fn main() {
     let proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
-        prover::prove_block_after_pre(block, circuits, pre_proof)
+        prover::prove_block_after_pre(block, circuits, pre_output, |circuits| {
+            let (pre_target, pre_data, pre_proof) = pre_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            circuits.install_pre(pre_target, pre_data);
+            pre_proof
+        })
     };
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
@@ -252,6 +254,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// arithmetic-on-promoted-frontier-1786506400
-
-// p90-fire-top1-50-1786515495
+// p90-fire-2162-1786560110

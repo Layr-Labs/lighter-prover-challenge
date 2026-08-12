@@ -474,7 +474,7 @@ where
         OpeningSet::new(
             zeta,
             g,
-            &prover_data.constants_sigmas_commitment,
+            prover_data.constants_sigmas(),
             &wires_commitment,
             &partial_products_zs_and_lookup_commitment,
             &quotient_polys_commitment,
@@ -490,7 +490,7 @@ where
         PolynomialBatch::<F, C, D>::prove_openings(
             &instance,
             &[
-                &prover_data.constants_sigmas_commitment,
+                prover_data.constants_sigmas(),
                 &wires_commitment,
                 &partial_products_zs_and_lookup_commitment,
                 &quotient_polys_commitment,
@@ -1225,10 +1225,7 @@ fn start_gpu_poseidon_gate_quotient<
     let selector_index = common_data.selectors_info.selector_indices[gate_index];
     let group = common_data.selectors_info.groups[selector_index].clone();
     let wires = wires_commitment.merkle_tree.shared_columns()?;
-    let constants = prover_data
-        .constants_sigmas_commitment
-        .merkle_tree
-        .shared_columns()?;
+    let constants = prover_data.constants_sigmas().merkle_tree.shared_columns()?;
     // z_1 contributes one term per challenge and the partial-product path
     // contributes `num_partial_products + 1`; all precede gate constraints.
     let alpha_offset = common_data.config.num_challenges * (common_data.num_partial_products + 2);
@@ -1693,11 +1690,7 @@ fn start_gpu_range_check_gate_quotient<
         }
         return None;
     };
-    let Some(constants) = prover_data
-        .constants_sigmas_commitment
-        .merkle_tree
-        .shared_columns()
-    else {
+    let Some(constants) = prover_data.constants_sigmas().merkle_tree.shared_columns() else {
         if gpu_poseidon_quotient_diagnostics_enabled() {
             eprintln!("[gpu-range-quotient] constants commitment is not Metal-backed");
         }
@@ -1766,10 +1759,7 @@ fn start_gpu_permutation_quotient<
         return None;
     }
     let wires = wires_commitment.merkle_tree.shared_columns()?;
-    let constants_sigmas = prover_data
-        .constants_sigmas_commitment
-        .merkle_tree
-        .shared_columns()?;
+    let constants_sigmas = prover_data.constants_sigmas().merkle_tree.shared_columns()?;
     let zs_partial_products = zs_partial_products_commitment
         .merkle_tree
         .shared_columns()?;
@@ -1820,6 +1810,12 @@ fn compute_quotient_polys<
     col_major_perm: bool,
     allow_gpu_poseidon: bool,
 ) -> Vec<PolynomialCoeffs<F>> {
+    // Resolve a deferred (background-built) constants/sigmas commitment here,
+    // in serial context, before the parallel batch loop below: the per-batch
+    // closures run on worker-pool threads, and blocking every pool thread on
+    // the resolution channel would starve the builder's own pool work.
+    let constants_sigmas_commitment = prover_data.constants_sigmas();
+
     let num_challenges = common_data.config.num_challenges;
 
     let has_lookup = common_data.num_lookup_polys != 0;
@@ -2162,7 +2158,7 @@ fn compute_quotient_polys<
                         }
                     }
                 } else {
-                    prover_data.constants_sigmas_commitment.fill_lde_batch(
+                    constants_sigmas_commitment.fill_lde_batch(
                         &scratch.indices,
                         step,
                         common_data.constants_range(),
@@ -2182,7 +2178,7 @@ fn compute_quotient_polys<
                     if permutation_products_offloaded {
                         scratch.s_sigmas_flat.clear();
                     } else {
-                        prover_data.constants_sigmas_commitment.fill_lde_batch(
+                        constants_sigmas_commitment.fill_lde_batch(
                             &scratch.indices,
                             step,
                             common_data.sigmas_range(),

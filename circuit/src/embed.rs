@@ -32,15 +32,29 @@
 //! must equal the embedded verifier data's cap, which transitively pins the
 //! circuit digest. On any mismatch the loader errors and callers fall back to
 //! building circuits from scratch.
+//!
+//! [`deserialize_embedded_deferred`] additionally moves the single most
+//! expensive recomputation — the constants/sigmas commitment (IFFT, rate-8
+//! LDE, Merkle tree; ~80% of a transaction-circuit load) — onto a background
+//! thread behind a [`DeferredConstantsSigmas`] handle, so the scored worker
+//! can start proving while the commitment is still being built. The first
+//! proof phase that needs the commitment blocks until it lands; the delivered
+//! value passes the same cap check as the eager path.
 
 use anyhow::{Context, Result, bail, ensure};
-use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
+use plonky2::field::fft::{FftRootTable, cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
+use plonky2::hash::merkle_tree::MerkleCap;
+use plonky2::iop::generator::WitnessGeneratorRef;
+use plonky2::iop::target::Target;
+use plonky2::plonk::circuit_builder::LookupWire;
 use plonky2::plonk::circuit_data::{
-    CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
+    CircuitData, CommonCircuitData, DeferredConstantsSigmas, GeneratorWatchIndex,
+    ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
+use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
@@ -67,6 +81,12 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
 const EMBED_VERSION: u32 = 1;
+
+/// Stack size for the deferred commitment builder thread. The thread mostly
+/// orchestrates `rayon` work executed on the worker pool (which carries the
+/// production stack size), but the orchestration itself runs FFT dispatch and
+/// Merkle routing frames, so give it comfortable headroom.
+const DEFERRED_COMMITMENT_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -294,16 +314,67 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 // Read side (runtime)
 // ---------------------------------------------------------------------------
 
-/// Reconstructs the target struct and the full [`CircuitData`] from a blob
-/// produced by [`serialize_embedded`].
-///
-/// The returned `CircuitData` is value-identical to the freshly built one:
-/// deserialized components are byte round trips, and every recomputed
-/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
-/// constants/sigmas commitment) is derived by the same code paths the builder
-/// itself runs, from the same inputs. The recomputed commitment cap is checked
-/// against the embedded verifier data before returning.
-pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+/// Every decoded and derived component of an embedded circuit *except* the
+/// constants/sigmas commitment, which [`CommitmentJob`] builds — inline for
+/// the eager loader, on a background thread for the deferred one.
+struct EmbedParts<T> {
+    target: T,
+    common: CommonCircuitData<F, D>,
+    verifier_only: VerifierOnlyCircuitData<C, D>,
+    public_inputs: Vec<Target>,
+    lookup_rows: Vec<LookupWire>,
+    lut_to_lookups: Vec<plonky2::gates::lookup::Lookup>,
+    generators: Vec<WitnessGeneratorRef<F, D>>,
+    generator_indices_by_watches: GeneratorWatchIndex,
+    generator_watch_counts: Vec<usize>,
+    subgroup: Vec<F>,
+    root_table: FftRootTable<F>,
+    max_fft_points: usize,
+    sigmas: Vec<Vec<F>>,
+    representative_map: Vec<u32>,
+    fixed_routed_wires: Vec<u8>,
+}
+
+/// Owned inputs of the constants/sigmas commitment build, movable across a
+/// thread boundary. `expected_cap` carries the verifier data's cap so the
+/// build validates itself wherever it runs.
+struct CommitmentJob {
+    constants_sigmas_vecs: Vec<PolynomialValues<F>>,
+    rate_bits: usize,
+    cap_height: usize,
+    max_fft_points: usize,
+    expected_cap: MerkleCap<F, <C as GenericConfig<D>>::Hasher>,
+}
+
+/// The builder's commitment path: values in, IFFT inside, LDE + Merkle.
+/// `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+/// The recomputed cap must equal the embedded verifier data's cap, which
+/// transitively pins the circuit digest.
+fn finish_commitment(
+    job: CommitmentJob,
+    root_table: &FftRootTable<F>,
+) -> Result<PolynomialBatch<F, C, D>> {
+    let commitment = PolynomialBatch::<F, C, D>::from_values(
+        job.constants_sigmas_vecs,
+        job.rate_bits,
+        false,
+        job.cap_height,
+        &mut TimingTree::default(),
+        Some(root_table),
+    );
+    if commitment.merkle_tree.cap != job.expected_cap {
+        bail!(
+            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
+             (stale or corrupt embedded circuit blob)"
+        );
+    }
+    Ok(commitment)
+}
+
+/// Decodes the blob and derives everything the builder would have produced,
+/// stopping just short of the constants/sigmas commitment: those inputs come
+/// back as a [`CommitmentJob`] for the caller to run inline or defer.
+fn parse_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(EmbedParts<T>, CommitmentJob)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -367,7 +438,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
             r.read_usize()
                 .map_err(|e| anyhow::anyhow!("deserializing lookup rows: {e:?}"))
         };
-        lookup_rows.push(plonky2::plonk::circuit_builder::LookupWire {
+        lookup_rows.push(LookupWire {
             last_lu_gate: read(&mut reader)?,
             last_lut_gate: read(&mut reader)?,
             first_lut_gate: read(&mut reader)?,
@@ -501,32 +572,60 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
             .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
-    // commitment below consumes those same values. Transposing first reads the
+    // commitment consumes those same values. Transposing first reads the
     // columns in place, so they can then be moved into the commitment instead
     // of cloned; the clone was one extra full copy of the sigma columns
     // (`num_routed_wires * degree` field elements) per circuit. Only the order
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
-    // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+    let job = CommitmentJob {
         constants_sigmas_vecs,
         rate_bits,
-        false,
         cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
-    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
-        bail!(
-            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
-             (stale or corrupt embedded circuit blob)"
-        );
-    }
+        max_fft_points,
+        expected_cap: verifier_only.constants_sigmas_cap.clone(),
+    };
 
+    Ok((
+        EmbedParts {
+            target,
+            common,
+            verifier_only,
+            public_inputs,
+            lookup_rows,
+            lut_to_lookups,
+            generators,
+            generator_indices_by_watches,
+            generator_watch_counts,
+            subgroup,
+            root_table,
+            max_fft_points,
+            sigmas,
+            representative_map,
+            fixed_routed_wires,
+        },
+        job,
+    ))
+}
+
+/// Assembles the final [`CircuitData`] from decoded parts plus the commitment
+/// (already built for the eager path, or a pending handle for the deferred
+/// one). The quotient-domain cache mirror is only derivable from a built
+/// commitment; the deferred path ships `None`, which is the documented
+/// fallback the quotient path already handles (and on the production circuits
+/// the cache is skipped anyway: their gather stride is 1).
+fn assemble<T>(
+    parts: EmbedParts<T>,
+    constants_sigmas_commitment: PolynomialBatch<F, C, D>,
+    constants_sigmas_deferred: Option<
+        std::sync::Arc<DeferredConstantsSigmas<F, C, D>>,
+    >,
+) -> (T, CircuitData<F, C, D>) {
+    let common = parts.common;
+    let verifier_only = parts.verifier_only;
     let circuit_digest = verifier_only.circuit_digest;
 
     // Mirror the builder's quotient-domain constants/sigmas cache (added by the
@@ -551,7 +650,10 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
         let domain = 1 << (common.degree_bits() + quotient_degree_bits);
         let cols = common.constants_range().len() + common.sigmas_range().len();
-        if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+        if constants_sigmas_deferred.is_none()
+            && step != 1
+            && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30
+        {
             match (
                 constants_sigmas_commitment.extract_lde_batch_columns(
                     step,
@@ -580,29 +682,84 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         constants_sigmas_quotient_cache,
         constants_sigmas_quotient_step,
         constants_sigmas_quotient_domain,
-        generators,
-        generator_indices_by_watches,
-        generator_watch_counts,
+        generators: parts.generators,
+        generator_indices_by_watches: parts.generator_indices_by_watches,
+        generator_watch_counts: parts.generator_watch_counts,
         constants_sigmas_commitment,
-        sigmas,
-        subgroup,
-        public_inputs,
-        representative_map,
-        fixed_routed_wires,
-        fft_root_table: Some(root_table),
+        constants_sigmas_deferred,
+        sigmas: parts.sigmas,
+        subgroup: parts.subgroup,
+        public_inputs: parts.public_inputs,
+        representative_map: parts.representative_map,
+        fixed_routed_wires: parts.fixed_routed_wires,
+        fft_root_table: Some(parts.root_table),
         circuit_digest,
-        lookup_rows,
-        lut_to_lookups,
+        lookup_rows: parts.lookup_rows,
+        lut_to_lookups: parts.lut_to_lookups,
     };
 
-    Ok((
-        target,
+    (
+        parts.target,
         CircuitData {
             prover_only,
             verifier_only,
             common,
         },
-    ))
+    )
+}
+
+/// Reconstructs the target struct and the full [`CircuitData`] from a blob
+/// produced by [`serialize_embedded`].
+///
+/// The returned `CircuitData` is value-identical to the freshly built one:
+/// deserialized components are byte round trips, and every recomputed
+/// component (subgroup, FFT root table, sigma values/transpose, watch counts,
+/// constants/sigmas commitment) is derived by the same code paths the builder
+/// itself runs, from the same inputs. The recomputed commitment cap is checked
+/// against the embedded verifier data before returning.
+pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+    let (parts, job) = parse_embedded::<T>(bytes)?;
+    let commitment = finish_commitment(job, &parts.root_table)?;
+    Ok(assemble(parts, commitment, None))
+}
+
+/// Like [`deserialize_embedded`], but returns as soon as everything except
+/// the constants/sigmas commitment is decoded, leaving the commitment (the
+/// IFFT + rate-8 LDE + Merkle build that dominates a transaction-circuit
+/// load) to a background thread behind the returned data's
+/// [`DeferredConstantsSigmas`] handle.
+///
+/// Value-exact relative to the eager loader: the background build runs
+/// `PolynomialBatch::from_values` on the identical inputs with an identical
+/// (process-cached) FFT root table and validates the identical cap check
+/// before delivering, so every commitment byte an eventual reader sees is the
+/// same. Only *when* the work runs changes — overlapped with the caller's
+/// proving instead of ahead of it. The first proof phase that reads the
+/// commitment blocks until delivery; a cap mismatch (a build defect: blobs
+/// and source ship in the same revision) panics the worker instead of the
+/// eager path's graceful build-from-scratch fallback, which is why only the
+/// scored worker startup uses this entry point.
+pub fn deserialize_embedded_deferred<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>)> {
+    let (parts, job) = parse_embedded::<T>(bytes)?;
+    let (sender, deferred) = DeferredConstantsSigmas::<F, C, D>::channel();
+    let max_fft_points = parts.max_fft_points;
+    std::thread::Builder::new()
+        .name("constants-sigmas-defer".into())
+        .stack_size(DEFERRED_COMMITMENT_STACK_BYTES)
+        .spawn(move || {
+            // Re-fetching from the process-wide cache clones the identical
+            // table the parse stored into `fft_root_table` (the cache is
+            // keyed, deterministic, and value-identical to a fresh build).
+            let root_table = cached_fft_root_table::<F>(max_fft_points);
+            let result = finish_commitment(job, &root_table).map_err(|e| format!("{e:#}"));
+            // A dropped receiver means the circuit was released before any
+            // proof needed the commitment; nothing to deliver to.
+            let _ = sender.send(result);
+        })
+        .context("spawning deferred constants/sigmas builder thread")?;
+    Ok(assemble(parts, PolynomialBatch::default(), Some(deferred)))
 }
 
 #[cfg(test)]

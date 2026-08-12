@@ -1467,6 +1467,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,
+            constants_sigmas_deferred: None,
             sigmas,
             subgroup,
             public_inputs: self.public_inputs,

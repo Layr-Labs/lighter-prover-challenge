@@ -1,6 +1,8 @@
-// Redraw marker top1-50-1786515495
+// Redraw marker rawqubit-redraw-1786535520
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
+
+use std::sync::OnceLock;
 
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
 use circuit::block_pre_execution_constraints::{
@@ -50,8 +52,12 @@ pub struct Circuits {
     /// the light thread joins — during the remaining block-lane join and final
     /// witness setup — instead of at [`Self::release_finished_circuit_extensions`].
     pub light_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
-    pub pre_target: BlockPreExecutionTarget,
-    pub pre_data: CircuitData<F, C, D>,
+    pub pre_target: OnceLock<BlockPreExecutionTarget>,
+    /// Installed before [`Self::build_block_circuit`]. The scored worker fills
+    /// this after the pre-execution *witness* has already produced public
+    /// inputs (so transaction paths can start) and the pre-execution *proof*
+    /// has finished (so this circuit's `common`/`verifier_only` can be read).
+    pub pre_data: OnceLock<CircuitData<F, C, D>>,
     pub heavy_chain_target: BlockTxChainTarget,
     /// See [`Circuits::heavy_tx_data`].
     pub heavy_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
@@ -108,7 +114,13 @@ impl Circuits {
         let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
                 let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
-                (pre.target, pre.builder.build::<C>())
+                let pre_target = OnceLock::new();
+                let pre_data = OnceLock::new();
+                pre_target.set(pre.target).expect("fresh OnceLock");
+                pre_data
+                    .set(pre.builder.build::<C>())
+                    .expect("fresh OnceLock");
+                (pre_target, pre_data)
             },
             || {
                 rayon::join(
@@ -167,9 +179,23 @@ impl Circuits {
     ///
     /// Value-exact: no quantity is computed differently, only storage that no
     /// subsequent read can reach is returned early.
+    pub fn install_pre(
+        &self,
+        pre_target: BlockPreExecutionTarget,
+        pre_data: CircuitData<F, C, D>,
+    ) {
+        let _ = self.pre_target.set(pre_target);
+        let _ = self.pre_data.set(pre_data);
+    }
+
     pub fn release_finished_circuit_extensions(&mut self) {
-        self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-        self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
+        if let Some(pre_data) = self.pre_data.get_mut() {
+            pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            // On the deferred-load path the resolved commitment lives behind this
+            // handle; dropping it is what actually returns the storage.
+            pre_data.prover_only.constants_sigmas_deferred = None;
+            pre_data.prover_only.constants_sigmas_quotient_cache = None;
+        }
         for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
@@ -180,6 +206,7 @@ impl Circuits {
                 .get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_deferred = None;
             // The quotient-domain cache is reachable only from the same proofs
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
@@ -216,6 +243,10 @@ impl Circuits {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            // On the deferred-load path the resolved commitment lives behind
+            // this handle (the path's proofs resolved it long before this
+            // release); dropping it is what actually returns the storage.
+            data.prover_only.constants_sigmas_deferred = None;
             // Same guard, same argument: the exclusive acquisition proves no
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
@@ -240,6 +271,8 @@ impl Circuits {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            // Same handle note as `release_heavy_circuit_extensions`.
+            data.prover_only.constants_sigmas_deferred = None;
             // Same guard, same argument: the exclusive acquisition proves no
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
@@ -263,9 +296,13 @@ impl Circuits {
             .light_chain_data
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pre_data = self
+            .pre_data
+            .get()
+            .expect("pre-execution circuit must be installed before building the block circuit");
         let block = BlockCircuit::define(
             CIRCUIT_CONFIG,
-            &self.pre_data,
+            pre_data,
             &light_chain_data,
             &heavy_chain_data,
             ON_CHAIN_OPERATIONS_LIMIT,

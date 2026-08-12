@@ -47,6 +47,10 @@ impl RemainingEmbeddedCircuits {
         pre: (BlockPreExecutionTarget, CircuitData<F, C, D>),
     ) -> Circuits {
         let (pre_target, pre_data) = pre;
+        let pre_target_lock = std::sync::OnceLock::new();
+        let pre_data_lock = std::sync::OnceLock::new();
+        pre_target_lock.set(pre_target).expect("fresh OnceLock");
+        pre_data_lock.set(pre_data).expect("fresh OnceLock");
         let (heavy_tx_target, heavy_tx_data) = self.heavy_tx;
         let (heavy_chain_target, heavy_chain_data) = self.heavy_chain;
         let (light_tx_target, light_tx_data) = self.light_tx;
@@ -56,8 +60,33 @@ impl RemainingEmbeddedCircuits {
             heavy_tx_data: std::sync::RwLock::new(heavy_tx_data),
             light_tx_target,
             light_tx_data: std::sync::RwLock::new(light_tx_data),
-            pre_target,
-            pre_data,
+            pre_target: pre_target_lock,
+            pre_data: pre_data_lock,
+            heavy_chain_target,
+            heavy_chain_data: std::sync::RwLock::new(heavy_chain_data),
+            light_chain_target,
+            light_chain_data: std::sync::RwLock::new(light_chain_data),
+            dummy_heavy_proof: self.dummy_heavy_proof,
+            dummy_light_proof: self.dummy_light_proof,
+        }
+    }
+
+    /// Transaction/chain circuits only. The scored worker starts those paths
+    /// from pre-execution *public inputs* while the pre-execution proof (and
+    /// therefore `pre_data`) is still running; [`Circuits::install_pre`] fills
+    /// the hole before the final block circuit is built.
+    pub(crate) fn into_circuits_without_pre(self) -> Circuits {
+        let (heavy_tx_target, heavy_tx_data) = self.heavy_tx;
+        let (heavy_chain_target, heavy_chain_data) = self.heavy_chain;
+        let (light_tx_target, light_tx_data) = self.light_tx;
+        let (light_chain_target, light_chain_data) = self.light_chain;
+        Circuits {
+            heavy_tx_target,
+            heavy_tx_data: std::sync::RwLock::new(heavy_tx_data),
+            light_tx_target,
+            light_tx_data: std::sync::RwLock::new(light_tx_data),
+            pre_target: std::sync::OnceLock::new(),
+            pre_data: std::sync::OnceLock::new(),
             heavy_chain_target,
             heavy_chain_data: std::sync::RwLock::new(heavy_chain_data),
             light_chain_target,
@@ -80,6 +109,26 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
+/// [`load_blob`] with the constants/sigmas commitment built on a background
+/// thread (see `deserialize_embedded_deferred`): the returned circuit is
+/// usable for witness generation and early proof phases immediately, and the
+/// first phase that reads the commitment blocks until the builder delivers
+/// it. Worker-startup only: the deferred cap check panics instead of falling
+/// back to a from-scratch build, which is the right trade only inside the
+/// scored process (blobs and source ship in the same revision, so a mismatch
+/// is a build defect, and the fallback would cost more than the run).
+fn load_blob_deferred<T: serde::de::DeserializeOwned>(
+    name: &'static str,
+    blob: &[u8],
+) -> anyhow::Result<(T, CircuitData<F, C, D>)> {
+    anyhow::ensure!(
+        !blob.is_empty(),
+        "embedded circuit blob {name} is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
+    );
+    circuit::embed::deserialize_embedded_deferred::<T>(blob)
+        .map_err(|error| error.context(format!("loading embedded circuit {name}")))
+}
+
 impl Circuits {
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
@@ -88,21 +137,56 @@ impl Circuits {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
     }
 
+    /// [`Self::load_pre`] with a deferred constants/sigmas commitment. The
+    /// pre-execution proof's witness and wire phases run while the (small)
+    /// commitment builds; its quotient phase resolves the handle. Worker
+    /// startup only.
+    pub(crate) fn load_pre_deferred()
+    -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
+        load_blob_deferred::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
     /// Loads every embedded circuit except pre-execution. This is public to
     /// the worker startup path only; normal callers should keep using
     /// [`Self::load`].
     pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingEmbeddedCircuits> {
+        Self::load_remaining_embedded_impl(false)
+    }
+
+    /// [`Self::load_remaining_embedded`] with deferred constants/sigmas
+    /// commitments: the four decoded circuits return roughly as soon as their
+    /// generators and sigma values are derived (the pipeline's first witness
+    /// work needs exactly that), while four background threads finish the
+    /// commitments the first quotient phases will block on. Worker startup
+    /// only — see [`load_blob_deferred`] for the failure-mode trade.
+    pub(crate) fn load_remaining_embedded_deferred() -> anyhow::Result<RemainingEmbeddedCircuits>
+    {
+        Self::load_remaining_embedded_impl(true)
+    }
+
+    fn load_remaining_embedded_impl(deferred: bool) -> anyhow::Result<RemainingEmbeddedCircuits> {
+        fn load<T: serde::de::DeserializeOwned>(
+            deferred: bool,
+            name: &'static str,
+            blob: &[u8],
+        ) -> anyhow::Result<(T, CircuitData<F, C, D>)> {
+            if deferred {
+                load_blob_deferred::<T>(name, blob)
+            } else {
+                load_blob::<T>(name, blob)
+            }
+        }
         let (heavy, light) = rayon::join(
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                    || load::<BlockTxTarget>(deferred, "heavy_tx", HEAVY_TX_BLOB),
+                    || load::<BlockTxChainTarget>(deferred, "heavy_chain", HEAVY_CHAIN_BLOB),
                 )
             },
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                    || load::<BlockTxTarget>(deferred, "light_tx", LIGHT_TX_BLOB),
+                    || load::<BlockTxChainTarget>(deferred, "light_chain", LIGHT_CHAIN_BLOB),
                 )
             },
         );
@@ -286,8 +370,14 @@ mod tests {
 
             assert_circuit_pair_identical(
                 "pre",
-                (&rebuilt.pre_target, &rebuilt.pre_data),
-                (&embedded.pre_target, &embedded.pre_data),
+                (
+                    rebuilt.pre_target.get().expect("rebuilt pre target"),
+                    rebuilt.pre_data.get().expect("rebuilt pre data"),
+                ),
+                (
+                    embedded.pre_target.get().expect("embedded pre target"),
+                    embedded.pre_data.get().expect("embedded pre data"),
+                ),
             );
             assert_circuit_pair_identical(
                 "heavy_tx",
