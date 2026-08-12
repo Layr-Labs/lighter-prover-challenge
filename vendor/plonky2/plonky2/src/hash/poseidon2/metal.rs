@@ -2460,9 +2460,38 @@ impl MetalShared {
             // rather than 1270 ms, and they land shortly after, long before the
             // first quotient evaluation of a proof asks for them.
             //
-            // Started below, once the required six have finished, so they do not
-            // simply move their MTLCompilerService contention onto the path they
-            // are being taken off.
+            // Started HERE, above the blocking scope, so all ten kernels lower
+            // concurrently.
+            //
+            // They used to be started below, once the required six had joined,
+            // on the premise that issuing them early would move their
+            // MTLCompilerService contention onto the path they are being taken
+            // off. Measured, that premise is true in direction and wrong in
+            // magnitude: starting all ten together costs **+21.7 ms** of
+            // blocking join (289.6 -> 311.3 ms median, n=6 quiet-gated
+            // startup-only runs, OS shader cache wiped before each), and that
+            // 21.7 ms converts to *nothing* — `prove_path` is invariant across
+            // the arms (611.3 -> 613.6 ms median) because the startup critical
+            // path is the serial blob-decode chain, not pipeline readiness, and
+            // the constants/sigmas GPU commitment work runs underneath it with
+            // ~190 ms of slack.
+            //
+            // What the deferred start cost instead: `poseidon2_absorb_pass`
+            // landed at 538-634 ms while its first caller — the startup
+            // constants/sigmas commitment — arrived at 327-420 ms, and
+            // `LazyPipeline::get()` *waits* rather than falling back. Across 16
+            // control-arm full runs the total deferred-pipeline wait was
+            // 0, 0, 0, 0, 0, 0, 3.5, 13.8, 65.8, 69.0, 72.0, 91.8, 281.7,
+            // 314.1, 356.1, 1011.5 ms (mean 142.5, 10 of 16 runs stalled).
+            // Starting the four here lands `absorb_pass` at 255-341 ms, ahead
+            // of its first use, and all ten pipelines by 653 ms median instead
+            // of 964 ms; measured deferred-pipeline wait afterwards: 0 ms in
+            // 10 of 10 runs.
+            //
+            // Scheduling only: the pipelines are the same objects lowered from
+            // the same library, so nothing they later compute can differ.
+            spawn_optional_pipelines(&device, &library);
+
             let (
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -2509,8 +2538,6 @@ impl MetalShared {
             let ntt_prepare_pipeline = ntt_prepare_pipeline?;
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
-
-            spawn_optional_pipelines(&device, &library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
