@@ -238,6 +238,23 @@ pub trait Poseidon2: PrimeField64 {
         Self::internal_linear_layer_x2(c, d);
     }
 
+    /// Four-state variant of `external_linear_layer`; the default is four
+    /// sequential calls. Goldilocks overrides with a fused form that
+    /// converts all four states once and interleaves the independent u128
+    /// chains. Bit-identical to four `external_linear_layer` calls.
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        Self::external_linear_layer(a);
+        Self::external_linear_layer(b);
+        Self::external_linear_layer(c);
+        Self::external_linear_layer(d);
+    }
+
     #[inline]
     fn internal_linear_layer_extension<F: FieldExtension<D, BaseField = Self>, const D: usize>(
         state: &mut [F; WIDTH],
@@ -483,6 +500,42 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
     }
 }
 
+/// Fused x4 external layer with a round's constants folded into the u128
+/// accumulator before the single reduction: the reduce emits M*x + rc
+/// directly, deleting the separate canonical add pass on the x4 path.
+/// The accumulator stays < 2^69 < 2^96, and the canonical output is the
+/// same residue `add_rc` would produce, so every downstream element is
+/// bit-identical. Callers fold rc_0 (initial layer) or rc_{r+1} (round r).
+#[inline]
+fn external_linear_layer_x4_with_rc(
+    a: &mut [F; WIDTH],
+    b: &mut [F; WIDTH],
+    c: &mut [F; WIDTH],
+    d: &mut [F; WIDTH],
+    rc: &[u64; WIDTH],
+) {
+    let mut au = core::array::from_fn(|i| a[i].to_noncanonical_u64() as u128);
+    let mut bu = core::array::from_fn(|i| b[i].to_noncanonical_u64() as u128);
+    let mut cu = core::array::from_fn(|i| c[i].to_noncanonical_u64() as u128);
+    let mut du = core::array::from_fn(|i| d[i].to_noncanonical_u64() as u128);
+    external_linear_layer_u128(&mut au);
+    external_linear_layer_u128(&mut bu);
+    external_linear_layer_u128(&mut cu);
+    external_linear_layer_u128(&mut du);
+    for i in 0..WIDTH {
+        au[i] += rc[i] as u128;
+        bu[i] += rc[i] as u128;
+        cu[i] += rc[i] as u128;
+        du[i] += rc[i] as u128;
+    }
+    for i in 0..WIDTH {
+        a[i] = F::from_noncanonical_u128_with_96_bits(au[i]);
+        b[i] = F::from_noncanonical_u128_with_96_bits(bu[i]);
+        c[i] = F::from_noncanonical_u128_with_96_bits(cu[i]);
+        d[i] = F::from_noncanonical_u128_with_96_bits(du[i]);
+    }
+}
+
 impl Poseidon2 for F {
     #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
@@ -601,6 +654,86 @@ impl Poseidon2 for F {
         b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
         c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
         d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
+    }
+
+    /// Fused x4 external layer: converts all four states to u128 once,
+    /// applies the M4-block + circulant layer to each state (the four
+    /// independent chains interleave in the u128 region), and converts
+    /// back once. Bit-identical to four sequential `external_linear_layer`
+    /// calls: per-state operand order is unchanged.
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        external_linear_layer_x4_with_rc(a, b, c, d, &[0; WIDTH]);
+    }
+
+
+
+    /// x4 permute with folded constants: rc_0 enters the initial external
+    /// layer and every full round's constants are folded by the previous
+    /// layer's u128 accumulator, so no `add_rc` pass runs on the x4 path.
+    /// Bit-identical to the trait default (differential-gated).
+    #[inline]
+    fn poseidon2_x4(
+        input_a: [Self; WIDTH],
+        input_b: [Self; WIDTH],
+        input_c: [Self; WIDTH],
+        input_d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        let mut a = input_a;
+        let mut b = input_b;
+        let mut c = input_c;
+        let mut d = input_d;
+        external_linear_layer_x4_with_rc(
+            &mut a, &mut b, &mut c, &mut d, &EXTERNAL_CONSTANTS[0],
+        );
+        Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, 0);
+        Self::partial_rounds_x4(&mut a, &mut b, &mut c, &mut d);
+        Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, ROUNDS_F_HALF);
+        (a, b, c, d)
+    }
+
+    /// x4 full rounds with folded constants: rc_0 entered the initial
+    /// external layer and each round's external layer folds the next
+    /// round's constants, so no `add_rc` pass runs on the x4 path. The
+    /// last full round folds nothing. Bit-identical to the default
+    /// `add_rc` + sbox + external sequence.
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn full_rounds_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+        start: usize,
+    ) {
+        for r in start..(start + ROUNDS_F_HALF) {
+            // The second call's first round adds its constant explicitly:
+            // the partial rounds sit between the calls, so rc_4 cannot be
+            // folded across that boundary. Round 0's rc_0 is folded into
+            // the initial external layer by `poseidon2_x4`.
+            if r == start && start != 0 {
+                Self::add_rc(a, r);
+                Self::add_rc(b, r);
+                Self::add_rc(c, r);
+                Self::add_rc(d, r);
+            }
+            Self::sbox(a);
+            Self::sbox(b);
+            Self::sbox(c);
+            Self::sbox(d);
+            if r + 1 < start + ROUNDS_F_HALF {
+                external_linear_layer_x4_with_rc(
+                    a, b, c, d, &EXTERNAL_CONSTANTS[r + 1],
+                );
+            } else {
+                Self::external_linear_layer_x4(a, b, c, d);
+            }
+        }
     }
 
     #[inline]
@@ -1279,3 +1412,5 @@ mod pair_hash_tests {
         );
     }
 }
+
+
