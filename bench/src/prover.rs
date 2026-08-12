@@ -533,12 +533,10 @@ fn prove_path(
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     light_tx_proof_window()
                 } else if path == TxPath::Light {
-                    // Ramp: while the heavy path's three chunks run, the old
-                    // depth-1 throttle left the GPU 38% idle and the buffer
-                    // set held only 50% (measured). Depth 2 fills that idle
-                    // without exceeding the single set's capacity; the full
-                    // window still waits for the heavy path's step-3 horizon.
-                    2
+                    // Ramp: depth 2 is tip. Isolated depth 3 (no extra buffer
+                    // set — dualbuf CI-failed) fills more of the heavy-path
+                    // window. Ranked is judge; revert to 2 if ≤25.
+                    3
                 } else {
                     1
                 };
