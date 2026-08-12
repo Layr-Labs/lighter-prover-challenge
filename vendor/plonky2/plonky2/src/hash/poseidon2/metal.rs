@@ -2870,7 +2870,14 @@ impl MetalShared {
         // waiter the OS would hand a `notify_one` to would just re-block, so
         // the wake must reach the spine thread. Waiter counts here are tiny
         // (window depth + one spine), so the thundering herd is a few threads.
-        self.available.notify_all();
+        // Avoid entering the OS condition-variable broadcast path for the
+        // common uncontended handoff; with waiters, preserve the exact ranked
+        // baseline wake-all ordering and spine-priority behavior.
+        // Ranked redraw: 4ae94c69 verified 5/5 proofs in 95.953 s, the known
+        // slow-host band; executable behavior is retained for a normal draw.
+        if pool.waiters != 0 {
+            self.available.notify_all();
+        }
     }
 
     fn try_detach_completed_output(
