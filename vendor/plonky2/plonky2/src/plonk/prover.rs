@@ -688,16 +688,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (denominators, denominator_inverses) = scratch;
+                    denominators.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -731,8 +729,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            denominators.push(denominator_0);
+                            denominators.push(denominator_1);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,8 +745,20 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    // Montgomery's trick pays for one ordinary inverse per
+                    // call. Interleave both challenges so this chunk pays it
+                    // once, while retaining each challenge's denominator and
+                    // quotient-product order.
+                    F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
+                    debug_assert_eq!(denominator_inverses.len(), 2 * products_0.len());
+                    for ((product_0, product_1), inverses) in products_0
+                        .iter_mut()
+                        .zip(products_1.iter_mut())
+                        .zip(denominator_inverses.chunks_exact(2))
+                    {
+                        *product_0 *= inverses[0];
+                        *product_1 *= inverses[1];
+                    }
                 },
             );
     }
@@ -761,10 +771,23 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // The final block's two independent Z chains each traverse 2^18 rows and
+    // form `num_chunks` dependent products per row. They were run serially
+    // after the parallel ratio pass even though this exclusive tail has no
+    // competing proof work. Keep smaller transaction/chain proofs sequential
+    // so the steady pipeline's Rayon demand and scheduling stay unchanged.
+    let (columns_0, columns_1) = if subgroup.len() >= 1 << 18 {
+        rayon::join(
+            || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+            || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+        )
+    } else {
+        (
+            z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+            z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+        )
+    };
+    vec![columns_0, columns_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -2347,8 +2370,8 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        let values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2379,22 +2402,15 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        let values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2428,22 +2444,15 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
+        let values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2465,27 +2474,13 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
@@ -2504,18 +2499,62 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let has_gpu_values = gpu_poseidon_values.is_some()
+        || gpu_range_values.is_some()
+        || gpu_permutation_values.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let has_gpu_values = false;
+
+    if has_gpu_values {
+        // The per-challenge columns are the next (IFFT) consumer, so write
+        // the completed quotient directly into them. This folds the former
+        // GPU accumulation pass and point-major scatter pass into one walk:
+        // CPU quotient pages are now read once and never dirtied again.
+        quotient_values
+            .par_chunks_exact(num_challenges)
+            .enumerate()
+            .for_each(|(i, cpu_values)| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                let start = i * num_challenges;
+                for (challenge, (&cpu, column)) in
+                    cpu_values.iter().zip(column_ptrs).enumerate()
+                {
+                    let mut value = cpu;
+                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                    {
+                        if let Some(values) = gpu_poseidon_values {
+                            value += values[start + challenge] * denominator_inv;
+                        }
+                        if let Some(values) = gpu_range_values {
+                            value += values[start + challenge] * denominator_inv;
+                        }
+                        if let Some(values) = gpu_permutation_values {
+                            value += values[start + challenge] * denominator_inv;
+                        }
+                    }
+                    // SAFETY: point `i` is owned by this parallel iteration,
+                    // and every (challenge, point) destination is written once.
+                    unsafe { *column.0.add(i) = value };
                 }
-            }
-        });
+            });
+    } else {
+        // CPU-only path: parallel scatter of the interleaved point-major
+        // buffer into the per-challenge columns.
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
+                }
+            });
+    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -3470,10 +3509,10 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // PolynomialValues requires power-of-two domains. Span a single
+        // point, short batches, the inversion boundary (INV_BATCH = 128),
+        // and several complete batches.
+        for &n_points in &[1usize, 2, 64, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
