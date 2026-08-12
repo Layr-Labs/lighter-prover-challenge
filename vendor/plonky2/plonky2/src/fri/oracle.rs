@@ -622,6 +622,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
+        // Ranked A/B isolation keeps this materialized batch boundary while
+        // measuring the paired permutation optimization independently.
         for FriBatchInfo { point, polynomials } in &instance.batches {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
