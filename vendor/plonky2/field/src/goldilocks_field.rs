@@ -221,6 +221,20 @@ impl Field for GoldilocksField {
         })
     }
 
+    #[inline(always)]
+    fn multiply_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+            (NeonGoldilocksField(lhs) * NeonGoldilocksField(rhs)).0
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            [lhs[0] * rhs[0], lhs[1] * rhs[1]]
+        }
+    }
+
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
         // u64 + u64 * u64 cannot overflow.
@@ -630,11 +644,40 @@ fn fermat_inverse_chain(base: GoldilocksField) -> GoldilocksField {
 
 #[cfg(test)]
 mod tests {
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Field;
     use crate::{test_field_arithmetic, test_prime_field_arithmetic};
-
     test_prime_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
     test_field_arithmetic!(crate::goldilocks_field::GoldilocksField);
 
+    /// The challenge-lane hook must preserve the exact scalar representative,
+    /// including inputs in Goldilocks' small non-canonical alias range.
+    #[test]
+    fn multiply_pair_matches_scalar_raw_representative() {
+        let edges = [
+            0u64,
+            1,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0001,
+            u64::MAX,
+        ];
+        for &a0 in &edges {
+            for &a1 in &edges {
+                for &b0 in &edges {
+                    for &b1 in &edges {
+                        let lhs = [GoldilocksField(a0), GoldilocksField(a1)];
+                        let rhs = [GoldilocksField(b0), GoldilocksField(b1)];
+                        let actual = GoldilocksField::multiply_pair(lhs, rhs);
+                        let expected = [lhs[0] * rhs[0], lhs[1] * rhs[1]];
+                        assert_eq!(actual[0].0, expected[0].0);
+                        assert_eq!(actual[1].0, expected[1].0);
+                    }
+                }
+            }
+        }
+    }
     /// Differential test for the AArch64 `multiply_accumulate` inline assembly
     /// against the portable expression it replaces.
     ///
