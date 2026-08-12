@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    fn extension_base_dot_product_with_subgroup_scales(
+        zeta_pows: &[QuadraticExtension<Self>],
+        g_pows: &[Self],
+        coeffs: &[Self],
+    ) -> QuadraticExtension<Self> {
+        ext2_dot_product_with_subgroup_scales(zeta_pows, g_pows, coeffs)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +285,26 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+/// `sum_i (g_i * c_i) * zeta^i` with the same delayed-reduction bound as
+/// [`ext2_base_scalar_dot_product`]: `g_i * c_i` is one Goldilocks product
+/// (still a `u64` limb), so the 160-bit accumulator contract is unchanged.
+#[inline]
+fn ext2_dot_product_with_subgroup_scales(
+    zeta_pows: &[QuadraticExtension<GoldilocksField>],
+    g_pows: &[GoldilocksField],
+    coeffs: &[GoldilocksField],
+) -> QuadraticExtension<GoldilocksField> {
+    let len = zeta_pows.len().min(g_pows.len()).min(coeffs.len());
+    if len == 0 {
+        return QuadraticExtension::ZERO;
+    }
+    let mut scaled = Vec::with_capacity(len);
+    for i in 0..len {
+        scaled.push(g_pows[i] * coeffs[i]);
+    }
+    ext2_base_scalar_dot_product(&zeta_pows[..len], &scaled)
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
@@ -805,6 +833,33 @@ mod tests {
         assert_eq!(
             <GF as Extendable<4>>::extension_base_dot_product(&[], &scalars),
             Q4::ZERO
+        );
+    }
+
+    #[test]
+    fn ext2_tableless_shifted_opening_matches_materialized_table() {
+        let n = 64usize;
+        let zeta = QuadraticExtension([GF::from_canonical_u64(3), GF::from_canonical_u64(5)]);
+        let zeta_pows: Vec<Q2> = zeta.powers().take(n).collect();
+        let g_pows: Vec<GF> = GF::TWO.powers().take(n).collect();
+        let coeffs: Vec<GF> = (0..n)
+            .map(|i| GF::from_noncanonical_u64(u64::MAX.wrapping_sub(i as u64 * 17)))
+            .collect();
+        let table: Vec<Q2> = zeta_pows
+            .iter()
+            .zip(&g_pows)
+            .map(|(&z, &g)| <Q2 as FieldExtension<2>>::scalar_mul(&z, g))
+            .collect();
+        let expected = <GF as Extendable<2>>::extension_base_dot_product(&table, &coeffs);
+        let actual = <GF as Extendable<2>>::extension_base_dot_product_with_subgroup_scales(
+            &zeta_pows, &g_pows, &coeffs,
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(
+            <GF as Extendable<2>>::extension_base_dot_product_with_subgroup_scales(
+                &[], &g_pows, &coeffs
+            ),
+            Q2::ZERO
         );
     }
 

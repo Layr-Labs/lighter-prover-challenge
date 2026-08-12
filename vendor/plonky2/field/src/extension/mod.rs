@@ -99,6 +99,27 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// `sum_i coeffs[i] * g_pows[i] * zeta_pows[i]` without building a
+    /// degree-sized `(g·ζ)^i` extension table. The default is the obvious
+    /// loop; Goldilocks D=2 delays reduction like `extension_base_dot_product`.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_with_subgroup_scales(
+        zeta_pows: &[Self::Extension],
+        g_pows: &[Self],
+        coeffs: &[Self],
+    ) -> Self::Extension {
+        let n = zeta_pows.len().min(g_pows.len()).min(coeffs.len());
+        (0..n)
+            .map(|i| {
+                <Self::Extension as FieldExtension<D>>::scalar_mul(
+                    &zeta_pows[i],
+                    g_pows[i] * coeffs[i],
+                )
+            })
+            .sum()
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
