@@ -597,9 +597,23 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         out_buffer.set_wire(output_high_wire, output_high)?;
         out_buffer.set_wire(output_low_wire, output_low)?;
 
+        // INV_U32_MAX is the multiplicative inverse of u32::MAX in the Goldilocks
+        // field. In the common no-high-half-overflow case the output high half is
+        // zero, so diff == u32::MAX and the else branch below would otherwise
+        // recompute a fixed field inverse (a ~72-multiplication Fermat chain) on
+        // every op. Since u32::MAX == 2^32 - 1 == 2^64 (mod p) and 2 has
+        // multiplicative order 192 in Goldilocks, u32::MAX^{-1} == 2^128 (mod p)
+        // == 0xffff_fffe_0000_0001. Value-exact: this equals
+        // F::from_canonical_u64(u32::MAX as u64).inverse() for the Goldilocks
+        // field this circuit uses (checked by the debug_assert below).
+        const INV_U32_MAX: u64 = 0xffff_fffe_0000_0001;
         let diff = u32::MAX as u64 - output_high_u64;
         let inverse = if diff == 0 {
             F::ZERO
+        } else if diff == u32::MAX as u64 {
+            let inv = F::from_canonical_u64(INV_U32_MAX);
+            debug_assert_eq!(inv, F::from_canonical_u64(u32::MAX as u64).inverse());
+            inv
         } else {
             F::from_canonical_u64(diff).inverse()
         };
