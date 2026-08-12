@@ -2049,15 +2049,15 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
-    // only when the GPU stream is unoccupied at entry, the same occupancy
-    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
-    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
-    // while an already-busy stream would just queue the absorb groups behind
-    // another tree and stretch both.
+    // Exclusive serial phases (pre-execution + chain drain) own the GPU:
+    // admit the production 2^17 spine trees so CPU LDE-fill overlaps GPU
+    // absorb on the sequential critical path. The old 2^20 exclusive floor
+    // matched no ranked exclusive shape and left streaming cold there.
+    // Outside exclusive, keep the existing 2^19 + idle-GPU gate for
+    // pipelined tx wire/Z/quotient commits (unchanged; concurrent wire
+    // stream without the idle check was previously closed as worse).
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
