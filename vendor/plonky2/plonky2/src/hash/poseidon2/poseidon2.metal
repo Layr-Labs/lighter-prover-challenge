@@ -1700,6 +1700,61 @@ kernel void ntt_stage(
     values[colbase + v_index] = out_v;
 }
 
+// Two adjacent radix-2 DIT stages fused into one radix-4 global-memory pass.
+// The first stage uses roots0[j] for both half-sized pairs; the second uses
+// roots1[j] and roots1[j + half_m] for the even and odd intermediates.
+kernel void ntt_stage_radix4(
+    device ulong* values [[buffer(0)]],
+    const device ulong* roots0 [[buffer(1)]],
+    const device ulong* roots1 [[buffer(2)]],
+    constant uint& lde_size [[buffer(3)]],
+    constant uint& log_half_m [[buffer(4)]],
+    constant uint& canonicalize [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint t = gid.x;
+    uint quarter_butterflies = lde_size >> 2;
+    if (t >= quarter_butterflies) {
+        return;
+    }
+    ulong colbase = (ulong)gid.y * lde_size;
+    uint half_m = 1u << log_half_m;
+    uint j = t & (half_m - 1u);
+    uint base = ((t >> log_half_m) << (log_half_m + 2u));
+    uint i0 = base + j;
+    uint i1 = i0 + half_m;
+    uint i2 = i1 + half_m;
+    uint i3 = i2 + half_m;
+
+    ulong a = values[colbase + i0];
+    ulong b = values[colbase + i1];
+    ulong c = values[colbase + i2];
+    ulong d = values[colbase + i3];
+    ulong w0 = roots0[j];
+    ulong wb = gl_mul(w0, b);
+    ulong wd = gl_mul(w0, d);
+    ulong p = gl_add(a, wb);
+    ulong q = gl_sub(a, wb);
+    ulong r = gl_add(c, wd);
+    ulong s = gl_sub(c, wd);
+
+    ulong wr = gl_mul(roots1[j], r);
+    ulong ws = gl_mul(roots1[j + half_m], s);
+    ulong out0 = gl_add(p, wr);
+    ulong out1 = gl_add(q, ws);
+    ulong out2 = gl_sub(p, wr);
+    ulong out3 = gl_sub(q, ws);
+    if (canonicalize != 0u) {
+        out0 = gl_canonicalize(out0);
+        out1 = gl_canonicalize(out1);
+        out2 = gl_canonicalize(out2);
+        out3 = gl_canonicalize(out3);
+    }
+    values[colbase + i0] = out0;
+    values[colbase + i1] = out1;
+    values[colbase + i2] = out2;
+    values[colbase + i3] = out3;
+}
+
 // Converts a forward-FFT output into IFFT coefficients, matching plonky2's
 // `ifft`: coeffs[i] = fft_out[(n - i) mod n] * n^{-1}, canonicalized so the
 // CPU-side readback and the downstream LDE prepare see canonical values.
