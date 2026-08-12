@@ -260,7 +260,7 @@ fn chain_step_proof(
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
     // This step is no longer part of the runnable backlog (see the matching
-    // spine_backlog_add(1) at all spawn sites).
+    // spine_backlog_add(1) at both spawn sites).
     plonky2::hash::poseidon2::spine_backlog_add(-1);
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
@@ -565,9 +565,6 @@ fn prove_path(
         }
 
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
-            // This post-loop step is runnable and decrements the global
-            // backlog in `chain_step_proof`, exactly like both spawn loops.
-            plonky2::hash::poseidon2::spine_backlog_add(1);
             let previous = chain.take();
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-step-{chain_step}"))
