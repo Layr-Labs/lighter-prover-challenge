@@ -813,6 +813,10 @@ pub(crate) fn prove_block_after_pre(
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, || {
+                    // Heavy witness preparation is hidden beneath the light
+                    // spine; its proof children raise their own QoS before
+                    // using the GPU, so only this slack CPU lane is demoted.
+                    mark_thread_utility();
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
