@@ -533,12 +533,13 @@ fn prove_path(
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     light_tx_proof_window()
                 } else if path == TxPath::Light {
-                    // Ramp: while the heavy path's three chunks run, the old
-                    // depth-1 throttle left the GPU 38% idle and the buffer
-                    // set held only 50% (measured). Depth 2 fills that idle
-                    // without exceeding the single set's capacity; the full
-                    // window still waits for the heavy path's step-3 horizon.
-                    2
+                    // Ramp: depth 2 filled a measured 38% GPU idle at depth 1
+                    // without exceeding the single buffer-set. Depth 3 is the
+                    // next integer probe in the already-measured safe band
+                    // (depth 4 RSS is still ~6.8 GB; depth 8 is the churn
+                    // cliff). The full window still waits for the heavy
+                    // path's step-3 horizon.
+                    3
                 } else {
                     1
                 };
