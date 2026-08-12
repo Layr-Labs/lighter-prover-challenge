@@ -467,6 +467,69 @@ pub trait Field:
         Self::MULTIPLICATIVE_GROUP_GENERATOR
     }
 
+    /// Multiply two independent pairs. The default is scalar; fields with a
+    /// two-lane backend may override this without changing either lane's
+    /// multiplication order or representation.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn multiply_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        [lhs[0] * rhs[0], lhs[1] * rhs[1]]
+    }
+
+    /// Multiply four independent lanes. The permutation prover presents its
+    /// two challenge lanes for both numerator and denominator together, which
+    /// lets arithmetic backends overlap all four reduction dependency chains.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn multiply_quad(lhs: [Self; 4], rhs: [Self; 4]) -> [Self; 4] {
+        [
+            lhs[0] * rhs[0],
+            lhs[1] * rhs[1],
+            lhs[2] * rhs[2],
+            lhs[3] * rhs[3],
+        ]
+    }
+
+    /// Evaluate two independent `acc + x * y` lanes. Backends with a paired
+    /// multiply-accumulate primitive may fuse both reductions; the default
+    /// preserves each scalar field's selected multiply-accumulate semantics.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn multiply_accumulate_pair(acc: [Self; 2], x: [Self; 2], y: [Self; 2]) -> [Self; 2] {
+        [
+            acc[0].multiply_accumulate(x[0], y[0]),
+            acc[1].multiply_accumulate(x[1], y[1]),
+        ]
+    }
+
+    /// Evaluate four independent `acc + x * y` lanes. The default preserves
+    /// each scalar field's selected multiply-accumulate semantics.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn multiply_accumulate_quad(acc: [Self; 4], x: [Self; 4], y: [Self; 4]) -> [Self; 4] {
+        [
+            acc[0].multiply_accumulate(x[0], y[0]),
+            acc[1].multiply_accumulate(x[1], y[1]),
+            acc[2].multiply_accumulate(x[2], y[2]),
+            acc[3].multiply_accumulate(x[3], y[3]),
+        ]
+    }
+
+    /// Invert two equal-length batches. Fields with a paired arithmetic backend
+    /// may share the Montgomery traversal and its terminal inversion; the
+    /// generic path preserves the established independent calls.
+    #[doc(hidden)]
+    fn batch_multiplicative_inverse_pair_into(
+        x0: &[Self],
+        x1: &[Self],
+        buf0: &mut Vec<Self>,
+        buf1: &mut Vec<Self>,
+    ) {
+        debug_assert_eq!(x0.len(), x1.len());
+        Self::batch_multiplicative_inverse_into(x0, buf0);
+        Self::batch_multiplicative_inverse_into(x1, buf1);
+    }
+
     /// Equivalent to *self + x * y, but may be cheaper.
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
