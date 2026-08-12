@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -161,7 +161,7 @@ const MAX_BUFFER_SETS: usize = 1;
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;
 /// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
-const MAX_DETACHED_READBACKS: usize = 2;
+const MAX_DETACHED_READBACKS: usize = 3;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
@@ -583,22 +583,19 @@ pub fn prewarm_large_column_store(bytes: u64) {
             .device
             .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
     });
+    const PAGE: isize = 16 * 1024;
     let base = buffer.contents().cast::<u8>();
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
-    const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
