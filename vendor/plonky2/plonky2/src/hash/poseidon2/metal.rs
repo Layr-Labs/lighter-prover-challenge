@@ -1304,7 +1304,7 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// the deferred chunk trees stretched the light path — this backlog gate is
 /// the balance point.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
+const SPINE_URGENT_BACKLOG: isize = 2;
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
