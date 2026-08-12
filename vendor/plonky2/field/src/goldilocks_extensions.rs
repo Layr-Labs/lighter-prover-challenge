@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[QuadraticExtension<Self>],
+        base_polynomials: [&[Self]; 2],
+    ) -> [QuadraticExtension<Self>; 2] {
+        ext2_base_scalar_dot_products_2(extension_values, base_polynomials)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +285,68 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+/// Compute two independent base-scalar dot products against the same
+/// extension-value slice:
+///
+/// ```text
+/// out[i] = sum_j extension_values[j].scalar_mul(base_polynomials[i][j])
+/// ```
+///
+/// Each extension power is loaded once and folded into both accumulators,
+/// deleting the second scan of the coefficient slice that two separate
+/// [`ext2_base_scalar_dot_product`] calls would make. The same delayed
+/// reduction bound applies per accumulator: a chunk holds at most
+/// `u32::MAX` arbitrary `u64 * u64` products, so each exact sum fits in 160
+/// bits before `reduce160`. Per-side zip length semantics match the
+/// single-dot form: each side iterates to its own shorter length.
+#[inline]
+fn ext2_base_scalar_dot_products_2(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_polynomials: [&[GoldilocksField]; 2],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len0 = extension_values.len().min(base_polynomials[0].len());
+    let len1 = extension_values.len().min(base_polynomials[1].len());
+    let result0 = if len0 == 0 {
+        QuadraticExtension::ZERO
+    } else {
+        let (mut lo0, mut hi0) = (0u128, 0u32);
+        let (mut lo1, mut hi1) = (0u128, 0u32);
+        for (&QuadraticExtension([a0, a1]), &scalar) in extension_values[..len0]
+            .iter()
+            .zip(&base_polynomials[0][..len0])
+        {
+            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
+            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        }
+        // SAFETY: the documented worst-case bound covers arbitrary u64
+        // representatives for up to u32::MAX terms in this chunk.
+        QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
+            reduce160(lo1, hi1)
+        }])
+    };
+    let result1 = if len1 == 0 {
+        QuadraticExtension::ZERO
+    } else {
+        let (mut lo0, mut hi0) = (0u128, 0u32);
+        let (mut lo1, mut hi1) = (0u128, 0u32);
+        for (&QuadraticExtension([a0, a1]), &scalar) in extension_values[..len1]
+            .iter()
+            .zip(&base_polynomials[1][..len1])
+        {
+            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
+            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        }
+        // SAFETY: the documented worst-case bound covers arbitrary u64
+        // representatives for up to u32::MAX terms in this chunk.
+        QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
+            reduce160(lo1, hi1)
+        }])
+    };
+    [result0, result1]
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
@@ -885,6 +955,114 @@ mod tests {
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
     }
+
+    #[test]
+    fn ext2_extension_base_dot_products_2_matches_two_singles_at_boundaries() {
+        let p = GF::ORDER;
+        let raw_specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
+        let lengths = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
+            (3, 2),
+            (15, 15),
+            (16, 16),
+            (17, 17),
+            (63, 64),
+            (64, 63),
+            (65, 65),
+            (256, 256),
+            (257, 257),
+            (4095, 4096),
+            (4096, 4095),
+            (4097, 4097),
+        ];
+
+        let mut state = 0x0F1E_2D3C_4B5A_6978u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (values_len, a_len, b_len) in lengths
+            .iter()
+            .flat_map(|&(a, b)| [(a, a, b), (b, a, b), (a, b, a)])
+        {
+            let values: Vec<Q2> = (0..values_len)
+                .map(|i| {
+                    let a0 = if i < raw_specials.len() {
+                        raw_specials[i]
+                    } else {
+                        next()
+                    };
+                    let a1 = if i < raw_specials.len() {
+                        raw_specials[raw_specials.len() - 1 - i]
+                    } else {
+                        next()
+                    };
+                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
+                })
+                .collect();
+            let poly_a: Vec<GF> = (0..a_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 7) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+            let poly_b: Vec<GF> = (0..b_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5 + 1) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+
+            let expected = [
+                generic_extension_base_dot_product(&values, &poly_a),
+                generic_extension_base_dot_product(&values, &poly_b),
+            ];
+            let expected_single = [
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &poly_a),
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &poly_b),
+            ];
+            let actual = <GF as Extendable<2>>::extension_base_dot_products_2(
+                &values,
+                [&poly_a, &poly_b],
+            );
+            for side in 0..2 {
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual[side].0[limb].to_canonical_u64(),
+                        expected[side].0[limb].to_canonical_u64(),
+                        "canonical limb {limb} side {side} at \
+                         (values={values_len}, a={a_len}, b={b_len})"
+                    );
+                    assert_eq!(
+                        actual[side].0[limb].0,
+                        expected_single[side].0[limb].0,
+                        "raw limb {limb} side {side} at \
+                         (values={values_len}, a={a_len}, b={b_len})"
+                    );
+                }
+            }
+        }
+        let empty: [&[GF]; 2] = [&[], &[]];
+        assert_eq!(
+            <GF as Extendable<2>>::extension_base_dot_products_2(&[], empty),
+            [Q2::ZERO, Q2::ZERO]
+        );
+    }
+
 
     #[test]
     fn ext2_extension_base_dot_product_reduce160_bound() {
