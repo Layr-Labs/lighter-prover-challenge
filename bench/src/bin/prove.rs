@@ -41,8 +41,11 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
+// Ranked v31 redraw: retain the consumer-fused inversion executable after its
+// first accepted evaluation landed in the benchmark's 25.x slow-host class.
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// v17 byte-mask permutation: one source-identical normal-runner control.
 
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
@@ -252,6 +255,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// arithmetic-on-promoted-frontier-1786506400
-
-// p90-fire-top1-50-1786515495
+// p90-fire-b7-1786376354
