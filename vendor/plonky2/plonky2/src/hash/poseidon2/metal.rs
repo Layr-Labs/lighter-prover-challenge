@@ -155,9 +155,11 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// Upper bound on concurrently in-flight GPU tree builds. One set serializes
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
-/// official ranked host (submission 41467098), so concurrent GPU submission is
-/// intentionally disabled.
-const MAX_BUFFER_SETS: usize = 1;
+/// official ranked host (submission 41467098). Two sets are a narrower bet:
+/// Fatih's chain-tail census attributes ~127 ms of the 4.6x spine inflation to
+/// buffer-set queue alone, and dual-set overlap targets that without the full
+/// 3-way thrash. Ranked is the judge; stop rule reverts to 1 on ≤25 or ~18.
+const MAX_BUFFER_SETS: usize = 2;
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;
 /// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
@@ -1304,7 +1306,12 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// the deferred chunk trees stretched the light path — this backlog gate is
 /// the balance point.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
+// Was 3: only the deepest chain lag got priority. Dropping to 2 pulls the
+// spine ahead sooner during the light-path drain (Fatih: ~145 ms rayon +
+// ~127 ms buffer-set of the 419 ms contended spine). With dual buffer sets
+// the deferred chunk trees have a second station, so earlier spine priority
+// is less likely to starve the tx window.
+const SPINE_URGENT_BACKLOG: isize = 2;
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
