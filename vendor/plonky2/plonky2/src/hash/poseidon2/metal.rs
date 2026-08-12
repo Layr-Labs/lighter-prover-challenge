@@ -172,7 +172,7 @@ const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
-const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
+const DIGEST_OUTPUT_POOL_BYTES: u64 = 640 * 1024 * 1024;
 
 struct MetalShared {
     device: Device,
@@ -833,6 +833,7 @@ impl QuotientOutputPool {
 #[derive(Default)]
 struct DigestOutputPool {
     free: Vec<Buffer>,
+    free_bytes: u64,
 }
 
 impl DigestOutputPool {
@@ -844,7 +845,9 @@ impl DigestOutputPool {
             .filter(|(_, buffer)| buffer.length() >= bytes)
             .min_by_key(|(_, buffer)| buffer.length())
             .map(|(index, _)| index)?;
-        Some(self.free.swap_remove(index))
+        let buffer = self.free.swap_remove(index);
+        self.free_bytes -= buffer.length();
+        Some(buffer)
     }
 
     fn recycle(&mut self, buffer: Buffer) {
@@ -852,20 +855,24 @@ impl DigestOutputPool {
         if length > MAX_CACHED_DIGEST_OUTPUT_BYTES {
             return;
         }
-        if self.free.len() < MAX_CACHED_DIGEST_OUTPUTS {
-            self.free.push(buffer);
-            return;
+        // Bytes-budget discipline (ColumnStorePool): evict the smallest
+        // retained buffers while adding this one would exceed the budget,
+        // so the cache holds as many large digests as the window's live
+        // proof count needs instead of a fixed small count.
+        while self.free_bytes + length > DIGEST_OUTPUT_POOL_BYTES {
+            let Some((smallest_index, _)) = self
+                .free
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, cached)| cached.length())
+            else {
+                return;
+            };
+            let evicted = self.free.swap_remove(smallest_index);
+            self.free_bytes -= evicted.length();
         }
-        let (smallest_index, smallest_length) = self
-            .free
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, cached)| cached.length())
-            .map(|(index, cached)| (index, cached.length()))
-            .expect("full digest output pool is nonempty");
-        if length > smallest_length {
-            self.free[smallest_index] = buffer;
-        }
+        self.free_bytes += length;
+        self.free.push(buffer);
     }
 }
 
