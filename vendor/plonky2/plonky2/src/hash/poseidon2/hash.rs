@@ -807,8 +807,7 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
         state_b[..chunk_b.len()].copy_from_slice(chunk_b);
         state_c[..chunk_c.len()].copy_from_slice(chunk_c);
         state_d[..chunk_d.len()].copy_from_slice(chunk_d);
-        (state_a, state_b, state_c, state_d) =
-            F::poseidon2_x4(state_a, state_b, state_c, state_d);
+        (state_a, state_b, state_c, state_d) = F::poseidon2_x4(state_a, state_b, state_c, state_d);
     }
 
     let out = |state: &[F; WIDTH]| HashOut {
@@ -1041,6 +1040,32 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
             },
         )
     }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_quotient_commitment_from_coset_values(
+        value_columns: &[&[F]],
+        rate_bits: usize,
+        cap_height: usize,
+    ) -> Option<(
+        crate::hash::merkle_tree::ColumnStore<F>,
+        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
+        Vec<Vec<F>>,
+    )> {
+        super::metal::build_quotient_commitment_from_coset_values(
+            value_columns,
+            rate_bits,
+            cap_height,
+        )
+        .map(|(columns, digests, cap, coeffs)| {
+            (
+                crate::hash::merkle_tree::ColumnStore::Shared(columns),
+                digests,
+                cap,
+                coeffs,
+            )
+        })
+    }
 }
 
 impl Poseidon2Hash {
@@ -1236,8 +1261,16 @@ mod pair_hash_tests {
             let a: Vec<F> = (0..width).map(|_| F::rand()).collect();
             let b: Vec<F> = (0..width).map(|_| F::rand()).collect();
             let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(&a, &b);
-            assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
-            assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
+            assert_eq!(
+                ha,
+                <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a),
+                "width {width} a"
+            );
+            assert_eq!(
+                hb,
+                <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b),
+                "width {width} b"
+            );
         }
     }
 

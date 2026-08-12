@@ -10,8 +10,8 @@
 use alloc::{vec, vec::Vec};
 use core::fmt::Debug;
 
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
@@ -227,6 +227,23 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// coefficient columns.
     #[allow(clippy::type_complexity)]
     fn try_build_commitment_from_values(
+        _value_columns: &[&[F]],
+        _rate_bits: usize,
+        _cap_height: usize,
+    ) -> Option<(
+        crate::hash::merkle_tree::ColumnStore<F>,
+        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
+        Vec<Vec<F>>,
+    )> {
+        None
+    }
+
+    /// Quotient-specialized form starting from two challenge columns evaluated
+    /// on the shifted quotient domain. A backend may coset-IFFT, split into
+    /// degree-n chunks, LDE and Merklize without host intermediates.
+    #[allow(clippy::type_complexity)]
+    fn try_build_quotient_commitment_from_coset_values(
         _value_columns: &[&[F]],
         _rate_bits: usize,
         _cap_height: usize,

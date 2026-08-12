@@ -1,8 +1,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -14,16 +14,16 @@ use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
-use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 #[cfg(test)]
 use circuit::block_tx_constraints::Circuit as _;
+use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
+use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 use plonky2::iop::witness::{PartitionWitness, Witness};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
@@ -60,6 +60,59 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
 // for experiments.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
+const LOW_MEMORY_LIGHT_TX_PROOF_WINDOW: usize = 4;
+const FULL_PIPELINE_MEMORY_BYTES: u64 = 32 << 30;
+
+#[cfg(target_os = "macos")]
+fn host_memory_bytes() -> Option<u64> {
+    use core::ffi::{c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+
+    let mut bytes = 0_u64;
+    let mut len = core::mem::size_of::<u64>();
+    // SAFETY: `hw.memsize` is a read-only scalar sysctl and both output
+    // pointers refer to live, correctly sized stack values.
+    let result = unsafe {
+        sysctlbyname(
+            b"hw.memsize\0".as_ptr().cast(),
+            (&mut bytes as *mut u64).cast(),
+            &mut len,
+            core::ptr::null_mut(),
+            0,
+        )
+    };
+    (result == 0 && len == core::mem::size_of::<u64>()).then_some(bytes)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_memory_bytes() -> Option<u64> {
+    None
+}
+
+fn default_light_window_for_memory(bytes: Option<u64>) -> usize {
+    if bytes.is_some_and(|bytes| bytes >= FULL_PIPELINE_MEMORY_BYTES) {
+        LIGHT_TX_PROOF_WINDOW
+    } else {
+        LOW_MEMORY_LIGHT_TX_PROOF_WINDOW
+    }
+}
+
+fn should_prewarm_final_store(bytes: Option<u64>) -> bool {
+    bytes.is_some_and(|bytes| bytes >= FULL_PIPELINE_MEMORY_BYTES)
+}
+
+fn should_trim_final_store_pool(bytes: Option<u64>) -> bool {
+    !bytes.is_some_and(|bytes| bytes >= FULL_PIPELINE_MEMORY_BYTES)
+}
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
@@ -76,7 +129,7 @@ fn light_tx_proof_window() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|w| (1..=12).contains(w))
-            .unwrap_or(LIGHT_TX_PROOF_WINDOW)
+            .unwrap_or_else(|| default_light_window_for_memory(host_memory_bytes()))
     })
 }
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
@@ -323,7 +376,9 @@ fn generate_tx_witness<'a>(
     )
     .and_then(PendingPartitionWitness::finish)
     .unwrap_or_else(|error| {
-        panic!("{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}")
+        panic!(
+            "{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}"
+        )
     });
     let new_jump = jump_from_witness(&partition_witness, &tx_target.new_jump);
     (partition_witness, new_jump)
@@ -458,7 +513,6 @@ fn prove_path(
     );
     jump = next_jump;
 
-
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
@@ -524,11 +578,7 @@ fn prove_path(
 
             in_flight.push_back((current_step, proof_handle));
             #[cfg(feature = "diagnostic_profile")]
-            plonky2::util::profile::counter(
-                "scheduler",
-                "tx_in_flight",
-                in_flight.len() as u64,
-            );
+            plonky2::util::profile::counter("scheduler", "tx_in_flight", in_flight.len() as u64);
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
                     light_tx_proof_window()
@@ -595,11 +645,7 @@ fn prove_path(
         // [`claims_exclusive_gpu_phase`]).
         let mut exclusive_drain = false;
         #[cfg(feature = "diagnostic_profile")]
-        plonky2::util::profile::counter(
-            "scheduler",
-            "drain_tx_in_flight",
-            in_flight.len() as u64,
-        );
+        plonky2::util::profile::counter("scheduler", "drain_tx_in_flight", in_flight.len() as u64);
         while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
             let tx_proof = {
                 #[cfg(feature = "diagnostic_profile")]
@@ -613,9 +659,7 @@ fn prove_path(
             // point the exclusive routing's lower GPU cutoff and occupancy
             // bypass would queue still-running chunk proofs' trees against
             // the drain's. Covers the sibling retiring mid-drain (relaxed).
-            if !exclusive_drain
-                && in_flight.is_empty()
-                && claims_exclusive_gpu_phase(active_paths)
+            if !exclusive_drain && in_flight.is_empty() && claims_exclusive_gpu_phase(active_paths)
             {
                 exclusive_drain = true;
                 plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
@@ -658,7 +702,7 @@ fn prove_path(
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
     active_paths.fetch_sub(1, Ordering::Release);
-    if path == TxPath::Heavy {
+    if path == TxPath::Heavy && should_prewarm_final_store(host_memory_bytes()) {
         // The heavy path retires far ahead of the light path; use the slack
         // to pre-fault the final block's wires column store (larger than the
         // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
@@ -713,11 +757,8 @@ pub(crate) fn prove_pre_execution_parallel(
     pre_exec: &BlockPreExec<F>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        "pre_execution",
-        0,
-        &[("proof_kind", 0)],
-    );
+    let _profile_context =
+        plonky2::util::profile::enter_context("pre_execution", 0, &[("proof_kind", 0)]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "pre_execution_proof");
     BlockPreExecutionCircuit::prove(pre_data, pre_exec, pre_target)
@@ -767,8 +808,7 @@ pub(crate) fn prove_block_after_pre(
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
     let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
-        Vec::with_capacity(tx_chunks.len());
+    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::with_capacity(tx_chunks.len());
     for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
         if chunk_is_light(&txs) {
             light_chunks.push((chunk_index, txs));
@@ -847,14 +887,10 @@ pub(crate) fn prove_block_after_pre(
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
                         circuits.build_block_circuit()
                     };
-                    let block_data: &'static CircuitData<F, C, D> =
-                        Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
+                    let block_data: &'static CircuitData<F, C, D> = Box::leak(Box::new(block_data));
+                    let early =
+                        BlockCircuit::witness_inputs_early(&block_target, block_ref, pre_proof_ref)
+                            .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
                         early,
                         &block_data.prover_only,
@@ -912,10 +948,9 @@ pub(crate) fn prove_block_after_pre(
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
-                block_circuit_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let (block_target, block_data, block_pending, heavy_chain_proof) = block_circuit_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             #[cfg(feature = "diagnostic_profile")]
             drop(_block_lane_wait);
             #[cfg(feature = "diagnostic_profile")]
@@ -949,6 +984,22 @@ pub(crate) fn prove_block_after_pre(
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
 
+    // The fixed final circuit has 20 Z/partial-product and 16 quotient
+    // columns over 2^21 LDE rows. Memory-constrained hosts keep only best-fit
+    // stores for those allocations. The 48 GiB ranked host retains the warm
+    // cache: synchronously releasing up to 2.5 GiB here lengthens the serial
+    // tail and there is ample headroom for the final allocations.
+    const FINAL_LDE_ROWS: u64 = 1 << 21;
+    const FINAL_Z_STORE_BYTES: u64 = 20 * FINAL_LDE_ROWS * 8;
+    const FINAL_QUOTIENT_STORE_BYTES: u64 = 16 * FINAL_LDE_ROWS * 8;
+    let trim_final_store_pool = should_trim_final_store_pool(host_memory_bytes());
+    if trim_final_store_pool {
+        plonky2::hash::poseidon2::enter_final_column_store_phase(&[
+            FINAL_Z_STORE_BYTES,
+            FINAL_QUOTIENT_STORE_BYTES,
+        ]);
+    }
+
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
         plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
@@ -979,10 +1030,12 @@ pub(crate) fn prove_block_after_pre(
     let final_proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "final_block_proof");
-        BlockCircuit::prove_prepared(block_pending, block_data)
-            .expect("final block proof failed")
+        BlockCircuit::prove_prepared(block_pending, block_data).expect("final block proof failed")
     };
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+    if trim_final_store_pool {
+        plonky2::hash::poseidon2::leave_final_column_store_phase();
+    }
     final_proof
 }
 
@@ -997,8 +1050,14 @@ mod tests {
     #[cfg(feature = "diagnostic_profile")]
     #[test]
     fn profile_path_context_names_are_stable() {
-        assert_eq!(profile_path_context(TxPath::Heavy, "witness"), "heavy_tx_witness");
-        assert_eq!(profile_path_context(TxPath::Light, "proof"), "light_tx_proof");
+        assert_eq!(
+            profile_path_context(TxPath::Heavy, "witness"),
+            "heavy_tx_witness"
+        );
+        assert_eq!(
+            profile_path_context(TxPath::Light, "proof"),
+            "light_tx_proof"
+        );
         assert_eq!(profile_path_context(TxPath::Heavy, "chain"), "heavy_chain");
         assert_eq!(profile_path_context(TxPath::Light, "chain"), "light_chain");
     }
@@ -1007,6 +1066,18 @@ mod tests {
     fn prove_block_returns_one_final_block_proof() {
         let prove: fn(Block<F>, Circuits) -> Proof = prove_block;
         let _ = prove;
+    }
+
+    #[test]
+    fn memory_policy_protects_small_hosts_without_throttling_ranked_hosts() {
+        assert_eq!(default_light_window_for_memory(Some(16 << 30)), 4);
+        assert!(!should_prewarm_final_store(Some(16 << 30)));
+        assert!(should_trim_final_store_pool(Some(16 << 30)));
+        assert_eq!(default_light_window_for_memory(Some(48 << 30)), 6);
+        assert!(should_prewarm_final_store(Some(48 << 30)));
+        assert!(!should_trim_final_store_pool(Some(48 << 30)));
+        assert_eq!(default_light_window_for_memory(None), 4);
+        assert!(should_trim_final_store_pool(None));
     }
 
     #[test]
@@ -1064,18 +1135,22 @@ mod tests {
                     .flatten()
                     .find(|tx| tx.tx_circuit_type == TX_LIGHT)
                     .expect("light padding must exist");
-                assert!(block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .filter(|tx| tx.tx_circuit_type != TX_LIGHT)
-                    .all(|tx| Arc::ptr_eq(tx, heavy)));
-                assert!(block
-                    .tx_chunks
-                    .iter()
-                    .flatten()
-                    .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
-                    .all(|tx| Arc::ptr_eq(tx, light)));
+                assert!(
+                    block
+                        .tx_chunks
+                        .iter()
+                        .flatten()
+                        .filter(|tx| tx.tx_circuit_type != TX_LIGHT)
+                        .all(|tx| Arc::ptr_eq(tx, heavy))
+                );
+                assert!(
+                    block
+                        .tx_chunks
+                        .iter()
+                        .flatten()
+                        .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
+                        .all(|tx| Arc::ptr_eq(tx, light))
+                );
                 assert!(!Arc::ptr_eq(heavy, light));
             })
             .expect("padding sharing test thread must start")
@@ -1158,7 +1233,7 @@ mod tests {
             .flatten()
             .find(|tx| tx.tx_type == TX_TYPE_EMPTY)
             .expect("fixture must contain an empty padding tx"))
-            .clone();
+        .clone();
         empty_tx.tx_circuit_type = TX_LIGHT;
         empty_tx.tx_index = F::NEG_ONE.to_canonical_u64();
 
