@@ -53,7 +53,11 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
+// Series draw marker: v15 = committed Metal pipeline archive ported onto the
+// 30.6448 frontier (612ea7a: exponentiation strength reduction + deferred
+// accumulator + spine-backlog accounting fix), sample 3. Samples 1-2 (73eca59,
+// 680160c) drew 25.51/25.80 slow-class — the archive line's draw ledger is now
+// 25.69, 25.53, 25.51, 25.80, all slow-runner assignments, all uninformative.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
