@@ -28,6 +28,11 @@ pub struct ZeroPolyOnCoset<F: Field> {
     /// `(self.n * (x - F::ONE)).inverse()`, the value [`Self::eval_l_0`] computes without the
     /// table.
     l_0_denominator_inverses: Option<Arc<Vec<F>>>,
+    /// Optional precomputed values of `L_0(g * w^i)` over the complete coset
+    /// domain, indexed by `i in 0..n * rate`. A caller may attach this only
+    /// when `eval_l_0` is evaluated at those indexed domain points; ordinary
+    /// and no-std callers leave it absent and retain the arbitrary-`x` path.
+    l_0_values: Option<Arc<Vec<F>>>,
 }
 
 impl<F: Field> ZeroPolyOnCoset<F> {
@@ -44,6 +49,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
             evals,
             inverses,
             l_0_denominator_inverses: None,
+            l_0_values: None,
         }
     }
 
@@ -52,6 +58,14 @@ impl<F: Field> ZeroPolyOnCoset<F> {
     /// computing the per-point field inversion.
     pub fn with_l_0_denominator_inverses(mut self, table: Arc<Vec<F>>) -> Self {
         self.l_0_denominator_inverses = Some(table);
+        self
+    }
+
+    /// Attaches raw-exact `L_0` values for this object's complete indexed
+    /// coset domain. The quotient prover is the only production caller; the
+    /// uncached constructor continues to evaluate arbitrary `x` values.
+    pub fn with_l_0_values(mut self, table: Arc<Vec<F>>) -> Self {
+        self.l_0_values = Some(table);
         self
     }
 
@@ -78,6 +92,9 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 
     /// Returns `L_0(x) = Z_H(x)/(n * (x - 1))` with `x = w^i`.
     pub fn eval_l_0(&self, i: usize, x: F) -> F {
+        if let Some(table) = &self.l_0_values {
+            return table[i];
+        }
         if let Some(table) = &self.l_0_denominator_inverses {
             // The table entry is bit-identical to the expression below, so the product is too.
             return self.eval(i) * table[i];
@@ -90,6 +107,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 mod tests {
     use super::*;
     use crate::goldilocks_field::GoldilocksField;
+    use crate::types::{Field64, PrimeField64};
 
     /// `eval` / `eval_inverse` index with `i & rate_mask`; that must be
     /// raw-`u64` identical to the `i % rate` it replaced, over every index the
@@ -112,6 +130,36 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Without a domain table, `eval_l_0` must continue to honor its explicit
+    /// `x` argument, including noncanonical raw words and unrelated points.
+    #[test]
+    fn uncached_eval_l_0_preserves_arbitrary_x_semantics() {
+        type F = GoldilocksField;
+
+        let z = ZeroPolyOnCoset::<F>::new(5, 3);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut raws = vec![0, 2, F::ORDER - 1, F::ORDER, F::ORDER + 2, u64::MAX];
+        for _ in 0..128 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            raws.push(state);
+        }
+        for (sample, raw) in raws.into_iter().enumerate() {
+            let x = GoldilocksField(raw);
+            if x == F::ONE {
+                continue;
+            }
+            let i = sample * 17 % (1 << 8);
+            let expected = z.eval(i) * (z.n * (x - F::ONE)).inverse();
+            assert_eq!(
+                z.eval_l_0(i, x).to_noncanonical_u64(),
+                expected.to_noncanonical_u64(),
+                "sample={sample}, raw_x={raw}",
+            );
         }
     }
 }
