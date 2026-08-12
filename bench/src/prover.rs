@@ -53,7 +53,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
+// Series draw marker: v12 surface (ramp depth 3), sample 1.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
@@ -535,10 +535,10 @@ fn prove_path(
                 } else if path == TxPath::Light {
                     // Ramp: while the heavy path's three chunks run, the old
                     // depth-1 throttle left the GPU 38% idle and the buffer
-                    // set held only 50% (measured). Depth 2 fills that idle
-                    // without exceeding the single set's capacity; the full
-                    // window still waits for the heavy path's step-3 horizon.
-                    2
+                    // set held only 50% (measured). Tip uses depth 2; try 3 on
+                    // ranked 48 GB to fill residual idle without jumping to the
+                    // full steady window (still waits for heavy step-3 horizon).
+                    3
                 } else {
                     1
                 };
