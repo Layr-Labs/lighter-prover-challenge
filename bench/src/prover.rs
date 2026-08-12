@@ -832,6 +832,10 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    // This lane has substantial slack before the light spine
+                    // joins it, so keep its CPU-heavy circuit construction
+                    // off the pipeline's performance-core critical path.
+                    mark_thread_utility();
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
                         "final_block_build",
