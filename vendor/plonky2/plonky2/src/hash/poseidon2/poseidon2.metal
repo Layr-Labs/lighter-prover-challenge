@@ -683,7 +683,84 @@ kernel void permutation_quotient(
     output[(ulong)gid * 2u + 1u] = gl_canonicalize(totals[1]);
 }
 
+// Deferred-reduction accumulator for one alpha-weighted constraint sum.
+//
+// `gl_mul_add` folds every product back to a single 64-bit representative, but
+// a gate family's running sum never looks at those intermediates: reduction mod
+// p is a ring homomorphism, so summing the raw 128-bit products and reducing
+// once is congruent to summing the reduced products. `mul_128` already delivers
+// each product as four base-2^32 limbs (l0, l1, h0, h1), and adding those limbs
+// into four 64-bit registers is carry-free -- exactly the split `lazy_t`
+// already uses, here as two pairs: (l0, l1) with weight 2^0 and (h0, h1) with
+// weight 2^64.
+//
+// Headroom. Every limb is at most 2^32 - 1, so after n accumulations each of
+// the four sums is at most n * (2^32 - 1) < n * 2^32, and the widest quantity
+// `alpha_acc_materialize` forms is low.hi + high.lo < 2 * n * 2^32. That stays
+// inside the 2^64 - 2^32 bound the fold needs for every n < 2^31 - 1, so no
+// intermediate fold is ever required: n is a family's constraint count, which
+// indexes `alpha_powers` and is at most `alpha_stride` (136 in the largest
+// production shape, giving sums below 2^40 -- twenty-four spare bits).
+struct alpha_acc_t {
+    lazy_t low;
+    lazy_t high;
+};
+
+inline void alpha_acc_mul_add(thread alpha_acc_t& acc, ulong a, ulong b) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
+    acc.low.lo += l0;
+    acc.low.hi += l1;
+    acc.high.lo += h0;
+    acc.high.hi += h1;
+}
+
+// Collapses the four limb sums to an ordinary 64-bit representative. With
+// 2^64 == EPSILON and 2^96 == 2^32 * EPSILON == -1 (mod p) the accumulated
+// value is
+//   low.lo + low.hi * 2^32 + high.lo * 2^64 + high.hi * 2^96
+//     == (low.lo - high.lo - high.hi) + (low.hi + high.lo) * 2^32   (mod p).
+// The positive part is precisely `lazy_t`'s (lo, hi) shape, so
+// `lazy_materialize` folds it; its proof needs only that the high word leave
+// room for `e = hh + carry` not to wrap, i.e. low.hi + high.lo < 2^64 - 2^32,
+// which the headroom note above establishes. The subtracted part is below
+// 2^33 * n <= 2^41 < p and the minuend is an arbitrary value < 2^64, which is
+// the operand range `gl_sub` is written for, so the result is a 64-bit
+// representative of the exact residue. Every consumer downstream
+// (`gl_mul_add` by the filter, then `gl_canonicalize`) is residue-exact for
+// any 64-bit representative, so the kernel's output is bit-identical to the
+// per-constraint reduction it replaces.
+inline ulong alpha_acc_materialize(alpha_acc_t acc) {
+    lazy_t positive = { acc.low.lo, acc.low.hi + acc.high.lo };
+    return gl_sub(lazy_materialize(positive), acc.high.lo + acc.high.hi);
+}
+
 inline void range_check_gate_emit(
+    ulong constraint,
+    constant ulong* alpha_powers,
+    uint alpha_stride,
+    thread alpha_acc_t accumulators[2],
+    uint constraint_index) {
+    alpha_acc_mul_add(
+        accumulators[0], constraint, alpha_powers[constraint_index]);
+    alpha_acc_mul_add(
+        accumulators[1], constraint, alpha_powers[alpha_stride + constraint_index]);
+}
+
+// Reducing emission, for the two quintic families only. Deferring costs four
+// extra live registers per challenge for the whole family body, and the
+// quintic gates are the only kinds whose own body is register-hungry enough to
+// care: the schoolbook product keeps nineteen field elements live and the
+// squaring twenty. Measured on the d16-heavy shape, deferring inside them is a
+// net loss -- dropping both families from the shape turns the kernel delta from
+// +0.4% to -2.3% -- while every other kind gains. They are also the kinds that
+// gain least: five and two multiplies per constraint respectively make the
+// accumulate a small share of their work. `alpha_acc_of` hands the family
+// result back to the shared tail, so the merge below is kind-agnostic.
+inline void range_check_gate_emit_strict(
     ulong constraint,
     constant ulong* alpha_powers,
     uint alpha_stride,
@@ -693,6 +770,12 @@ inline void range_check_gate_emit(
         gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
     accumulators[1] = gl_mul_add(
         constraint, alpha_powers[alpha_stride + constraint_index], accumulators[1]);
+}
+
+// Lifts an ordinary 64-bit representative into the deferred form: its two
+// halves are the (l0, l1) limb sums of a single product with a zero high half.
+inline alpha_acc_t alpha_acc_of(ulong value) {
+    return { lazy_of(value), { 0, 0 } };
 }
 
 // Each RangeCheck metadata record is ten uints:
@@ -785,7 +868,10 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
-        ulong gate_accumulators[2] = { 0, 0 };
+        alpha_acc_t gate_accumulators[2] = {
+            { { 0, 0 }, { 0, 0 } },
+            { { 0, 0 }, { 0, 0 } },
+        };
         uint constraint_index = 0;
         for (uint op = 0; op < num_ops; ++op) {
             ulong input = wires[(ulong)op * lde_rows + source_row];
@@ -823,8 +909,10 @@ kernel void range_check_gate_quotient(
             }
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        total[0] = gl_mul_add(
+            filter, alpha_acc_materialize(gate_accumulators[0]), total[0]);
+        total[1] = gl_mul_add(
+            filter, alpha_acc_materialize(gate_accumulators[1]), total[1]);
     }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
@@ -854,7 +942,10 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
-        ulong gate_accumulators[2] = { 0, 0 };
+        alpha_acc_t gate_accumulators[2] = {
+            { { 0, 0 }, { 0, 0 } },
+            { { 0, 0 }, { 0, 0 } },
+        };
         uint constraint_index = 0;
         if (kind == 0u) {
             // U32ArithmeticGate: six routed words followed by 32 base-4
@@ -1084,6 +1175,7 @@ kernel void range_check_gate_quotient(
                     constraint_index++);
             }
         } else if (kind == 4u) {
+            ulong strict_accumulators[2] = { 0, 0 };
             // QuinticMultiplicationGate: fifteen routed words per operation
             // (five limbs each for a, b and the claimed product c). The five
             // constraints are the schoolbook product limbs reduced by
@@ -1108,15 +1200,18 @@ kernel void range_check_gate_quotient(
                         ? gl_add(d[k], gl_mul(3, d[k + 5u]))
                         : d[k];
                     ulong c = wires[(routed_base + 10u + k) * lde_rows + source_row];
-                    range_check_gate_emit(
+                    range_check_gate_emit_strict(
                         gl_sub(term, c),
                         alpha_powers,
                         alpha_stride,
-                        gate_accumulators,
+                        strict_accumulators,
                         constraint_index++);
                 }
             }
+            gate_accumulators[0] = alpha_acc_of(strict_accumulators[0]);
+            gate_accumulators[1] = alpha_acc_of(strict_accumulators[1]);
         } else if (kind == 5u) {
+            ulong strict_accumulators[2] = { 0, 0 };
             // QuinticSquaringGate: ten routed words per operation (input
             // limbs a then output limbs c) plus ten temporary wires. Each
             // constraint checks one accumulation step of the squaring
@@ -1137,75 +1232,77 @@ kernel void range_check_gate_quotient(
                 }
 
                 // c[0]
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_mul(a[0], a[0]), extra[0]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[1]), a[4]), extra[0]), extra[1]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[3]), extra[1]), c[0]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[1]
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_mul(gl_mul(3, a[3]), a[3]), extra[2]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[1]), extra[2]), extra[3]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[2]), a[4]), extra[3]), c[1]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[2]
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_mul(a[1], a[1]), extra[4]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[2]), extra[4]), extra[5]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(6, a[3]), a[4]), extra[5]), c[2]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[3]
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_mul(gl_mul(3, a[4]), a[4]), extra[6]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[3]), extra[6]), extra[7]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[2]), extra[7]), c[3]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
 
                 // c[4]
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_mul(a[2], a[2]), extra[8]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[0]), a[4]), extra[8]), extra[9]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
-                range_check_gate_emit(
+                range_check_gate_emit_strict(
                     gl_sub(gl_add(gl_mul(gl_mul(2, a[1]), a[3]), extra[9]), c[4]),
-                    alpha_powers, alpha_stride, gate_accumulators,
+                    alpha_powers, alpha_stride, strict_accumulators,
                     constraint_index++);
             }
+            gate_accumulators[0] = alpha_acc_of(strict_accumulators[0]);
+            gate_accumulators[1] = alpha_acc_of(strict_accumulators[1]);
         } else if (kind == 6u) {
             uint bits = num_addends;
             uint num_extra_constants = result_limbs;
@@ -1430,6 +1527,18 @@ kernel void range_check_gate_quotient(
         } else if (kind == 11u) {
             // BaseSumGate: wire 0 is the sum and the next `num_ops` wires are
             // little-endian limbs. The addend-count slot carries base 2 or 4.
+            //
+            // The Horner step's `gl_mul(computed, base)` looks like free money
+            // -- both bases are powers of two, so doubling or `gl_quadruple`
+            // would replace a 128-bit product with one or two field adds, 63
+            // of them per row on the widest family. Measured, it is not:
+            // specializing the base outside the loop costs more in code
+            // duplication than the arithmetic saves. Recomposition-only,
+            // against the deferred-accumulator kernel: d18 160.9 -> 161.6 ms,
+            // d16-heavy 60.40 -> 60.53 ms, d14 4.135 -> 4.112 ms; splitting the
+            // range-constraint loop as well costs another 1.5 ms on d18. Both
+            // arms bit-exact, so this is a scheduling/footprint effect, not an
+            // arithmetic one. Keep the multiply.
             ulong base = num_addends;
             ulong computed = 0;
             for (uint remaining = num_ops; remaining > 0u; --remaining) {
@@ -1483,8 +1592,10 @@ kernel void range_check_gate_quotient(
                 constraint_index++);
         }
 
-        total[0] = gl_mul_add(filter, gate_accumulators[0], total[0]);
-        total[1] = gl_mul_add(filter, gate_accumulators[1], total[1]);
+        total[0] = gl_mul_add(
+            filter, alpha_acc_materialize(gate_accumulators[0]), total[0]);
+        total[1] = gl_mul_add(
+            filter, alpha_acc_materialize(gate_accumulators[1]), total[1]);
     }
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);

@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "4f1eeb2cfdc57c7e8ead4b3671c094baa9cf0e514cb77fb91e44e255f8615d67";
+    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -2028,9 +2028,9 @@ static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
+/// the GPU absorbs each prepared span while the CPU fills the next. Only used
+/// inside exclusive proving phases (nothing else contends for the GPU stream)
+/// and for large wide trees, where the overlap converts the previously serial
 /// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
@@ -2104,15 +2104,25 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
+    // Group-wise fill + absorb. Only the wide final wire tree prepares two
+    // eight-column sponge groups together: sixteen independent FFT columns
+    // expose enough Rayon work to occupy all twelve P-cores, and both absorb
+    // dispatches share one command buffer. Narrow final trees retain the
+    // promoted eight-column pipeline, so their first absorb still overlaps the
+    // next CPU fill. Commands on one queue remain ordered, and every prepared
+    // span is committed before the next fill starts.
     let groups = leaf_width.div_ceil(8);
+    let groups_per_fill = if leaf_count >= 1 << 20 && leaf_width >= 64 {
+        2
+    } else {
+        1
+    };
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
+    let mut absorb_commands: Vec<CommandBuffer> =
+        Vec::with_capacity(groups.div_ceil(groups_per_fill));
+    for group_start in (0..groups).step_by(groups_per_fill) {
+        let col_start = group_start * 8;
+        let chunk = (leaf_width - col_start).min(8 * groups_per_fill);
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
@@ -2125,24 +2135,29 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     )
                 })
                 .collect();
-            fill_group(group, &mut slices);
+            fill_group(group_start, &mut slices);
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
-            encoder.end_encoding();
+            for pass in 0..chunk.div_ceil(8) {
+                let group = group_start + pass;
+                let pass_col_start = group * 8;
+                let pass_chunk = (leaf_width - pass_col_start).min(8);
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, pass_col_start as u32);
+                set_u32(encoder, 7, pass_chunk as u32);
+                set_u32(encoder, 8, (group == 0) as u32);
+                set_u32(encoder, 9, (group == groups - 1) as u32);
+                dispatch(encoder, pipeline, leaf_count);
+                encoder.end_encoding();
+            }
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
             command_buffer.commit();

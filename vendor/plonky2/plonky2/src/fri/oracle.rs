@@ -169,9 +169,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             if let Some(mut columns) =
                 C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height)
             {
-                // Streamed exclusive-phase path: the backend absorbs each
-                // group of eight LDE columns while the CPU computes the next
-                // group, collapsing the serial FFT-then-hash commitment into
+                // Streamed exclusive-phase path: the backend absorbs prepared
+                // spans of LDE columns while the CPU computes the next span,
+                // collapsing the serial FFT-then-hash commitment into
                 // max(FFT, hash). Falls through to the classic fill + build
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
