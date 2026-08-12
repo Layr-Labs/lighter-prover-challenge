@@ -69,8 +69,9 @@ pub trait Poseidon2: PrimeField64 {
         for r in 0..ROUNDS_P {
             a[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
+            let (sa, sb) = Self::sbox_p_x2(&a[0], &b[0]);
+            a[0] = sa;
+            b[0] = sb;
             Self::internal_linear_layer_x2(a, b);
         }
     }
@@ -138,10 +139,12 @@ pub trait Poseidon2: PrimeField64 {
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             c[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             d[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
-            c[0] = Self::sbox_p(&c[0]);
-            d[0] = Self::sbox_p(&d[0]);
+            let (sa, sb) = Self::sbox_p_x2(&a[0], &b[0]);
+            let (sc, sd) = Self::sbox_p_x2(&c[0], &d[0]);
+            a[0] = sa;
+            b[0] = sb;
+            c[0] = sc;
+            d[0] = sd;
             Self::internal_linear_layer_x4(a, b, c, d);
         }
     }
@@ -278,6 +281,16 @@ pub trait Poseidon2: PrimeField64 {
     }
 
     fn sbox_p(a: &Self) -> Self;
+
+    /// `(sbox_p(a), sbox_p(b))` for two independent inputs.
+    ///
+    /// The partial rounds of `poseidon2_x2` and `poseidon2_x4` have several
+    /// S-boxes in flight at once, so an implementation can schedule the two
+    /// power chains against each other. The default just runs them in sequence.
+    #[inline]
+    fn sbox_p_x2(a: &Self, b: &Self) -> (Self, Self) {
+        (Self::sbox_p(a), Self::sbox_p(b))
+    }
 
     fn sbox_p_extension<F: FieldExtension<D, BaseField = Self>, const D: usize>(a: &F) -> F;
 
@@ -604,11 +617,57 @@ impl Poseidon2 for F {
     }
 
     #[inline]
+    #[cfg(not(target_arch = "aarch64"))]
     fn sbox_p(a: &Self) -> Self {
         let a2 = a.square();
         let a4 = a2.square();
         let a3 = *a * a2;
         a3 * a4
+    }
+
+    /// `a^7` through the same four products as the generic body, with the two
+    /// that are independent of each other issued together.
+    ///
+    /// Once `a^2` is known, `a^3 = a * a^2` and `a^4 = a^2 * a^2` depend on
+    /// nothing else, so they go through one `NeonGoldilocksField` multiply.
+    /// That is `mul_reduce_pair`: nine instructions per product against the
+    /// twelve the `Mul` impl's `reduce128` costs, and no borrow branch. The
+    /// arithmetic is unchanged — the paired assembly computes the same
+    /// intermediates and yields the same `u64` representative per product as
+    /// `reduce128`, so `a^3`, `a^4` and the final `a^3 * a^4` are bit-identical
+    /// to the generic body's.
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    fn sbox_p(a: &Self) -> Self {
+        use crate::field::NeonGoldilocksField;
+
+        let a2 = a.square();
+        let a34 = NeonGoldilocksField([*a, a2]) * NeonGoldilocksField([a2, a2]);
+        a34.0[0] * a34.0[1]
+    }
+
+    /// Two `a^7` chains sharing every multiply with a partner.
+    ///
+    /// Eight products in four paired multiplies, three deep: the two squarings
+    /// pair across the inputs, the `a^3`/`a^4` step pairs within each input
+    /// (the arrangement that keeps the chain at three), and the closing
+    /// `a^3 * a^4` pairs across again. Each product is the same `u64` the
+    /// scalar `sbox_p` would produce for that input.
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    fn sbox_p_x2(a: &Self, b: &Self) -> (Self, Self) {
+        use crate::field::NeonGoldilocksField;
+
+        let ab = NeonGoldilocksField([*a, *b]);
+        let ab2 = ab * ab;
+        let (a2, b2) = (ab2.0[0], ab2.0[1]);
+
+        let a34 = NeonGoldilocksField([*a, a2]) * NeonGoldilocksField([a2, a2]);
+        let b34 = NeonGoldilocksField([*b, b2]) * NeonGoldilocksField([b2, b2]);
+
+        let ab7 =
+            NeonGoldilocksField([a34.0[0], b34.0[0]]) * NeonGoldilocksField([a34.0[1], b34.0[1]]);
+        (ab7.0[0], ab7.0[1])
     }
 
     #[inline]
@@ -1107,7 +1166,7 @@ mod test {
     use rand::{RngCore, thread_rng};
 
     use super::*;
-    use crate::field::types::PrimeField64;
+    use crate::field::types::{Field64, PrimeField64};
     use crate::hash::hashing::hash_n_to_m_no_pad;
     use crate::hash::poseidon2::p3::p3_poseidon2_hash_n_to_m_no_pad;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
@@ -1137,6 +1196,92 @@ mod test {
                 expected_output_f[i].to_canonical_u64(),
                 expected_output_f3[i].as_canonical_u64()
             );
+        }
+    }
+
+    /// The partial-round S-box raised to a seventh power, written the way the
+    /// generic body writes it. Both `sbox_p` and `sbox_p_x2` have to reproduce
+    /// this on the raw `u64`, not merely on the field value: `GoldilocksField`
+    /// is compared and hashed in whatever non-canonical representative it
+    /// happens to hold, so a different representative is a different state.
+    fn scalar_sbox_p(a: F) -> F {
+        let a2 = a.square();
+        let a4 = a2.square();
+        let a3 = a * a2;
+        a3 * a4
+    }
+
+    /// Inputs that exercise both conditional folds of the reduction: the rare
+    /// borrow in `x_lo - x_hi_hi` and the carry out of the `EPSILON` add.
+    fn sbox_p_test_values() -> Vec<F> {
+        let mut rng = thread_rng();
+        let mut values = vec![
+            F(0),
+            F(1),
+            F(2),
+            F(F::ORDER - 1),
+            F(F::ORDER),
+            F(F::ORDER + 1),
+            F(u32::MAX as u64),
+            F(1 << 32),
+            F(u64::MAX),
+            F(u64::MAX - 1),
+            F(0xffff_ffff_0000_0001),
+            F(0x0000_0000_ffff_ffff),
+        ];
+        values.extend((0..64).map(|_| F(rng.next_u64())));
+        values
+    }
+
+    #[test]
+    fn sbox_p_matches_scalar_power_chain() {
+        for a in sbox_p_test_values() {
+            assert_eq!(
+                F::sbox_p(&a).0,
+                scalar_sbox_p(a).0,
+                "sbox_p({:#x}) changed representative",
+                a.0
+            );
+            assert_eq!(F::sbox_p(&a), a.exp_u64(7), "sbox_p({:#x}) is not a^7", a.0);
+        }
+    }
+
+    #[test]
+    fn sbox_p_x2_matches_two_scalar_chains() {
+        let values = sbox_p_test_values();
+        // Every ordered pair, including a value with itself, so a lane mix-up
+        // in either direction shows up.
+        for &a in &values {
+            for &b in &values {
+                let (x, y) = F::sbox_p_x2(&a, &b);
+                assert_eq!(x.0, scalar_sbox_p(a).0, "lane 0 for {:#x}", a.0);
+                assert_eq!(y.0, scalar_sbox_p(b).0, "lane 1 for {:#x}", b.0);
+            }
+        }
+    }
+
+    /// `poseidon2_x2` and `poseidon2_x4` now reach their partial-round S-boxes
+    /// through `sbox_p_x2`; each state must still come out equal to the
+    /// single-state permutation, element for element and bit for bit.
+    #[test]
+    fn poseidon2_batched_matches_single_state() {
+        let mut rng = thread_rng();
+        for _ in 0..64 {
+            let states: [[F; WIDTH]; 4] =
+                core::array::from_fn(|_| core::array::from_fn(|_| F(rng.next_u64())));
+            let expected = states.map(F::poseidon2);
+
+            let (a, b) = F::poseidon2_x2(states[0], states[1]);
+            let (c, d, e, f) = F::poseidon2_x4(states[0], states[1], states[2], states[3]);
+
+            for i in 0..WIDTH {
+                assert_eq!(a[i].0, expected[0][i].0);
+                assert_eq!(b[i].0, expected[1][i].0);
+                assert_eq!(c[i].0, expected[0][i].0);
+                assert_eq!(d[i].0, expected[1][i].0);
+                assert_eq!(e[i].0, expected[2][i].0);
+                assert_eq!(f[i].0, expected[3][i].0);
+            }
         }
     }
 
