@@ -41,6 +41,25 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
+//
+// `narenas` is left at jemalloc's default (`4 * num_cpus`, so ~48 arenas on
+// this 12-core host) even though the process spawns roughly a hundred
+// short-lived scoped threads per worker (`prove_path`'s per-chunk tx/chain
+// threads, `prove_block_after_pre`'s three proving lanes). jemalloc assigns
+// each new thread an arena round-robin; with far more arenas than
+// concurrently-live threads, a thread that repeats an earlier thread's
+// alloc/free shape (chunk N+1 doing the same witness/coefficient sizes as
+// chunk N) usually lands on a *different* arena and cannot reuse that
+// arena's freed extents, forcing a fresh mmap/fault instead. Capping
+// `narenas` to the small number of lanes that are ever concurrently live
+// (heavy-tx-chain, light-tx-chain, block-circuit-build, plus slack) raises
+// the odds that consecutive same-shape allocations land in the same arena.
+// This changes only which arena backs an allocation, never a computed
+// value, and is independent of and does not touch the decay setting above.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 10] = b"narenas:4\0";
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
@@ -252,4 +271,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// p90-fire-top1-34-1786503529
+// p90-fire-top1-25-1786496403
