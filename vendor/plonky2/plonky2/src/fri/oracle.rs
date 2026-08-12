@@ -684,9 +684,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail(
+            coset_fft_zero_tail::<F, D>(
                 &lde_final_poly,
-                F::coset_shift().into(),
+                F::coset_shift(),
                 live_coeffs,
                 Some(fri_params.config.rate_bits),
                 None,
@@ -723,24 +723,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 /// would have computed there; the FFT input is therefore element-wise
 /// identical. With `rate_bits = 3` that deletes 7/8 of the extension-field
 /// multiplies *and* 7/8 of the serial `powers()` chain, at one memset.
-pub(crate) fn coset_fft_zero_tail<F: Field>(
-    coeffs: &PolynomialCoeffs<F>,
+pub(crate) fn coset_fft_zero_tail<F: Field + Extendable<D>, const D: usize>(
+    coeffs: &PolynomialCoeffs<F::Extension>,
     shift: F,
     live: usize,
     zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F>>,
-) -> PolynomialValues<F> {
+    root_table: Option<&FftRootTable<F::Extension>>,
+) -> PolynomialValues<F::Extension> {
     let len = coeffs.len();
     debug_assert!(live <= len);
     let zero_tail_is_unread =
         matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
-    debug_assert!(zero_tail_is_unread || coeffs.coeffs[live..].iter().all(F::is_zero));
+    debug_assert!(zero_tail_is_unread || coeffs.coeffs[live..].iter().all(F::Extension::is_zero));
     let mut scaled = Vec::with_capacity(len);
     scaled.extend(
         shift
             .powers()
             .zip(&coeffs.coeffs[..live])
-            .map(|(r, &c)| r * c),
+            .map(|(scalar, &value)| {
+                <F::Extension as Field>::mul_fft_base_twiddle(scalar.into(), value)
+            }),
     );
     if zero_tail_is_unread {
         // SAFETY: capacity is exactly `len`. The zero-padded FFT reads only
@@ -749,7 +751,7 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         // invariant the `lde_values` fast path relies on.
         unsafe { scaled.set_len(len) };
     } else {
-        scaled.resize(len, F::ZERO);
+        scaled.resize(len, F::Extension::ZERO);
     }
     if crate::hash::poseidon2::is_exclusive_gpu_phase() {
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
@@ -995,35 +997,138 @@ mod tests {
     /// field and the quadratic extension actually used by FRI.
     #[test]
     fn coset_fft_zero_tail_matches_classic() {
-        fn check<F: Field + Sample>() {
+        fn check<const D: usize>()
+        where
+            GoldilocksField: Extendable<D>,
+            <GoldilocksField as Extendable<D>>::Extension: Sample,
+        {
+            type F = GoldilocksField;
             for lg_n in [1usize, 2, 4, 6, 9] {
                 let n = 1usize << lg_n;
                 for rate_bits in 1..=3usize.min(lg_n) {
                     let support = n >> rate_bits;
                     for live in [support, support / 2, support.saturating_sub(1)] {
-                        let mut coeffs = F::rand_vec(live);
-                        coeffs.resize(n, F::ZERO);
+                        let mut coeffs =
+                            <<F as Extendable<D>>::Extension as Sample>::rand_vec(live);
+                        coeffs.resize(n, <<F as Extendable<D>>::Extension as Field>::ZERO);
                         let poly = PolynomialCoeffs::new(coeffs);
                         let shift = F::rand();
                         let expected =
-                            poly.coset_fft_with_options(shift, Some(rate_bits), None);
+                            poly.coset_fft_with_options(shift.into(), Some(rate_bits), None);
                         let actual =
-                            coset_fft_zero_tail(&poly, shift, live, Some(rate_bits), None);
+                            coset_fft_zero_tail::<F, D>(&poly, shift, live, Some(rate_bits), None);
                         assert_eq!(actual.values, expected.values);
                     }
                 }
                 // `rate_bits = 0` is the degenerate no-tail case.
-                let poly = PolynomialCoeffs::new(F::rand_vec(n));
+                let poly =
+                    PolynomialCoeffs::new(<<F as Extendable<D>>::Extension as Sample>::rand_vec(n));
                 let shift = F::rand();
                 assert_eq!(
-                    coset_fft_zero_tail(&poly, shift, n, None, None).values,
-                    poly.coset_fft_with_options(shift, None, None).values
+                    coset_fft_zero_tail::<F, D>(&poly, shift, n, None, None).values,
+                    poly.coset_fft_with_options(shift.into(), None, None).values
                 );
             }
         }
 
-        check::<GoldilocksField>();
-        check::<<GoldilocksField as Extendable<2>>::Extension>();
+        check::<1>();
+        check::<2>();
+    }
+
+    #[test]
+    fn base_shift_powers_match_embedded_ext2_raw_limbs() {
+        use crate::field::extension::quadratic::QuadraticExtension;
+        use crate::field::types::{Field64, PrimeField64};
+
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        let shifts = [
+            F::coset_shift(),
+            GoldilocksField(0),
+            GoldilocksField(1),
+            GoldilocksField(F::ORDER - 1),
+            GoldilocksField(F::ORDER),
+            GoldilocksField(F::ORDER + 1),
+            GoldilocksField(u64::MAX),
+        ];
+        for shift in shifts {
+            for (index, (base_power, extension_power)) in shift
+                .powers()
+                .zip(FE::from(shift).powers())
+                .take(257)
+                .enumerate()
+            {
+                assert_eq!(
+                    [base_power.to_noncanonical_u64(), 0],
+                    extension_power.0.map(|limb| limb.to_noncanonical_u64()),
+                    "shift={}, index={index}",
+                    shift.to_noncanonical_u64(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coset_fft_zero_tail_base_shift_matches_extension_path_raw_with_poisoned_tail() {
+        use crate::field::extension::quadratic::QuadraticExtension;
+        use crate::field::types::{Field64, PrimeField64};
+
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        fn raw(values: &[FE]) -> Vec<u64> {
+            values
+                .iter()
+                .flat_map(|value| value.0)
+                .map(|limb: GoldilocksField| limb.to_noncanonical_u64())
+                .collect()
+        }
+
+        let specials = [0, 1, F::ORDER - 1, F::ORDER, F::ORDER + 1, u64::MAX];
+        for lg_n in [2usize, 4, 7, 9] {
+            let n = 1usize << lg_n;
+            for rate_bits in 1..=3usize.min(lg_n - 1) {
+                let live = n >> rate_bits;
+                debug_assert!(live >= 2);
+                let live_coeffs = (0..live)
+                    .map(|index| {
+                        QuadraticExtension([
+                            GoldilocksField(specials[index % specials.len()]),
+                            GoldilocksField(specials[(index * 5 + 1) % specials.len()]),
+                        ])
+                    })
+                    .collect::<Vec<_>>();
+                let mut historical_coeffs = live_coeffs.clone();
+                historical_coeffs.resize(n, FE::ZERO);
+                let historical = PolynomialCoeffs::new(historical_coeffs).coset_fft_with_options(
+                    FE::from(F::coset_shift()),
+                    Some(rate_bits),
+                    None,
+                );
+
+                let mut poisoned_coeffs = live_coeffs.clone();
+                poisoned_coeffs.resize(
+                    n,
+                    QuadraticExtension([
+                        GoldilocksField(u64::MAX),
+                        GoldilocksField(F::ORDER.wrapping_add(1)),
+                    ]),
+                );
+                let specialized = coset_fft_zero_tail::<F, 2>(
+                    &PolynomialCoeffs::new(poisoned_coeffs),
+                    F::coset_shift(),
+                    live,
+                    Some(rate_bits),
+                    None,
+                );
+                assert_eq!(
+                    raw(&specialized.values),
+                    raw(&historical.values),
+                    "n={n}, rate_bits={rate_bits}, live={live}",
+                );
+            }
+        }
     }
 
     /// The fused quotient accumulation must be bit-identical (raw u64

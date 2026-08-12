@@ -216,9 +216,9 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // unread — everything below this loop uses only `coeffs` — so the
         // last round's transform is entirely dead work. Skip it.
         if round + 1 < num_rounds {
-            values = coset_fft_zero_tail(
+            values = coset_fft_zero_tail::<F, D>(
                 &coeffs,
-                shift.into(),
+                shift,
                 live_chunks,
                 Some(fri_params.config.rate_bits),
                 None,
