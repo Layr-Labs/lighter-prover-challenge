@@ -27,8 +27,8 @@ use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witne
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
-use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
+use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
     eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
@@ -36,8 +36,8 @@ use crate::plonk::vanishing_poly::{
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
+use crate::util::log2_ceil;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -181,10 +181,7 @@ where
         count("degree_rows", degree);
         count("lde_rows", common_data.lde_size());
         count("wire_values", degree * config.num_wires);
-        count(
-            "routed_wire_values",
-            degree * config.num_routed_wires,
-        );
+        count("routed_wire_values", degree * config.num_routed_wires);
         count(
             "quotient_domain_points",
             degree * common_data.quotient_degree_factor,
@@ -335,6 +332,7 @@ where
     challenger.observe_cap::<C::Hasher>(&partial_products_zs_and_lookup_commitment.merkle_tree.cap);
 
     let alphas = challenger.get_n_challenges(num_challenges);
+    let quotient_normalization = quotient_normalization_for_proof();
 
     let quotient_polys = timed!(
         timing,
@@ -354,6 +352,7 @@ where
             // circuit has no lookups; the per-point path otherwise.
             !has_lookup,
             true,
+            quotient_normalization,
         )
     );
 
@@ -375,6 +374,7 @@ where
             &alphas,
             true,
             false,
+            quotient_normalization,
         );
         assert_eq!(quotient_polys.len(), reference.len());
         for (p, (actual, expected)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
@@ -414,6 +414,7 @@ where
             &alphas,
             false,
             false,
+            quotient_normalization,
         );
         assert_eq!(quotient_polys.len(), reference.len());
         for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
@@ -427,6 +428,65 @@ where
             }
         }
     }
+
+    // Test-only field-semantic oracle for the normalization seam. Recompute
+    // from the same commitments and challenges with the pre-change
+    // per-contribution multiplication order and compare every final quotient
+    // coefficient canonically.
+    #[cfg(test)]
+    let normalization_reference = if quotient_normalization == QuotientNormalization::Deferred
+        && COMPARE_QUOTIENT_NORMALIZATIONS.with(core::cell::Cell::get)
+    {
+        let reference = compute_quotient_polys::<F, C, D>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            &betas,
+            &gammas,
+            &beta_k_is,
+            &deltas,
+            &alphas,
+            !has_lookup,
+            true,
+            QuotientNormalization::PerContribution,
+        );
+        assert_eq!(quotient_polys.len(), reference.len());
+        for (poly, (actual, expected)) in quotient_polys.iter().zip(&reference).enumerate() {
+            assert_eq!(actual.coeffs.len(), expected.coeffs.len());
+            for (coefficient, (actual, expected)) in
+                actual.coeffs.iter().zip(&expected.coeffs).enumerate()
+            {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "quotient normalization divergence: poly {poly}, coefficient {coefficient}"
+                );
+            }
+        }
+        Some(reference)
+    } else {
+        None
+    };
+
+    #[cfg(test)]
+    let normalization_reference_chunks = normalization_reference.and_then(|quotient_polys| {
+        if !COMPARE_QUOTIENT_NORMALIZATION_COMMITMENT.with(core::cell::Cell::get) {
+            return None;
+        }
+        Some(
+            quotient_polys
+                .into_par_iter()
+                .flat_map(|mut quotient_poly| {
+                    quotient_poly.trim_to_len(quotient_degree).expect(
+                        "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                    );
+                    quotient_poly.chunks(degree)
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
 
     let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
         timing,
@@ -456,6 +516,29 @@ where
         )
     );
 
+    #[cfg(test)]
+    let normalization_reference_commitment = normalization_reference_chunks.map(|chunks| {
+        assert!(
+            !config.zero_knowledge,
+            "normalization commitment differential requires unblinded quotient polynomials"
+        );
+        PolynomialBatch::<F, C, D>::from_coeffs(
+            chunks,
+            config.fri_config.rate_bits,
+            false,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+    });
+    #[cfg(test)]
+    if let Some(reference) = &normalization_reference_commitment {
+        assert_eq!(
+            quotient_polys_commitment.merkle_tree.cap, reference.merkle_tree.cap,
+            "quotient normalization commitment divergence"
+        );
+    }
+
     challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
 
     let zeta = challenger.get_extension_challenge::<D>();
@@ -481,6 +564,22 @@ where
             common_data
         )
     );
+    #[cfg(test)]
+    if let Some(reference) = &normalization_reference_commitment {
+        let reference_openings = OpeningSet::new(
+            zeta,
+            g,
+            &prover_data.constants_sigmas_commitment,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            reference,
+            common_data,
+        );
+        assert_eq!(
+            openings, reference_openings,
+            "quotient normalization opening divergence"
+        );
+    }
     challenger.observe_openings(&openings.to_fri_openings());
     let instance = common_data.get_fri_instance(zeta);
 
@@ -672,14 +771,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
     let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
     {
-        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_0,
-            product_count,
-        );
-        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_1,
-            product_count,
-        );
+        let product_slots_0 =
+            crate::hash::merkle_tree::capacity_up_to_mut(&mut quotient_products_0, product_count);
+        let product_slots_1 =
+            crate::hash::merkle_tree::capacity_up_to_mut(&mut quotient_products_1, product_count);
         product_slots_0
             .par_chunks_mut(INV_BATCH * num_chunks)
             .zip(product_slots_1.par_chunks_mut(INV_BATCH * num_chunks))
@@ -804,8 +899,10 @@ fn wires_permutation_partial_products_and_zs<
     // witness generation and the Zs/partial-products commitment.
     let product_count = subgroup.len() * num_chunks;
     let mut all_quotient_chunk_products: Vec<F> = Vec::with_capacity(product_count);
-    let product_slots =
-        crate::hash::merkle_tree::capacity_up_to_mut(&mut all_quotient_chunk_products, product_count);
+    let product_slots = crate::hash::merkle_tree::capacity_up_to_mut(
+        &mut all_quotient_chunk_products,
+        product_count,
+    );
     product_slots
         .par_chunks_mut(INV_BATCH * num_chunks)
         .zip(subgroup.par_chunks(INV_BATCH))
@@ -1019,6 +1116,76 @@ fn compute_all_lookup_polys<
 }
 
 const BATCH_SIZE: usize = 32;
+
+/// Controls where the common quotient denominator inverse is applied.
+/// Production always accumulates every numerator contribution first and
+/// normalizes once while scattering into challenge columns. The former
+/// per-contribution order is retained only as a test oracle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotientNormalization {
+    Deferred,
+    #[cfg(test)]
+    PerContribution,
+}
+
+impl QuotientNormalization {
+    #[inline(always)]
+    fn is_per_contribution(self) -> bool {
+        match self {
+            Self::Deferred => false,
+            #[cfg(test)]
+            Self::PerContribution => true,
+        }
+    }
+
+    #[inline(always)]
+    fn finish<F: Field>(self, value: F, denominator_inv: F) -> F {
+        if self.is_per_contribution() {
+            value
+        } else {
+            value * denominator_inv
+        }
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FORCE_PER_CONTRIBUTION_QUOTIENT_NORMALIZATION: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+    static COMPARE_QUOTIENT_NORMALIZATIONS: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+    static COMPARE_QUOTIENT_NORMALIZATION_COMMITMENT: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+    static DEFERRED_QUOTIENT_NORMALIZATION_CALLS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "std", target_arch = "aarch64", target_os = "macos"))]
+std::thread_local! {
+    static GPU_POSEIDON_QUOTIENT_STARTED_FOR_TESTS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static GPU_POSEIDON_QUOTIENT_COMPLETED_FOR_TESTS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static GPU_RANGE_QUOTIENT_STARTED_FOR_TESTS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static GPU_RANGE_QUOTIENT_COMPLETED_FOR_TESTS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static GPU_PERMUTATION_QUOTIENT_STARTED_FOR_TESTS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static GPU_PERMUTATION_QUOTIENT_COMPLETED_FOR_TESTS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn quotient_normalization_for_proof() -> QuotientNormalization {
+    #[cfg(test)]
+    if FORCE_PER_CONTRIBUTION_QUOTIENT_NORMALIZATION.with(core::cell::Cell::get) {
+        return QuotientNormalization::PerContribution;
+    }
+    QuotientNormalization::Deferred
+}
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
@@ -1245,6 +1412,8 @@ fn start_gpu_poseidon_gate_quotient<
         alpha_offset,
     )?;
     let started = GPU_POSEIDON_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(test)]
+    GPU_POSEIDON_QUOTIENT_STARTED_FOR_TESTS.with(|count| count.set(count.get() + 1));
     log::info!(
         "Metal Poseidon2 gate quotient active: started={started}, gate={gate_index}, \
          selector={selector_index}, rows={quotient_rows}, step={step}, challenges={}, \
@@ -1291,14 +1460,13 @@ fn start_gpu_range_check_gate_quotient<
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
 )> {
     use core::sync::atomic::Ordering;
+
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
-    use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
-    };
+    use crate::hash::poseidon2::metal::{RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec};
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     // `EqualityGate` reads a gate-local constant, whose commitment column is
@@ -1336,9 +1504,7 @@ fn start_gpu_range_check_gate_quotient<
         let u32_gate = gate.0.u32_quotient_gate();
         if range.is_some() && u32_gate.is_some() {
             if gpu_poseidon_quotient_diagnostics_enabled() {
-                eprintln!(
-                    "[gpu-range-quotient] gate {gate_index} advertised conflicting layouts"
-                );
+                eprintln!("[gpu-range-quotient] gate {gate_index} advertised conflicting layouts");
             }
             return None;
         }
@@ -1394,10 +1560,7 @@ fn start_gpu_range_check_gate_quotient<
                 // Every width shares one layout: five routed words per
                 // operation followed by `base_bits / 2` base-4 result limbs,
                 // so the wire and constraint counts are linear in the width.
-                U32QuotientGate::Subtraction {
-                    num_ops,
-                    base_bits,
-                } => {
+                U32QuotientGate::Subtraction { num_ops, base_bits } => {
                     let Some(result_limbs) = supported_quotient_result_limbs(base_bits) else {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
                             eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
@@ -1425,9 +1588,7 @@ fn start_gpu_range_check_gate_quotient<
                     };
                     if num_addends == 0 || num_addends > 16 || num_carry_limbs == 0 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid U32 metadata: {u32_gate:?}");
                         }
                         return None;
                     }
@@ -1446,9 +1607,7 @@ fn start_gpu_range_check_gate_quotient<
                 U32QuotientGate::ByteDecomposition { num_ops, num_limbs } => {
                     if num_limbs == 0 || num_limbs > 24 {
                         if gpu_poseidon_quotient_diagnostics_enabled() {
-                            eprintln!(
-                                "[gpu-range-quotient] invalid byte metadata: {u32_gate:?}"
-                            );
+                            eprintln!("[gpu-range-quotient] invalid byte metadata: {u32_gate:?}");
                         }
                         return None;
                     }
@@ -1626,9 +1785,7 @@ fn start_gpu_range_check_gate_quotient<
                     reducing.num_coeffs.checked_mul(2)?,
                 ))
             }
-        } else if let Some(reducing) =
-            gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
-        {
+        } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>() {
             if D != 2 {
                 None
             } else {
@@ -1730,6 +1887,8 @@ fn start_gpu_range_check_gate_quotient<
     };
     gate_indices.extend(random_access_gate_indices);
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(test)]
+    GPU_RANGE_QUOTIENT_STARTED_FOR_TESTS.with(|count| count.set(count.get() + 1));
     log::info!(
         "Metal RangeCheck quotient active: started={started}, gates={gate_indices:?}, \
          rows={quotient_rows}, step={step}, shared_columns=true"
@@ -1790,12 +1949,13 @@ fn start_gpu_permutation_quotient<
         beta_k_is,
         alphas,
     )?;
+    #[cfg(test)]
+    GPU_PERMUTATION_QUOTIENT_STARTED_FOR_TESTS.with(|count| count.set(count.get() + 1));
     if gpu_poseidon_quotient_diagnostics_enabled() {
         eprintln!(
             "[gpu-permutation-quotient] active rows={quotient_rows} step={step} \
              routed={} partials={} shared_columns=true",
-            common_data.config.num_routed_wires,
-            common_data.num_partial_products,
+            common_data.config.num_routed_wires, common_data.num_partial_products,
         );
     }
     Some(job)
@@ -1819,6 +1979,7 @@ fn compute_quotient_polys<
     alphas: &[F],
     col_major_perm: bool,
     allow_gpu_poseidon: bool,
+    normalization: QuotientNormalization,
 ) -> Vec<PolynomialCoeffs<F>> {
     let num_challenges = common_data.config.num_challenges;
 
@@ -1958,12 +2119,11 @@ fn compute_quotient_polys<
     // computed once per circuit shape for the process and shared across proofs. Each cached
     // entry is bit-identical to the per-point inversion it replaces.
     #[cfg(feature = "std")]
-    let z_h_on_coset = z_h_on_coset.with_l_0_denominator_inverses(
-        l_0_table_cache::l_0_denominator_inverses::<F>(
+    let z_h_on_coset =
+        z_h_on_coset.with_l_0_denominator_inverses(l_0_table_cache::l_0_denominator_inverses::<F>(
             common_data.degree_bits(),
             quotient_degree_bits,
-        ),
-    );
+        ));
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -2056,8 +2216,7 @@ fn compute_quotient_polys<
         eprintln!(
             "[gpu-gate-quotient] CPU wire gather width {cpu_num_wires}/{}; \
              constraint rows {cpu_num_gate_constraints}/{}; excluded={excluded_gate_indices:?}",
-            common_data.config.num_wires,
-            common_data.num_gate_constraints,
+            common_data.config.num_wires, common_data.num_gate_constraints,
         );
     }
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2334,14 +2493,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if normalization.is_per_contribution() {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2351,6 +2512,8 @@ fn compute_quotient_polys<
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                GPU_POSEIDON_QUOTIENT_COMPLETED_FOR_TESTS.with(|count| count.set(count.get() + 1));
                 values
             }
             Err(error) => {
@@ -2376,20 +2539,28 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    normalization,
                 );
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        if normalization.is_per_contribution() {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        } else {
+            quotient_values
+                .par_iter_mut()
+                .zip(gpu_values.par_iter())
+                .for_each(|(cpu, &gpu)| *cpu += gpu);
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2397,6 +2568,8 @@ fn compute_quotient_polys<
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                #[cfg(test)]
+                GPU_RANGE_QUOTIENT_COMPLETED_FOR_TESTS.with(|count| count.set(count.get() + 1));
                 values
             }
             Err(error) => {
@@ -2405,9 +2578,7 @@ fn compute_quotient_polys<
                     "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
                 if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
+                    eprintln!("[gpu-range-quotient] runtime failure; falling back to CPU: {error}");
                 }
                 let result = compute_quotient_polys(
                     common_data,
@@ -2422,6 +2593,7 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    normalization,
                 );
                 #[cfg(test)]
                 job.mark_cpu_recompute_completed_for_tests();
@@ -2429,22 +2601,34 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        if normalization.is_per_contribution() {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        } else {
+            quotient_values
+                .par_iter_mut()
+                .zip(gpu_values.par_iter())
+                .for_each(|(cpu, &gpu)| *cpu += gpu);
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some(job) = &gpu_permutation {
         let gpu_values = match job.finish() {
-            Ok(values) => values,
+            Ok(values) => {
+                #[cfg(test)]
+                GPU_PERMUTATION_QUOTIENT_COMPLETED_FOR_TESTS
+                    .with(|count| count.set(count.get() + 1));
+                values
+            }
             Err(error) => {
                 log::warn!(
                     "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
@@ -2462,20 +2646,38 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    normalization,
                 );
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        if normalization.is_per_contribution() {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .zip(gpu_values.par_chunks_exact(num_challenges))
+                .enumerate()
+                .for_each(|(i, (cpu_values, gpu_values))| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                        *cpu += gpu * denominator_inv;
+                    }
+                });
+        } else {
+            quotient_values
+                .par_iter_mut()
+                .zip(gpu_values.par_iter())
+                .for_each(|(cpu, &gpu)| *cpu += gpu);
+        }
+    }
+
+    #[cfg(test)]
+    match normalization {
+        QuotientNormalization::Deferred => {
+            DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(|count| count.set(count.get() + 1));
+        }
+        QuotientNormalization::PerContribution => {
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(|count| count.set(count.get() + 1));
+        }
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2510,9 +2712,16 @@ fn compute_quotient_polys<
         .for_each(|(chunk_i, chunk)| {
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                let denominator_inv = if normalization.is_per_contribution() {
+                    F::ONE
+                } else {
+                    z_h_on_coset.eval_inverse(base + k)
+                };
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
                     // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    unsafe {
+                        *column.0.add(base + k) = normalization.finish(value, denominator_inv)
+                    };
                 }
             }
         });
@@ -2599,7 +2808,10 @@ pub(crate) mod precomputed {
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             get_or_compute(&SHIFTED_SUBGROUPS, n_log, || {
                 let shift = F::coset_shift();
-                two_adic_subgroup::<F>(n_log).iter().map(|&x| shift * x).collect()
+                two_adic_subgroup::<F>(n_log)
+                    .iter()
+                    .map(|&x| shift * x)
+                    .collect()
             })
         }
 
@@ -2632,7 +2844,12 @@ pub(crate) mod precomputed {
 
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             let shift = F::coset_shift();
-            Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
+            Arc::new(
+                F::two_adic_subgroup(n_log)
+                    .into_iter()
+                    .map(|x| shift * x)
+                    .collect::<Vec<F>>(),
+            )
         }
 
         pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
@@ -2655,16 +2872,28 @@ pub(crate) mod precomputed {
 #[cfg(test)]
 mod quotient_layout_tests {
     use core::sync::atomic::Ordering;
+    use std::sync::Arc;
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{
+        gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT,
+        GPU_PERMUTATION_QUOTIENT_COMPLETED_FOR_TESTS, GPU_PERMUTATION_QUOTIENT_STARTED_FOR_TESTS,
+        GPU_POSEIDON_QUOTIENT_COMPLETED_FOR_TESTS, GPU_POSEIDON_QUOTIENT_STARTED_FOR_TESTS,
+        GPU_RANGE_QUOTIENT_COMPLETED_FOR_TESTS, GPU_RANGE_QUOTIENT_STARTED_FOR_TESTS,
+    };
+    use super::{
+        precomputed, BatchLayout, QuotientNormalization, COMPARE_QUOTIENT_LAYOUTS,
+        COMPARE_QUOTIENT_NORMALIZATIONS, COMPARE_QUOTIENT_NORMALIZATION_COMMITMENT,
+        DEFERRED_QUOTIENT_NORMALIZATION_CALLS, FORCE_PER_CONTRIBUTION_QUOTIENT_NORMALIZATION,
+        PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS,
+    };
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
+    use crate::gates::lookup_table::LookupTable;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::noop::NoopGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2672,16 +2901,17 @@ mod quotient_layout_tests {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
 
-    fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
-        let config = CircuitConfig::standard_recursion_config();
+    fn small_circuit_with_config(
+        config: CircuitConfig,
+    ) -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let mut builder = CircuitBuilder::<F, D>::new(config);
         let x = builder.add_virtual_target();
         let mut cur = x;
@@ -2695,6 +2925,233 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
+        small_circuit_with_config(CircuitConfig::standard_recursion_config())
+    }
+
+    fn accumulate_quotient_contributions(
+        normalization: QuotientNormalization,
+        cpu: F,
+        gpu: [F; 3],
+        mask: u8,
+        denominator_inv: F,
+    ) -> F {
+        let mut value = if normalization.is_per_contribution() {
+            cpu * denominator_inv
+        } else {
+            cpu
+        };
+        for (contribution, bit) in gpu.into_iter().zip([1u8, 2, 4]) {
+            if mask & bit != 0 {
+                value += if normalization.is_per_contribution() {
+                    contribution * denominator_inv
+                } else {
+                    contribution
+                };
+            }
+        }
+        normalization.finish(value, denominator_inv)
+    }
+
+    /// The deferred expression `(((C + P) + R) + M) * I` is equal as a field
+    /// element to the legacy `C*I + P*I + R*I + M*I`, for every subset of GPU
+    /// contributions. Deliberately noncanonical representatives also pin that
+    /// the two evaluation orders are not being confused with raw-bit identity.
+    #[test]
+    fn deferred_normalization_matches_per_contribution_canonically() {
+        let order = F::ORDER;
+        let raw = [
+            0,
+            1,
+            2,
+            3,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            order - 2,
+            order - 1,
+            order,
+            order + 1,
+            u64::MAX - 1,
+            u64::MAX,
+            0xffff_ffff_0000_0000,
+            0x8000_0000_0000_0001,
+            0x1234_5678_9abc_def0,
+        ];
+        let mut observed_raw_difference = false;
+
+        for seed in 0..raw.len() {
+            let cpu = F::from_noncanonical_u64(raw[seed]);
+            let gpu = [
+                F::from_noncanonical_u64(raw[(seed + 3) % raw.len()]),
+                F::from_noncanonical_u64(raw[(seed + 7) % raw.len()]),
+                F::from_noncanonical_u64(raw[(seed + 11) % raw.len()]),
+            ];
+            let mut denominator_inv = F::from_noncanonical_u64(raw[(seed + 5) % raw.len()]);
+            if denominator_inv.is_zero() {
+                denominator_inv = F::from_canonical_u64(7);
+            }
+
+            for mask in 0..8 {
+                let legacy = accumulate_quotient_contributions(
+                    QuotientNormalization::PerContribution,
+                    cpu,
+                    gpu,
+                    mask,
+                    denominator_inv,
+                );
+                let deferred = accumulate_quotient_contributions(
+                    QuotientNormalization::Deferred,
+                    cpu,
+                    gpu,
+                    mask,
+                    denominator_inv,
+                );
+                assert_eq!(
+                    legacy.to_canonical_u64(),
+                    deferred.to_canonical_u64(),
+                    "seed={seed}, mask={mask:03b}"
+                );
+                observed_raw_difference |=
+                    legacy.to_noncanonical_u64() != deferred.to_noncanonical_u64();
+            }
+        }
+
+        assert!(
+            observed_raw_difference,
+            "adversarial representatives must distinguish operation order at the raw-limb level"
+        );
+    }
+
+    /// Pins the submitted archive to the default deferred normalization
+    /// mechanism without changing any production code or field arithmetic.
+    #[test]
+    fn deferred_normalization_archive_identity_regression() {
+        let denominator_inv = F::from_noncanonical_u64(0xffff_ffff_0000_0001);
+        let cpu = F::from_noncanonical_u64(0xffff_ffff_ffff_fffe);
+        let gpu = [
+            F::from_noncanonical_u64(F::ORDER),
+            F::from_noncanonical_u64(F::ORDER + 1),
+            F::from_noncanonical_u64(0x8000_0000_0000_0001),
+        ];
+
+        let deferred = accumulate_quotient_contributions(
+            QuotientNormalization::Deferred,
+            cpu,
+            gpu,
+            0b111,
+            denominator_inv,
+        );
+        let oracle = accumulate_quotient_contributions(
+            QuotientNormalization::PerContribution,
+            cpu,
+            gpu,
+            0b111,
+            denominator_inv,
+        );
+        assert_eq!(deferred.to_canonical_u64(), oracle.to_canonical_u64());
+        assert_eq!(super::quotient_normalization_for_proof(), QuotientNormalization::Deferred);
+    }
+
+    /// Same circuit and witness through the test-only legacy order and the
+    /// production-default deferred order. The candidate call also recomputes
+    /// the legacy quotient from its exact commitments and challenges, checks
+    /// canonical coefficients, rebuilds the quotient cap, and checks openings.
+    #[test]
+    fn quotient_normalization_paths_agree_and_verify() -> Result<()> {
+        let (data, pw) = small_circuit();
+        assert!(!data.common.config.zero_knowledge);
+
+        let legacy_before =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        FORCE_PER_CONTRIBUTION_QUOTIENT_NORMALIZATION.with(|force| force.set(true));
+        let legacy = data.prove(pw.clone());
+        FORCE_PER_CONTRIBUTION_QUOTIENT_NORMALIZATION.with(|force| force.set(false));
+        let legacy = legacy?;
+        let legacy_after =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        assert!(legacy_after > legacy_before);
+        data.verify(legacy)?;
+
+        let deferred_before = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(true));
+        COMPARE_QUOTIENT_NORMALIZATION_COMMITMENT.with(|compare| compare.set(true));
+        let deferred = data.prove(pw);
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(false));
+        COMPARE_QUOTIENT_NORMALIZATION_COMMITMENT.with(|compare| compare.set(false));
+        let deferred = deferred?;
+        let deferred_after = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        assert!(
+            deferred_after > deferred_before,
+            "the default proof must execute deferred normalization"
+        );
+        data.verify(deferred)?;
+        Ok(())
+    }
+
+    /// A valid lookup proof exercises the generic CPU-only quotient path: all
+    /// three Metal contribution starters reject lookup circuits by contract.
+    #[test]
+    fn deferred_normalization_cpu_lookup_proof_verifies() -> Result<()> {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let table: LookupTable = Arc::new(vec![(0, 9), (1, 7), (2, 26), (3, 63)]);
+        let table_index = builder.add_lookup_table_from_pairs(table);
+        let input = builder.constant(F::from_canonical_u64(2));
+        let output = builder.add_lookup_from_index(input, table_index);
+        let expected = builder.constant(F::from_canonical_u64(26));
+        builder.connect(output, expected);
+        builder.register_public_input(output);
+        let data = builder.build::<C>();
+        assert!(!data.common.luts.is_empty());
+
+        let before = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let legacy_before =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(true));
+        let proof = data.prove(PartialWitness::new());
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(false));
+        let proof = proof?;
+        let after = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let legacy_after =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        assert!(
+            after > before,
+            "lookup proofs must use the default deferred path"
+        );
+        assert!(
+            legacy_after > legacy_before,
+            "lookup constraints must be covered by the legacy normalization oracle"
+        );
+        data.verify(proof)?;
+        Ok(())
+    }
+
+    /// Legitimately build a three-challenge circuit, rather than mutating
+    /// already-built common data, and exercise the generic scatter width plus
+    /// the field-semantic legacy oracle.
+    #[test]
+    fn deferred_normalization_three_challenges_verifies() -> Result<()> {
+        let mut config = CircuitConfig::standard_recursion_config();
+        config.num_challenges = 3;
+        let (data, pw) = small_circuit_with_config(config);
+        assert_eq!(data.common.config.num_challenges, 3);
+
+        let deferred_before = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let legacy_before =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(true));
+        let proof = data.prove(pw);
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(false));
+        let proof = proof?;
+        let deferred_after = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let legacy_after =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        assert!(deferred_after > deferred_before);
+        assert!(legacy_after > legacy_before);
+        data.verify(proof)?;
+        Ok(())
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2806,13 +3263,25 @@ mod quotient_layout_tests {
                 Target::wire(selection_row, selection_gate.wire_ith_output(op)),
             );
         }
-        // A 2^16-point LDE retains both wire and constants/sigmas commitments
-        // in shared Metal columns, exercising the production full-domain seam.
-        while builder.num_gates() <= (1 << 12) {
+        // The former 2^16-point fixture left its width-20 Z/partial-products
+        // commitment below the non-exclusive Metal threshold, so Permutation
+        // correctly stayed on CPU. At 2^18 points that same commitment costs
+        // 3 * 2^18 + (2^18 - 16) > 2^19 Poseidon permutations and is retained,
+        // making the normal non-exclusive route exercise P, Range and
+        // Permutation together without a test-only routing override.
+        while builder.num_gates() <= (1 << 14) {
             builder.add_gate(NoopGate, vec![]);
         }
         let data = builder.build::<Poseidon2GoldilocksConfig>();
         assert!(data.common.luts.is_empty());
+        assert_eq!(data.common.degree_bits(), 15);
+        assert_eq!(data.common.quotient_degree_factor, 8);
+        assert_eq!(data.common.num_partial_products, 9);
+        assert_eq!(
+            data.common.config.num_challenges * (data.common.num_partial_products + 1),
+            20
+        );
+        assert_eq!(data.common.lde_size(), 1 << 18);
         let mut advertised = data
             .common
             .gates
@@ -2861,21 +3330,84 @@ mod quotient_layout_tests {
         assert_eq!(selections, vec![20]);
 
         let before = gpu_poseidon_quotient_stats();
+        let deferred_before = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let legacy_before =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let poseidon_started_before =
+            GPU_POSEIDON_QUOTIENT_STARTED_FOR_TESTS.with(core::cell::Cell::get);
+        let poseidon_completed_before =
+            GPU_POSEIDON_QUOTIENT_COMPLETED_FOR_TESTS.with(core::cell::Cell::get);
+        let range_started_before = GPU_RANGE_QUOTIENT_STARTED_FOR_TESTS.with(core::cell::Cell::get);
+        let range_completed_before =
+            GPU_RANGE_QUOTIENT_COMPLETED_FOR_TESTS.with(core::cell::Cell::get);
+        let permutation_started_before =
+            GPU_PERMUTATION_QUOTIENT_STARTED_FOR_TESTS.with(core::cell::Cell::get);
+        let permutation_completed_before =
+            GPU_PERMUTATION_QUOTIENT_COMPLETED_FOR_TESTS.with(core::cell::Cell::get);
         COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(true));
         let proof = data.prove(PartialWitness::new());
+        COMPARE_QUOTIENT_NORMALIZATIONS.with(|compare| compare.set(false));
         COMPARE_GPU_QUOTIENT.store(false, Ordering::SeqCst);
         let proof = proof?;
         let after = gpu_poseidon_quotient_stats();
+        let deferred_after = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let legacy_after =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let poseidon_started_after =
+            GPU_POSEIDON_QUOTIENT_STARTED_FOR_TESTS.with(core::cell::Cell::get);
+        let poseidon_completed_after =
+            GPU_POSEIDON_QUOTIENT_COMPLETED_FOR_TESTS.with(core::cell::Cell::get);
+        let range_started_after = GPU_RANGE_QUOTIENT_STARTED_FOR_TESTS.with(core::cell::Cell::get);
+        let range_completed_after =
+            GPU_RANGE_QUOTIENT_COMPLETED_FOR_TESTS.with(core::cell::Cell::get);
+        let permutation_started_after =
+            GPU_PERMUTATION_QUOTIENT_STARTED_FOR_TESTS.with(core::cell::Cell::get);
+        let permutation_completed_after =
+            GPU_PERMUTATION_QUOTIENT_COMPLETED_FOR_TESTS.with(core::cell::Cell::get);
+        assert!(after.started > before.started);
+        assert!(after.completed > before.completed);
         assert!(after.range_started > before.range_started);
         assert!(after.range_completed > before.range_completed);
+        assert!(
+            deferred_after > deferred_before,
+            "normal Metal proofs must complete deferred normalization"
+        );
+        assert!(
+            legacy_after > legacy_before,
+            "normal Metal proofs must execute the legacy normalization oracle"
+        );
+        assert!(poseidon_started_after >= poseidon_started_before + 2);
+        assert!(poseidon_completed_after >= poseidon_completed_before + 2);
+        assert!(range_started_after >= range_started_before + 2);
+        assert!(range_completed_after >= range_completed_before + 2);
+        assert!(permutation_started_after >= permutation_started_before + 2);
+        assert!(permutation_completed_after >= permutation_completed_before + 2);
         data.verify(proof)?;
 
+        let legacy_before =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let deferred_before = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
         let fault = crate::hash::poseidon2::metal::force_range_quotient_finish_failure_for_tests();
-        let fallback_proof = data.prove(PartialWitness::new())?;
+        FORCE_PER_CONTRIBUTION_QUOTIENT_NORMALIZATION.with(|force| force.set(true));
+        let fallback_proof = data.prove(PartialWitness::new());
+        FORCE_PER_CONTRIBUTION_QUOTIENT_NORMALIZATION.with(|force| force.set(false));
+        let fallback_proof = fallback_proof?;
         assert!(fault.captured());
         assert!(fault.forced());
         assert!(fault.cpu_recompute_completed());
         drop(fault);
+        let legacy_after =
+            PER_CONTRIBUTION_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        let deferred_after = DEFERRED_QUOTIENT_NORMALIZATION_CALLS.with(core::cell::Cell::get);
+        assert!(
+            legacy_after > legacy_before,
+            "Range failure recursion must retain the caller's normalization mode"
+        );
+        assert_eq!(
+            deferred_after, deferred_before,
+            "Range failure recursion must not silently switch to the default mode"
+        );
         data.verify(fallback_proof)?;
         Ok(())
     }
@@ -3079,9 +3611,8 @@ mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
     use plonky2_field::types::{Field, PrimeField64};
 
-    use crate::util::partial_products::quotient_chunk_products_into;
-
     use super::divide_chunk_products;
+    use crate::util::partial_products::quotient_chunk_products_into;
 
     type F = GoldilocksField;
 
@@ -3300,18 +3831,17 @@ mod l_0_table_tests {
 /// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
+    use super::{
+        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        two_challenge_wires_permutation_partial_products_and_zs,
+        wires_permutation_partial_products_and_zs,
+    };
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::iop::witness::MatrixWitness;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
-
-    use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
-        two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
-    };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
     const D: usize = 2;
@@ -3654,7 +4184,10 @@ mod permutation_pairing_tests {
         let fixed_positions = (0..n * num_routed_wires)
             .filter(|&index| fixed_routed_wire(&data.prover_only.fixed_routed_wires, index))
             .collect::<Vec<_>>();
-        assert!(!fixed_positions.is_empty(), "test circuit has no fixed routed positions");
+        assert!(
+            !fixed_positions.is_empty(),
+            "test circuit has no fixed routed positions"
+        );
         assert_eq!(
             data.prover_only.fixed_routed_wires.len(),
             (n * num_routed_wires).div_ceil(8)
@@ -3664,7 +4197,10 @@ mod permutation_pairing_tests {
         assert_eq!(data.prover_only.subgroup[0], F::ONE);
         data.prover_only.subgroup[0] = F::from_noncanonical_u64(F::ORDER + 1);
         assert_eq!(data.prover_only.subgroup[0], F::ONE);
-        assert_eq!(data.prover_only.subgroup[0].to_noncanonical_u64(), F::ORDER + 1);
+        assert_eq!(
+            data.prover_only.subgroup[0].to_noncanonical_u64(),
+            F::ORDER + 1
+        );
 
         let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
         let gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
@@ -3682,8 +4218,10 @@ mod permutation_pairing_tests {
         // Keep every non-cancelled denominator invertible for the independent reference.
         for i in 0..n {
             for j in 0..num_routed_wires {
-                if fixed_routed_wire(&data.prover_only.fixed_routed_wires, i * num_routed_wires + j)
-                {
+                if fixed_routed_wire(
+                    &data.prover_only.fixed_routed_wires,
+                    i * num_routed_wires + j,
+                ) {
                     continue;
                 }
                 while betas.iter().zip(gammas).any(|(&beta, gamma)| {
@@ -3701,9 +4239,8 @@ mod permutation_pairing_tests {
         witness.wire_values[zero_column][zero_row] =
             -(betas[0] * data.prover_only.sigmas[zero_row][zero_column] + gammas[0]);
         let x = data.prover_only.subgroup[zero_row];
-        let numerator = witness.get_wire(zero_row, zero_column)
-            + beta_k_is[zero_column] * x
-            + gammas[0];
+        let numerator =
+            witness.get_wire(zero_row, zero_column) + beta_k_is[zero_column] * x + gammas[0];
         let denominator = witness.get_wire(zero_row, zero_column)
             + betas[0] * data.prover_only.sigmas[zero_row][zero_column]
             + gammas[0];
@@ -3724,8 +4261,7 @@ mod permutation_pairing_tests {
                 &data.prover_only.sigmas,
                 Some(&data.prover_only.fixed_routed_wires),
                 betas[challenge],
-                &beta_k_is
-                    [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
+                &beta_k_is[challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
                 gammas[challenge],
                 degree,
                 num_routed_wires,
