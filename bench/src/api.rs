@@ -1,4 +1,4 @@
-// Redraw marker top1-50-1786515495
+// Candidate marker 791-gpt56-sol-first-opening-buffer-reuse-20260812
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

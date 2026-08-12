@@ -622,7 +622,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
+        for (batch_index, FriBatchInfo { point, polynomials }) in
+            instance.batches.iter().enumerate()
+        {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -645,8 +647,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // Horner recurrence and leaves its top slot as the power-of-two
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
-            let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            // The first opening batch has no accumulated quotient yet. Reuse
+            // its full-degree composition allocation as that quotient instead
+            // of allocating and filling an equally large destination merely to
+            // copy the same Horner recurrence into it. `shift_factor` would
+            // multiply the empty accumulator only, so resetting the factor is
+            // the identical transcript-independent state transition.
+            if batch_index == 0 && final_poly.coeffs.is_empty() {
+                alpha.reset();
+                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
+            } else {
+                let shift = alpha.shift_factor();
+                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            }
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
