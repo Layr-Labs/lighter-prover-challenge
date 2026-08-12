@@ -4,13 +4,13 @@
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
 
-use anyhow::{ensure, Result};
+use anyhow::{Result, ensure};
 use hashbrown::HashMap;
 use plonky2_maybe_rayon::*;
 
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
-use crate::field::fft::ifft_borrowed;
+use crate::field::fft::{fft_in_place_with_options, ifft_borrowed};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -27,17 +27,17 @@ use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witne
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
-use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
+use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
-    VanishingScratch,
+    PermutationBatch, VanishingScratch, eval_vanishing_poly_base_batch, get_lut_poly,
+    interleave_pair_plan,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil};
+use crate::util::{log2_ceil, log2_strict};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -150,9 +150,8 @@ where
     let has_lookup = !common_data.luts.is_empty();
     let config = &common_data.config;
     let num_challenges = config.num_challenges;
-    let quotient_degree = common_data.quotient_degree();
+    #[cfg(feature = "diagnostic_profile")]
     let degree = common_data.degree();
-
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = {
         let digest_bytes =
@@ -336,7 +335,7 @@ where
 
     let alphas = challenger.get_n_challenges(num_challenges);
 
-    let quotient_polys = timed!(
+    let all_quotient_poly_chunks = timed!(
         timing,
         "compute quotient polys",
         compute_quotient_polys::<F, C, D>(
@@ -376,8 +375,12 @@ where
             true,
             false,
         );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (actual, expected)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+        assert_eq!(all_quotient_poly_chunks.len(), reference.len());
+        for (p, (actual, expected)) in all_quotient_poly_chunks
+            .iter()
+            .zip(reference.iter())
+            .enumerate()
+        {
             assert_eq!(actual.coeffs.len(), expected.coeffs.len());
             for (i, (actual, expected)) in
                 actual.coeffs.iter().zip(expected.coeffs.iter()).enumerate()
@@ -415,8 +418,12 @@ where
             false,
             false,
         );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+        assert_eq!(all_quotient_poly_chunks.len(), reference.len());
+        for (p, (a, b)) in all_quotient_poly_chunks
+            .iter()
+            .zip(reference.iter())
+            .enumerate()
+        {
             assert_eq!(a.coeffs.len(), b.coeffs.len());
             for (i, (x, y)) in a.coeffs.iter().zip(b.coeffs.iter()).enumerate() {
                 assert_eq!(
@@ -427,21 +434,6 @@ where
             }
         }
     }
-
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "split up quotient polys",
-        quotient_polys
-            .into_par_iter()
-            .flat_map(|mut quotient_poly| {
-                quotient_poly.trim_to_len(quotient_degree).expect(
-                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
-            })
-            .collect()
-    );
 
     let quotient_polys_commitment = timed!(
         timing,
@@ -1019,6 +1011,164 @@ fn compute_all_lookup_polys<
 }
 
 const BATCH_SIZE: usize = 32;
+
+const QUOTIENT_TRIM_FAILURE: &str =
+    "Quotient has failed, the vanishing polynomial is not divisible by Z_H";
+
+/// Finish one coefficient from the in-place FFT work buffer in exactly the
+/// order used by `ifft_with_options_and_postscale`: reverse first (except for
+/// coefficient zero), multiply by `n_inv`, then multiply by the caller's
+/// inverse-coset power. The `n == 1` branch preserves the legacy post-pass's
+/// double write to `buffer[0]` before its single postscale.
+#[inline]
+fn quotient_ifft_terminal_coefficient<F: Field>(
+    butterfly_values: &[F],
+    inverse_shift_powers: &[F],
+    n_inv: F,
+    k: usize,
+) -> F {
+    let n = butterfly_values.len();
+    let source = if k == 0 { 0 } else { n - k };
+    let mut coefficient = butterfly_values[source];
+    coefficient *= n_inv;
+    if n == 1 {
+        coefficient *= n_inv;
+    }
+    coefficient *= inverse_shift_powers[k];
+    coefficient
+}
+
+/// Materialize only the retained quotient coefficients into their final
+/// degree-sized chunks after the required in-place FFT butterflies have run.
+///
+/// The full `butterfly_values` allocation remains the FFT work buffer. Tail
+/// coefficients are still normalized and postscaled before `F::is_zero`, so
+/// this preserves `PolynomialCoeffs::trim_to_len`'s success/failure contract
+/// without first writing a full normalized/reversed coefficient vector.
+fn quotient_ifft_terminal_chunks_from_butterflies<F: Field>(
+    butterfly_values: &[F],
+    inverse_shift_powers: &[F],
+    retained_len: usize,
+    chunk_size: usize,
+) -> Result<Vec<PolynomialCoeffs<F>>> {
+    let n = butterfly_values.len();
+    assert_eq!(inverse_shift_powers.len(), n);
+    if n < retained_len {
+        return Err(anyhow::anyhow!("Condition failed: `self.len() >= len`"));
+    }
+
+    // `Vec::chunks` in the legacy splitter has the same precondition. Every
+    // valid circuit shape supplies `degree > 0` here.
+    assert!(chunk_size != 0, "chunk size must be non-zero");
+    let n_inv = F::inverse_2exp(log2_strict(n));
+    let mut chunks = Vec::with_capacity(retained_len.div_ceil(chunk_size));
+    for start in (0..retained_len).step_by(chunk_size) {
+        let end = min(start + chunk_size, retained_len);
+        let mut coefficients = Vec::with_capacity(end - start);
+        for k in start..end {
+            coefficients.push(quotient_ifft_terminal_coefficient(
+                butterfly_values,
+                inverse_shift_powers,
+                n_inv,
+                k,
+            ));
+        }
+        chunks.push(PolynomialCoeffs::new(coefficients));
+    }
+
+    // The legacy IFFT normalized and postscaled the entire tail before
+    // `trim_to_len` scanned it. Do not short-circuit on an invalid coefficient:
+    // finish every tail coefficient and call `F::is_zero` for each one so even
+    // the failure path preserves that terminal-work contract.
+    let mut tail_is_zero = true;
+    for k in retained_len..n {
+        let coefficient = quotient_ifft_terminal_coefficient(
+            butterfly_values,
+            inverse_shift_powers,
+            n_inv,
+            k,
+        );
+        tail_is_zero &= coefficient.is_zero();
+    }
+    if !tail_is_zero {
+        return Err(anyhow::anyhow!(
+            "Condition failed: `self.coeffs[len..].iter().all(F::is_zero)`"
+        ));
+    }
+
+    Ok(chunks)
+}
+
+fn quotient_coset_ifft_terminal_chunks<F: Field>(
+    mut values: Vec<F>,
+    inverse_shift_powers: &[F],
+    retained_len: usize,
+    chunk_size: usize,
+) -> Result<Vec<PolynomialCoeffs<F>>> {
+    // A coset IFFT in this implementation is the ordinary in-place forward
+    // FFT butterflies followed by the reversal/normalization/postscale above.
+    fft_in_place_with_options(&mut values, None, None);
+    quotient_ifft_terminal_chunks_from_butterflies(
+        &values,
+        inverse_shift_powers,
+        retained_len,
+        chunk_size,
+    )
+}
+
+fn quotient_columns_into_terminal_chunks<F: Field>(
+    challenge_columns: Vec<Vec<F>>,
+    inverse_shift_powers: &[F],
+    retained_len: usize,
+    chunk_size: usize,
+) -> Vec<PolynomialCoeffs<F>> {
+    let chunks_by_challenge: Vec<Vec<PolynomialCoeffs<F>>> = challenge_columns
+        .into_par_iter()
+        .map(|column| {
+            quotient_coset_ifft_terminal_chunks(
+                column,
+                inverse_shift_powers,
+                retained_len,
+                chunk_size,
+            )
+            .expect(QUOTIENT_TRIM_FAILURE)
+        })
+        .collect();
+    // The outer indexed collect fixes challenge-major order; each inner Vec is
+    // already in increasing chunk-index order.
+    chunks_by_challenge.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+fn legacy_quotient_columns_into_chunks<F: Field>(
+    challenge_columns: Vec<Vec<F>>,
+    inverse_shift_powers: &[F],
+    retained_len: usize,
+    chunk_size: usize,
+) -> Vec<PolynomialCoeffs<F>> {
+    let chunks_by_challenge: Vec<Vec<PolynomialCoeffs<F>>> = challenge_columns
+        .into_par_iter()
+        .map(|column| {
+            let mut quotient_poly =
+                PolynomialValues::new(column).coset_ifft_with_powers(inverse_shift_powers);
+            quotient_poly
+                .trim_to_len(retained_len)
+                .expect(QUOTIENT_TRIM_FAILURE);
+            quotient_poly.chunks(chunk_size)
+        })
+        .collect();
+    chunks_by_challenge.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DIRECT_QUOTIENT_IFFT_TERMINAL_CALLS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+    static COMPARE_QUOTIENT_IFFT_TERMINALS: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+    static FORCE_LEGACY_QUOTIENT_IFFT_TERMINAL: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
@@ -1794,13 +1944,14 @@ fn start_gpu_permutation_quotient<
         eprintln!(
             "[gpu-permutation-quotient] active rows={quotient_rows} step={step} \
              routed={} partials={} shared_columns=true",
-            common_data.config.num_routed_wires,
-            common_data.num_partial_products,
+            common_data.config.num_routed_wires, common_data.num_partial_products,
         );
     }
     Some(job)
 }
 
+/// Compute the quotient and return its final degree-sized commitment chunks in
+/// challenge-major, chunk-index order.
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2517,16 +2668,58 @@ fn compute_quotient_polys<
             }
         });
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
-    challenge_columns
-        .into_par_iter()
-        .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
-            PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
-        })
-        .collect()
+    let retained_len = common_data.quotient_degree();
+    let chunk_size = common_data.degree();
+
+    #[cfg(test)]
+    if FORCE_LEGACY_QUOTIENT_IFFT_TERMINAL.with(core::cell::Cell::get) {
+        return legacy_quotient_columns_into_chunks(
+            challenge_columns,
+            inverse_coset_shift_powers.as_slice(),
+            retained_len,
+            chunk_size,
+        );
+    }
+
+    #[cfg(test)]
+    DIRECT_QUOTIENT_IFFT_TERMINAL_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+    #[cfg(test)]
+    if COMPARE_QUOTIENT_IFFT_TERMINALS.with(core::cell::Cell::get) {
+        let reference = legacy_quotient_columns_into_chunks(
+            challenge_columns.clone(),
+            inverse_coset_shift_powers.as_slice(),
+            retained_len,
+            chunk_size,
+        );
+        let actual = quotient_columns_into_terminal_chunks(
+            challenge_columns,
+            inverse_coset_shift_powers.as_slice(),
+            retained_len,
+            chunk_size,
+        );
+        assert_eq!(actual.len(), reference.len());
+        for (chunk, (actual, reference)) in actual.iter().zip(&reference).enumerate() {
+            assert_eq!(actual.coeffs.len(), reference.coeffs.len());
+            for (coefficient, (actual, reference)) in
+                actual.coeffs.iter().zip(&reference.coeffs).enumerate()
+            {
+                assert_eq!(
+                    actual.to_noncanonical_u64(),
+                    reference.to_noncanonical_u64(),
+                    "quotient IFFT terminal divergence: chunk {chunk}, coefficient {coefficient}"
+                );
+            }
+        }
+        return actual;
+    }
+
+    quotient_columns_into_terminal_chunks(
+        challenge_columns,
+        inverse_coset_shift_powers.as_slice(),
+        retained_len,
+        chunk_size,
+    )
 }
 
 /// Process-global caches for deterministic per-degree precomputations that
@@ -2658,11 +2851,17 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        BatchLayout, COMPARE_QUOTIENT_IFFT_TERMINALS, COMPARE_QUOTIENT_LAYOUTS,
+        DIRECT_QUOTIENT_IFFT_TERMINAL_CALLS, FORCE_LEGACY_QUOTIENT_IFFT_TERMINAL,
+        QUOTIENT_TRIM_FAILURE, legacy_quotient_columns_into_chunks, precomputed,
+        quotient_columns_into_terminal_chunks, quotient_coset_ifft_terminal_chunks,
+        quotient_ifft_terminal_chunks_from_butterflies,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{COMPARE_GPU_QUOTIENT, gpu_poseidon_quotient_stats};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2672,9 +2871,9 @@ mod quotient_layout_tests {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
@@ -2695,6 +2894,229 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    fn raw_chunks(chunks: &[crate::field::polynomial::PolynomialCoeffs<F>]) -> Vec<Vec<u64>> {
+        chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .coeffs
+                    .iter()
+                    .map(PrimeField64::to_noncanonical_u64)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Independent copy of the pre-change terminal pass, starting after the
+    /// shared forward FFT butterflies. Keeping its paired in-place writes here
+    /// makes the source/destination mapping and raw multiplication order an
+    /// oracle for the direct chunk writer.
+    fn legacy_terminal_chunks_from_butterflies(
+        mut buffer: Vec<F>,
+        inverse_shift_powers: &[F],
+        retained_len: usize,
+        chunk_size: usize,
+    ) -> Result<Vec<crate::field::polynomial::PolynomialCoeffs<F>>> {
+        let n = buffer.len();
+        let n_inv = F::inverse_2exp(crate::util::log2_strict(n));
+        buffer[0] *= n_inv;
+        buffer[n / 2] *= n_inv;
+        buffer[0] *= inverse_shift_powers[0];
+        if n > 1 {
+            buffer[n / 2] *= inverse_shift_powers[n / 2];
+        }
+        for i in 1..(n / 2) {
+            let j = n - i;
+            let mut coefficient_i = buffer[j] * n_inv;
+            let mut coefficient_j = buffer[i] * n_inv;
+            coefficient_i *= inverse_shift_powers[i];
+            coefficient_j *= inverse_shift_powers[j];
+            buffer[i] = coefficient_i;
+            buffer[j] = coefficient_j;
+        }
+        let mut polynomial = crate::field::polynomial::PolynomialCoeffs::new(buffer);
+        polynomial.trim_to_len(retained_len)?;
+        Ok(polynomial.chunks(chunk_size))
+    }
+
+    fn panic_text(payload: Box<dyn core::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            message.clone()
+        } else if let Some(message) = payload.downcast_ref::<&'static str>() {
+            (*message).to_string()
+        } else {
+            "non-string panic payload".to_string()
+        }
+    }
+
+    #[test]
+    fn quotient_ifft_terminal_chunks_match_legacy_raw_matrix() -> Result<()> {
+        let order = F::ORDER;
+        for n in [1usize, 2, 32] {
+            let values = (0..n)
+                .map(|i| {
+                    F::from_noncanonical_u64(match i % 6 {
+                        0 => 0,
+                        1 => 1,
+                        2 => order - 1,
+                        3 => order,
+                        4 => order + 1,
+                        _ => u64::MAX,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let scales = (0..n)
+                .map(|i| {
+                    F::from_noncanonical_u64(match i % 5 {
+                        0 => 1,
+                        1 => order - 1,
+                        2 => order + 1,
+                        3 => u64::MAX,
+                        _ => 17,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            // Full-length coverage enters through the same in-place FFT seam
+            // as production, then compares every output limb and chunk shape.
+            let expected = {
+                let mut polynomial =
+                    crate::field::polynomial::PolynomialValues::new(values.clone())
+                        .coset_ifft_with_powers(&scales);
+                polynomial.trim_to_len(n)?;
+                polynomial.chunks(8)
+            };
+            let actual = quotient_coset_ifft_terminal_chunks(values, &scales, n, 8)?;
+            assert_eq!(raw_chunks(&actual), raw_chunks(&expected), "N={n}");
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|chunk| chunk.coeffs.len())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|chunk| chunk.coeffs.len())
+                    .collect::<Vec<_>>(),
+                "chunk shape for N={n}"
+            );
+
+            // Also compare directly at the post-butterfly seam. For N=32 the
+            // retained length produces two full chunks and a short last chunk.
+            let retained_len = if n == 32 { 19 } else { n };
+            let mut butterflies = (0..n)
+                .map(|i| {
+                    F::from_noncanonical_u64(match i % 5 {
+                        0 => order,
+                        1 => order + 1,
+                        2 => u64::MAX,
+                        3 => 29,
+                        _ => order - 1,
+                    })
+                })
+                .collect::<Vec<_>>();
+            for k in retained_len..n {
+                let source = if k == 0 { 0 } else { n - k };
+                // Noncanonical field zero: tail acceptance must use
+                // `F::is_zero`, not a raw-limb comparison.
+                butterflies[source] = F::from_noncanonical_u64(order);
+                assert_eq!(butterflies[source].to_noncanonical_u64(), order);
+            }
+            let expected = legacy_terminal_chunks_from_butterflies(
+                butterflies.clone(),
+                &scales,
+                retained_len,
+                8,
+            )?;
+            let actual = quotient_ifft_terminal_chunks_from_butterflies(
+                &butterflies,
+                &scales,
+                retained_len,
+                8,
+            )?;
+            assert_eq!(
+                raw_chunks(&actual),
+                raw_chunks(&expected),
+                "post-butterfly N={n}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quotient_ifft_terminal_tail_failure_matches_legacy_contract() {
+        let butterflies = vec![F::from_canonical_u64(11), F::from_canonical_u64(7)];
+        let scales = vec![F::ONE; 2];
+        let direct_error =
+            quotient_ifft_terminal_chunks_from_butterflies(&butterflies, &scales, 1, 1)
+                .unwrap_err();
+        let legacy_error =
+            legacy_terminal_chunks_from_butterflies(butterflies, &scales, 1, 1).unwrap_err();
+        assert_eq!(direct_error.to_string(), legacy_error.to_string());
+
+        // The public prover contract is the `expect` panic, not the inner
+        // anyhow error. Pin its exact text against the retained legacy path.
+        let values = vec![F::ONE, F::ZERO];
+        let direct_panic = std::panic::catch_unwind(|| {
+            quotient_columns_into_terminal_chunks(vec![values.clone()], &scales, 1, 1)
+        })
+        .unwrap_err();
+        let legacy_panic = std::panic::catch_unwind(|| {
+            legacy_quotient_columns_into_chunks(vec![values], &scales, 1, 1)
+        })
+        .unwrap_err();
+        let direct_text = panic_text(direct_panic);
+        let legacy_text = panic_text(legacy_panic);
+        assert_eq!(direct_text, legacy_text);
+        assert!(direct_text.contains(QUOTIENT_TRIM_FAILURE));
+    }
+
+    #[test]
+    fn quotient_ifft_terminal_end_to_end_matches_legacy_and_activates() -> Result<()> {
+        let (data, pw) = small_circuit();
+        let prove_pair = || {
+            let before = DIRECT_QUOTIENT_IFFT_TERMINAL_CALLS.with(core::cell::Cell::get);
+            FORCE_LEGACY_QUOTIENT_IFFT_TERMINAL.with(|forced| forced.set(true));
+            let baseline = data.prove(pw.clone());
+            FORCE_LEGACY_QUOTIENT_IFFT_TERMINAL.with(|forced| forced.set(false));
+            COMPARE_QUOTIENT_IFFT_TERMINALS.with(|compare| compare.set(true));
+            let candidate = data.prove(pw);
+            COMPARE_QUOTIENT_IFFT_TERMINALS.with(|compare| compare.set(false));
+            let after = DIRECT_QUOTIENT_IFFT_TERMINAL_CALLS.with(core::cell::Cell::get);
+            (baseline, candidate, before, after)
+        };
+        #[cfg(feature = "parallel")]
+        let (baseline, candidate, before, after) =
+            plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap()
+                .install(prove_pair);
+        #[cfg(not(feature = "parallel"))]
+        let (baseline, candidate, before, after) = prove_pair();
+
+        let baseline = baseline?;
+        let candidate = candidate?;
+        data.verify(baseline.clone())?;
+        data.verify(candidate.clone())?;
+        // Other libtests can transiently enable the retained process-global
+        // quotient-layout differential, causing additional recomputations on
+        // this private worker. The forced legacy baseline cannot increment
+        // this thread-local counter, so any positive delta proves the default
+        // proof activated the direct terminal path without making the test
+        // depend on unrelated diagnostic recomputation counts.
+        assert!(after > before, "default terminal path was not active");
+        assert_eq!(
+            candidate.proof.quotient_polys_cap,
+            baseline.proof.quotient_polys_cap
+        );
+        assert_eq!(
+            candidate.proof.openings.quotient_polys,
+            baseline.proof.openings.quotient_polys
+        );
+        assert_eq!(candidate.to_bytes(), baseline.to_bytes());
+        Ok(())
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
