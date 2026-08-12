@@ -663,7 +663,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
 
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     let product_count = subgroup.len() * num_chunks;
     // Same uninitialised-capacity handling as the per-challenge path: every
     // slot is written below before anything reads it, so zero-filling first is
@@ -1381,7 +1381,14 @@ fn start_gpu_range_check_gate_quotient<
             // existing CPU direct-accumulation evaluator instead: skipping it
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // bits=6 is already CPU-side. bits=3 is the 30.404 ranked
+            // isolate (d74bc5b). bits=4 stays on Metal: ra3+ra4 scored
+            // 29.968 (4c36121), below RA-3 alone.
+            if matches!(
+                u32_gate,
+                U32QuotientGate::RandomAccess { bits: 6, .. }
+                    | U32QuotientGate::RandomAccess { bits: 3, .. }
+            ) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
