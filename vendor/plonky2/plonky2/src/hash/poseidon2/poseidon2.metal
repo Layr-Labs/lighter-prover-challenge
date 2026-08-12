@@ -1700,6 +1700,99 @@ kernel void ntt_stage(
     values[colbase + v_index] = out_v;
 }
 
+// Two adjacent radix-2 DIT stages fused into one radix-4 global-memory pass.
+// The first stage uses roots0[j] for both half-sized pairs; the second uses
+// roots1[j] and roots1[j + half_m] for the even and odd intermediates.
+kernel void ntt_stage_radix4(
+    device ulong* values [[buffer(0)]],
+    const device ulong* roots0 [[buffer(1)]],
+    const device ulong* roots1 [[buffer(2)]],
+    constant uint& lde_size [[buffer(3)]],
+    constant uint& log_half_m [[buffer(4)]],
+    constant uint& canonicalize [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint t = gid.x;
+    uint quarter_butterflies = lde_size >> 2;
+    if (t >= quarter_butterflies) {
+        return;
+    }
+    ulong colbase = (ulong)gid.y * lde_size;
+    uint half_m = 1u << log_half_m;
+    uint j = t & (half_m - 1u);
+    uint base = ((t >> log_half_m) << (log_half_m + 2u));
+    uint i0 = base + j;
+    uint i1 = i0 + half_m;
+    uint i2 = i1 + half_m;
+    uint i3 = i2 + half_m;
+
+    ulong a = values[colbase + i0];
+    ulong b = values[colbase + i1];
+    ulong c = values[colbase + i2];
+    ulong d = values[colbase + i3];
+    ulong w0 = roots0[j];
+    ulong wb = gl_mul(w0, b);
+    ulong wd = gl_mul(w0, d);
+    ulong p = gl_add(a, wb);
+    ulong q = gl_sub(a, wb);
+    ulong r = gl_add(c, wd);
+    ulong s = gl_sub(c, wd);
+
+    ulong wr = gl_mul(roots1[j], r);
+    ulong ws = gl_mul(roots1[j + half_m], s);
+    ulong out0 = gl_add(p, wr);
+    ulong out1 = gl_add(q, ws);
+    ulong out2 = gl_sub(p, wr);
+    ulong out3 = gl_sub(q, ws);
+    if (canonicalize != 0u) {
+        out0 = gl_canonicalize(out0);
+        out1 = gl_canonicalize(out1);
+        out2 = gl_canonicalize(out2);
+        out3 = gl_canonicalize(out3);
+    }
+    values[colbase + i0] = out0;
+    values[colbase + i1] = out1;
+    values[colbase + i2] = out2;
+    values[colbase + i3] = out3;
+}
+
+// Combines the CPU survivor contribution with every available GPU-specialized
+// contribution and transposes the two challenges to column-major order in the
+// same pass. `denominator_inverses` is the short periodic Z_H inverse table.
+kernel void quotient_accumulate_colmajor(
+    const device ulong* cpu_values [[buffer(0)]],
+    const device ulong* poseidon_values [[buffer(1)]],
+    const device ulong* range_values [[buffer(2)]],
+    const device ulong* permutation_values [[buffer(3)]],
+    const device ulong* denominator_inverses [[buffer(4)]],
+    device ulong* columns [[buffer(5)]],
+    constant uint& rows [[buffer(6)]],
+    constant uint& denominator_mask [[buffer(7)]],
+    constant uint& contribution_mask [[buffer(8)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= rows) {
+        return;
+    }
+    ulong denominator_inv = denominator_inverses[gid & denominator_mask];
+    ulong2 gpu = ulong2(0);
+    if ((contribution_mask & 1u) != 0u) {
+        gpu.x = gl_add(gpu.x, poseidon_values[(ulong)gid * 2]);
+        gpu.y = gl_add(gpu.y, poseidon_values[(ulong)gid * 2 + 1]);
+    }
+    if ((contribution_mask & 2u) != 0u) {
+        gpu.x = gl_add(gpu.x, range_values[(ulong)gid * 2]);
+        gpu.y = gl_add(gpu.y, range_values[(ulong)gid * 2 + 1]);
+    }
+    if ((contribution_mask & 4u) != 0u) {
+        gpu.x = gl_add(gpu.x, permutation_values[(ulong)gid * 2]);
+        gpu.y = gl_add(gpu.y, permutation_values[(ulong)gid * 2 + 1]);
+    }
+    ulong cpu0 = cpu_values[(ulong)gid * 2];
+    ulong cpu1 = cpu_values[(ulong)gid * 2 + 1];
+    columns[gid] = gl_canonicalize(gl_add(cpu0, gl_mul(gpu.x, denominator_inv)));
+    columns[(ulong)rows + gid] =
+        gl_canonicalize(gl_add(cpu1, gl_mul(gpu.y, denominator_inv)));
+}
+
 // Converts a forward-FFT output into IFFT coefficients, matching plonky2's
 // `ifft`: coeffs[i] = fft_out[(n - i) mod n] * n^{-1}, canonicalized so the
 // CPU-side readback and the downstream LDE prepare see canonical values.
@@ -1716,6 +1809,27 @@ kernel void ifft_finalize(
     ulong colbase = (ulong)gid.y * n;
     uint src = (n - i) & (n - 1u);
     coeffs[colbase + i] = gl_canonicalize(gl_mul(fft_out[colbase + src], n_inv));
+}
+
+// Coset-domain IFFT finalize used by quotient evaluations. The ordinary IFFT
+// coefficient at i is additionally scaled by shift^{-i}; its output can then
+// be reinterpreted directly as degree-n quotient chunks.
+kernel void coset_ifft_finalize(
+    const device ulong* fft_out [[buffer(0)]],
+    device ulong* coeffs [[buffer(1)]],
+    const device ulong* inverse_shift_powers [[buffer(2)]],
+    constant uint& n [[buffer(3)]],
+    constant ulong& n_inv [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint i = gid.x;
+    if (i >= n) {
+        return;
+    }
+    ulong colbase = (ulong)gid.y * n;
+    uint src = (n - i) & (n - 1u);
+    ulong coefficient = gl_mul(fft_out[colbase + src], n_inv);
+    coeffs[colbase + i] =
+        gl_canonicalize(gl_mul(coefficient, inverse_shift_powers[i]));
 }
 
 kernel void poseidon2_hash_leaves_colmajor(

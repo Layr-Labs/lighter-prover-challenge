@@ -6,12 +6,12 @@ use alloc::vec::Vec;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::extension::{unflatten, Extendable, FieldExtension};
+use crate::field::extension::{Extendable, FieldExtension, unflatten};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::oracle::coset_fft_zero_tail;
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
-use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
+use crate::hash::hash_types::{NUM_HASH_OUT_ELTS, RichField};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
@@ -19,7 +19,7 @@ use crate::plonk::config::GenericConfig;
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_strict, reverse_bits};
+use crate::util::reverse_bits;
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -82,44 +82,43 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
     1 << degree_bits
 }
 
-/// Bit-reversal + flatten in one gather pass: output leaf `i` is the base-field
-/// limb array of `values[reverse_bits(i, log2(values.len()))]`, so the returned
-/// flat buffer is the bit-reversed codeword laid out row-major, ready for
-/// [`MerkleTree::new_flat`].
+/// Natural-layout columns for one FRI round. For leaf `i` and in-leaf element
+/// `q`, bit reversal factorizes as
 ///
-/// The gather is bandwidth- and latency-bound rather than arithmetic-bound:
-/// `reverse_bits` scatters consecutive outputs across the whole codeword, so
-/// essentially every read is a cache miss and a single thread can only keep a
-/// handful of them in flight. Splitting the *output* range into blocks lets one
-/// worker per core drive its own independent miss stream. Block `b` owns
-/// outputs `b * FLATTEN_BLOCK .. (b + 1) * FLATTEN_BLOCK`, a partition of
-/// `0..n`, so every slot is written exactly once and the source is only read —
-/// the result is index-for-index identical to the serial fill.
-fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
-    const FLATTEN_BLOCK: usize = 1 << 10;
-
+/// `rev(i * arity + q, log_n) = rev(q, arity_bits) * leaves + rev(i, log_leaves)`.
+///
+/// Thus each `q` is one contiguous segment of the natural codeword, reordered
+/// only at column granularity. [`MerkleTree::new_columns`] applies the remaining
+/// `rev(i)` while hashing/querying. This replaces the former full-domain random
+/// gather into a row-major buffer with contiguous segment reads and no separate
+/// bit-reversed leaf image.
+fn fri_natural_columns<F: RichField + Extendable<D>, const D: usize>(
+    values: &[F::Extension],
+    arity_bits: usize,
+) -> Vec<Vec<F>> {
     let n = values.len();
-    let log_n = log2_strict(n);
-    let mut flat: Vec<F> = Vec::with_capacity(n * D);
-    {
-        let spare = &mut flat.spare_capacity_mut()[..n * D];
-        spare
-            .par_chunks_mut(FLATTEN_BLOCK * D)
-            .enumerate()
-            .for_each(|(block, out)| {
-                let base = block * FLATTEN_BLOCK;
-                for (j, slot) in out.chunks_exact_mut(D).enumerate() {
-                    let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
-                    for k in 0..D {
-                        slot[k].write(limbs[k]);
-                    }
+    let arity = 1usize << arity_bits;
+    let leaves = n >> arity_bits;
+    assert_eq!(n, leaves * arity);
+
+    let segments = (0..arity)
+        .into_par_iter()
+        .map(|q| {
+            let segment = reverse_bits(q, arity_bits);
+            let source = &values[segment * leaves..(segment + 1) * leaves];
+            let mut columns = (0..D)
+                .map(|_| Vec::with_capacity(leaves))
+                .collect::<Vec<_>>();
+            for value in source {
+                let limbs = value.to_basefield_array();
+                for k in 0..D {
+                    columns[k].push(limbs[k]);
                 }
-            });
-    }
-    // SAFETY: the loop above wrote every one of the `n * D` slots of spare
-    // capacity exactly once, so the whole prefix is initialized.
-    unsafe { flat.set_len(n * D) };
-    flat
+            }
+            columns
+        })
+        .collect::<Vec<_>>();
+    segments.into_iter().flatten().collect()
 }
 
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -137,17 +136,8 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
-        let tree = MerkleTree::<F, C::Hasher>::new_flat(
-            flat_values,
-            arity * D,
-            fri_params.config.cap_height,
-        );
+        let columns = fri_natural_columns::<F, D>(&values.values, *arity_bits);
+        let tree = MerkleTree::<F, C::Hasher>::new_columns(columns, fri_params.config.cap_height);
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -346,7 +336,8 @@ fn fri_prover_query_round<
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
-        let evals = unflatten(tree.get(x_index >> arity_bits));
+        let leaf = tree.leaf_vec(x_index >> arity_bits);
+        let evals = unflatten(&leaf);
         let merkle_proof = tree.prove(x_index >> arity_bits);
 
         query_steps.push(FriQueryStep {
@@ -371,31 +362,37 @@ mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
 
-    /// `bitrev_flatten` must be raw-`u64`-identical to the serial
-    /// gather-and-extend loop it replaced, for every leaf and every limb.
+    /// Natural segment columns must reconstruct exactly the historical
+    /// bit-reversed row-major FRI leaves, for every leaf and limb.
     #[test]
-    fn bitrev_flatten_matches_serial_gather() {
+    fn fri_natural_columns_match_bitrev_leaves() {
         const D: usize = 2;
         type F = GoldilocksField;
         type FE = <F as Extendable<D>>::Extension;
 
-        // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 10` grain: below it
-        // (a single partial chunk), exactly on it, and several blocks past it.
-        for log_n in [0usize, 1, 5, 10, 11, 13] {
+        for log_n in [4usize, 5, 10, 11, 13] {
             let n = 1usize << log_n;
             let values: Vec<FE> = (0..n).map(|_| FE::rand()).collect();
-
-            // Reference: the original serial fill.
-            let mut expected: Vec<F> = Vec::with_capacity(n * D);
-            for i in 0..n {
-                let x: [F; D] = values[reverse_bits(i, log_n)].to_basefield_array();
-                expected.extend_from_slice(&x);
-            }
-
-            let actual = bitrev_flatten::<F, D>(&values);
-            assert_eq!(actual.len(), expected.len(), "length for n = {n}");
-            for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
-                assert_eq!(a.0, e.0, "limb {k} of {n}");
+            for arity_bits in 1..=4.min(log_n) {
+                let arity = 1usize << arity_bits;
+                let leaves = n / arity;
+                let log_leaves = log_n - arity_bits;
+                let columns = fri_natural_columns::<F, D>(&values, arity_bits);
+                assert_eq!(columns.len(), arity * D);
+                for leaf in 0..leaves {
+                    let natural_row = reverse_bits(leaf, log_leaves);
+                    for q in 0..arity {
+                        let expected: [F; D] =
+                            values[reverse_bits(leaf * arity + q, log_n)].to_basefield_array();
+                        for k in 0..D {
+                            assert_eq!(
+                                columns[q * D + k][natural_row].0,
+                                expected[k].0,
+                                "n={n} arity={arity} leaf={leaf} q={q} limb={k}"
+                            );
+                        }
+                    }
+                }
             }
         }
     }
