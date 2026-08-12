@@ -631,13 +631,18 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// wires of every row — 80 columns at the production shape — and keeps nothing
 /// warm for the next challenge, which then re-streams the identical bytes.
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
-/// two Rayon fork/joins over the subgroup, into one.
+/// two Rayon fork/joins over the subgroup, into one. The paired field hook also
+/// maps the two independent challenge lanes onto AArch64's existing two-lane
+/// Goldilocks multiply backend, so the shared traversal does paired arithmetic
+/// instead of merely issuing the same scalar instruction stream twice.
 ///
 /// Value-exactness: each challenge keeps its own accumulators, its own
 /// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// inversion batch in the same push order, and its own Z chain. The paired
+/// multiply is raw-representative-identical lane by lane. The two Z chains are
+/// evaluated concurrently but retain their original left-to-right recurrence,
+/// so every output limb is bit-identical to running the per-challenge path
+/// twice.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -650,6 +655,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
+    // Source-identical redraw after the first official run landed in the 25.6 TPS runner band.
     debug_assert_eq!(betas.len(), 2);
     debug_assert_eq!(gammas.len(), 2);
     let degree = common_data.quotient_degree_factor;
@@ -691,11 +697,17 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    let (
+                        denominators_0,
+                        denominators_1,
+                        denominator_inverses_0,
+                        denominator_inverses_1,
+                    ) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
                     for (t, &x) in xs.iter().enumerate() {
@@ -705,10 +717,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
-                            let mut numerator_0 = F::ONE;
-                            let mut numerator_1 = F::ONE;
-                            let mut denominator_0 = F::ONE;
-                            let mut denominator_1 = F::ONE;
+                            let mut numerators = [F::ONE; 2];
+                            let mut denominators = [F::ONE; 2];
                             for j in start..end {
                                 // A singleton routed copy component maps this position to itself:
                                 // sigma(i,j) = k_j * x. Its numerator and denominator factors are
@@ -723,16 +733,32 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let beta_k_x = F::multiply_pair(
+                                    [beta_k_is_0[j], beta_k_is_1[j]],
+                                    [x; 2],
+                                );
+                                numerators = F::multiply_pair(
+                                    numerators,
+                                    [
+                                        wire_value + beta_k_x[0] + gamma_0,
+                                        wire_value + beta_k_x[1] + gamma_1,
+                                    ],
+                                );
+                                let beta_sigma =
+                                    F::multiply_pair([beta_0, beta_1], [sigma; 2]);
+                                denominators = F::multiply_pair(
+                                    denominators,
+                                    [
+                                        wire_value + beta_sigma[0] + gamma_0,
+                                        wire_value + beta_sigma[1] + gamma_1,
+                                    ],
+                                );
                             }
                             let output = t * num_chunks + chunk;
-                            products_0[output].write(numerator_0);
-                            products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            products_0[output].write(numerators[0]);
+                            products_1[output].write(numerators[1]);
+                            denominators_0.push(denominators[0]);
+                            denominators_1.push(denominators[1]);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,8 +773,22 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    F::batch_multiplicative_inverse_into(
+                        denominators_0,
+                        denominator_inverses_0,
+                    );
+                    F::batch_multiplicative_inverse_into(
+                        denominators_1,
+                        denominator_inverses_1,
+                    );
+                    for index in 0..products_0.len() {
+                        let quotient_pair = F::multiply_pair(
+                            [products_0[index], products_1[index]],
+                            [denominator_inverses_0[index], denominator_inverses_1[index]],
+                        );
+                        products_0[index] = quotient_pair[0];
+                        products_1[index] = quotient_pair[1];
+                    }
                 },
             );
     }
@@ -761,10 +801,11 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    let (z_0, z_1) = join(
+        || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![z_0, z_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.

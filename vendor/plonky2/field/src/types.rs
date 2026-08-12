@@ -467,6 +467,15 @@ pub trait Field:
         Self::MULTIPLICATIVE_GROUP_GENERATOR
     }
 
+    /// Multiply two independent pairs. The default is scalar; fields with a
+    /// two-lane backend may override this without changing either lane's
+    /// multiplication order or representation.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn multiply_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        [lhs[0] * rhs[0], lhs[1] * rhs[1]]
+    }
+
     /// Equivalent to *self + x * y, but may be cheaper.
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
