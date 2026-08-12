@@ -761,10 +761,15 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // The two Z chains are independent pure functions of disjoint product
+    // buffers. Join them so the second chain can use idle Rayon workers while
+    // the first finishes its serial prefix/interpolation work. Values are
+    // bit-identical to the sequential calls; only the schedule changes.
+    let (z0, z1) = plonky2_maybe_rayon::join(
+        || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![z0, z1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
