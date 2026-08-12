@@ -32,7 +32,7 @@ use plonky2::util::timing::TimingTree;
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TxPath {
+pub(crate) enum TxPath {
     Heavy,
     Light,
 }
@@ -53,7 +53,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
+// Series draw marker: v17, sample 6.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
@@ -329,6 +329,157 @@ fn generate_tx_witness<'a>(
     (partition_witness, new_jump)
 }
 
+/// The block-derived inputs a first transaction witness needs that only exist
+/// once the pre-execution proof does.
+pub(crate) struct HoistInputs {
+    pre_output: BlockPreExecWitness<F>,
+    state_metadata_hash: HashOut<F>,
+}
+
+/// Reads them off the finished pre-execution proof — the same two derivations
+/// [`prove_block_after_pre`] makes from the same proof, so the values a hoisted
+/// witness is built from are the values the pipeline would have used.
+pub(crate) fn hoist_inputs(pre_proof: &Proof) -> HoistInputs {
+    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+    let state_metadata_hash = pre_output.new_state_metadata.hash();
+    HoistInputs {
+        pre_output,
+        state_metadata_hash,
+    }
+}
+
+/// A first-chunk transaction witness generated before its circuit data reached
+/// its final home, carried across that move without a borrow.
+///
+/// [`PartitionWitness`] borrows exactly one thing — `representative_map` — and
+/// every one of its fields is public, so the borrow can be dropped here and
+/// re-taken inside [`prove_path`] against the same circuit's representative
+/// map. Nothing about the witness is recomputed and nothing is copied: the two
+/// `Vec`s are moved through untouched, and the slice it is re-attached to is
+/// the same bytes of the same circuit it was generated from (asserted below).
+pub(crate) struct HoistedTxWitness {
+    chunk_index: usize,
+    values: Vec<F>,
+    set_bitmap: Vec<u64>,
+    num_wires: usize,
+    degree: usize,
+    next_jump: JumpState<F>,
+}
+
+impl HoistedTxWitness {
+    fn reattach(
+        self,
+        tx_data: &CircuitData<F, C, D>,
+    ) -> (usize, PartitionWitness<'_, F>, JumpState<F>) {
+        let representative_map = &tx_data.prover_only.representative_map;
+        assert_eq!(
+            self.values.len(),
+            representative_map.len(),
+            "hoisted transaction witness was generated against a different circuit"
+        );
+        assert_eq!(
+            self.num_wires, tx_data.common.config.num_wires,
+            "hoisted transaction witness was generated against a different circuit"
+        );
+        assert_eq!(
+            self.degree,
+            tx_data.common.degree(),
+            "hoisted transaction witness was generated against a different circuit"
+        );
+        (
+            self.chunk_index,
+            PartitionWitness {
+                values: self.values,
+                set_bitmap: self.set_bitmap,
+                representative_map,
+                num_wires: self.num_wires,
+                degree: self.degree,
+            },
+            self.next_jump,
+        )
+    }
+}
+
+/// Generates a path's first transaction witness away from [`prove_path`], for a
+/// caller that holds the circuit data earlier than the pipeline does.
+///
+/// Value-exact: this is the same [`generate_tx_witness`] call on the same
+/// inputs — chunk 0 of the path, `JumpState::initial` of the pre-execution
+/// outputs — that `prove_path` makes when no hoisted witness is supplied.
+/// Witness generation is a pure function of those inputs and the circuit, so
+/// the witness, and therefore the proof, is bit-identical either way.
+pub(crate) fn hoist_first_tx_witness(
+    path: TxPath,
+    chunk: (usize, Vec<Arc<Tx<F>>>),
+    tx_data: &CircuitData<F, C, D>,
+    tx_target: &BlockTxTarget,
+    created_at: i64,
+    old_account_delta_tree_root: HashOut<F>,
+    hoist: &HoistInputs,
+) -> HoistedTxWitness {
+    let (chunk_index, txs) = chunk;
+    let (witness, next_jump) = generate_tx_witness(
+        path,
+        chunk_index,
+        txs,
+        tx_data,
+        tx_target,
+        created_at,
+        hoist.state_metadata_hash,
+        JumpState::initial(
+            hoist.pre_output.new_state_root,
+            old_account_delta_tree_root,
+        ),
+    );
+    let PartitionWitness {
+        values,
+        set_bitmap,
+        representative_map: _,
+        num_wires,
+        degree,
+    } = witness;
+    HoistedTxWitness {
+        chunk_index,
+        values,
+        set_bitmap,
+        num_wires,
+        degree,
+        next_jump,
+    }
+}
+
+/// Chunks and hoisted first witnesses handed to [`prove_block_after_pre`] by
+/// the worker startup path.
+pub(crate) struct PipelineInputs {
+    pub(crate) heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
+    pub(crate) light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
+    pub(crate) heavy_first: Option<HoistedTxWitness>,
+    pub(crate) light_first: Option<HoistedTxWitness>,
+}
+
+/// Splits the block's transaction chunks into the two paths and leaves the
+/// block holding the single empty chunk the final block witness expects.
+pub(crate) fn split_tx_chunks(
+    block: &mut Block<F>,
+) -> (
+    Vec<(usize, Vec<Arc<Tx<F>>>)>,
+    Vec<(usize, Vec<Arc<Tx<F>>>)>,
+) {
+    let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
+    let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
+    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::with_capacity(tx_chunks.len());
+    for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
+        if chunk_is_light(&txs) {
+            light_chunks.push((chunk_index, txs));
+        } else {
+            heavy_chunks.push((chunk_index, txs));
+        }
+    }
+    block.tx_chunks = tx_chunks;
+    block.tx_chunks.push(Vec::new());
+    (heavy_chunks, light_chunks)
+}
+
 fn prove_tx_witness(
     path: TxPath,
     chunk_index: usize,
@@ -363,6 +514,7 @@ fn prove_tx_witness(
 fn prove_path(
     path: TxPath,
     chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
+    first_witness: Option<HoistedTxWitness>,
     circuits: &Circuits,
     block_number: u64,
     created_at: i64,
@@ -371,8 +523,10 @@ fn prove_path(
     state_metadata_hash: HashOut<F>,
     active_paths: &AtomicUsize,
 ) -> Proof {
+    // `chunks` excludes the first chunk exactly when its witness was hoisted
+    // into the startup load window and arrives here instead.
     assert!(
-        !chunks.is_empty(),
+        !chunks.is_empty() || first_witness.is_some(),
         "{path:?} transaction path must contain at least one chunk"
     );
     #[cfg(feature = "diagnostic_profile")]
@@ -442,22 +596,30 @@ fn prove_path(
         pre_output.new_validium_root,
         old_account_delta_tree_root,
     );
-    let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
     let mut chunks = chunks.into_iter();
-    let (mut current_chunk_index, first_txs) =
-        chunks.next().expect("transaction path must not be empty");
-    let (mut current_witness, next_jump) = generate_tx_witness(
-        path,
-        current_chunk_index,
-        first_txs,
-        tx_data,
-        tx_target,
-        created_at,
-        state_metadata_hash,
-        jump,
-    );
-    jump = next_jump;
-
+    // The first witness is generated here only when it was not already
+    // generated inside the startup load window (waterfall row #3b): its inputs
+    // — the pre-execution outputs and this path's chunk 0 — exist well before
+    // the blob loads return, and running it here leaves the GPU dead for its
+    // whole duration. Either way it is the same call on the same inputs.
+    let (mut current_chunk_index, mut current_witness, mut jump) = match first_witness {
+        Some(hoisted) => hoisted.reattach(tx_data),
+        None => {
+            let (chunk_index, first_txs) =
+                chunks.next().expect("transaction path must not be empty");
+            let (witness, next_jump) = generate_tx_witness(
+                path,
+                chunk_index,
+                first_txs,
+                tx_data,
+                tx_target,
+                created_at,
+                state_metadata_hash,
+                JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root),
+            );
+            (chunk_index, witness, next_jump)
+        }
+    };
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
@@ -735,7 +897,7 @@ pub(crate) fn prove_pre_execution_parallel(
 /// [`prove_pre_execution_parallel`]). `#[cfg(test)]` because the release build
 /// would otherwise warn it dead.
 #[cfg(test)]
-pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
+pub fn prove_block(mut block: Block<F>, circuits: Circuits) -> Proof {
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
@@ -746,16 +908,28 @@ pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
         &BlockPreExec::from_block(&block),
     );
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    prove_block_after_pre(block, circuits, pre_proof)
+    let (heavy_chunks, light_chunks) = split_tx_chunks(&mut block);
+    prove_block_after_pre(
+        block,
+        circuits,
+        pre_proof,
+        PipelineInputs {
+            heavy_chunks,
+            light_chunks,
+            heavy_first: None,
+            light_first: None,
+        },
+    )
 }
 
 /// The pipeline after the pre-execution proof. The startup-overlap path calls
 /// this once both the pre-execution proof and the remaining circuit loads have
 /// completed.
 pub(crate) fn prove_block_after_pre(
-    mut block: Block<F>,
+    block: Block<F>,
     mut circuits: Circuits,
     pre_proof: Proof,
+    inputs: PipelineInputs,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
@@ -765,19 +939,12 @@ pub(crate) fn prove_block_after_pre(
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
-    let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
-    let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
-        Vec::with_capacity(tx_chunks.len());
-    for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
-        if chunk_is_light(&txs) {
-            light_chunks.push((chunk_index, txs));
-        } else {
-            heavy_chunks.push((chunk_index, txs));
-        }
-    }
-    block.tx_chunks = tx_chunks;
-    block.tx_chunks.push(Vec::new());
+    let PipelineInputs {
+        heavy_chunks,
+        mut light_chunks,
+        heavy_first,
+        light_first,
+    } = inputs;
 
     // Both transaction paths prove concurrently and each ends in a strictly
     // sequential chain tail, but the exclusive-GPU switch that tail wants is
@@ -816,6 +983,7 @@ pub(crate) fn prove_block_after_pre(
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
+                        heavy_first,
                         circuits,
                         block.block_number,
                         block.created_at,
@@ -899,6 +1067,7 @@ pub(crate) fn prove_block_after_pre(
                     prove_path(
                         TxPath::Light,
                         light_chunks,
+                        light_first,
                         circuits,
                         block.block_number,
                         block.created_at,
