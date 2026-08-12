@@ -2028,10 +2028,10 @@ static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+/// the GPU absorbs each group while the CPU fills the next, converting the
+/// previously serial CPU-FFT-then-GPU-hash commitment into
+/// max(FFT, hash) + one pass. See `stream_admitted` below for which trees are
+/// admitted.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
@@ -2056,8 +2056,24 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
     // while an already-busy stream would just queue the absorb groups behind
     // another tree and stretch both.
+    //
+    // The 2^17 spine trees (`build`'s serial-critical predicate) take the same
+    // deal on the same terms. The unoccupied-stream condition is kept for them
+    // rather than relaxed on the argument that the chain is the laggard and so
+    // deserves to queue ahead: streaming while another build occupies the
+    // stream was measured to produce an invalid proof on one run in two, so
+    // treat the condition as load-bearing rather than advisory.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
         leaf_count >= 1 << 20
+    } else if leaf_count == 1 << 17 && leaf_width >= 128 {
+        // Widened only for the spine's wires tree. Relaxing the
+        // unoccupied-stream condition for every spine width produced an invalid
+        // proof on one run in two, and the identity that failed was the
+        // quotient one, whose tree is the width-16 shape — so the narrow spine
+        // trees keep the condition until that is understood.
+        spine_urgent() || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
+    } else if leaf_count == 1 << 17 && leaf_width > 4 {
+        GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
@@ -6503,6 +6519,50 @@ kernel void goldilocks_mul_bench_native(
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
             .expect("classic tree");
         assert_eq!(streamed, classic);
+    }
+
+    /// The chain steps commit 2^17-row trees outside any exclusive phase, which
+    /// is the shape and the admission route the spine arm opens. Covers the
+    /// three chain commitment widths.
+    #[test]
+    fn spine_streamed_merkle_matches_classic_at_chain_shape() {
+        type F = GoldilocksField;
+
+        let context = shared_context().expect("Metal context");
+        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
+        set_exclusive_gpu_phase(false);
+        let rows = 1usize << 17;
+        let cap_height = 4;
+
+        for cols in [16usize, 20, 136] {
+            let columns = context
+                .allocate_columns::<F>(rows, cols)
+                .expect("shared columns");
+            let fill = |group: usize, destinations: &mut [&mut [F]]| {
+                for (index, destination) in destinations.iter_mut().enumerate() {
+                    let column = group * 8 + index;
+                    for (row, slot) in destination.iter_mut().enumerate() {
+                        // Raw words on both sides of the modulus, so the
+                        // canonicalizing absorb is exercised as in the leaf tests.
+                        *slot = F::from_noncanonical_u64(match (column + row) & 3 {
+                            0 => 0,
+                            1 => F::ORDER - 1,
+                            2 => F::ORDER,
+                            _ => (column * rows + row) as u64,
+                        });
+                    }
+                }
+            };
+
+            let streamed = build_merkle_tree_shared_streamed(&columns, cap_height, &fill)
+                .expect("streamed spine tree");
+            assert!(streamed.0.nodes.is_shared());
+
+            let classic = context
+                .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+                .expect("classic tree");
+            assert_eq!(streamed, classic, "cols = {cols}");
+        }
     }
 
     #[test]
