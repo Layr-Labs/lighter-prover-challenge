@@ -467,6 +467,30 @@ pub trait Field:
         Self::MULTIPLICATIVE_GROUP_GENERATOR
     }
 
+    /// Multiply two independent pairs. The default is scalar; fields with a
+    /// two-lane backend may override this without changing either lane's
+    /// multiplication order or representation.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn multiply_pair(lhs: [Self; 2], rhs: [Self; 2]) -> [Self; 2] {
+        [lhs[0] * rhs[0], lhs[1] * rhs[1]]
+    }
+
+    /// Invert two equal-length batches. Fields with a paired arithmetic backend
+    /// may share the Montgomery traversal and its terminal inversion; the
+    /// generic path preserves the established independent calls.
+    #[doc(hidden)]
+    fn batch_multiplicative_inverse_pair_into(
+        x0: &[Self],
+        x1: &[Self],
+        buf0: &mut Vec<Self>,
+        buf1: &mut Vec<Self>,
+    ) {
+        debug_assert_eq!(x0.len(), x1.len());
+        Self::batch_multiplicative_inverse_into(x0, buf0);
+        Self::batch_multiplicative_inverse_into(x1, buf1);
+    }
+
     /// Equivalent to *self + x * y, but may be cheaper.
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
