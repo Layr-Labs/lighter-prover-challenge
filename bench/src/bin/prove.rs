@@ -42,30 +42,74 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
 // Keep the promoted writer path while exercising a second submission from that baseline.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+// The serialized proof measures ~196 KB at the ranked circuit shapes, so the
+// prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
+// a single write(2) with ~2.6x headroom over the measured size, while cutting
+// the per-worker buffer allocation 4x. Value-exact: buffer capacity changes
+// only syscall batching, never the serialized bytes.
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
 
 fn main() {
+    // F1 — the highest-value pin in the tree. This thread runs the run's most
+    // serial window: the final light-chain witness feed and the entire final
+    // block proof under `set_exclusive_gpu_phase(true)`. It was the only
+    // serial-critical lane at default QoS, competing on equal terms with a
+    // saturated pool for performance cores. Pinned first so that every thread
+    // this function later creates inherits a defined class rather than the
+    // harness's, and so the pin covers the startup window too.
+    //
+    // Scheduling only: no work is added, moved or reordered, and this changes
+    // no computed value. Best-effort — a failed pin leaves the previous QoS,
+    // which is exactly the pre-change behavior. No-op off macOS.
+    prover::mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let profile_process = plonky2::util::profile::span("process", "prove_worker");
-    // First statement in the process: the Metal shader compile and pipeline
+    // First statements in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
     // cache, which disables it entirely — so every scored worker pays the full
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
+    //
+    // Before submitting the prewarm, register the proof-output directory as the
+    // staging area for the prebuilt pipeline archive: `MTLBinaryArchive` opens
+    // from a file URL only, and that directory is the one path the ranked
+    // Seatbelt profile lets this process write. An archive hit lets the prewarm
+    // skip the AIR->ISA lowering outright. Reading argv here — and asserting its
+    // shape only after the prewarm is in flight — keeps the lowering off the
+    // critical path even by the few microseconds argument handling costs.
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    if let Some(dir) = std::path::Path::new(&output).parent() {
+        plonky2::hash::poseidon2::set_pipeline_archive_dir(dir);
+    }
     {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("startup", "metal_prewarm_submit");
         plonky2::hash::poseidon2::prewarm_gpu();
     }
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        // F7 — every rayon worker was permanently default QoS: the pool is
+        // built here, before any pinning existed, and no start handler was
+        // ever installed, so a `rayon::join` submitted *from* a 0x21
+        // chain-step thread still executed on default-QoS workers. Giving the
+        // workers USER_INITIATED puts the bulk pool one class below the
+        // serial-critical lanes (0x21) and one above nothing, preserving the
+        // intended ordering spine > pool while keeping bulk work off the
+        // efficiency cores it was drifting onto.
+        //
+        // The handler runs once per worker at thread start, before any work is
+        // taken, and touches only that thread's scheduling class.
+        .start_handler(|_index| prover::mark_thread_user_initiated())
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
@@ -74,11 +118,6 @@ fn main() {
         "rayon_threads",
         rayon::current_num_threads() as u64,
     );
-
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
     let (block, pre_circuits) = rayon::join(
@@ -120,6 +159,9 @@ fn main() {
     // Value-exact: no quantity is computed differently, only in parallel.
     let (pre_handle, remaining) = std::thread::scope(|scope| {
         let remaining_handle = scope.spawn(|| {
+            // F5 — the startup lane the main thread blocks on before the
+            // pipeline can start.
+            prover::mark_spine_thread_latency_critical();
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
             (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
@@ -134,6 +176,9 @@ fn main() {
             .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
             .spawn(move || {
+                // F4 — gates the pipeline start; contends with the blob-load
+                // lane and the pool for the whole startup window.
+                prover::mark_spine_thread_latency_critical();
                 let (pre_target, mut pre_data) = pre_circuits;
                 let pre_proof =
                     prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
@@ -252,6 +297,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// arithmetic-on-promoted-frontier-1786506400
-
-// p90-fire-top1-50-1786515495
+// zarar-arc-1
