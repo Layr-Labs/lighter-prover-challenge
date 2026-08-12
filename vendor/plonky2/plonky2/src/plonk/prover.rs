@@ -1381,7 +1381,15 @@ fn start_gpu_range_check_gate_quotient<
             // existing CPU direct-accumulation evaluator instead: skipping it
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // bits=6 is already CPU-side (sparse 64-entry fold). bits=3 is
+            // the heaviest remaining RandomAccess family and is free on the
+            // CPU gather amplifiers of any shape that already contains the
+            // 67-bit exponentiation gate. Keep it off the shared Metal command.
+            if matches!(
+                u32_gate,
+                U32QuotientGate::RandomAccess { bits: 6, .. }
+                    | U32QuotientGate::RandomAccess { bits: 3, .. }
+            ) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
