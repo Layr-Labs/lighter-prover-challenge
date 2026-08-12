@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "5e1f80d3af505005462d0ed901d486f909008a0edd00c5b1aae24a7ad7dc69af";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1691,6 +1691,8 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
         || wires.rows == 0
         || wires.rows != constants.rows
+        || wires.cols == 0
+        || wires.cols > 136
         || quotient_rows == 0
         || step == 0
         || quotient_rows.checked_mul(step) != Some(wires.rows)
@@ -2697,7 +2699,8 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            set_u32(encoder, 11, wires.cols as u32);
+            dispatch_range_tile(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3831,6 +3834,27 @@ fn dispatch2d(
         },
         MTLSize {
             width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn dispatch_range_tile(
+    encoder: &metal::ComputeCommandEncoderRef,
+    _pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    // Must match RANGE_TILE_ROWS in poseidon2.metal.
+    const TILE_ROWS: NSUInteger = 16;
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: TILE_ROWS,
             height: 1,
             depth: 1,
         },
