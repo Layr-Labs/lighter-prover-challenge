@@ -47,6 +47,10 @@ circuit = { path = "../circuit", default-features = true }
 [build-dependencies]
 anyhow = { workspace = true }
 rayon = { workspace = true }
+# `build.rs` needs `CircuitData` to hand the pre-execution and chain circuits
+# to `BlockCircuit::define` for the embedded final block circuit. Already in
+# this package's dependency graph, so `Cargo.lock` is unchanged.
+plonky2 = { workspace = true, default-features = false }
 circuit = { path = "../circuit", default-features = true }
 
 [dev-dependencies]

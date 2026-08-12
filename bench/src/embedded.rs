@@ -14,6 +14,7 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -124,6 +126,40 @@ impl Circuits {
             dummy_heavy_proof,
             dummy_light_proof,
         })
+    }
+
+    /// Loads the final block circuit from its embedded blob, falling back to
+    /// [`Self::build_block_circuit`] on any error.
+    ///
+    /// `BlockCircuit::define` reads only the `common` and `verifier_only` data
+    /// of the pre-execution and two chain circuits, all of which are fixed at
+    /// compile time, so this circuit is exactly as compile-time-determined as
+    /// the other five and `build.rs` constructs it the same way. The
+    /// construction it replaces was measured at 11.2 s (sigma generation plus
+    /// preprocessing for a 2^18-row circuit) on the block lane, which runs
+    /// concurrently with the light transaction pipeline's ramp — hidden from
+    /// the critical path but competing with it for cores and for the
+    /// serialized GPU stream. Loading the blob instead removes that work from
+    /// every scored worker.
+    ///
+    /// The blob's own `deserialize_embedded` cap check still applies: the
+    /// recomputed constants/sigmas commitment cap must equal the embedded
+    /// verifier data's cap, which transitively pins the circuit digest. A
+    /// stale or corrupt blob therefore falls back to the build path rather
+    /// than producing a proof the verifier would reject.
+    pub(crate) fn load_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            return self.build_block_circuit();
+        }
+        match load_blob::<BlockTarget>("block", BLOCK_BLOB) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                log::warn!(
+                    "embedded final block circuit unavailable ({error:#}); building from scratch"
+                );
+                self.build_block_circuit()
+            }
+        }
     }
 
     /// Reconstructs all five startup circuits from the blobs embedded at
@@ -334,6 +370,18 @@ mod tests {
                 ),
             );
 
+            // The final block circuit is loaded on its own lane rather than as
+            // part of `Circuits`, but it is embedded by the same mechanism and
+            // needs the same oracle: `build_block_circuit` is the construction
+            // `load_block_circuit` replaces, so the two must be value-identical.
+            let rebuilt_block = rebuilt.build_block_circuit();
+            let embedded_block = embedded.load_block_circuit();
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_block.0, &rebuilt_block.1),
+                (&embedded_block.0, &embedded_block.1),
+            );
+
             // The gate serializer round trip below also pins the common data
             // encoding used by the blobs.
             let mut bytes = Vec::new();
@@ -424,6 +472,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),

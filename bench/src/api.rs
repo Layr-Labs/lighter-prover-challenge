@@ -204,7 +204,9 @@ impl Circuits {
     /// remains, because every reader of these two circuits holds a shared guard
     /// for the whole span in which it may touch them — the heavy path from
     /// before its first witness until after its chain proof, and
-    /// [`Self::build_block_circuit`] for the duration of `BlockCircuit::define`.
+    /// [`Self::build_block_circuit`] for the duration of `BlockCircuit::define`
+    /// on the fallback path (the embedded block-circuit load reads no circuit at
+    /// all, so it takes no guard and only weakens the obligation).
     /// The caller runs this after joining the heavy path's thread, so both
     /// guards are already gone and the acquisition is uncontended.
     ///
@@ -248,8 +250,13 @@ impl Circuits {
     }
 
     /// Builds the final block circuit, which depends on the pre-execution and
-    /// both chain circuits but is only needed for the final proof. Callers run
-    /// this concurrently with transaction/chain proving.
+    /// both chain circuits but is only needed for the final proof.
+    ///
+    /// The scored worker does not call this: it loads the same circuit from an
+    /// embedded blob (`Circuits::load_block_circuit`), which keeps this as the
+    /// fallback for a missing or stale blob and as the equality oracle's
+    /// reference construction. Callers run either one concurrently with
+    /// transaction/chain proving.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
