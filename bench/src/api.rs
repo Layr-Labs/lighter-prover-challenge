@@ -1,5 +1,4 @@
-// Redraw marker top1-50-1786515495
-// Copyright (c) Elliot Technologies, Inc.
+// Redraw marker opus-spine-lane-r2
 // SPDX-License-Identifier: BUSL-1.1
 
 use circuit::block_constraints::{BlockCircuit, BlockTarget, Circuit as _};
