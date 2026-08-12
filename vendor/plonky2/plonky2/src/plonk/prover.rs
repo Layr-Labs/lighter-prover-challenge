@@ -601,24 +601,62 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     let num_chunks = num_prods + 1;
     debug_assert_eq!(all_quotient_chunk_products.len() % num_chunks, 0);
     let n_points = all_quotient_chunk_products.len() / num_chunks;
-    let mut columns: Vec<Vec<F>> = (0..num_chunks)
-        .map(|_| Vec::with_capacity(n_points))
-        .collect();
-    let mut z_x = F::ONE;
-    for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
-        let mut acc = z_x;
-        for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
-            acc *= quotient_chunk_product;
-            if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
-                columns[k].push(z_x);
-                z_x = acc;
-            } else {
-                columns[k].push(acc);
-            }
-        }
+
+    // prefixes[i * num_prods + k] = product of chunks 0..=k for point i (vs ONE).
+    // full_products[i] = product of all num_chunks factors for point i.
+    let mut full_products = vec![F::ZERO; n_points];
+    let mut prefixes = vec![F::ZERO; n_points.saturating_mul(num_prods)];
+    if num_prods > 0 {
+        prefixes
+            .par_chunks_mut(num_prods)
+            .zip(full_products.par_iter_mut())
+            .zip(all_quotient_chunk_products.par_chunks_exact(num_chunks))
+            .for_each(|((prefix_out, full_out), chunk_products)| {
+                let mut acc = F::ONE;
+                for (k, &p) in chunk_products.iter().enumerate() {
+                    acc *= p;
+                    if k < num_prods {
+                        prefix_out[k] = acc;
+                    }
+                }
+                *full_out = acc;
+            });
+    } else {
+        full_products
+            .par_iter_mut()
+            .zip(all_quotient_chunk_products.par_chunks_exact(num_chunks))
+            .for_each(|(full_out, chunk_products)| {
+                let mut acc = F::ONE;
+                for &p in chunk_products {
+                    acc *= p;
+                }
+                *full_out = acc;
+            });
     }
+
+    // Exclusive scan: z_at[i] = product of full_products[0..i], z_at[0] = ONE.
+    let mut z_at = Vec::with_capacity(n_points);
+    let mut z_x = F::ONE;
+    for &full in &full_products {
+        z_at.push(z_x);
+        z_x *= full;
+    }
+
+    let mut columns: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| vec![F::ZERO; n_points])
+        .collect();
+    // Small outer loop (production num_prods ~9): each column streams n_points
+    // in parallel. Avoid nested Rayon on the same pool.
+    for k in 0..num_prods {
+        columns[k]
+            .par_iter_mut()
+            .zip(z_at.par_iter())
+            .zip(prefixes.par_chunks_exact(num_prods))
+            .for_each(|((out, &z), prefs)| {
+                *out = z * prefs[k];
+            });
+    }
+    columns[num_prods].copy_from_slice(&z_at);
 
     columns.into_iter().map(PolynomialValues::new).collect()
 }
@@ -663,7 +701,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
 
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     let product_count = subgroup.len() * num_chunks;
     // Same uninitialised-capacity handling as the per-challenge path: every
     // slot is written below before anything reads it, so zero-filling first is
@@ -761,10 +799,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // The two challenge Z-chains share no state. Run them concurrently so the
+    // exclusive scans and column fills occupy two P-cores instead of serializing
+    // ~10-18 ms of pure chain work per production proof (measured road-to-50).
+    let (z0, z1) = join(
+        || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![z0, z1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -793,7 +835,7 @@ fn wires_permutation_partial_products_and_zs<
     // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     // Every slot of this buffer is assigned below before anything reads it —
     // the inner loop writes `quotient_products[t * num_chunks + chunk]` for
     // every `t` in the batch and every `chunk`, which covers each sub-slice
