@@ -1274,6 +1274,32 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
     }
 }
 
+/// Routing switch for the `ExponentiationGate` quotient contribution.
+///
+/// The Metal Range/U32 command already carries a complete Exponentiation
+/// kernel (`U32QuotientKind::Exponentiation`, shader branch `kind == 7`),
+/// and in the d16 transaction circuit this gate is the sole reason the CPU
+/// quotient pass keeps a 136-wide wire gather and 68 constraint rows: it is
+/// the max on both axes among the CPU-resident gates. Offloading it drops
+/// the gather to 80 (ArithmeticGate) and the rows to 26 (MulExtensionGate).
+///
+/// Default on; set `LIGHTER_GPU_EXPONENTIATION=0` to restore the previous
+/// CPU-resident behaviour. NOTE: usable for LOCAL experiments only. The
+/// ranked bridge copies the worker into the sandbox with its environment
+/// cleared (BENCHMARK.md), so on the official host this variable is
+/// unreadable and the offload is unconditionally on: there is no ranked
+/// kill switch and no env-selected control arm. A ranked A/B needs two
+/// separately built binaries.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn gpu_exponentiation_quotient_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_GPU_EXPONENTIATION")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
@@ -1591,15 +1617,32 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
-            // The transaction circuits' 67-bit exponentiation loop is the
-            // most divergent native branch in the shared Range/U32 command.
-            // Leave this one family on the existing CPU quotient evaluator:
-            // it stays out of `gate_indices`, so it is not CPU-excluded and
-            // its selector/alpha contribution remains byte-for-byte the
-            // ordinary generic path. This trades a small parallel CPU span
-            // for a shorter process-shared Metal queue tail.
-            None
+        let native = if let Some(exponentiation) =
+            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
+        {
+            // Wire 0 is the base, wires `1..=n` the power bits in
+            // little-endian order, wire `1 + n` the output and wires
+            // `2 + n .. 2 + 2n` the running intermediate values, for
+            // `2n + 2` wires and `n + 1` constraints. `num_ops` carries the
+            // power-bit count `n`, matching the kernel's `kind == 7` branch.
+            //
+            // This gate used to be left CPU-resident on the theory that it
+            // was a small parallel CPU span. The gate census refutes that
+            // for the d16 transaction circuit: it is simultaneously the
+            // widest (136 wires) and tallest (68 constraints) CPU-resident
+            // gate there, so it alone pins `cpu_num_wires` and
+            // `cpu_num_gate_constraints` for the whole quotient pass.
+            if gpu_exponentiation_quotient_enabled() {
+                let num_power_bits = exponentiation.num_power_bits;
+                Some((
+                    U32QuotientKind::Exponentiation,
+                    num_power_bits,
+                    num_power_bits.checked_mul(2)?.checked_add(2)?,
+                    num_power_bits.checked_add(1)?,
+                ))
+            } else {
+                None
+            }
         } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
             // The gate reads its single constant (the "one" value) as local
             // constant 0, i.e. the column immediately after the selector
