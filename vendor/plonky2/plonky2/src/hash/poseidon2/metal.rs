@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "938d7a8724a2ab35550bdac5600f0d664417dbf0a87806bdb60bfd7a611f6da6";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -2697,7 +2697,10 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            // Threadgroup size 16 matches RANGE_TILE_ROWS in poseidon2.metal so
+            // the kernel's cooperative 16x136 wire tile path admits. Larger
+            // groups leave use_tile false and fall back to device loads.
+            dispatch_threadgroups(encoder, pipeline, quotient_rows, 16);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3855,6 +3858,34 @@ fn dispatch(
         },
         MTLSize {
             width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// 1-D dispatch with an explicit threadgroup width. The range/U32 quotient
+/// kernel admits its cooperative 16-row wire tile only when this width equals
+/// `RANGE_TILE_ROWS` (16) in `poseidon2.metal`.
+fn dispatch_threadgroups(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    group_width: usize,
+) {
+    // Do not clamp up to `thread_execution_width` (often 32): the range/U32
+    // tile path requires an exact group width of 16. Metal allows non-multiple
+    // of execution width for dispatch_threads group size on Apple GPUs.
+    let max_width = pipeline.max_total_threads_per_threadgroup() as usize;
+    let group_width = group_width.min(max_width).max(1);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width as NSUInteger,
             height: 1,
             depth: 1,
         },
