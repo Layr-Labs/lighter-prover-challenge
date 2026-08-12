@@ -761,10 +761,17 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // Each challenge now owns an independent quotient-product buffer. Its Z
+    // recurrence must remain sequential within that challenge, but the two
+    // production recurrences have no dependency on one another. Run them on
+    // separate Rayon workers while preserving every multiplication and push
+    // in each chain verbatim; this shortens the serial tail without changing
+    // raw Goldilocks representatives or output order.
+    let (z_polynomials_0, z_polynomials_1) = plonky2_maybe_rayon::join(
+        move || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        move || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![z_polynomials_0, z_polynomials_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -3470,10 +3477,11 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // Production subgroup lengths, spanning a single point, a short first
+        // inversion batch, the INV_BATCH = 128 boundary exactly, and two full
+        // batches. `PolynomialValues::new` requires a power-of-two length, so
+        // non-power-of-two synthetic sizes cannot reach the comparison below.
+        for &n_points in &[1usize, 4, 128, 256] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
