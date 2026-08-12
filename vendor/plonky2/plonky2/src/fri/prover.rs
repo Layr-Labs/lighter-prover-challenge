@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -287,15 +287,33 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    // Candidates are mutually independent — each is one permutation of the same
+    // intermediate state with one element replaced — so four of them can share a
+    // single interleaved permutation call. `permute_x4` is bit-identical to four
+    // sequential `permute`s (default impl IS four sequential `permute`s), so this
+    // is a pure issue-slot reclamation, not a change of what is computed.
+    //
+    // `find_any` already returns an arbitrary satisfying witness rather than the
+    // smallest one, so widening the unit of work from one candidate to four does
+    // not change the contract; only which valid witness is returned.
+    const POW_BATCH: u64 = 4;
+    let last_block = F::NEG_ONE.to_canonical_u64() / POW_BATCH;
+    let pow_witness = (0..=last_block)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .find_map_any(|block| {
+            let first = block * POW_BATCH;
+            let mut states = [duplex_intermediate_state; POW_BATCH as usize];
+            for (k, state) in states.iter_mut().enumerate() {
+                state.set_elt(F::from_canonical_u64(first + k as u64), witness_input_pos);
+            }
+            <C::Hasher as Hasher<F>>::Permutation::permute_x4(&mut states);
+            for (k, state) in states.iter().enumerate() {
+                let pow_response = state.squeeze().iter().last().unwrap();
+                if pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros {
+                    return Some(first + k as u64);
+                }
+            }
+            None
         })
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
@@ -366,10 +384,162 @@ fn fri_prover_query_round<
 
 #[cfg(test)]
 mod tests {
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{Field64, PrimeField64, Sample};
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+
+    /// `permute_x4` must be bit-identical to four sequential `permute`s, on
+    /// random and adversarial states. This is the whole correctness obligation
+    /// of the batched grinder: it changes the unit of work, not the work.
+    #[test]
+    fn permute_x4_matches_four_sequential_permutes() {
+        use crate::hash::poseidon2::hash::Poseidon2Permutation;
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+        type F = GoldilocksField;
+        type P = <<Poseidon2GoldilocksConfig as GenericConfig<2>>::Hasher as Hasher<F>>::Permutation;
+        const _: () = assert!(core::mem::size_of::<P>() == core::mem::size_of::<Poseidon2Permutation<F>>());
+
+        let corners: Vec<u64> = {
+            let mut v = vec![0u64, 1, 2, u32::MAX as u64, 1u64 << 32, F::ORDER - 1, F::ORDER - 2];
+            for b in 0..63 {
+                v.push(1u64 << b);
+            }
+            v
+        };
+        let mut quads: Vec<[P; 4]> = Vec::new();
+        for _ in 0..500 {
+            quads.push(core::array::from_fn(|_| {
+                P::new((0..P::WIDTH).map(|_| F::rand()))
+            }));
+        }
+        for c in corners.chunks(4) {
+            if c.len() < 4 {
+                continue;
+            }
+            quads.push(core::array::from_fn(|k| {
+                P::new((0..P::WIDTH).map(|_| F::from_canonical_u64(c[k] % F::ORDER)))
+            }));
+        }
+        for quad in quads {
+            let mut want = quad;
+            for s in want.iter_mut() {
+                s.permute();
+            }
+            let mut got = quad;
+            P::permute_x4(&mut got);
+            for k in 0..4 {
+                let w: Vec<u64> = want[k].as_ref().iter().map(|e| e.0).collect();
+                let g: Vec<u64> = got[k].as_ref().iter().map(|e| e.0).collect();
+                assert_eq!(w, g, "lane {k} raw-word mismatch");
+            }
+        }
+    }
+
+    /// Control arm: the pre-batch `find_any` grinder, kept verbatim so the two
+    /// arms can be timed off one binary.
+    #[cfg(test)]
+    fn fri_proof_of_work_scalar<
+        F: RichField + Extendable<D>,
+        C: GenericConfig<D, F = F>,
+        const D: usize,
+    >(
+        challenger: &mut Challenger<F, C::Hasher>,
+        config: &FriConfig,
+    ) -> F {
+        let min_leading_zeros = config.proof_of_work_bits + (64 - F::order().bits()) as u32;
+        let mut duplex_intermediate_state = challenger.sponge_state;
+        let witness_input_pos = challenger.input_buffer.len();
+        duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
+        let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+            .into_par_iter()
+            .find_any(|&candidate| {
+                let mut duplex_state = duplex_intermediate_state;
+                duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                duplex_state.permute();
+                let pow_response = duplex_state.squeeze().iter().last().unwrap();
+                pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros
+            })
+            .map(F::from_canonical_u64)
+            .expect("Proof of work failed. This is highly unlikely!");
+        challenger.observe_element(pow_witness);
+        let pow_response = challenger.get_challenge();
+        assert!(pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros);
+        pow_witness
+    }
+
+    /// Single-arm CPU-time driver for the FRI proof-of-work grinder. Run with
+    /// `/usr/bin/time -l` over N calls and divide, exactly as the 2026-08-12
+    /// `find_any` closure measurement did (42.2 core-ms/call at 16 bits).
+    ///
+    ///   cargo test --release -p plonky2 pow_timing_batch4 -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn pow_timing_batch4() {
+        use crate::fri::{FriConfig, FriReductionStrategy};
+        use crate::iop::challenger::Challenger;
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let config = FriConfig {
+            rate_bits: 3,
+            cap_height: 4,
+            proof_of_work_bits: 16,
+            reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
+            num_query_rounds: 28,
+        };
+        const CALLS: usize = 200;
+        let t = std::time::Instant::now();
+        let mut sink = 0u64;
+        for i in 0..CALLS {
+            let mut ch = Challenger::<F, <C as GenericConfig<2>>::Hasher>::new();
+            ch.observe_element(F::from_canonical_u64(0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1)));
+            sink ^= fri_proof_of_work::<F, C, 2>(&mut ch, &config).to_canonical_u64();
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "pow_timing_batch4: {CALLS} calls, {:.1} ms wall total, {:.3} ms wall/call, sink {sink:#x}",
+            ms,
+            ms / CALLS as f64
+        );
+    }
+
+    /// Control arm for `pow_timing_batch4`: the original one-candidate-per-item
+    /// `find_any` grinder.
+    ///
+    ///   cargo test --release -p plonky2 pow_timing_scalar -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn pow_timing_scalar() {
+        use crate::fri::{FriConfig, FriReductionStrategy};
+        use crate::iop::challenger::Challenger;
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let config = FriConfig {
+            rate_bits: 3,
+            cap_height: 4,
+            proof_of_work_bits: 16,
+            reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
+            num_query_rounds: 28,
+        };
+        const CALLS: usize = 200;
+        let t = std::time::Instant::now();
+        let mut sink = 0u64;
+        for i in 0..CALLS {
+            let mut ch = Challenger::<F, <C as GenericConfig<2>>::Hasher>::new();
+            ch.observe_element(F::from_canonical_u64(0x9E3779B97F4A7C15u64.wrapping_mul(i as u64 + 1)));
+            sink ^= fri_proof_of_work_scalar::<F, C, 2>(&mut ch, &config).to_canonical_u64();
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "pow_timing_scalar: {CALLS} calls, {:.1} ms wall total, {:.3} ms wall/call, sink {sink:#x}",
+            ms,
+            ms / CALLS as f64
+        );
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
