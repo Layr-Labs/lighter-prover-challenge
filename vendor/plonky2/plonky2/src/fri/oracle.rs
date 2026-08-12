@@ -622,7 +622,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
+        for (batch_index, FriBatchInfo { point, polynomials }) in
+            instance.batches.iter().enumerate()
+        {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -632,6 +634,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // here — so the `String` is allocated, written and dropped without
             // ever being read. A static label costs nothing and reads the same
             // in a timing build.
+            // The first (and widest) batch can donate its composition buffer
+            // to the quotient without changing the wide reduction's schedule:
+            // there is no prior `final_poly` to preserve.
+            // Later tiny batches stream cache-sized reduction blocks directly
+            // into the running quotient, avoiding another full-degree
+            // composition allocation and write/read pass.
+            if batch_index > 0 && polynomials.len() <= 16 {
+                timed!(
+                    timing,
+                    "reduce and accumulate small opening batch",
+                    alpha.accumulate_small_polys_base_linear_quotient(
+                        polys_coeff,
+                        &mut final_poly,
+                        *point,
+                    )
+                );
+                continue;
+            }
             let composition_poly = timed!(
                 timing,
                 "reduce batch of polynomials",
@@ -645,8 +665,18 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // Horner recurrence and leaves its top slot as the power-of-two
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
-            let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            if final_poly.coeffs.is_empty() {
+                // Multiplying the empty accumulator by `shift` is a no-op.
+                // Reuse the wide composition allocation as the quotient and
+                // remove the equally large zero-fill/output pass. Resetting
+                // the reducing factor also avoids exponentiating alpha for a
+                // factor that would only multiply the empty accumulator.
+                alpha.reset();
+                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
+            } else {
+                let shift = alpha.shift_factor();
+                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            }
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -1083,6 +1113,60 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+        }
+    }
+
+    /// Streaming a small opening batch must preserve the complete reduction,
+    /// alpha-power shift and synthetic-division recurrence. In particular,
+    /// block boundaries run in descending order, because Horner's accumulator
+    /// carries from the high block into the next lower block.
+    #[test]
+    fn streamed_small_opening_batch_matches_materialized_path() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::PrimeField64;
+
+        type BF = GoldilocksField;
+        type F = <BF as Extendable<2>>::Extension;
+
+        fn raw(values: &[F]) -> Vec<u64> {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: BF| c.to_noncanonical_u64())
+                .collect()
+        }
+
+        for &(num_polys, degree, old_len) in &[
+            (1usize, 1usize, 0usize),
+            (2, 8, 8),
+            (2, 2048, 2048),
+            (2, 2049, 2049),
+            (2, 4097, 4097),
+            (16, 257, 300),
+        ] {
+            let polys = (0..num_polys)
+                .map(|_| PolynomialCoeffs::new(BF::rand_vec(degree)))
+                .collect::<Vec<_>>();
+            let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
+            let base = F::rand();
+            let z = F::rand();
+
+            let mut reference_factor = ReducingFactor::new(base);
+            let composition =
+                reference_factor.reduce_polys_base::<BF, 2>(polys.iter());
+            let shift = reference_factor.shift_factor();
+            let mut expected = initial.clone();
+            accumulate_linear_quotient(&mut expected, &composition, z, shift);
+
+            let mut streamed_factor = ReducingFactor::new(base);
+            let mut actual = initial;
+            streamed_factor.accumulate_small_polys_base_linear_quotient::<BF, 2>(
+                polys.iter(),
+                &mut actual,
+                z,
+            );
+
+            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
         }
     }
 
