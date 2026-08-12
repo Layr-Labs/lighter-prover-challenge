@@ -589,18 +589,39 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
-/// Accumulate the sequential Z chain directly into the column-major output
-/// polynomials, deleting the per-point row Vec, the row-major intermediate,
-/// and the whole-phase transpose. Values and their order are identical to the
-/// swap-based version: for each point, column k receives the k-th running
-/// product, and the last column receives the previous Z(x).
-fn z_polynomials_from_quotient_chunk_products<F: Field>(
-    all_quotient_chunk_products: Vec<F>,
+fn z_polynomial_columns_from_quotient_chunk_products<F: Field>(
+    all_quotient_chunk_products: &[F],
     num_prods: usize,
-) -> Vec<PolynomialValues<F>> {
+) -> Vec<Vec<F>> {
     let num_chunks = num_prods + 1;
     debug_assert_eq!(all_quotient_chunk_products.len() % num_chunks, 0);
     let n_points = all_quotient_chunk_products.len() / num_chunks;
+    if num_chunks == 10 {
+        // Production uses 80 routed wires at quotient degree 8. Pre-size its
+        // ten columns once, then write them by index; the Z-chain arithmetic,
+        // terminal-column store, and multiplication order remain unchanged.
+        let mut columns = (0..10)
+            .map(|_| vec![F::ZERO; n_points])
+            .collect::<Vec<_>>();
+        let mut z_x = F::ONE;
+        for (i, quotient_chunk_products) in all_quotient_chunk_products
+            .chunks_exact(num_chunks)
+            .enumerate()
+        {
+            let mut acc = z_x;
+            for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
+                acc *= quotient_chunk_product;
+                if k == num_prods {
+                    columns[k][i] = z_x;
+                    z_x = acc;
+                } else {
+                    columns[k][i] = acc;
+                }
+            }
+        }
+        return columns;
+    }
+
     let mut columns: Vec<Vec<F>> = (0..num_chunks)
         .map(|_| Vec::with_capacity(n_points))
         .collect();
@@ -610,8 +631,6 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
         for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
             acc *= quotient_chunk_product;
             if k == num_prods {
-                // The last term is Z(gx), but we store Z(x) in its place,
-                // otherwise Z would end up shifted.
                 columns[k].push(z_x);
                 z_x = acc;
             } else {
@@ -619,8 +638,25 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
             }
         }
     }
+    columns
+}
 
-    columns.into_iter().map(PolynomialValues::new).collect()
+/// Accumulate the sequential Z chain directly into the column-major output
+/// polynomials, deleting the per-point row Vec, the row-major intermediate,
+/// and the whole-phase transpose. Values and their order are identical to the
+/// swap-based version: for each point, column k receives the k-th running
+/// product, and the last column receives the previous Z(x).
+fn z_polynomials_from_quotient_chunk_products<F: Field>(
+    all_quotient_chunk_products: Vec<F>,
+    num_prods: usize,
+) -> Vec<PolynomialValues<F>> {
+    z_polynomial_columns_from_quotient_chunk_products(
+        &all_quotient_chunk_products,
+        num_prods,
+    )
+    .into_iter()
+    .map(PolynomialValues::new)
+    .collect()
 }
 
 /// Compute both production permutation challenges in one pass over the witness
@@ -3077,11 +3113,14 @@ mod l_0_table_cache {
 #[cfg(test)]
 mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::{Field, PrimeField64};
+    use plonky2_field::types::{Field, Field64, PrimeField64};
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{
+        divide_chunk_products, z_polynomial_columns_from_quotient_chunk_products,
+        z_polynomials_from_quotient_chunk_products,
+    };
 
     type F = GoldilocksField;
 
@@ -3151,6 +3190,35 @@ mod flat_chunk_products_tests {
                 columns[k].push(acc);
             }
         }
+    }
+
+    /// Exact copy of the generic push-based storage loop that preceded the
+    /// ten-column specialization. Kept test-only as an independent raw-limb
+    /// oracle for both the specialized and fallback shapes.
+    fn generic_z_polynomial_storage_reference(
+        all_quotient_chunk_products: &[F],
+        num_prods: usize,
+    ) -> Vec<Vec<F>> {
+        let num_chunks = num_prods + 1;
+        assert_eq!(all_quotient_chunk_products.len() % num_chunks, 0);
+        let n_points = all_quotient_chunk_products.len() / num_chunks;
+        let mut columns: Vec<Vec<F>> = (0..num_chunks)
+            .map(|_| Vec::with_capacity(n_points))
+            .collect();
+        let mut z_x = F::ONE;
+        for quotient_chunk_products in all_quotient_chunk_products.chunks_exact(num_chunks) {
+            let mut acc = z_x;
+            for (k, &quotient_chunk_product) in quotient_chunk_products.iter().enumerate() {
+                acc *= quotient_chunk_product;
+                if k == num_prods {
+                    columns[k].push(z_x);
+                    z_x = acc;
+                } else {
+                    columns[k].push(acc);
+                }
+            }
+        }
+        columns
     }
 
     /// Differential test for the flat chunk-products refactor: the legacy pipeline (a fresh
@@ -3223,6 +3291,89 @@ mod flat_chunk_products_tests {
                     raw(legacy_column),
                     "column {k} mismatch for {n_points} points"
                 );
+            }
+        }
+    }
+
+    /// The production ten-column direct-write path and every generic fallback
+    /// shape must be raw-identical to the former push-based implementation.
+    /// Point counts straddle the 128-row producer batches, including empty and
+    /// one-row inputs; chunk counts cover both sides of the production shape.
+    #[test]
+    fn z_polynomial_storage_specialization_matches_generic_raw() {
+        const POINT_COUNTS: [usize; 5] = [0, 1, 127, 128, 129];
+        const CHUNK_COUNTS: [usize; 5] = [1, 2, 9, 10, 11];
+        const RAW_BOUNDARIES: [u64; 6] =
+            [1, 2, F::ORDER - 1, F::ORDER + 1, F::ORDER + 2, u64::MAX];
+
+        for n_points in POINT_COUNTS {
+            for num_chunks in CHUNK_COUNTS {
+                let len = n_points * num_chunks;
+                let mut state = 0xd1b5_4a32_d192_ed03u64
+                    ^ (n_points as u64).rotate_left(17)
+                    ^ num_chunks as u64;
+                let mut products = Vec::with_capacity(len);
+                for i in 0..len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let mut raw = if i < RAW_BOUNDARIES.len() {
+                        RAW_BOUNDARIES[i]
+                    } else {
+                        state
+                    };
+                    if raw == 0 || raw == F::ORDER {
+                        raw = F::ORDER + 7;
+                    }
+                    products.push(GoldilocksField(raw));
+                }
+                // Exercise the noncanonical zero alias without collapsing any
+                // subsequent output: put it in the final product only.
+                if let Some(last) = products.last_mut() {
+                    *last = GoldilocksField(F::ORDER);
+                }
+
+                let expected = generic_z_polynomial_storage_reference(&products, num_chunks - 1);
+                let actual = z_polynomial_columns_from_quotient_chunk_products(
+                    &products,
+                    num_chunks - 1,
+                );
+                assert_eq!(actual.len(), num_chunks);
+                assert_eq!(expected.len(), num_chunks);
+                for (column, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        raw(actual),
+                        raw(expected),
+                        "n_points={n_points}, num_chunks={num_chunks}, column={column}",
+                    );
+                }
+
+                if cfg!(debug_assertions) && (n_points == 0 || !n_points.is_power_of_two()) {
+                    let wrapper = std::panic::catch_unwind(|| {
+                        z_polynomials_from_quotient_chunk_products(
+                            products.clone(),
+                            num_chunks - 1,
+                        )
+                    });
+                    assert!(
+                        wrapper.is_err(),
+                        "wrapper must preserve the historical non-power-of-two panic"
+                    );
+                } else {
+                    let wrapped = z_polynomials_from_quotient_chunk_products(
+                        products,
+                        num_chunks - 1,
+                    );
+                    for (column, (wrapped, expected)) in
+                        wrapped.iter().zip(&expected).enumerate()
+                    {
+                        assert_eq!(
+                            raw(&wrapped.values),
+                            raw(expected),
+                            "wrapper n_points={n_points}, num_chunks={num_chunks}, column={column}",
+                        );
+                    }
+                }
             }
         }
     }
