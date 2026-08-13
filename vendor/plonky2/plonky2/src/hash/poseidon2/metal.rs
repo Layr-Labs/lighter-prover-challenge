@@ -1106,15 +1106,14 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Completes the four optional pipelines on the context's blocking path.
 ///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
-///
-/// Scheduling only. The pipelines are the same objects the blocking build
-/// produced, lowered from the same library, so nothing they later compute can
-/// differ; only the instant at which they become available does.
+/// The fat metallib already carries the applegpu slice, so each
+/// `newComputePipelineStateWithFunction` is a lookup, not AIR→ISA lowering.
+/// Detaching them was a hedge against MTLCompilerService contention that
+/// no longer exists; a first quotient that arrived before those threads
+/// finished silently took the CPU path. Building them here means every
+/// later `get` is a `OnceLock` hit. Same pipeline objects, same kernels.
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
@@ -1125,35 +1124,17 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
-        let device = device.clone();
-        let library = library.clone();
-        let spawned = std::thread::Builder::new()
-            .name(format!("poseidon2-metal-{name}"))
-            .spawn(move || {
-                let pipeline = autoreleasepool(|| {
-                    library.get_function(name, None).ok().and_then(|function| {
-                        device
-                            .new_compute_pipeline_state_with_function(&function)
-                            .ok()
-                    })
-                });
-                if pipeline.is_none() {
-                    log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
-                }
-                let _ = slot.built.set(pipeline);
-            });
-        match spawned {
-            Ok(handle) => {
-                if let Ok(mut builder) = slot.builder.lock() {
-                    *builder = Some(handle);
-                }
-            }
-            // No thread means nothing will ever populate the slot; settle it now
-            // so readers fall back instead of looking for a build in flight.
-            Err(_) => {
-                let _ = slot.built.set(None);
-            }
+        let pipeline = autoreleasepool(|| {
+            library.get_function(name, None).ok().and_then(|function| {
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .ok()
+            })
+        });
+        if pipeline.is_none() {
+            log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
         }
+        let _ = slot.built.set(pipeline);
     }
 }
 
