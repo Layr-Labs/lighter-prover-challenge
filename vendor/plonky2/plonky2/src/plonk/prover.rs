@@ -2334,15 +2334,9 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
+                // One-common-Z_H (one-scale merge): CPU numerator stays raw here;
+                // Z_H^-1 scaling is deferred to a single pass after every family
+                // (CPU, Poseidon, Range/U32, permutation) has accumulated raw.
             },
         );
 
@@ -2383,11 +2377,11 @@ fn compute_quotient_polys<
         quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(cpu_values, gpu_values)| {
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    // Raw accumulation; Z_H^-1 scaling happens once after all
+                    // families have merged (one-common-Z_H).
+                    *cpu += gpu;
                 }
             });
     }
@@ -2432,11 +2426,11 @@ fn compute_quotient_polys<
         quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(cpu_values, gpu_values)| {
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    // Raw accumulation; Z_H^-1 scaling happens once after all
+                    // families have merged (one-common-Z_H).
+                    *cpu += gpu;
                 }
             });
     }
@@ -2469,16 +2463,28 @@ fn compute_quotient_polys<
         quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(cpu_values, gpu_values)| {
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    // Raw accumulation; Z_H^-1 scaling happens once after all
+                    // families have merged (one-common-Z_H).
+                    *cpu += gpu;
                 }
             });
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    // One-common-Z_H: CPU, Poseidon, Range/U32 and permutation numerators
+    // are all raw above; scale every (point, challenge) value by the shared
+    // Z_H^-1 once, right before the scatter. Sum-then-scale is limb-identical
+    // to the former per-family scale-then-sum: (a+b+c)*d == a*d+b*d+c*d.
+    quotient_values
+        .par_chunks_exact_mut(num_challenges)
+        .enumerate()
+        .for_each(|(i, vals)| {
+            let denominator_inv = z_h_on_coset.eval_inverse(i);
+            vals.iter_mut().for_each(|v| *v *= denominator_inv);
+        });
+
     // Parallel scatter of the interleaved point-major buffer into the
     // per-challenge columns. The former single streaming pass was serial:
     // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
