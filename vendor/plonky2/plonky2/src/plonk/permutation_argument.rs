@@ -251,21 +251,37 @@ impl Forest {
     /// array and the final serial sweep over every forest entry.
     pub fn wire_partition(&mut self) -> WirePartition {
         let mut sigma = vec![0u32; self.degree * self.num_routed_wires];
-        let mut last = vec![u32::MAX; self.parents.len()];
+        // Only roots reached by routed wires need a tail. The old `u32::MAX` fill wrote the
+        // entire target-domain-sized array before the routed scan, including every advice wire
+        // and virtual target that is never used as a routed-component root. Keep the tail slots
+        // uninitialized and use one validity bit per possible root instead. The allocation keeps
+        // identical O(1) direct root indexing, while a slot is read only after its bit proves that
+        // an earlier routed member initialized it.
+        let mut last = Vec::<core::mem::MaybeUninit<u32>>::with_capacity(self.parents.len());
+        // SAFETY: `MaybeUninit<u32>` permits uninitialized storage. Every later read is guarded by
+        // `tail_initialized`, whose bit is set only after the corresponding slot is written.
+        unsafe { last.set_len(self.parents.len()) };
+        let mut tail_initialized = vec![0u8; self.parents.len().div_ceil(8)];
 
         for row in 0..self.degree {
             for column in 0..self.num_routed_wires {
                 let t = Target::Wire(Wire { row, column });
                 let parent = self.parents[self.target_index(t)] as usize;
                 let index = (column * self.degree + row) as u32;
-                let old_tail = last[parent];
-                if old_tail == u32::MAX {
+                let initialized_byte = parent >> 3;
+                let initialized_bit = 1u8 << (parent & 7);
+                if tail_initialized[initialized_byte] & initialized_bit == 0 {
                     sigma[index as usize] = index;
+                    last[parent].write(index);
+                    tail_initialized[initialized_byte] |= initialized_bit;
                 } else {
+                    // SAFETY: this root's validity bit is set only after `last[parent]` is written,
+                    // and the slot remains initialized for the rest of the traversal.
+                    let old_tail = unsafe { *last[parent].assume_init_ref() };
                     sigma[index as usize] = sigma[old_tail as usize];
                     sigma[old_tail as usize] = index;
+                    last[parent].write(index);
                 }
-                last[parent] = index;
             }
         }
 
