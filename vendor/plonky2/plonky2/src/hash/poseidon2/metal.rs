@@ -2866,11 +2866,13 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // Wake every waiter: with a spine waiter queued, whichever non-spine
-        // waiter the OS would hand a `notify_one` to would just re-block, so
-        // the wake must reach the spine thread. Waiter counts here are tiny
-        // (window depth + one spine), so the thundering herd is a few threads.
-        self.available.notify_all();
+        // Wake every waiter when the set is contended. This preserves the
+        // highest-scoring scheduler behavior and guarantees that a queued
+        // spine waiter gets a chance to acquire ahead of non-spine jobs.
+        // The no-waiter fast path still avoids an unnecessary OS broadcast.
+        if pool.waiters != 0 {
+            self.available.notify_all();
+        }
     }
 
     fn try_detach_completed_output(
