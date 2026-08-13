@@ -255,3 +255,7 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+
+// range-u32-base-sum-retry-1786600342
+
+// range-u32-basesum-fast-class-redraw-1786601975
