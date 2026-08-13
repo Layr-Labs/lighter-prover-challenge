@@ -1130,6 +1130,24 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
+                // MTLCompilerService inherits this thread's QoS. The prewarm
+                // parent already boosts (QOS_CLASS_USER_INITIATED); these
+                // optional-pipeline threads still ran default. Scheduling only
+                // — same pipeline objects. Not shared-pipeline / excl-stream /
+                // stash-size (those are burned or already fired).
+                #[allow(non_camel_case_types)]
+                {
+                    type qos_class_t = u32;
+                    unsafe extern "C" {
+                        fn pthread_set_qos_class_self_np(
+                            qos_class: qos_class_t,
+                            relative_priority: i32,
+                        ) -> i32;
+                    }
+                    unsafe {
+                        let _ = pthread_set_qos_class_self_np(0x19, 0);
+                    }
+                }
                 let pipeline = autoreleasepool(|| {
                     library.get_function(name, None).ok().and_then(|function| {
                         device
