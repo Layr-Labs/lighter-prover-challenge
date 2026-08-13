@@ -35,6 +35,21 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn twisted_extension_base_dot_product_pair(
+        extension_values: &[QuadraticExtension<Self>],
+        twists: &[Self],
+        base_scalars_0: &[Self],
+        base_scalars_1: &[Self],
+    ) -> (QuadraticExtension<Self>, QuadraticExtension<Self>) {
+        ext2_twisted_base_scalar_dot_product_pair(
+            extension_values,
+            twists,
+            base_scalars_0,
+            base_scalars_1,
+        )
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +292,91 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+/// Paired form of [`ext2_base_scalar_dot_product`] for
+/// `sum_i extension_values[i] * twists[i] * base_scalars_j[i]`, `j in 0..2`.
+///
+/// Multiplying `twists[i] * base_scalars_j[i]` first is exact in the base field and lets both
+/// outputs share one traversal of the extension values and twists. Each accumulator has the same
+/// term bound as the single-output routine above, so the same delayed-reduction proof applies.
+#[inline]
+fn ext2_twisted_base_scalar_dot_product_pair(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    twists: &[GoldilocksField],
+    base_scalars_0: &[GoldilocksField],
+    base_scalars_1: &[GoldilocksField],
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+    let len = extension_values
+        .len()
+        .min(twists.len())
+        .min(base_scalars_0.len())
+        .min(base_scalars_1.len());
+    if len == 0 {
+        return (QuadraticExtension::ZERO, QuadraticExtension::ZERO);
+    }
+
+    let reduce_chunk = |values: &[QuadraticExtension<GoldilocksField>],
+                        twists: &[GoldilocksField],
+                        scalars_0: &[GoldilocksField],
+                        scalars_1: &[GoldilocksField]| {
+        debug_assert_eq!(values.len(), twists.len());
+        debug_assert_eq!(values.len(), scalars_0.len());
+        debug_assert_eq!(values.len(), scalars_1.len());
+        debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
+        let (mut lo00, mut hi00) = (0u128, 0u32);
+        let (mut lo01, mut hi01) = (0u128, 0u32);
+        let (mut lo10, mut hi10) = (0u128, 0u32);
+        let (mut lo11, mut hi11) = (0u128, 0u32);
+        for ((&QuadraticExtension([z0, z1]), &twist), (&scalar_0, &scalar_1)) in values
+            .iter()
+            .zip(twists)
+            .zip(scalars_0.iter().zip(scalars_1))
+        {
+            let twisted_scalar_0 = twist * scalar_0;
+            let twisted_scalar_1 = twist * scalar_1;
+            u160_add_product(&mut lo00, &mut hi00, z0.0, twisted_scalar_0.0);
+            u160_add_product(&mut lo01, &mut hi01, z1.0, twisted_scalar_0.0);
+            u160_add_product(&mut lo10, &mut hi10, z0.0, twisted_scalar_1.0);
+            u160_add_product(&mut lo11, &mut hi11, z1.0, twisted_scalar_1.0);
+        }
+        (
+            QuadraticExtension([
+                unsafe { reduce160(lo00, hi00) },
+                unsafe { reduce160(lo01, hi01) },
+            ]),
+            QuadraticExtension([
+                unsafe { reduce160(lo10, hi10) },
+                unsafe { reduce160(lo11, hi11) },
+            ]),
+        )
+    };
+
+    let first_end = len.min(MAX_TERMS_PER_REDUCTION);
+    let (mut result_0, mut result_1) = reduce_chunk(
+        &extension_values[..first_end],
+        &twists[..first_end],
+        &base_scalars_0[..first_end],
+        &base_scalars_1[..first_end],
+    );
+    let mut start = first_end;
+    while start < len {
+        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
+        let (chunk_0, chunk_1) = reduce_chunk(
+            &extension_values[start..end],
+            &twists[start..end],
+            &base_scalars_0[start..end],
+            &base_scalars_1[start..end],
+        );
+        result_0 += chunk_0;
+        result_1 += chunk_1;
+        start = end;
+    }
+    (result_0, result_1)
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
@@ -884,6 +984,60 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_twisted_dot_product_pair_matches_materialized_reference() {
+        let lengths = [
+            (0, 0, 0, 0),
+            (1, 1, 1, 1),
+            (17, 16, 18, 19),
+            (4097, 4097, 4097, 4097),
+        ];
+        for (value_len, twist_len, scalar_0_len, scalar_1_len) in lengths {
+            let values: Vec<Q2> = (0..value_len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                        GoldilocksField((i as u64 + 1).wrapping_mul(u64::MAX - 58)),
+                    ])
+                })
+                .collect();
+            let twists: Vec<GF> = (0..twist_len)
+                .map(|i| GoldilocksField((i as u64 + 3).wrapping_mul(u64::MAX - 4)))
+                .collect();
+            let scalars_0: Vec<GF> = (0..scalar_0_len)
+                .map(|i| {
+                    GoldilocksField((i as u64 + 5).wrapping_mul(0xD1B5_4A32_D192_ED03))
+                })
+                .collect();
+            let scalars_1: Vec<GF> = (0..scalar_1_len)
+                .map(|i| {
+                    GoldilocksField((i as u64 + 7).wrapping_mul(0x94D0_49BB_1331_11EB))
+                })
+                .collect();
+            let len = value_len
+                .min(twist_len)
+                .min(scalar_0_len)
+                .min(scalar_1_len);
+            let expected = |scalars: &[GF]| {
+                (0..len)
+                    .map(|i| {
+                        <Q2 as FieldExtension<2>>::scalar_mul(
+                            &values[i],
+                            twists[i] * scalars[i],
+                        )
+                    })
+                    .sum::<Q2>()
+            };
+            let actual = <GF as Extendable<2>>::twisted_extension_base_dot_product_pair(
+                &values,
+                &twists,
+                &scalars_0,
+                &scalars_1,
+            );
+            assert_eq!(actual, (expected(&scalars_0), expected(&scalars_1)));
+        }
     }
 
     #[test]
