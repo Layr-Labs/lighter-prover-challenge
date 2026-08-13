@@ -212,6 +212,15 @@ impl<F: Field> ReducingFactor<F> {
         tmp
     }
 
+    /// Account for a two-polynomial reduction and return its two weights.
+    /// This is the exact production shape of the shifted FRI opening batch;
+    /// exposing it lets the caller consume each reduced coefficient directly
+    /// instead of materializing a degree-sized composition polynomial.
+    pub(crate) fn take_pair_powers(&mut self) -> [F; 2] {
+        self.count += 2;
+        [F::ONE, self.base]
+    }
+
     pub fn reset(&mut self) {
         self.count = 0;
     }
