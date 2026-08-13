@@ -105,6 +105,25 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+/// Whether a newly changed watch can make this generator do useful work.
+///
+/// General generators may emit partial outputs before all watches are populated, so they must be
+/// revisited on every changed watch. A [`SimpleGeneratorAdapter`] is stricter: until its last
+/// unresolved watch reaches zero, `run_with_ready_hint` is provably a no-op. Keeping that fact on
+/// the erased generator lets the scheduler avoid queueing and dispatching those known-empty runs.
+#[inline]
+fn should_enqueue_generator<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    generators: &[WitnessGeneratorRef<F, D>],
+    unresolved_watches: &[usize],
+    generator_idx: usize,
+) -> bool {
+    unresolved_watches[generator_idx] == 0
+        || !generators[generator_idx].0.runs_only_when_ready()
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -224,7 +243,13 @@ fn run_generator_worklist<
                                 if !generator_is_expired[watching_generator_idx] {
                                     debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
                                     unresolved_watches[watching_generator_idx] -= 1;
-                                    next_pending_generator_indices.push(watching_generator_idx);
+                                    if should_enqueue_generator(
+                                        generators,
+                                        unresolved_watches,
+                                        watching_generator_idx,
+                                    ) {
+                                        next_pending_generator_indices.push(watching_generator_idx);
+                                    }
                                 }
                             }
                         }
@@ -268,7 +293,13 @@ fn run_generator_worklist<
                             if !generator_is_expired[watching_generator_idx] {
                                 debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
                                 unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
+                                if should_enqueue_generator(
+                                    generators,
+                                    unresolved_watches,
+                                    watching_generator_idx,
+                                ) {
+                                    next_pending_generator_indices.push(watching_generator_idx);
+                                }
                             }
                         }
                     }
@@ -364,21 +395,29 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
 /// applying `feed`'s exact bookkeeping: each first-populated representative
 /// decrements its unfinished watchers and queues them for the resume
 /// worklist; expired generators are skipped.
-pub struct PartitionFeeder<'a, 'b, F: Field> {
+pub struct PartitionFeeder<
+    'a,
+    'b,
+    F: RichField + Extendable<D>,
+    const D: usize,
+> {
     witness: &'b mut PartitionWitness<'a, F>,
     unresolved_watches: &'b mut [usize],
     generator_is_expired: &'b [bool],
     pending_generator_indices: &'b mut Vec<usize>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
+    generators: &'b [WitnessGeneratorRef<F, D>],
 }
 
-impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
+impl<F: RichField + Extendable<D>, const D: usize> Debug for PartitionFeeder<'_, '_, F, D> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PartitionFeeder").finish_non_exhaustive()
     }
 }
 
-impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
+impl<F: RichField + Extendable<D>, const D: usize> WitnessWrite<F>
+    for PartitionFeeder<'_, '_, F, D>
+{
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
@@ -386,7 +425,13 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
                     if !self.generator_is_expired[watching_generator_idx] {
                         debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
                         self.unresolved_watches[watching_generator_idx] -= 1;
-                        self.pending_generator_indices.push(watching_generator_idx);
+                        if should_enqueue_generator(
+                            self.generators,
+                            self.unresolved_watches,
+                            watching_generator_idx,
+                        ) {
+                            self.pending_generator_indices.push(watching_generator_idx);
+                        }
                     }
                 }
             }
@@ -395,7 +440,9 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
     }
 }
 
-impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
+impl<F: RichField + Extendable<D>, const D: usize> Witness<F>
+    for PartitionFeeder<'_, '_, F, D>
+{
     fn try_get_target(&self, target: Target) -> Option<F> {
         self.witness.try_get_target(target)
     }
@@ -559,7 +606,13 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                         if !self.generator_is_expired[watching_generator_idx] {
                             debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
                             self.unresolved_watches[watching_generator_idx] -= 1;
-                            pending_generator_indices.push(watching_generator_idx);
+                            if should_enqueue_generator(
+                                &self.prover_data.generators,
+                                &self.unresolved_watches,
+                                watching_generator_idx,
+                            ) {
+                                pending_generator_indices.push(watching_generator_idx);
+                            }
                         }
                     }
                 }
@@ -584,7 +637,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// unfinished watchers of newly populated representatives are queued.
     pub fn feed_seeded(
         &mut self,
-        seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
+        seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F, D>) -> Result<()>,
     ) -> Result<()> {
         let mut pending_generator_indices = Vec::new();
         seed(&mut PartitionFeeder {
@@ -593,6 +646,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             generator_is_expired: &self.generator_is_expired,
             pending_generator_indices: &mut pending_generator_indices,
             generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+            generators: &self.prover_data.generators,
         })?;
 
         run_generator_worklist(
@@ -647,6 +701,13 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         _all_watches_populated: bool,
     ) -> bool {
         self.run(witness, out_buffer)
+    }
+
+    /// True when an invocation cannot produce output before every watched representative is set.
+    /// The scheduler uses this only to suppress known-empty pre-ready dispatches.
+    #[doc(hidden)]
+    fn runs_only_when_ready(&self) -> bool {
+        false
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
@@ -800,6 +861,10 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated: bool,
     ) -> bool {
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
+    }
+
+    fn runs_only_when_ready(&self) -> bool {
+        true
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
