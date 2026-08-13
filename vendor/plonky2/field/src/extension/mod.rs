@@ -99,6 +99,23 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Two independent `extension_base_dot_product`s that share the same
+    /// extension-power lane. Default is two separate calls in argument
+    /// order. A base field may load each power once and keep two delayed-
+    /// reduction accumulators.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[Self::Extension],
+        base_scalars_a: &[Self],
+        base_scalars_b: &[Self],
+    ) -> (Self::Extension, Self::Extension) {
+        (
+            Self::extension_base_dot_product(extension_values, base_scalars_a),
+            Self::extension_base_dot_product(extension_values, base_scalars_b),
+        )
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
