@@ -290,6 +290,76 @@ impl<F: Field> MatrixWitness<F> {
     }
 }
 
+/// Largest circuit for which the prover retains the runtime-only direct-IFFT
+/// representative plan. The dynamic final block is degree 2^18 and remains on
+/// the matrix fallback, bounding plan residency to the historical H41 shapes.
+pub const MAX_DIRECT_WIRE_IFFT_DEGREE: usize = 1 << 16;
+
+/// Whether a circuit has the exact production shape admitted to full H41.
+/// Plan construction and proof dispatch share this predicate so no fallback
+/// circuit allocates or consumes a direct-IFFT plan.
+pub fn direct_wire_ifft_shape_is_eligible(
+    num_wires: usize,
+    num_routed_wires: usize,
+    num_challenges: usize,
+    degree: usize,
+    has_lookup: bool,
+) -> bool {
+    !has_lookup
+        && num_wires == 136
+        && num_routed_wires == 80
+        && num_challenges == 2
+        && (degree == 1 << 14 || degree == 1 << 16)
+}
+
+/// Only the full-H41 experiment arm owns the historical circuit-fixed plan.
+/// All three arms parse the same process-fixed selector during circuit load;
+/// invalid values fail closed before any proof can be labeled.
+#[cfg(feature = "std")]
+pub fn direct_wire_ifft_plan_is_requested() -> bool {
+    match std::env::var("LIGHTER_H41_ARM").as_deref() {
+        Ok("full-h41") => true,
+        Err(std::env::VarError::NotPresent) | Ok("control") | Ok("hybrid") => false,
+        Ok(other) => panic!(
+            "invalid LIGHTER_H41_ARM={other:?}; expected control, full-h41, or hybrid"
+        ),
+        Err(error) => panic!("invalid LIGHTER_H41_ARM: {error}"),
+    }
+}
+
+#[cfg(not(feature = "std"))]
+pub fn direct_wire_ifft_plan_is_requested() -> bool {
+    false
+}
+
+/// Build the circuit-fixed column-major, bit-reversed representative plan.
+/// The plan is a pure derivation of `representative_map`, built once during
+/// circuit construction/deserialization and borrowed lock-free by each proof.
+pub fn build_wire_ifft_representative_plan(
+    representative_map: &[u32],
+    num_wires: usize,
+    degree: usize,
+) -> Option<Vec<u32>> {
+    if degree > MAX_DIRECT_WIRE_IFFT_DEGREE {
+        return None;
+    }
+    assert!(degree.is_power_of_two());
+    let wire_cells = num_wires
+        .checked_mul(degree)
+        .expect("wire IFFT plan length overflow");
+    assert!(representative_map.len() >= wire_cells);
+    let degree_bits = degree.trailing_zeros() as usize;
+    let mut plan = Vec::with_capacity(wire_cells);
+    for column in 0..num_wires {
+        for destination in 0..degree {
+            let source_row =
+                destination.reverse_bits() >> (usize::BITS as usize - degree_bits);
+            plan.push(representative_map[source_row * num_wires + column]);
+        }
+    }
+    Some(plan)
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PartialWitness<F: Field> {
     pub target_values: HashMap<Target, F>,
@@ -409,6 +479,94 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         target.index(self.num_wires, self.degree)
     }
 
+    /// Split the production wire representation at the permutation boundary.
+    /// Routed columns retain the exact natural, column-major layout consumed
+    /// by the permutation argument; non-routed columns are gathered directly
+    /// into the bit-reversed input order consumed by `ifft_from_bit_reversed`.
+    /// Consuming `self` here drops the Partition storage at the same boundary
+    /// as `full_witness`, before either wire IFFT or commitment starts.
+    pub fn routed_witness_and_direct_ifft_inputs(
+        self,
+        num_routed_wires: usize,
+    ) -> (MatrixWitness<F>, Vec<Vec<F>>) {
+        assert!(num_routed_wires <= self.num_wires);
+        assert!(self.degree.is_power_of_two());
+
+        let degree = self.degree;
+        let num_wires = self.num_wires;
+        let mut routed_values: Vec<Vec<F>> = (0..num_routed_wires)
+            .map(|_| Vec::with_capacity(degree))
+            .collect();
+        let num_chunks = 16.min(degree.max(1));
+        let chunk_rows = degree.div_ceil(num_chunks);
+        {
+            let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
+                .map(|_| Vec::with_capacity(num_routed_wires))
+                .collect();
+            for column in routed_values.iter_mut() {
+                let mut rest = crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
+                for segment_columns in segments.iter_mut() {
+                    let take = chunk_rows.min(rest.len());
+                    let (head, tail) = rest.split_at_mut(take);
+                    segment_columns.push(head);
+                    rest = tail;
+                }
+            }
+            use plonky2_maybe_rayon::*;
+            segments
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(chunk, columns)| {
+                    let rows = columns.first().map_or(0, |column| column.len());
+                    let first_row = chunk * chunk_rows;
+                    for i in 0..rows {
+                        let row_base = (first_row + i) * num_wires;
+                        for (j, column) in columns.iter_mut().enumerate() {
+                            let rep = self.representative_map[row_base + j] as usize;
+                            let value = if self.is_set_by_rep_index(rep) {
+                                self.values[rep]
+                            } else {
+                                F::ZERO
+                            };
+                            column[i].write(value);
+                        }
+                    }
+                });
+        }
+        for column in routed_values.iter_mut() {
+            // SAFETY: every slot was initialized exactly once by the disjoint
+            // row segments above.
+            unsafe { column.set_len(degree) };
+        }
+
+        use plonky2_maybe_rayon::*;
+        let degree_bits = degree.trailing_zeros() as usize;
+        let direct_inputs = (num_routed_wires..num_wires)
+            .into_par_iter()
+            .map(|column| {
+                (0..degree)
+                    .map(|destination| {
+                        let source_row = destination.reverse_bits()
+                            >> (usize::BITS as usize - degree_bits);
+                        let rep = self.representative_map[source_row * num_wires + column] as usize;
+                        if self.is_set_by_rep_index(rep) {
+                            self.values[rep]
+                        } else {
+                            F::ZERO
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        (
+            MatrixWitness {
+                wire_values: routed_values,
+            },
+            direct_inputs,
+        )
+    }
+
     pub fn full_witness(self) -> MatrixWitness<F> {
         // Single fused pass, parallel over row chunks. Cell (column j, row i)
         // is `values[representative_map[i * num_wires + j]]` (unset slots hold
@@ -511,6 +669,136 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
             Some(self.values[rep_index])
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod wire_representation_tests {
+    use plonky2_util::reverse_index_bits;
+
+    use super::{PartitionWitness, build_wire_ifft_representative_plan};
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+
+    #[test]
+    fn routed_split_matches_full_matrix_and_direct_bitrev_raw_limbs() {
+        type F = GoldilocksField;
+        let num_wires = 5;
+        let num_routed_wires = 3;
+        let degree = 8;
+        let representative_map: Vec<u32> = (0..num_wires * degree)
+            .map(|index| ((index * 7 + 5) % (num_wires * degree)) as u32)
+            .collect();
+        let mut partition = PartitionWitness::<F>::new(num_wires, degree, &representative_map);
+        for (index, value) in partition.values.iter_mut().enumerate() {
+            *value = GoldilocksField(match index % 4 {
+                0 => 0xffff_ffff_0000_0001,
+                1 => 0xffff_ffff_0000_0002,
+                2 => u64::MAX,
+                _ => (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            });
+        }
+        partition.set_bitmap.fill(u64::MAX);
+
+        let full = partition.clone().full_witness();
+        let (routed, direct) =
+            partition.routed_witness_and_direct_ifft_inputs(num_routed_wires);
+        assert_eq!(routed.wire_values.len(), num_routed_wires);
+        for column in 0..num_routed_wires {
+            let actual: Vec<_> = routed.wire_values[column]
+                .iter()
+                .map(|value| value.0)
+                .collect();
+            let expected: Vec<_> = full.wire_values[column]
+                .iter()
+                .map(|value| value.0)
+                .collect();
+            assert_eq!(actual, expected, "routed column {column}");
+        }
+        for (offset, actual) in direct.iter().enumerate() {
+            let column = num_routed_wires + offset;
+            let expected = reverse_index_bits(&full.wire_values[column]);
+            assert_eq!(
+                actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                "direct column {column}"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_wire_representations_match_sparse_unset_full_matrix_raw_limbs() {
+        type F = GoldilocksField;
+        let num_wires = 5;
+        let num_routed_wires = 3;
+        let degree = 8;
+        let representative_map: Vec<u32> = (0..num_wires * degree)
+            .map(|index| ((index * 7 + 5) % (num_wires * degree)) as u32)
+            .collect();
+        let mut partition = PartitionWitness::<F>::new(num_wires, degree, &representative_map);
+        for (index, value) in partition.values.iter_mut().enumerate() {
+            *value = GoldilocksField(match index % 4 {
+                0 => 0xffff_ffff_0000_0001,
+                1 => 0xffff_ffff_0000_0002,
+                2 => u64::MAX,
+                _ => (index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            });
+            if index % 3 != 0 {
+                partition.set_bitmap[index >> 6] |= 1u64 << (index & 63);
+            }
+        }
+
+        let full = partition.clone().full_witness();
+        let plan = build_wire_ifft_representative_plan(
+            &representative_map,
+            num_wires,
+            degree,
+        )
+        .unwrap();
+        for (column, column_plan) in plan.chunks_exact(degree).enumerate() {
+            let actual: Vec<_> = column_plan
+                .iter()
+                .map(|&rep| {
+                    let rep = rep as usize;
+                    if partition.is_set_by_rep_index(rep) {
+                        partition.values[rep].0
+                    } else {
+                        F::ZERO.0
+                    }
+                })
+                .collect();
+            let expected = reverse_index_bits(&full.wire_values[column]);
+            assert_eq!(
+                actual,
+                expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                "full-H41 sparse column {column}"
+            );
+        }
+
+        let (routed, direct) =
+            partition.routed_witness_and_direct_ifft_inputs(num_routed_wires);
+        for column in 0..num_routed_wires {
+            assert_eq!(
+                routed.wire_values[column]
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>(),
+                full.wire_values[column]
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>(),
+                "hybrid routed sparse column {column}"
+            );
+        }
+        for (offset, actual) in direct.iter().enumerate() {
+            let column = num_routed_wires + offset;
+            let expected = reverse_index_bits(&full.wire_values[column]);
+            assert_eq!(
+                actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+                "hybrid direct sparse column {column}"
+            );
         }
     }
 }

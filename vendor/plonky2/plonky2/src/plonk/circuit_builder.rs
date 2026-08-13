@@ -41,6 +41,10 @@ use crate::iop::generator::{
     ConstantGenerator, CopyGenerator, RandomValueGenerator, SimpleGenerator, WitnessGeneratorRef,
 };
 use crate::iop::target::{BoolTarget, Target};
+use crate::iop::witness::{
+    build_wire_ifft_representative_plan, direct_wire_ifft_plan_is_requested,
+    direct_wire_ifft_shape_is_eligible,
+};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{
     CircuitConfig, CircuitData, CommonCircuitData, GeneratorWatchIndex, MockCircuitData,
@@ -1454,8 +1458,25 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
+        let representative_map = forest.parents;
+        let wire_ifft_representative_plan = (direct_wire_ifft_plan_is_requested()
+            && direct_wire_ifft_shape_is_eligible(
+                common.config.num_wires,
+                common.config.num_routed_wires,
+                common.config.num_challenges,
+                degree,
+                num_luts != 0,
+            ))
+        .then(|| {
+            build_wire_ifft_representative_plan(
+                &representative_map,
+                common.config.num_wires,
+                degree,
+            )
+        })
+        .flatten();
         let fixed_routed_wires = fixed_routed_wire_mask(
-            &forest.parents,
+            &representative_map,
             common.config.num_wires,
             common.config.num_routed_wires,
             subgroup.len(),
@@ -1470,7 +1491,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             sigmas,
             subgroup,
             public_inputs: self.public_inputs,
-            representative_map: forest.parents,
+            representative_map,
+            wire_ifft_representative_plan,
             fixed_routed_wires,
             fft_root_table: Some(fft_root_table),
             circuit_digest,

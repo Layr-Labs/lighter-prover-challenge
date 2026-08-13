@@ -328,11 +328,16 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
 /// butterfly layers and coefficient reversal/scaling run. Value-identical
 /// to `ifft(PolynomialValues::new(values.to_vec()))`.
 pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
-    let n = values.len();
+    ifft_from_bit_reversed(plonky2_util::reverse_index_bits(values))
+}
+
+/// IFFT of a buffer already gathered in the bit-reversed input order used by
+/// [`ifft_borrowed`]. This keeps the butterfly and normalization schedule
+/// identical while allowing a caller to omit a natural-order materialization.
+pub fn ifft_from_bit_reversed<F: Field>(mut buffer: Vec<F>) -> PolynomialCoeffs<F> {
+    let n = buffer.len();
     let lg_n = log2_strict(n);
     let n_inv = F::inverse_2exp(lg_n);
-
-    let mut buffer = plonky2_util::reverse_index_bits(values);
 
     #[cfg(feature = "std")]
     let root_table = root_table_cache::get::<F>(lg_n);
@@ -2786,6 +2791,31 @@ mod tests {
         check::<GoldilocksField>();
         check::<QuadraticExtension<GoldilocksField>>();
         check::<QuarticExtension<GoldilocksField>>();
+    }
+
+    #[test]
+    fn ifft_from_bit_reversed_matches_legacy_raw_goldilocks_limbs() {
+        use crate::fft::ifft_from_bit_reversed;
+
+        for lg_n in [1usize, 2, 4, 7, 10] {
+            let n = 1 << lg_n;
+            let values = (0..n)
+                .map(|i| match i % 4 {
+                    0 => GoldilocksField(0xffff_ffff_0000_0001),
+                    1 => GoldilocksField(0xffff_ffff_0000_0002),
+                    2 => GoldilocksField(u64::MAX),
+                    _ => GoldilocksField((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                })
+                .collect::<Vec<_>>();
+            let expected = ifft(PolynomialValues::new(values.clone()));
+            let gathered = plonky2_util::reverse_index_bits(&values);
+            let actual = ifft_from_bit_reversed(gathered);
+            assert_eq!(
+                actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
+                "raw IFFT limb mismatch at 2^{lg_n}"
+            );
+        }
     }
 
     /// The cached-table dispatch path (no caller-supplied table) must return

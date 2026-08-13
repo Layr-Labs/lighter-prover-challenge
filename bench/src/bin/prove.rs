@@ -1,4 +1,5 @@
 // Copyright (c) Elliot Technologies, Inc.
+// h41-fast-runner-redraw-1786609401
 // SPDX-License-Identifier: BUSL-1.1
 
 #![feature(stmt_expr_attributes)]
@@ -212,6 +213,29 @@ fn main() {
     // `fsync` would only add durability latency to the scored process lifetime.
     let file = writer.into_inner().expect("cannot flush proof output");
     drop(file);
+    if std::env::var_os("LIGHTER_H41_REPORT").is_some_and(|value| value == "1") {
+        let (control, full_h41, hybrid, fallback) =
+            plonky2::plonk::prover::h41_wire_drain_counts();
+        let requested = std::env::var("LIGHTER_H41_ARM")
+            .unwrap_or_else(|_| "hybrid".to_string());
+        let expected = match requested.as_str() {
+            "control" => (105, 0, 0, 1),
+            "full-h41" => (0, 105, 0, 1),
+            "hybrid" => (0, 0, 105, 1),
+            other => panic!(
+                "invalid LIGHTER_H41_ARM={other:?}; expected control, full-h41, or hybrid"
+            ),
+        };
+        assert_eq!(
+            (control, full_h41, hybrid, fallback),
+            expected,
+            "exact H41 production proof census drift"
+        );
+        eprintln!(
+            "[h41-wire-drain] requested={} control={control} full_h41={full_h41} hybrid={hybrid} fallback={fallback}",
+            requested
+        );
+    }
     #[cfg(feature = "diagnostic_profile")]
     {
         drop(_output_span);
