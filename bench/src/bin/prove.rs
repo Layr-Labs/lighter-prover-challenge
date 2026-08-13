@@ -255,3 +255,7 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+
+// Draw marker: controlled redraw 1 of the cold-allocation first-touch tree
+// (see submission 56097b96). Inert; changes only the archive identity.
+// redraw-2-1786520000
