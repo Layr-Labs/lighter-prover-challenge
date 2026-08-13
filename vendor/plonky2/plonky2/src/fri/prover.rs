@@ -15,15 +15,39 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
 
+/// An initial Merkle tree entering FRI: either borrowed from long-lived data
+/// (constants/sigmas, owned by the reusable circuit prover data) or owned
+/// per-proof (wires, Z/partial-products, quotient). FRI is the last consumer
+/// of the per-proof trees, so it takes ownership and drops them at their
+/// exact last use — after every challenged initial leaf and Merkle path has
+/// been copied into the proof — instead of holding their full LDE leaf stores
+/// until the final FRI-step query proof. Dropping a Metal-backed tree returns
+/// its shared leaf buffer to the column-store pool while other proofs are
+/// still in flight.
+#[derive(Debug)]
+pub enum FriInitialTree<'a, F: RichField, H: Hasher<F>> {
+    Borrowed(&'a MerkleTree<F, H>),
+    Owned(MerkleTree<F, H>),
+}
+
+impl<F: RichField, H: Hasher<F>> FriInitialTree<'_, F, H> {
+    fn tree(&self) -> &MerkleTree<F, H> {
+        match self {
+            FriInitialTree::Borrowed(tree) => tree,
+            FriInitialTree::Owned(tree) => tree,
+        }
+    }
+}
+
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
-    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    initial_merkle_trees: Vec<FriInitialTree<'_, F, C::Hasher>>,
     // Coefficients of the polynomial on which the LDT is performed. Only the first `1/rate` coefficients are non-zero.
     lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
     // Evaluation of the polynomial on the large domain.
@@ -313,37 +337,64 @@ fn fri_prover_query_rounds<
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
-    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    initial_merkle_trees: Vec<FriInitialTree<'_, F, C::Hasher>>,
     trees: &[MerkleTree<F, C::Hasher>],
     challenger: &mut Challenger<F, C::Hasher>,
     n: usize,
     fri_params: &FriParams,
 ) -> Vec<FriQueryRound<F, C::Hasher, D>> {
-    challenger
+    let x_indices = challenger
         .get_n_challenges(fri_params.config.num_query_rounds)
+        .into_iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect::<Vec<_>>();
+    // The historical single per-query pass held the initial trees' full LDE
+    // leaf stores alive until the last FRI-step query proof. Split it: first
+    // extract every challenged initial-tree leaf and Merkle path (same
+    // `leaf_vec`/`prove` calls in the same oracle order), which is the exact
+    // last use of the per-proof trees...
+    let initial_proofs = x_indices
+        .par_iter()
+        .map(|&x_index| {
+            initial_merkle_trees
+                .iter()
+                .map(|t| {
+                    let tree = t.tree();
+                    (tree.leaf_vec(x_index), tree.prove(x_index))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // ...then retire them, returning Metal-backed leaf buffers to the
+    // column-store pool while other proofs are still in flight, before the
+    // FRI-step rounds run (same index shifts, same reduction-round order).
+    drop(initial_merkle_trees);
+    let query_steps = x_indices
         .into_par_iter()
-        .map(|rand| {
-            let x_index = rand.to_canonical_u64() as usize % n;
-            fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
+        .map(|x_index| fri_prover_query_steps::<F, C, D>(trees, x_index, fri_params))
+        .collect::<Vec<_>>();
+    initial_proofs
+        .into_iter()
+        .zip(query_steps)
+        .map(|(initial_proof, steps)| FriQueryRound {
+            initial_trees_proof: FriInitialTreeProof {
+                evals_proofs: initial_proof,
+            },
+            steps,
         })
         .collect()
 }
 
-fn fri_prover_query_round<
+fn fri_prover_query_steps<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
-    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
     trees: &[MerkleTree<F, C::Hasher>],
     mut x_index: usize,
     fri_params: &FriParams,
-) -> FriQueryRound<F, C::Hasher, D> {
+) -> Vec<FriQueryStep<F, C::Hasher, D>> {
     let mut query_steps = Vec::new();
-    let initial_proof = initial_merkle_trees
-        .iter()
-        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
-        .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
         let evals = unflatten(tree.get(x_index >> arity_bits));
@@ -356,12 +407,7 @@ fn fri_prover_query_round<
 
         x_index >>= arity_bits;
     }
-    FriQueryRound {
-        initial_trees_proof: FriInitialTreeProof {
-            evals_proofs: initial_proof,
-        },
-        steps: query_steps,
-    }
+    query_steps
 }
 
 #[cfg(test)]

@@ -14,7 +14,7 @@ use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{fri_proof, FriInitialTree};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
@@ -598,10 +598,42 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .collect_vec()
     }
 
-    /// Produces a batch opening proof.
+    /// Produces a batch opening proof, borrowing every oracle's Merkle tree
+    /// for the whole FRI query phase.
     pub fn prove_openings(
         instance: &FriInstanceInfo<F, D>,
         oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
+        Self::prove_openings_retiring(
+            instance,
+            oracles,
+            oracles.iter().map(|_| None).collect(),
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    /// [`Self::prove_openings`] with ownership transfer of per-proof Merkle
+    /// trees. `owned_trees` is parallel to `oracles`: `Some(tree)` is oracle
+    /// `i`'s Merkle tree, moved out of the batch by the caller so FRI can
+    /// drop it — returning Metal-backed leaf stores to the column pool — as
+    /// soon as every challenged initial leaf and path has been copied into
+    /// the proof; `None` borrows `oracles[i].merkle_tree` as before.
+    /// Polynomial coefficients are always borrowed from `oracles` in their
+    /// original order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_openings_retiring(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        owned_trees: Vec<Option<MerkleTree<F, C::Hasher>>>,
         challenger: &mut Challenger<F, C::Hasher>,
         fri_params: &FriParams,
         final_poly_coeff_len: Option<usize>,
@@ -693,11 +725,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             )
         );
 
+        let initial_trees = oracles
+            .iter()
+            .zip(owned_trees)
+            .map(|(oracle, owned)| match owned {
+                Some(tree) => FriInitialTree::Owned(tree),
+                None => FriInitialTree::Borrowed(&oracle.merkle_tree),
+            })
+            .collect::<Vec<_>>();
         let fri_proof = fri_proof::<F, C, D>(
-            &oracles
-                .par_iter()
-                .map(|c| &c.merkle_tree)
-                .collect::<Vec<_>>(),
+            initial_trees,
             lde_final_poly,
             lde_final_values,
             challenger,

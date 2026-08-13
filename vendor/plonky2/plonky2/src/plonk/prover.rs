@@ -227,7 +227,7 @@ where
             .collect()
     );
 
-    let wires_commitment = timed!(
+    let mut wires_commitment = timed!(
         timing,
         "compute wires commitment",
         PolynomialBatch::<F, C, D>::from_coeffs(
@@ -319,7 +319,7 @@ where
         zs_partial_products.extend(lookup_polys);
     }
 
-    let partial_products_zs_and_lookup_commitment = timed!(
+    let mut partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
         PolynomialBatch::from_values(
@@ -443,7 +443,7 @@ where
             .collect()
     );
 
-    let quotient_polys_commitment = timed!(
+    let mut quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
         PolynomialBatch::<F, C, D>::from_coeffs(
@@ -484,10 +484,29 @@ where
     challenger.observe_openings(&openings.to_fri_openings());
     let instance = common_data.get_fri_instance(zeta);
 
+    // Clone the small caps for the proof body, then move the three per-proof
+    // Merkle trees into the opening proof: FRI is their last consumer, and
+    // ownership lets it drop them — returning Metal leaf stores to the column
+    // pool while other proofs are in flight — once every challenged initial
+    // leaf and path has been copied out, instead of holding all three full
+    // LDE stores through the FRI-step query rounds. Constants/sigmas stay
+    // borrowed: they belong to the reusable circuit prover data.
+    let wires_cap = wires_commitment.merkle_tree.cap.clone();
+    let plonk_zs_partial_products_cap =
+        partial_products_zs_and_lookup_commitment.merkle_tree.cap.clone();
+    let quotient_polys_cap = quotient_polys_commitment.merkle_tree.cap.clone();
+    let owned_trees = vec![
+        None,
+        Some(core::mem::take(&mut wires_commitment.merkle_tree)),
+        Some(core::mem::take(
+            &mut partial_products_zs_and_lookup_commitment.merkle_tree,
+        )),
+        Some(core::mem::take(&mut quotient_polys_commitment.merkle_tree)),
+    ];
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        PolynomialBatch::<F, C, D>::prove_openings_retiring(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
@@ -495,6 +514,7 @@ where
                 &partial_products_zs_and_lookup_commitment,
                 &quotient_polys_commitment,
             ],
+            owned_trees,
             &mut challenger,
             &common_data.fri_params,
             None,
@@ -504,9 +524,9 @@ where
     );
 
     let proof = Proof::<F, C, D> {
-        wires_cap: wires_commitment.merkle_tree.cap,
-        plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
-        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        wires_cap,
+        plonk_zs_partial_products_cap,
+        quotient_polys_cap,
         openings,
         opening_proof,
     };
@@ -2393,11 +2413,11 @@ fn compute_quotient_polys<
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values: Option<&[F]> = match &gpu_range {
+        Some((_, job)) => match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                Some(values)
             }
             Err(error) => {
                 GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2427,24 +2447,14 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        },
+        None => None,
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
+    let gpu_permutation_values: Option<&[F]> = match &gpu_permutation {
+        Some(job) => match job.finish() {
+            Ok(values) => Some(values),
             Err(error) => {
                 log::warn!(
                     "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
@@ -2464,19 +2474,47 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        },
+        None => None,
+    };
+
+    // Fused tail: when both queue-tail Metal jobs (Range/U32 and permutation)
+    // completed, their numerators are not merged back into `quotient_values`
+    // through two full-domain read/modify/write passes. Their slices stay
+    // borrowed (both jobs remain in scope through the scatter, so neither
+    // output buffer can be recycled) and the addition is folded into the
+    // already-required challenge-column scatter below:
+    // `col[c][i] = cpu_and_poseidon_scaled + (range + perm) * Z_H(i)^-1`.
+    // The Poseidon merge above deliberately stays early and separate: its CPU
+    // pass can overlap the still-executing Range/U32 and permutation command
+    // buffers. If either tail job is absent, its partner keeps the individual
+    // merge path unchanged.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let fused_tail_pair: Option<(&[F], &[F])> = match (gpu_range_values, gpu_permutation_values) {
+        (Some(range_values), Some(permutation_values)) => {
+            debug_assert_eq!(range_values.len(), quotient_values.len());
+            debug_assert_eq!(permutation_values.len(), quotient_values.len());
+            Some((range_values, permutation_values))
+        }
+        (range_only, permutation_only) => {
+            for gpu_values in [range_only, permutation_only].into_iter().flatten() {
+                debug_assert_eq!(gpu_values.len(), quotient_values.len());
+                quotient_values
+                    .par_chunks_exact_mut(num_challenges)
+                    .zip(gpu_values.par_chunks_exact(num_challenges))
+                    .enumerate()
+                    .for_each(|(i, (cpu_values, gpu_values))| {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                            *cpu += gpu * denominator_inv;
+                        }
+                    });
+            }
+            None
+        }
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let fused_tail_pair: Option<(&[F], &[F])> = None;
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
@@ -2504,18 +2542,56 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+    if let Some((range_values, permutation_values)) = fused_tail_pair {
+        // Fused tail scatter: identical chunking, destinations, and disjoint-
+        // write proof as the plain scatter below; the only new reads are the
+        // identically chunked Range/U32 and permutation slices at the same
+        // point/challenge offsets. `(range + perm) * d` equals the two former
+        // separately scaled merges by distributivity; raw noncanonical limbs
+        // may differ, but proof construction and verification consume field
+        // values (validated end-to-end, see
+        // `fused_tail_gpu_pair_matches_separate_scales`).
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .zip(range_values.par_chunks(BATCH_SIZE * num_challenges))
+            .zip(permutation_values.par_chunks(BATCH_SIZE * num_challenges))
+            .enumerate()
+            .for_each(|(chunk_i, ((chunk, range_chunk), permutation_chunk))| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, ((point_values, range_point), permutation_point)) in chunk
+                    .chunks_exact(num_challenges)
+                    .zip(range_chunk.chunks_exact(num_challenges))
+                    .zip(permutation_chunk.chunks_exact(num_challenges))
+                    .enumerate()
+                {
+                    let denominator_inv = z_h_on_coset.eval_inverse(base + k);
+                    for ((column, &value), (&range, &permutation)) in column_ptrs
+                        .iter()
+                        .zip(point_values)
+                        .zip(range_point.iter().zip(permutation_point))
+                    {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe {
+                            *column.0.add(base + k) =
+                                value + (range + permutation) * denominator_inv;
+                        }
+                    }
                 }
-            }
-        });
+            });
+    } else {
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
+                }
+            });
+    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -2662,7 +2738,7 @@ mod quotient_layout_tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2728,6 +2804,40 @@ mod quotient_layout_tests {
 
         data.verify(proof?)?;
         Ok(())
+    }
+
+    /// Algebraic differential for the fused tail scatter: the fused expression
+    /// `c + (r + p) * d` must equal the two former separately scaled merges
+    /// `(c + r*d) + p*d` as a field value for every combination of zero, one,
+    /// small canonical values, `2^32 - 1`, and a full-width noncanonical input
+    /// in each of the four expression positions. Raw noncanonical limbs may
+    /// differ (reductions occur at different intermediate boundaries), so the
+    /// comparison is on canonical representatives.
+    #[test]
+    fn fused_tail_gpu_pair_matches_separate_scales() {
+        let samples = [
+            GoldilocksField::ZERO,
+            GoldilocksField::ONE,
+            GoldilocksField::from_canonical_u64(7),
+            GoldilocksField::from_canonical_u64((1 << 32) - 1),
+            GoldilocksField::from_canonical_u64(GoldilocksField::ORDER - 1),
+            GoldilocksField::from_noncanonical_u64(u64::MAX),
+        ];
+        for c in samples {
+            for r in samples {
+                for p in samples {
+                    for d in samples {
+                        let separate = (c + r * d) + p * d;
+                        let fused = c + (r + p) * d;
+                        assert_eq!(
+                            fused.to_canonical_u64(),
+                            separate.to_canonical_u64(),
+                            "c={c:?} r={r:?} p={p:?} d={d:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// End-to-end retained-column differential for every audited combined-gate
