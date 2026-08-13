@@ -385,10 +385,31 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
-        let rep_index = self.representative_map[self.target_index(target)] as usize;
+        self.set_target_index_returning_rep(self.target_index(target), value)
+    }
+
+    /// The flat-target-index form of [`Self::set_target_returning_rep`].
+    ///
+    /// Generator output staging has already computed `Target::index`; accepting
+    /// that exact index here avoids retaining the larger `Target` enum in the
+    /// transient output buffer and recomputing the index during the merge.
+    pub(crate) fn set_target_index_returning_rep(
+        &mut self,
+        target_index: usize,
+        value: F,
+    ) -> Result<Option<usize>> {
+        let rep_index = self.representative_map[target_index] as usize;
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {
+                let wire_slots = self.degree * self.num_wires;
+                let target = if target_index < wire_slots {
+                    Target::wire(target_index / self.num_wires, target_index % self.num_wires)
+                } else {
+                    Target::VirtualTarget {
+                        index: target_index - wire_slots,
+                    }
+                };
                 return Err(anyhow!(
                     "Partition containing {:?} was set twice with different values: {} != {}",
                     target,
