@@ -373,10 +373,34 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             }
         }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
+            // Width-2 pair eval: stream the shared powers table once per
+            // two polynomials. Each opening is the same field element as
+            // a standalone `extension_base_dot_product` (Ext2 fused path
+            // also keeps the delayed-reduction representative). Odd
+            // leftover uses the single-dot hook. Not tableless g-zeta.
+            let pairs = polynomials
+                .par_chunks(2)
+                .map(|chunk| match chunk {
+                    [a, b] => {
+                        let (x, y) = F::extension_base_dot_product_pair(
+                            pows,
+                            &a.coeffs,
+                            &b.coeffs,
+                        );
+                        (x, Some(y))
+                    }
+                    [a] => (F::extension_base_dot_product(pows, &a.coeffs), None),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            let mut out = Vec::with_capacity(polynomials.len());
+            for (x, y) in pairs {
+                out.push(x);
+                if let Some(y) = y {
+                    out.push(y);
+                }
+            }
+            out
         };
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)

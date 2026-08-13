@@ -99,6 +99,24 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute two independent `extension_base_dot_product`s against
+    /// the same extension-value table. The default calls the single
+    /// hook twice. A base field may fuse the pair so each table entry
+    /// is loaded once. Each result is the same field element as the
+    /// corresponding standalone call.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_pair(
+        extension_values: &[Self::Extension],
+        base_scalars_a: &[Self],
+        base_scalars_b: &[Self],
+    ) -> (Self::Extension, Self::Extension) {
+        (
+            Self::extension_base_dot_product(extension_values, base_scalars_a),
+            Self::extension_base_dot_product(extension_values, base_scalars_b),
+        )
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
