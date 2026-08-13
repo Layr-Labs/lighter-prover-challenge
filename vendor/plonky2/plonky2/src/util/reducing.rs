@@ -261,7 +261,19 @@ where
         )
     };
 
-    let mut acc = vec![F::ZERO; max_len];
+    // `ext2_base_scalar_dot_slots` *assigns* every output slot (`*o = reduce160(...)`)
+    // from a zero-seed accumulator; it never reads `out`. Prefilling with
+    // `F::ZERO` is therefore dead. `QuadraticExtension` has no `IsZero`
+    // specialization, so `vec![F::ZERO; n]` is a real serial store loop over
+    // the whole degree (1 MiB at d16, 4 MiB at d18) on the per-proof FRI
+    // composition spine, ahead of the parallel slot partition — serial-then-
+    // parallel, same class of leftover the quotient/Z-product paths already
+    // deleted. Generic `+=` path above still needs its zero seed.
+    let mut acc: Vec<F> = Vec::with_capacity(max_len);
+    // SAFETY: capacity is exactly `max_len`. Both arms below hand the whole
+    // buffer to `ext2_base_scalar_dot_slots`, which writes every element
+    // before any is read (including a short final SLOT_BLOCK). `F` is plain data.
+    unsafe { acc.set_len(max_len) };
     // Same shape split as the generic path: small batches stay serial, large
     // batches partition the coefficient slots so each worker visits all
     // polynomials for one cache-sized output range.
