@@ -102,12 +102,30 @@ impl<F: Field> ReducingFactor<F> {
         // exact, commutative and associative, so regrouping the sum by chunk
         // produces the identical field element for every coefficient.
         let polys: Vec<_> = polys.into_iter().collect();
-        let num_polys = polys.len();
-        let max_len = polys
+        let slices = polys
             .iter()
-            .map(|p| p.borrow().coeffs.len())
-            .max()
-            .unwrap_or(0);
+            .map(|p| p.borrow().coeffs.as_slice())
+            .collect::<Vec<_>>();
+        self.reduce_polys_base_slices(&slices)
+    }
+
+    /// Slice-backed form of [`Self::reduce_polys_base`]. This is deliberately
+    /// crate-private: quotient commitments may retain their two producer
+    /// columns and expose degree-sized logical chunks without manufacturing
+    /// sixteen owning `Vec`s. Ordinary polynomial batches continue through
+    /// the public, ownership-preserving wrapper above.
+    pub(crate) fn reduce_polys_base_slices<
+        BF: Extendable<D, Extension = F>,
+        const D: usize,
+    >(
+        &mut self,
+        polys: &[&[BF]],
+    ) -> PolynomialCoeffs<F>
+    where
+        F: FieldExtension<D, BaseField = BF>,
+    {
+        let num_polys = polys.len();
+        let max_len = polys.iter().map(|p| p.len()).max().unwrap_or(0);
         let base_powers: Vec<F> = self.base.powers().take(num_polys).collect();
         self.count += num_polys as u64;
 
@@ -120,12 +138,13 @@ impl<F: Field> ReducingFactor<F> {
         // same license as the parallel path below (every consumer treats
         // these coefficients value-wise and proof serialization canonicalizes
         // every limb).
-        if let Some(acc) = goldilocks_ext2_reduce_polys_base::<BF, F, D>(&polys, &base_powers, max_len)
+        if let Some(acc) =
+            goldilocks_ext2_reduce_polys_base::<BF, F, D>(polys, &base_powers, max_len)
         {
             return PolynomialCoeffs::new(acc);
         }
 
-        let accumulate_chunk = |ps: &[_], powers: &[F]| -> Vec<F> {
+        let accumulate_chunk = |ps: &[&[BF]], powers: &[F]| -> Vec<F> {
             // Build the accumulator straight from the chunk's first
             // polynomial's scaled coefficients (the base tree's
             // direct-construction trick: `ZERO + x == x` exactly, so skipping
@@ -134,12 +153,10 @@ impl<F: Field> ReducingFactor<F> {
             // empty in the common all-equal-degree case.
             let mut ps_iter = powers.iter().zip(ps);
             let mut acc: Vec<F> = match ps_iter.next() {
-                Some((base_power, poly)) => {
-                    let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
+                Some((base_power, coeffs)) => {
                     let mut acc = Vec::with_capacity(max_len);
                     acc.extend(
                         coeffs
-                            .coeffs
                             .iter()
                             .map(|&c| <F as FieldExtension<D>>::scalar_mul(base_power, c)),
                     );
@@ -148,9 +165,8 @@ impl<F: Field> ReducingFactor<F> {
                 }
                 None => vec![F::ZERO; max_len],
             };
-            for (base_power, poly) in ps_iter {
-                let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
-                for (a, &c) in acc.iter_mut().zip(coeffs.coeffs.iter()) {
+            for (base_power, coeffs) in ps_iter {
+                for (a, &c) in acc.iter_mut().zip(coeffs.iter()) {
                     *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
                 }
             }
@@ -176,15 +192,15 @@ impl<F: Field> ReducingFactor<F> {
             .enumerate()
             .for_each(|(block, out)| {
                 let start = block * SLOT_BLOCK;
-                for (base_power, poly) in base_powers.iter().zip(&polys) {
-                    let coeffs: &PolynomialCoeffs<BF> = Borrow::borrow(poly);
-                    if coeffs.coeffs.len() <= start {
+                for (base_power, poly) in base_powers.iter().zip(polys) {
+                    let coeffs = *poly;
+                    if coeffs.len() <= start {
                         continue;
                     }
-                    let live = (coeffs.coeffs.len() - start).min(out.len());
+                    let live = (coeffs.len() - start).min(out.len());
                     for (a, &c) in out[..live]
                         .iter_mut()
-                        .zip(&coeffs.coeffs[start..start + live])
+                        .zip(&coeffs[start..start + live])
                     {
                         *a += <F as FieldExtension<D>>::scalar_mul(base_power, c);
                     }
@@ -222,7 +238,7 @@ impl<F: Field> ReducingFactor<F> {
 /// modular reduction across the whole polynomial batch. Returns `None` for
 /// any other field configuration, leaving the generic path untouched.
 fn goldilocks_ext2_reduce_polys_base<BF, F, const D: usize>(
-    polys: &[impl Borrow<PolynomialCoeffs<BF>> + Sync],
+    polys: &[&[BF]],
     base_powers: &[F],
     max_len: usize,
 ) -> Option<Vec<F>>
@@ -243,7 +259,7 @@ where
     let slices: Vec<&[GoldilocksField]> = polys
         .iter()
         .map(|p| {
-            let coeffs = p.borrow().coeffs.as_slice();
+            let coeffs = *p;
             unsafe {
                 core::slice::from_raw_parts(
                     coeffs.as_ptr().cast::<GoldilocksField>(),

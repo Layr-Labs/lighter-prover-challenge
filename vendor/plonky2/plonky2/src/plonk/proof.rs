@@ -322,6 +322,55 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         quotient_polys_commitment: &PolynomialBatch<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
     ) -> Self {
+        let quotient_slices = quotient_polys_commitment
+            .polynomials
+            .iter()
+            .map(|p| p.coeffs.as_slice())
+            .collect::<Vec<_>>();
+        Self::new_with_quotient_slices(
+            zeta,
+            g,
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            &quotient_slices,
+            common_data,
+        )
+    }
+
+    pub(crate) fn new_with_quotient<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
+        wires_commitment: &PolynomialBatch<F, C, D>,
+        zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
+        quotient_polys_commitment: &crate::fri::oracle::QuotientPolynomialBatch<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
+        use crate::fri::oracle::FriPolynomialSource;
+        let quotient_slices = (0..quotient_polys_commitment.polynomial_count())
+            .map(|i| quotient_polys_commitment.coeff_slice(i))
+            .collect::<Vec<_>>();
+        Self::new_with_quotient_slices(
+            zeta,
+            g,
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            &quotient_slices,
+            common_data,
+        )
+    }
+
+    fn new_with_quotient_slices<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
+        wires_commitment: &PolynomialBatch<F, C, D>,
+        zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
+        quotient_polynomial_slices: &[&[F]],
+        common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
         // Every committed polynomial in these batches has at most `degree`
         // coefficients, so one powers table per opening point covers all of
         // them. Evaluating as `sum_i c_i * z^i` against the table replaces the
@@ -381,13 +430,19 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)
         };
+        let eval_slices = |pows: &[F::Extension], polynomials: &[&[F]]| {
+            polynomials
+                .par_iter()
+                .map(|p| F::extension_base_dot_product(pows, p))
+                .collect::<Vec<_>>()
+        };
         let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval =
             eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
         let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
+        let quotient_polys = eval_slices(&zeta_pows, quotient_polynomial_slices);
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),

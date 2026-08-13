@@ -56,6 +56,43 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
     pub blinding: bool,
 }
 
+/// Internal quotient-only commitment. The public `PolynomialBatch` shape and
+/// its serialized representation remain untouched: only the producer of the
+/// quotient oracle may retain full columns and address their degree-sized
+/// chunks as borrowed slices.
+#[derive(Eq, PartialEq, Debug)]
+pub(crate) enum QuotientPolynomialBatch<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    Owned(PolynomialBatch<F, C, D>),
+    ChunkView {
+        columns: Vec<PolynomialCoeffs<F>>,
+        chunks_per_column: usize,
+        chunk_len: usize,
+        merkle_tree: MerkleTree<F, C::Hasher>,
+        degree_log: usize,
+        rate_bits: usize,
+    },
+}
+
+pub(crate) trait FriPolynomialSource<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    fn polynomial_count(&self) -> usize;
+    fn coeff_slice(&self, index: usize) -> &[F];
+    fn merkle_tree(&self) -> &MerkleTree<F, C::Hasher>;
+}
+
+static QUOTIENT_VIEW_ATTEMPTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static QUOTIENT_VIEW_ENGAGEMENTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static QUOTIENT_VIEW_FALLBACKS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
     for PolynomialBatch<F, C, D>
 {
@@ -66,6 +103,224 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
+        }
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    FriPolynomialSource<F, C, D> for PolynomialBatch<F, C, D>
+{
+    fn polynomial_count(&self) -> usize {
+        self.polynomials.len()
+    }
+
+    fn coeff_slice(&self, index: usize) -> &[F] {
+        &self.polynomials[index].coeffs
+    }
+
+    fn merkle_tree(&self) -> &MerkleTree<F, C::Hasher> {
+        &self.merkle_tree
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    QuotientPolynomialBatch<F, C, D>
+{
+    pub(crate) fn from_columns_or_classic(
+        columns: Vec<PolynomialCoeffs<F>>,
+        chunks_per_column: usize,
+        chunk_len: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        Self::from_columns_or_classic_inner(
+            columns,
+            chunks_per_column,
+            chunk_len,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+            false,
+        )
+    }
+
+    fn from_columns_or_classic_inner(
+        columns: Vec<PolynomialCoeffs<F>>,
+        chunks_per_column: usize,
+        chunk_len: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        force_classic: bool,
+    ) -> Self {
+        use core::sync::atomic::Ordering::Relaxed;
+
+        // There is no meaningful classic commitment for an empty oracle or
+        // zero-sized logical polynomial. Reject those private-constructor
+        // contract violations before `chunks(0)` or `from_coeffs([])` can
+        // obscure the cause. Every valid but view-ineligible production shape
+        // below still retains its columns and takes the classic path.
+        assert!(chunks_per_column != 0, "quotient chunk count must be nonzero");
+        assert!(chunk_len != 0, "quotient chunk length must be nonzero");
+        assert!(!columns.is_empty(), "quotient columns must be nonempty");
+        QUOTIENT_VIEW_ATTEMPTS.fetch_add(1, Relaxed);
+
+        let expected_column_len = chunks_per_column.checked_mul(chunk_len);
+        let exact_shape = chunk_len.is_power_of_two()
+            && expected_column_len.is_some()
+            && columns
+                .iter()
+                .all(|column| Some(column.len()) == expected_column_len);
+        if !blinding && exact_shape && !force_classic {
+            let slices = columns
+                .iter()
+                .flat_map(|column| column.coeffs.chunks_exact(chunk_len))
+                .collect::<Vec<_>>();
+            debug_assert_eq!(slices.len(), columns.len() * chunks_per_column);
+            if let Some(merkle_tree) = PolynomialBatch::<F, C, D>::
+                try_merkle_tree_from_coeff_slices(
+                    &slices,
+                    rate_bits,
+                    cap_height,
+                    timing,
+                    fft_root_table,
+                )
+            {
+                QUOTIENT_VIEW_ENGAGEMENTS.fetch_add(1, Relaxed);
+                #[cfg(feature = "std")]
+                if std::env::var_os("LIGHTER_QUOTIENT_CHUNK_VIEW_REPORT").is_some() {
+                    eprintln!(
+                        "[quotient-chunk-view] engaged attempts={} engagements={} fallbacks={}",
+                        QUOTIENT_VIEW_ATTEMPTS.load(Relaxed),
+                        QUOTIENT_VIEW_ENGAGEMENTS.load(Relaxed),
+                        QUOTIENT_VIEW_FALLBACKS.load(Relaxed),
+                    );
+                }
+                return Self::ChunkView {
+                    columns,
+                    chunks_per_column,
+                    chunk_len,
+                    merkle_tree,
+                    degree_log: log2_strict(chunk_len),
+                    rate_bits,
+                };
+            }
+        }
+
+        QUOTIENT_VIEW_FALLBACKS.fetch_add(1, Relaxed);
+        #[cfg(feature = "std")]
+        if std::env::var_os("LIGHTER_QUOTIENT_CHUNK_VIEW_REPORT").is_some() {
+            eprintln!(
+                "[quotient-chunk-view] classic attempts={} engagements={} fallbacks={}",
+                QUOTIENT_VIEW_ATTEMPTS.load(Relaxed),
+                QUOTIENT_VIEW_ENGAGEMENTS.load(Relaxed),
+                QUOTIENT_VIEW_FALLBACKS.load(Relaxed),
+            );
+        }
+        let chunks = columns
+            .into_par_iter()
+            .flat_map(|column| column.chunks(chunk_len))
+            .collect();
+        Self::Owned(PolynomialBatch::from_coeffs(
+            chunks,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+        ))
+    }
+
+    pub(crate) fn merkle_tree(&self) -> &MerkleTree<F, C::Hasher> {
+        FriPolynomialSource::merkle_tree(self)
+    }
+
+    pub(crate) fn into_merkle_tree(self) -> MerkleTree<F, C::Hasher> {
+        match self {
+            Self::Owned(batch) => batch.merkle_tree,
+            Self::ChunkView { merkle_tree, .. } => merkle_tree,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn view_census() -> (usize, usize, usize) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (
+            QUOTIENT_VIEW_ATTEMPTS.load(Relaxed),
+            QUOTIENT_VIEW_ENGAGEMENTS.load(Relaxed),
+            QUOTIENT_VIEW_FALLBACKS.load(Relaxed),
+        )
+    }
+
+    /// Pure owner/view constructor for testing logical indexing independently
+    /// of Metal routing thresholds. The default tree is never opened or
+    /// observed; commitment equivalence remains the real production-size
+    /// component test below.
+    #[cfg(test)]
+    fn chunk_view_for_raw_test(
+        columns: Vec<PolynomialCoeffs<F>>,
+        chunks_per_column: usize,
+        chunk_len: usize,
+    ) -> Self {
+        assert!(chunks_per_column != 0);
+        assert!(chunk_len.is_power_of_two());
+        assert!(!columns.is_empty());
+        let column_len = chunks_per_column
+            .checked_mul(chunk_len)
+            .expect("test chunk shape overflow");
+        assert!(columns.iter().all(|column| column.len() == column_len));
+        Self::ChunkView {
+            columns,
+            chunks_per_column,
+            chunk_len,
+            merkle_tree: MerkleTree::default(),
+            degree_log: log2_strict(chunk_len),
+            rate_bits: 0,
+        }
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    FriPolynomialSource<F, C, D> for QuotientPolynomialBatch<F, C, D>
+{
+    fn polynomial_count(&self) -> usize {
+        match self {
+            Self::Owned(batch) => batch.polynomials.len(),
+            Self::ChunkView {
+                columns,
+                chunks_per_column,
+                ..
+            } => columns.len() * chunks_per_column,
+        }
+    }
+
+    fn coeff_slice(&self, index: usize) -> &[F] {
+        match self {
+            Self::Owned(batch) => &batch.polynomials[index].coeffs,
+            Self::ChunkView {
+                columns,
+                chunks_per_column,
+                chunk_len,
+                ..
+            } => {
+                let column = index / chunks_per_column;
+                let chunk = index % chunks_per_column;
+                &columns[column].coeffs[chunk * chunk_len..(chunk + 1) * chunk_len]
+            }
+        }
+    }
+
+    fn merkle_tree(&self) -> &MerkleTree<F, C::Hasher> {
+        match self {
+            Self::Owned(batch) => &batch.merkle_tree,
+            Self::ChunkView { merkle_tree, .. } => merkle_tree,
         }
     }
 }
@@ -321,9 +576,103 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .collect()
     }
 
+    /// Builds a nonblinded commitment directly from borrowed coefficient
+    /// columns. Declining retained column storage returns `None` without
+    /// consuming the producer-owned columns, so the caller can fail closed to
+    /// the classic owning `PolynomialBatch` construction.
+    fn try_merkle_tree_from_coeff_slices(
+        polynomials: &[&[F]],
+        rate_bits: usize,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Option<MerkleTree<F, C::Hasher>> {
+        let degree = polynomials.first()?.len();
+        if degree == 0 || polynomials.iter().any(|p| p.len() != degree) {
+            return None;
+        }
+        let lde_len = degree.checked_shl(rate_bits as u32)?;
+        let mut columns = C::Hasher::try_allocate_merkle_tree_columns(
+            polynomials.len(),
+            lde_len,
+            cap_height,
+        )?;
+        // Preserve the promoted streamed commitment schedule. Only the
+        // coefficient owner changed: each logical polynomial is now a slice
+        // into a retained quotient column. A streamed decline is idempotent;
+        // the ordinary fill below rewrites every destination cell.
+        let streamed = {
+            let coset_powers =
+                crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+            C::Hasher::try_build_merkle_tree_column_store_streamed(
+                &columns,
+                cap_height,
+                &|group, destinations: &mut [&mut [F]]| {
+                    destinations.par_iter_mut().enumerate().for_each(
+                        |(k, destination)| {
+                            let polynomial = polynomials[group * 8 + k];
+                            debug_assert_eq!(polynomial.len(), degree);
+                            batch_multiply_into(
+                                &mut destination[..degree],
+                                polynomial,
+                                &coset_powers,
+                            );
+                            if rate_bits == 0 || degree < 2 {
+                                destination[degree..].fill(F::ZERO);
+                            }
+                            fft_in_place_with_options(
+                                destination,
+                                Some(rate_bits),
+                                fft_root_table,
+                            );
+                        },
+                    );
+                },
+            )
+        };
+        if let Some((level_digests, cap)) = streamed {
+            return Some(timed!(
+                timing,
+                "build Merkle tree",
+                MerkleTree::from_prebuilt_columns(columns, level_digests, cap)
+            ));
+        }
+        let initialized = timed!(
+            timing,
+            "FFT + blinding",
+            Self::fill_lde_column_store_slices(
+                &mut columns,
+                polynomials,
+                rate_bits,
+                fft_root_table,
+            )
+        );
+        if !initialized {
+            return None;
+        }
+        Some(timed!(
+            timing,
+            "build Merkle tree",
+            MerkleTree::new_column_store(columns, cap_height)
+        ))
+    }
+
     fn fill_lde_column_store(
         columns: &mut ColumnStore<F>,
         polynomials: &[PolynomialCoeffs<F>],
+        rate_bits: usize,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> bool {
+        let slices = polynomials
+            .iter()
+            .map(|polynomial| polynomial.coeffs.as_slice())
+            .collect::<Vec<_>>();
+        Self::fill_lde_column_store_slices(columns, &slices, rate_bits, fft_root_table)
+    }
+
+    fn fill_lde_column_store_slices(
+        columns: &mut ColumnStore<F>,
+        polynomials: &[&[F]],
         rate_bits: usize,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> bool {
@@ -352,7 +701,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // (possibly uninitialized) destination.
                 batch_multiply_into(
                     &mut destination[..degree],
-                    &polynomial.coeffs,
+                    polynomial,
                     &coset_powers,
                 );
                 if rate_bits == 0 || degree < 2 {
@@ -608,6 +957,56 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         max_num_query_steps: Option<usize>,
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
+        let sources = oracles
+            .iter()
+            .map(|oracle| *oracle as &dyn FriPolynomialSource<F, C, D>)
+            .collect::<Vec<_>>();
+        Self::prove_openings_from_sources(
+            instance,
+            &sources,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    pub(crate) fn prove_openings_with_quotient(
+        instance: &FriInstanceInfo<F, D>,
+        ordinary_oracles: &[&Self],
+        quotient: &QuotientPolynomialBatch<F, C, D>,
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
+        let mut sources = ordinary_oracles
+            .iter()
+            .map(|oracle| *oracle as &dyn FriPolynomialSource<F, C, D>)
+            .collect::<Vec<_>>();
+        sources.push(quotient);
+        Self::prove_openings_from_sources(
+            instance,
+            &sources,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    fn prove_openings_from_sources(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&dyn FriPolynomialSource<F, C, D>],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
@@ -624,9 +1023,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
         for FriBatchInfo { point, polynomials } in &instance.batches {
             // Collect the coefficients of all the polynomials in `polynomials`.
-            let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-            });
+            let polys_coeff = polynomials
+                .iter()
+                .map(|fri_poly| {
+                    let oracle = oracles[fri_poly.oracle_index];
+                    debug_assert!(fri_poly.polynomial_index < oracle.polynomial_count());
+                    oracle.coeff_slice(fri_poly.polynomial_index)
+                })
+                .collect::<Vec<_>>();
             // The label is formatted unconditionally, but `timing`'s `push` is
             // compiled out unless the `timing` feature is on — which it is not
             // here — so the `String` is allocated, written and dropped without
@@ -635,7 +1039,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             let composition_poly = timed!(
                 timing,
                 "reduce batch of polynomials",
-                alpha.reduce_polys_base(polys_coeff)
+                alpha.reduce_polys_base_slices(&polys_coeff)
             );
             // Fused (value-exact) form of:
             //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
@@ -694,10 +1098,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         let fri_proof = fri_proof::<F, C, D>(
-            &oracles
-                .par_iter()
-                .map(|c| &c.merkle_tree)
-                .collect::<Vec<_>>(),
+            &oracles.iter().map(|c| c.merkle_tree()).collect::<Vec<_>>(),
             lde_final_poly,
             lde_final_values,
             challenger,
@@ -1232,5 +1633,190 @@ mod tests {
             };
             assert_eq!(raw(&by_ref), raw(&consumed), "width={width} degree={degree}");
         }
+    }
+
+    /// Pure ownership/order oracle, intentionally independent of Metal's
+    /// production routing threshold. The classic materializer must expose the
+    /// same raw logical polynomials as the owner-backed view.
+    #[test]
+    fn quotient_chunk_view_raw_order_fallback_and_census() {
+        use crate::field::types::PrimeField64;
+
+        const CHUNKS: usize = 8;
+        const CHUNK_LEN: usize = 64;
+        const RATE_BITS: usize = 1;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let columns = (0..2)
+            .map(|column| {
+                PolynomialCoeffs::new(
+                    (0..CHUNKS * CHUNK_LEN)
+                        .map(|i| {
+                            GoldilocksField(
+                                ((column + 1) as u64)
+                                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                    .wrapping_add(i as u64),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = columns
+            .iter()
+            .flat_map(|column| column.coeffs.chunks_exact(CHUNK_LEN))
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(PrimeField64::to_noncanonical_u64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let view = QuotientPolynomialBatch::<F, C, 2>::chunk_view_for_raw_test(
+            columns.clone(),
+            CHUNKS,
+            CHUNK_LEN,
+        );
+        assert!(matches!(
+            &view,
+            QuotientPolynomialBatch::ChunkView { .. }
+        ));
+        let actual = (0..view.polynomial_count())
+            .map(|i| {
+                view.coeff_slice(i)
+                    .iter()
+                    .map(PrimeField64::to_noncanonical_u64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let before = QuotientPolynomialBatch::<F, C, 2>::view_census();
+        let classic = QuotientPolynomialBatch::<F, C, 2>::from_columns_or_classic_inner(
+            columns,
+            CHUNKS,
+            CHUNK_LEN,
+            RATE_BITS,
+            false,
+            2,
+            &mut TimingTree::default(),
+            None,
+            true,
+        );
+        assert!(matches!(&classic, QuotientPolynomialBatch::Owned(_)));
+        let classic_raw = (0..classic.polynomial_count())
+            .map(|i| {
+                classic
+                    .coeff_slice(i)
+                    .iter()
+                    .map(PrimeField64::to_noncanonical_u64)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(classic_raw, expected);
+
+        let after = QuotientPolynomialBatch::<F, C, 2>::view_census();
+        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(after.1 - before.1, 0);
+        assert_eq!(after.2 - before.2, 1);
+
+        // Exact production roster: one quotient commitment per proof attempt,
+        // with two columns and eight chunks per column. This census is also
+        // the copy-deletion arithmetic (Goldilocks words are eight bytes).
+        let roster = [(53usize, 14usize), (52, 16), (1, 18)];
+        let attempts = roster.iter().map(|(count, _)| count).sum::<usize>();
+        let copied_bytes = roster
+            .iter()
+            .map(|(count, bits)| count * 2 * CHUNKS * (1usize << bits) * 8)
+            .sum::<usize>();
+        assert_eq!(attempts, 106);
+        assert_eq!(copied_bytes, 580_911_104);
+    }
+
+    #[test]
+    #[should_panic(expected = "quotient chunk length must be nonzero")]
+    fn quotient_chunk_view_rejects_zero_chunk_before_classic() {
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+        let _ = QuotientPolynomialBatch::<F, C, 2>::from_columns_or_classic(
+            vec![PolynomialCoeffs::new(vec![])],
+            8,
+            0,
+            1,
+            false,
+            2,
+            &mut TimingTree::default(),
+            None,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "quotient columns must be nonempty")]
+    fn quotient_chunk_view_rejects_empty_columns_before_classic() {
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+        let _ = QuotientPolynomialBatch::<F, C, 2>::from_columns_or_classic(
+            vec![],
+            8,
+            64,
+            1,
+            false,
+            2,
+            &mut TimingTree::default(),
+            None,
+        );
+    }
+
+    /// Real backend component at the smallest admitted production quotient
+    /// shape. This is Metal-only and forces context readiness before the
+    /// allocator decision; it does not weaken any global routing threshold.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn quotient_chunk_view_d14_component_engages_real_backend() {
+        const CHUNKS: usize = 8;
+        const CHUNK_LEN: usize = 1 << 14;
+        const RATE_BITS: usize = 3;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        crate::hash::poseidon2::metal::force_context_for_tests();
+        let columns = (0..2)
+            .map(|column| {
+                PolynomialCoeffs::new(
+                    (0..CHUNKS * CHUNK_LEN)
+                        .map(|i| {
+                            F::from_noncanonical_u64(
+                                (column as u64 + 1)
+                                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                    .wrapping_add(i as u64),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let before = QuotientPolynomialBatch::<F, C, 2>::view_census();
+        let view = QuotientPolynomialBatch::<F, C, 2>::from_columns_or_classic(
+            columns,
+            CHUNKS,
+            CHUNK_LEN,
+            RATE_BITS,
+            false,
+            4,
+            &mut TimingTree::default(),
+            None,
+        );
+        assert!(matches!(
+            &view,
+            QuotientPolynomialBatch::ChunkView { .. }
+        ));
+        assert_eq!(view.polynomial_count(), 16);
+        assert_eq!(view.merkle_tree().leaf_width(), 16);
+        assert_eq!(view.merkle_tree().num_leaves, 1 << 17);
+        let after = QuotientPolynomialBatch::<F, C, 2>::view_census();
+        assert_eq!(after.0 - before.0, 1);
+        assert_eq!(after.1 - before.1, 1);
+        assert_eq!(after.2 - before.2, 0);
     }
 }
