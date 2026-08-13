@@ -1348,6 +1348,12 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 &generator_watch_representatives,
                 &generator_watch_counts,
             );
+        let generator_watch_counts = generator_watch_counts
+            .into_iter()
+            .map(|count| {
+                u32::try_from(count).expect("generator distinct watch count exceeds u32")
+            })
+            .collect();
         drop(generator_watch_representatives);
         drop(generator_representatives);
 
