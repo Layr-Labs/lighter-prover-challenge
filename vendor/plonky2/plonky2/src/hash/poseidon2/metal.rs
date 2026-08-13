@@ -1311,6 +1311,13 @@ pub fn spine_backlog_add(delta: isize) {
     SPINE_BACKLOG.fetch_add(delta, core::sync::atomic::Ordering::Relaxed);
 }
 
+/// Merkle builds occupying the serialized GPU stream (buffer acquire through
+/// `wait_until_completed`). Scheduling heuristic only; either routing
+/// hashes the identical tree.
+pub fn gpu_jobs_in_flight() -> usize {
+    GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 fn spine_urgent() -> bool {
     SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed) >= SPINE_URGENT_BACKLOG
 }

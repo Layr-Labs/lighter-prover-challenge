@@ -60,24 +60,71 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
 // for experiments.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
+/// When the serialized GPU stream is idle and peak RSS is under the churn
+/// cap, admit one extra in-flight light proof. Depth 8 collapsed at ~9.5 GiB
+/// from allocator/fault churn, so the idle ceiling is 7, not 8.
+/// Isolate marker: light-gpu-window-1786679000.
+const LIGHT_TX_PROOF_WINDOW_IDLE: usize = 7;
+/// Peak RSS above this keeps the busy-path depth 6 even if the GPU is idle.
+const LIGHT_RSS_CAP_BYTES: u64 = 12 << 30;
 
-/// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
-/// experiments; read once. Depth is deliberately NOT scaled up on
-/// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
-/// RSS on a 24 GiB machine — the collapse is allocator/fault churn from more
-/// concurrent proof allocations, not memory capacity, and a 48 GiB host runs
-/// the same allocator. Measured: depth 6 beats 4 by ~4.6% on a quiet
-/// machine; under heavy external load the ordering inverts, so depth tuning
-/// beyond 6 needs quiet-host evidence first.
+fn peak_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        #[repr(C)]
+        struct Timeval {
+            tv_sec: i64,
+            tv_usec: i32,
+            _pad: i32,
+        }
+        #[repr(C)]
+        struct Rusage {
+            ru_utime: Timeval,
+            ru_stime: Timeval,
+            ru_maxrss: i64,
+        }
+        unsafe extern "C" {
+            fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+        }
+        const RUSAGE_SELF: i32 = 0;
+        let mut usage = core::mem::MaybeUninit::<Rusage>::uninit();
+        let rc = unsafe { getrusage(RUSAGE_SELF, usage.as_mut_ptr()) };
+        if rc != 0 {
+            return None;
+        }
+        let maxrss = unsafe { usage.assume_init().ru_maxrss };
+        if maxrss <= 0 {
+            return None;
+        }
+        Some(maxrss as u64)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Light in-flight cap. Env `LIGHTER_LIGHT_WINDOW` still wins (1..=12) for
+/// experiments. Ranked harness `env_clear`s, so the official path is:
+/// depth 6 while a GPU Merkle job is in flight or peak RSS ≥ 12 GiB,
+/// depth 7 when the GPU stream is empty and RSS has slack.
 fn light_tx_proof_window() -> usize {
-    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *WINDOW.get_or_init(|| {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    if let Some(fixed) = *OVERRIDE.get_or_init(|| {
         std::env::var("LIGHTER_LIGHT_WINDOW")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|w| (1..=12).contains(w))
-            .unwrap_or(LIGHT_TX_PROOF_WINDOW)
-    })
+    }) {
+        return fixed;
+    }
+    let gpu_idle = plonky2::hash::poseidon2::gpu_jobs_in_flight() == 0;
+    let rss_ok = peak_rss_bytes().map(|b| b < LIGHT_RSS_CAP_BYTES).unwrap_or(true);
+    if gpu_idle && rss_ok {
+        LIGHT_TX_PROOF_WINDOW_IDLE
+    } else {
+        LIGHT_TX_PROOF_WINDOW
+    }
 }
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
