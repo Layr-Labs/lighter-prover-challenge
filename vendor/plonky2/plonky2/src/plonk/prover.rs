@@ -1801,6 +1801,48 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Adds all completed GPU quotient terms in their established order while
+/// walking the CPU quotient buffer only once. Each contribution is already in
+/// point-major challenge order. Keeping the contribution loop inside the
+/// point-owned task preserves the exact `cpu += gpu * denominator_inverse`
+/// sequence for every field element; it only avoids repeating the outer
+/// full-buffer traversal and the identical inverse lookup for each GPU class.
+///
+/// The helper is deliberately independent of the GPU backend so its raw-word
+/// behavior can be checked directly with noncanonical field representatives.
+fn add_gpu_quotient_contributions<F: Field>(
+    quotient_values: &mut [F],
+    num_challenges: usize,
+    contributions: &[Option<&[F]>],
+    denominator_inverse: impl Fn(usize) -> F + Sync,
+) {
+    if contributions.iter().all(Option::is_none) {
+        return;
+    }
+    assert_ne!(num_challenges, 0, "quotient must have a challenge column");
+    for contribution in contributions.iter().flatten() {
+        assert_eq!(
+            contribution.len(),
+            quotient_values.len(),
+            "GPU quotient contribution shape mismatch"
+        );
+    }
+
+    quotient_values
+        .par_chunks_exact_mut(num_challenges)
+        .enumerate()
+        .for_each(|(point_index, cpu_values)| {
+            let denominator_inv = denominator_inverse(point_index);
+            let start = point_index * num_challenges;
+            let end = start + num_challenges;
+            for contribution in contributions.iter().flatten() {
+                for (cpu, &gpu) in cpu_values.iter_mut().zip(&contribution[start..end]) {
+                    *cpu += gpu * denominator_inv;
+                }
+            }
+        });
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2347,7 +2389,7 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2380,20 +2422,13 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        Some(gpu_values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2429,20 +2464,13 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        Some(gpu_values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
         let gpu_values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
@@ -2466,17 +2494,18 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        Some(gpu_values)
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    add_gpu_quotient_contributions(
+        &mut quotient_values,
+        num_challenges,
+        &[gpu_poseidon_values, gpu_range_values, gpu_permutation_values],
+        |point_index| z_h_on_coset.eval_inverse(point_index),
+    );
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
@@ -2658,11 +2687,13 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        add_gpu_quotient_contributions, precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2728,6 +2759,78 @@ mod quotient_layout_tests {
 
         data.verify(proof?)?;
         Ok(())
+    }
+
+    /// The three GPU quotient classes used to walk the full point-major
+    /// quotient buffer independently. The fused pass must retain the same
+    /// contribution order per element, including for raw noncanonical field
+    /// representatives and incomplete contribution sets.
+    #[test]
+    fn fused_gpu_quotient_contributions_match_separate_raw_order() {
+        fn next_u64(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        let mut state = 0x5a17_0c7e_1234_5678u64;
+        for (points, num_challenges, active_contributions) in [
+            (1usize, 1usize, 0usize),
+            (1, 2, 1),
+            (7, 2, 2),
+            (32, 2, 3),
+            (33, 3, 3),
+        ] {
+            let len = points * num_challenges;
+            let base: Vec<F> = (0..len)
+                .map(|_| F::from_noncanonical_u64(next_u64(&mut state)))
+                .collect();
+            let denominators: Vec<F> = (0..points)
+                .map(|_| F::from_noncanonical_u64(next_u64(&mut state)))
+                .collect();
+            let contributions: [Vec<F>; 3] = core::array::from_fn(|_| {
+                (0..len)
+                    .map(|_| F::from_noncanonical_u64(next_u64(&mut state)))
+                    .collect()
+            });
+
+            let mut separate = base.clone();
+            for contribution in contributions.iter().take(active_contributions) {
+                for (point_index, values) in separate.chunks_exact_mut(num_challenges).enumerate()
+                {
+                    for (value, &contribution) in values.iter_mut().zip(
+                        &contribution[point_index * num_challenges
+                            ..(point_index + 1) * num_challenges],
+                    ) {
+                        *value += contribution * denominators[point_index];
+                    }
+                }
+            }
+
+            let mut fused = base;
+            let contribution_refs: [Option<&[F]>; 3] = core::array::from_fn(|index| {
+                (index < active_contributions).then(|| contributions[index].as_slice())
+            });
+            add_gpu_quotient_contributions(
+                &mut fused,
+                num_challenges,
+                &contribution_refs,
+                |point_index| denominators[point_index],
+            );
+
+            assert_eq!(
+                fused
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                separate
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                "raw contribution order mismatch for points={points}, challenges={num_challenges}, active={active_contributions}"
+            );
+        }
     }
 
     /// End-to-end retained-column differential for every audited combined-gate
