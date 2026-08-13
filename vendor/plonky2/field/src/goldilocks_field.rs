@@ -362,7 +362,16 @@ impl Mul for GoldilocksField {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-        reduce128((self.0 as u128) * (rhs.0 as u128))
+        // `mul_acc_reduce(0, a, b)` is bit-identical to `reduce128(a*b)`
+        // (documented on the helper). Portable path unchanged off aarch64.
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self(mul_acc_reduce(0, self.0, rhs.0))
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            reduce128((self.0 as u128) * (rhs.0 as u128))
+        }
     }
 }
 
