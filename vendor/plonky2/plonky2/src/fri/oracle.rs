@@ -5,7 +5,7 @@ use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+use crate::field::batch_util::batch_multiply_into;
 use crate::field::extension::Extendable;
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
@@ -296,19 +296,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // with the packed batch multiply over the precomputed table.
                 let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
-                buffer.extend_from_slice(&p.coeffs);
+                // Same fused write as `fill_lde_column_store`: the unscaled
+                // copy `extend_from_slice` used to materialize is never
+                // observed. `batch_multiply_into` assigns every live slot.
+                // SAFETY: capacity is `lde_len`. Live prefix is written below;
+                // with `Some(rate_bits)` the zero-padded FFT reads only that
+                // prefix and writes every tail element before reading it.
+                unsafe { buffer.set_len(lde_len) };
+                batch_multiply_into(&mut buffer[..degree], &p.coeffs, &coset_powers);
                 if rate_bits == 0 || degree < 2 {
-                    buffer.resize(lde_len, F::ZERO);
-                } else {
-                    // SAFETY: capacity is exactly `lde_len`. With `Some(rate_bits)`
-                    // the zero-padded FFT reads only the first `degree` coefficients
-                    // and writes every tail element before reading it (all expansion
-                    // paths fill back-to-front), so the tail never needs the memset.
-                    // `degree < 2` is excluded: the first-layer block writes nothing
-                    // for a single live coefficient.
-                    unsafe { buffer.set_len(lde_len) };
+                    buffer[degree..].fill(F::ZERO);
                 }
-                batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
                 PolynomialCoeffs::new(buffer)
                     .fft_with_options(Some(rate_bits), fft_root_table)
                     .values
