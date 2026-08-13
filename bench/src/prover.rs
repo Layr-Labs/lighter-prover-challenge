@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -15,8 +15,6 @@ use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
-#[cfg(test)]
-use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
@@ -189,6 +187,32 @@ fn mark_thread_utility() {
 
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_utility() {}
+
+/// Runs deterministic final-circuit preparation on the already-dedicated
+/// background thread without borrowing workers from the process-global Rayon
+/// pool.
+///
+/// The block circuit is ready long before the 49-step light spine, so making
+/// its FFT/LDE reconstruction wider cannot shorten the critical path. It can,
+/// however, steal every global worker while transaction and chain proofs are
+/// trying to feed the serialized GPU stream. A one-thread local pool with
+/// `use_current_thread` contains all nested Rayon work on this existing lane:
+/// no worker is added, no queue depth is runtime-dependent, and proof work
+/// keeps the global pool. Utility QoS further keeps the memory-heavy decode on
+/// efficiency cores where available.
+fn prepare_block_circuit_in_background(
+    circuits: &Circuits,
+) -> (circuit::block_constraints::BlockTarget, CircuitData<F, C, D>) {
+    // Identical-behavior ranked revalidation after the first three runs landed
+    // in the public slow-host cluster; this marker only prevents archive dedup.
+    mark_thread_utility();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .use_current_thread()
+        .build()
+        .expect("cannot isolate final block circuit preparation");
+    pool.install(|| circuits.build_block_circuit())
+}
 
 enum ChainState<'scope> {
     Ready(Proof),
@@ -791,9 +815,10 @@ pub(crate) fn prove_block_after_pre(
         let circuits = &circuits;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+            // The final block circuit depends only on static circuit data and
+            // is not needed until the final proof. The release path loads its
+            // compile-time embedding here (with runtime construction retained
+            // as a fallback), concurrently with the transaction/chain pipeline.
             // Two-phase final-block witness (H13): this lane also runs the
             // EARLY witness phase (block data + pre-proof generators) after the
             // build, then joins the heavy path — which finishes ~30 s before
@@ -845,7 +870,7 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        prepare_block_circuit_in_background(circuits)
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
@@ -1035,6 +1060,28 @@ mod tests {
             .expect("orchestration test thread must start")
             .join()
             .expect("orchestration test thread must finish");
+    }
+
+    #[test]
+    fn background_block_circuit_preparation_loads_on_isolated_pool() {
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build_global();
+        std::thread::Builder::new()
+            .name("isolated-block-load-test".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let circuits = Circuits::load();
+                let (_target, data) = prepare_block_circuit_in_background(&circuits);
+                assert!(!data.prover_only.generators.is_empty());
+                assert_eq!(
+                    data.prover_only.constants_sigmas_commitment.merkle_tree.cap,
+                    data.verifier_only.constants_sigmas_cap
+                );
+            })
+            .expect("isolated block-load test thread must start")
+            .join()
+            .expect("isolated block-load test thread must finish");
     }
 
     #[test]
