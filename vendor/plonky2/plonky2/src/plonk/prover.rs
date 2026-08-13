@@ -14,7 +14,7 @@ use crate::field::fft::ifft_borrowed;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
-use crate::fri::oracle::{BatchLayout, PolynomialBatch};
+use crate::fri::oracle::{BatchLayout, PolynomialBatch, QuotientPolynomialBatch};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::poseidon2::Poseidon2Gate;
@@ -428,17 +428,16 @@ where
         }
     }
 
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+    let quotient_poly_columns: Vec<PolynomialCoeffs<F>> = timed!(
         timing,
-        "split up quotient polys",
+        "prepare quotient polys",
         quotient_polys
             .into_par_iter()
-            .flat_map(|mut quotient_poly| {
+            .map(|mut quotient_poly| {
                 quotient_poly.trim_to_len(quotient_degree).expect(
                     "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
                 );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
+                quotient_poly
             })
             .collect()
     );
@@ -446,8 +445,10 @@ where
     let quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            all_quotient_poly_chunks,
+        QuotientPolynomialBatch::<F, C, D>::from_columns_or_classic(
+            quotient_poly_columns,
+            common_data.quotient_degree_factor,
+            degree,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
@@ -456,7 +457,7 @@ where
         )
     );
 
-    challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
+    challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree().cap);
 
     let zeta = challenger.get_extension_challenge::<D>();
     // To avoid leaking witness data, we want to ensure that our opening locations, `zeta` and
@@ -471,7 +472,7 @@ where
     let openings = timed!(
         timing,
         "construct the opening set, including lookups",
-        OpeningSet::new(
+        OpeningSet::new_with_quotient(
             zeta,
             g,
             &prover_data.constants_sigmas_commitment,
@@ -487,14 +488,14 @@ where
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        PolynomialBatch::<F, C, D>::prove_openings_with_quotient(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
                 &wires_commitment,
                 &partial_products_zs_and_lookup_commitment,
-                &quotient_polys_commitment,
             ],
+            &quotient_polys_commitment,
             &mut challenger,
             &common_data.fri_params,
             None,
@@ -503,10 +504,11 @@ where
         )
     );
 
+    let quotient_merkle_tree = quotient_polys_commitment.into_merkle_tree();
     let proof = Proof::<F, C, D> {
         wires_cap: wires_commitment.merkle_tree.cap,
         plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
-        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        quotient_polys_cap: quotient_merkle_tree.cap,
         openings,
         opening_proof,
     };
@@ -1800,6 +1802,8 @@ fn start_gpu_permutation_quotient<
     }
     Some(job)
 }
+
+// Archive retry fingerprint: quotient chunk-view V4, retry 1.
 
 fn compute_quotient_polys<
     'a,
