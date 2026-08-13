@@ -308,7 +308,7 @@ mod build_timing {
     use super::*;
 
     /// Manual timing harness for the startup circuit builds, which run once per
-    /// worker spawn inside the ranked timed window (five spawns per run). Run:
+    /// worker spawn inside the ranked timed window (five spawns per ranked run). Run:
     /// `cargo test --release -p bench --bin prove -- --ignored build_phase_timing --nocapture`
     #[test]
     #[ignore = "manual timing harness"]
