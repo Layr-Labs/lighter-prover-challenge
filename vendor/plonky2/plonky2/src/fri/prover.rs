@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -122,6 +122,52 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
+// Functional-neutral archive marker for the disclosed fast-runner redraw:
+// p3e-fast-runner-redraw-1786600170.
+/// Builds a FRI tree without materializing the bit-reversed row-major leaf
+/// buffer first. For arity `a`, column `(k, limb)` contains the natural-order
+/// contiguous segment selected by the high reversed bits of `k`; the existing
+/// bit-reversed-row column view then presents exactly the same leaves as
+/// `bitrev_flatten(values)`, grouped into `a`-wide extension leaves.
+///
+/// A declined specialized allocation returns `None` and preserves the current
+/// flat path verbatim. No CPU routing or proof protocol changes.
+fn try_fri_leaf_native_tree<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    values: &[F::Extension],
+    arity: usize,
+    cap_height: usize,
+) -> Option<MerkleTree<F, C::Hasher>> {
+    debug_assert!(arity.is_power_of_two());
+    debug_assert_eq!(values.len() % arity, 0);
+    let leaf_count = values.len() / arity;
+    let arity_bits = log2_strict(arity);
+    let mut columns = C::Hasher::try_allocate_merkle_tree_columns(
+        arity.checked_mul(D)?,
+        leaf_count,
+        cap_height,
+    )?;
+    let destinations = columns.columns_mut()?;
+    destinations
+        .into_par_iter()
+        .enumerate()
+        .for_each(|(column, destination)| {
+            let value_in_leaf = column / D;
+            let limb = column % D;
+            let source_start = reverse_bits(value_in_leaf, arity_bits) * leaf_count;
+            destination
+                .par_iter_mut()
+                .zip(&values[source_start..source_start + leaf_count])
+                .for_each(|(output, value)| *output = value.to_basefield_array()[limb]);
+        });
+    Some(MerkleTree::<F, C::Hasher>::new_column_store(
+        columns, cap_height,
+    ))
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -142,12 +188,19 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // codeword starting at `i * arity`), instead of a random-access
         // in-place permutation followed by a separate flattening pass with a
         // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
-        let tree = MerkleTree::<F, C::Hasher>::new_flat(
-            flat_values,
-            arity * D,
+        let tree = try_fri_leaf_native_tree::<F, C, D>(
+            &values.values,
+            arity,
             fri_params.config.cap_height,
-        );
+        )
+        .unwrap_or_else(|| {
+            let flat_values = bitrev_flatten::<F, D>(&values.values);
+            MerkleTree::<F, C::Hasher>::new_flat(
+                flat_values,
+                arity * D,
+                fri_params.config.cap_height,
+            )
+        });
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -346,7 +399,11 @@ fn fri_prover_query_round<
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
-        let evals = unflatten(tree.get(x_index >> arity_bits));
+        // Column-backed leaf-native trees and row-backed fallbacks share this
+        // exact leaf view. The queried leaf is tiny and was allocated by
+        // `unflatten` on the old path as well.
+        let leaf = tree.leaf_vec(x_index >> arity_bits);
+        let evals = unflatten(&leaf);
         let merkle_proof = tree.prove(x_index >> arity_bits);
 
         query_steps.push(FriQueryStep {
@@ -398,5 +455,82 @@ mod tests {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
             }
         }
+    }
+
+    /// Production-shape semantic and service screen. d14 must preserve the
+    /// current fallback; d16/d18 must engage retained columns and match raw
+    /// leaves, all digests/cap words, and representative paths.
+    #[test]
+    #[ignore = "production-shape Metal component; frozen arbiter only"]
+    fn fri_leaf_native_production_component() {
+        use std::time::Instant;
+
+        use crate::hash::merkle_tree::MerkleLeaves;
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+        const D: usize = 2;
+        const ARITY: usize = 16;
+        const CAP_HEIGHT: usize = 4;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+        type C = Poseidon2GoldilocksConfig;
+
+        // The production component isolates layout cost, not the process-cold
+        // shader prewarm policy. Force the real context before either arm so
+        // the one-shot startup probe cannot decline one route selectively.
+        crate::hash::poseidon2::metal::force_context_for_tests();
+        crate::hash::poseidon2::set_exclusive_gpu_phase(true);
+        for degree_bits in [14usize, 16, 18] {
+            let n = 1usize << (degree_bits + 3);
+            let values: Vec<FE> = (0..n)
+                .map(|i| {
+                    FE::from_basefield_array([
+                        F::from_noncanonical_u64((i as u64).wrapping_mul(0x9e3779b97f4a7c15)),
+                        F::from_noncanonical_u64((i as u64).wrapping_mul(0xd1b54a32d192ed03)),
+                    ])
+                })
+                .collect();
+
+            let current_start = Instant::now();
+            let current = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_flat(
+                bitrev_flatten::<F, D>(&values),
+                ARITY * D,
+                CAP_HEIGHT,
+            );
+            let current_ns = current_start.elapsed().as_nanos();
+            let candidate_start = Instant::now();
+            let candidate = try_fri_leaf_native_tree::<F, C, D>(&values, ARITY, CAP_HEIGHT);
+            let candidate_ns = candidate_start.elapsed().as_nanos();
+
+            if degree_bits == 14 {
+                assert!(candidate.is_none(), "d14 must retain exact current fallback");
+                eprintln!("P3E shape=d14 engaged=false current_ns={current_ns} candidate_probe_ns={candidate_ns}");
+                continue;
+            }
+            let candidate = candidate.expect("d16/d18 leaf-native route must engage");
+            assert!(matches!(&candidate.leaves, MerkleLeaves::Columns { .. }));
+            let candidate_levels = candidate
+                .level_digests
+                .as_ref()
+                .expect("d16/d18 must use the Metal column-store build");
+            assert!(
+                candidate_levels.nodes.is_shared(),
+                "d16/d18 must retain shared Metal digest backing"
+            );
+            assert_eq!(current.cap, candidate.cap, "cap d{degree_bits}");
+            assert_eq!(current.level_digests, candidate.level_digests, "digests d{degree_bits}");
+            assert_eq!(current.digests, candidate.digests, "CPU digests d{degree_bits}");
+            for leaf in 0..current.num_leaves {
+                assert_eq!(current.get(leaf), candidate.leaf_vec(leaf), "leaf {leaf} d{degree_bits}");
+            }
+            for leaf in [0, 1, current.num_leaves / 3, current.num_leaves / 2, current.num_leaves - 1] {
+                assert_eq!(current.prove(leaf), candidate.prove(leaf), "path {leaf} d{degree_bits}");
+            }
+            eprintln!(
+                "P3E shape=d{degree_bits} engaged=true current_ns={current_ns} candidate_ns={candidate_ns} saved_ns={}",
+                current_ns as i128 - candidate_ns as i128
+            );
+        }
+        crate::hash::poseidon2::set_exclusive_gpu_phase(false);
     }
 }
