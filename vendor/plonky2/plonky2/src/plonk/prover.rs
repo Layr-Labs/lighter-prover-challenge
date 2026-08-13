@@ -2608,7 +2608,15 @@ pub(crate) mod precomputed {
         /// on every proof of a given size, so build it once per process.
         pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
             get_or_compute(&INVERSE_COSET_POWERS, degree, || {
-                F::coset_shift().inverse().powers().take(degree).collect()
+                // Carry 1/n in the same chain the IFFT post-pass applies, so
+                // that pass is one multiply per coefficient instead of two.
+                let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|s| n_inv * s)
+                    .collect()
             })
         }
     }
@@ -2636,11 +2644,13 @@ pub(crate) mod precomputed {
         }
 
         pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
             Arc::new(
                 F::coset_shift()
                     .inverse()
                     .powers()
                     .take(degree)
+                    .map(|s| n_inv * s)
                     .collect::<Vec<F>>(),
             )
         }

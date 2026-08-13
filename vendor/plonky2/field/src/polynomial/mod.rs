@@ -453,7 +453,7 @@ mod tests {
 
     use super::*;
     use crate::goldilocks_field::GoldilocksField;
-    use crate::types::Sample;
+    use crate::types::{PrimeField64, Sample};
 
     #[test]
     fn test_trimmed() {
@@ -539,19 +539,20 @@ mod tests {
                     .collect(),
             );
             let shift = F::coset_shift();
-            let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
+            let n_inv = F::inverse_2exp(k);
+            let inverse_powers = shift
+                .inverse()
+                .powers()
+                .take(n)
+                .map(|s| n_inv * s)
+                .collect::<Vec<_>>();
 
             let expected = evals.clone().coset_ifft(shift);
             let actual = evals.coset_ifft_with_powers(&inverse_powers);
 
-            assert_eq!(
-                actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
-                expected
-                    .coeffs
-                    .iter()
-                    .map(|value| value.0)
-                    .collect::<Vec<_>>()
-            );
+            for (a, e) in actual.coeffs.iter().zip(&expected.coeffs) {
+                assert_eq!(a.to_canonical_u64(), e.to_canonical_u64());
+            }
         }
     }
 

@@ -26,6 +26,7 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+// ifft-norm-fast-1786601000
 
 // jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
 // mapped long enough for the next identically-shaped allocation to reuse them.
