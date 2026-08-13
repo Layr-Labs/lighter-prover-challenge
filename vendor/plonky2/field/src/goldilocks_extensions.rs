@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars_a: &[Self],
+        base_scalars_b: &[Self],
+    ) -> (QuadraticExtension<Self>, QuadraticExtension<Self>) {
+        ext2_base_scalar_dot_products_2(extension_values, base_scalars_a, base_scalars_b)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +286,52 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+#[inline]
+fn ext2_base_scalar_dot_products_2(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars_a: &[GoldilocksField],
+    base_scalars_b: &[GoldilocksField],
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    let na = extension_values.len().min(base_scalars_a.len());
+    let nb = extension_values.len().min(base_scalars_b.len());
+    let n_both = na.min(nb);
+    if n_both == 0 {
+        return (
+            ext2_base_scalar_dot_product(extension_values, base_scalars_a),
+            ext2_base_scalar_dot_product(extension_values, base_scalars_b),
+        );
+    }
+    let (mut lo0a, mut hi0a) = (0u128, 0u32);
+    let (mut lo1a, mut hi1a) = (0u128, 0u32);
+    let (mut lo0b, mut hi0b) = (0u128, 0u32);
+    let (mut lo1b, mut hi1b) = (0u128, 0u32);
+    for i in 0..n_both {
+        let QuadraticExtension([p0, p1]) = extension_values[i];
+        u160_add_product(&mut lo0a, &mut hi0a, p0.0, base_scalars_a[i].0);
+        u160_add_product(&mut lo1a, &mut hi1a, p1.0, base_scalars_a[i].0);
+        u160_add_product(&mut lo0b, &mut hi0b, p0.0, base_scalars_b[i].0);
+        u160_add_product(&mut lo1b, &mut hi1b, p1.0, base_scalars_b[i].0);
+    }
+    let mut ra = QuadraticExtension([
+        unsafe { reduce160(lo0a, hi0a) },
+        unsafe { reduce160(lo1a, hi1a) },
+    ]);
+    let mut rb = QuadraticExtension([
+        unsafe { reduce160(lo0b, hi0b) },
+        unsafe { reduce160(lo1b, hi1b) },
+    ]);
+    if na > n_both {
+        ra += ext2_base_scalar_dot_product(&extension_values[n_both..na], &base_scalars_a[n_both..na]);
+    }
+    if nb > n_both {
+        rb += ext2_base_scalar_dot_product(&extension_values[n_both..nb], &base_scalars_b[n_both..nb]);
+    }
+    (ra, rb)
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction

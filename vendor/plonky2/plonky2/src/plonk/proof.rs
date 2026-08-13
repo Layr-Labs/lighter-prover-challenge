@@ -372,43 +372,82 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
             }
         }
-        let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
+        let eval_polynomials = |pows: &[F::Extension], polynomials: &[&PolynomialCoeffs<F>]| {
+            let n = polynomials.len();
+            let n_pairs = n / 2;
+            let mut out = Vec::with_capacity(n);
+            if n_pairs > 0 {
+                let pairs: Vec<_> = (0..n_pairs)
+                    .into_par_iter()
+                    .map(|i| {
+                        F::extension_base_dot_products_2(
+                            pows,
+                            &polynomials[2 * i].coeffs,
+                            &polynomials[2 * i + 1].coeffs,
+                        )
+                    })
+                    .collect();
+                for (a, b) in pairs {
+                    out.push(a);
+                    out.push(b);
+                }
+            }
+            if n % 2 == 1 {
+                out.push(F::extension_base_dot_product(
+                    pows,
+                    &polynomials[n - 1].coeffs,
+                ));
+            }
+            out
         };
-        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
-            eval_polynomials(pows, &c.polynomials)
-        };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
-
-        // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
+        // One zeta-side wave: four commitments in historical order so the
+        // range slices below stay bit-identical. No lookup_range().len().
+        let cs_polys = &constants_sigmas_commitment.polynomials;
+        let wire_polys = &wires_commitment.polynomials;
+        let zs_polys = &zs_partial_products_lookup_commitment.polynomials;
+        let quot_polys = &quotient_polys_commitment.polynomials;
+        let cs_n = cs_polys.len();
+        let wires_n = wire_polys.len();
+        let zs_n = zs_polys.len();
+        let mut zeta_refs = Vec::with_capacity(cs_n + wires_n + zs_n + quot_polys.len());
+        zeta_refs.extend(cs_polys.iter());
+        zeta_refs.extend(wire_polys.iter());
+        zeta_refs.extend(zs_polys.iter());
+        zeta_refs.extend(quot_polys.iter());
+        let zeta_evals = eval_polynomials(&zeta_pows, &zeta_refs);
+        let constants_sigmas_eval = &zeta_evals[..cs_n];
+        let wires_eval = &zeta_evals[cs_n..cs_n + wires_n];
         let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
-        let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
+            &zeta_evals[cs_n + wires_n..cs_n + wires_n + zs_n];
+        let quotient_polys = zeta_evals[cs_n + wires_n + zs_n..].to_vec();
+        let shifted_polynomials = zs_polys;
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
+            wires: wires_eval.to_vec(),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             // Partial-product polynomials are opened only at `zeta`, never at
             // `g * zeta`; evaluate only the shifted Z polynomials consumed by
             // the FRI next batch.
-            plonk_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.zs_range()],
-            ),
+            plonk_zs_next: {
+                let refs: Vec<&PolynomialCoeffs<F>> = shifted_polynomials
+                    [common_data.zs_range()]
+                    .iter()
+                    .collect();
+                eval_polynomials(&g_zeta_pows, &refs)
+            },
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
             quotient_polys,
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.lookup_range()],
-            ),
+            lookup_zs_next: {
+                let refs: Vec<&PolynomialCoeffs<F>> = shifted_polynomials
+                    [common_data.lookup_range()]
+                    .iter()
+                    .collect();
+                eval_polynomials(&g_zeta_pows, &refs)
+            },
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {

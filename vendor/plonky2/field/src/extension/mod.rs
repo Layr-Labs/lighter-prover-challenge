@@ -99,6 +99,19 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[Self::Extension],
+        base_scalars_a: &[Self],
+        base_scalars_b: &[Self],
+    ) -> (Self::Extension, Self::Extension) {
+        (
+            Self::extension_base_dot_product(extension_values, base_scalars_a),
+            Self::extension_base_dot_product(extension_values, base_scalars_b),
+        )
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
