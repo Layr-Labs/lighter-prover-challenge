@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// Candidate marker 802-gpt56-sol-opening-wave-dot2-20260813
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

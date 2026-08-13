@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[QuadraticExtension<Self>],
+        base_polynomials: [&[Self]; 2],
+    ) -> [QuadraticExtension<Self>; 2] {
+        ext2_base_scalar_dot_products_2(extension_values, base_polynomials)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +285,96 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+/// Compute two dot products sharing one powers-table read:
+/// `out[k] = sum_i extension_values[i].scalar_mul(base_polynomials[k][i])`
+/// for `k in 0..2`, in GF(p^2), delaying reduction across each complete dot.
+///
+/// Each extension value is loaded once and folded into two independent
+/// 160-bit accumulator pairs (one per output polynomial, two limbs each). The
+/// per-accumulator bound is identical to the single-point case, so
+/// `reduce160`'s precondition holds through `n = 2^32 - 1` terms per chunk.
+/// Each output retains its own coefficient length (zip/minimum-length), so
+/// uneven polynomials fall back to the two independent single dots exactly.
+#[inline]
+fn ext2_base_scalar_dot_products_2(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_polynomials: [&[GoldilocksField]; 2],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len_0 = extension_values.len().min(base_polynomials[0].len());
+    let len_1 = extension_values.len().min(base_polynomials[1].len());
+    let len = len_0.max(len_1);
+    if len == 0 {
+        return [QuadraticExtension::ZERO, QuadraticExtension::ZERO];
+    }
+
+    let reduce_chunk = |values: &[QuadraticExtension<GoldilocksField>],
+                        poly_a: &[GoldilocksField],
+                        poly_b: &[GoldilocksField],
+                        a_terms: usize,
+                        b_terms: usize| {
+        debug_assert!(a_terms <= poly_a.len());
+        debug_assert!(b_terms <= poly_b.len());
+        debug_assert!(a_terms <= values.len());
+        debug_assert!(b_terms <= values.len());
+        let (mut a0_lo, mut a0_hi) = (0u128, 0u32);
+        let (mut a1_lo, mut a1_hi) = (0u128, 0u32);
+        let (mut b0_lo, mut b0_hi) = (0u128, 0u32);
+        let (mut b1_lo, mut b1_hi) = (0u128, 0u32);
+        for i in 0..a_terms.max(b_terms) {
+            let QuadraticExtension([v0, v1]) = values[i];
+            if i < a_terms {
+                let c = poly_a[i].0;
+                u160_add_product(&mut a0_lo, &mut a0_hi, v0.0, c);
+                u160_add_product(&mut a1_lo, &mut a1_hi, v1.0, c);
+            }
+            if i < b_terms {
+                let c = poly_b[i].0;
+                u160_add_product(&mut b0_lo, &mut b0_hi, v0.0, c);
+                u160_add_product(&mut b1_lo, &mut b1_hi, v1.0, c);
+            }
+        }
+        // SAFETY: the exact worst-case bound documented above covers arbitrary
+        // u64 representatives for every term in this chunk.
+        [
+            QuadraticExtension([unsafe { reduce160(a0_lo, a0_hi) }, unsafe {
+                reduce160(a1_lo, a1_hi)
+            }]),
+            QuadraticExtension([unsafe { reduce160(b0_lo, b0_hi) }, unsafe {
+                reduce160(b1_lo, b1_hi)
+            }]),
+        ]
+    };
+
+    let first_a = len_0.min(MAX_TERMS_PER_REDUCTION);
+    let first_b = len_1.min(MAX_TERMS_PER_REDUCTION);
+    let mut out = reduce_chunk(
+        &extension_values[..len.min(MAX_TERMS_PER_REDUCTION)],
+        &base_polynomials[0][..first_a],
+        &base_polynomials[1][..first_b],
+        first_a,
+        first_b,
+    );
+    let mut start = len.min(MAX_TERMS_PER_REDUCTION);
+    while start < len {
+        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
+        let a_end = len_0.min(end);
+        let b_end = len_1.min(end);
+        let [ta, tb] = reduce_chunk(
+            &extension_values[start..end],
+            &base_polynomials[0][start..a_end],
+            &base_polynomials[1][start..b_end],
+            a_end - start,
+            b_end - start,
+        );
+        out[0] += ta;
+        out[1] += tb;
+        start = end;
+    }
+    out
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
@@ -884,6 +982,113 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_products_2_matches_two_singles_at_boundaries() {
+        let p = GF::ORDER;
+        let raw_specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
+        let lengths = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
+            (3, 2),
+            (15, 15),
+            (16, 16),
+            (17, 17),
+            (63, 64),
+            (64, 63),
+            (65, 65),
+            (256, 256),
+            (257, 257),
+            (4095, 4096),
+            (4096, 4095),
+            (4097, 4097),
+        ];
+
+        let mut state = 0x0F1E_2D3C_4B5A_6978u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (values_len, a_len, b_len) in lengths
+            .iter()
+            .flat_map(|&(a, b)| [(a, a, b), (b, a, b), (a, b, a)])
+        {
+            let values: Vec<Q2> = (0..values_len)
+                .map(|i| {
+                    let a0 = if i < raw_specials.len() {
+                        raw_specials[i]
+                    } else {
+                        next()
+                    };
+                    let a1 = if i < raw_specials.len() {
+                        raw_specials[raw_specials.len() - 1 - i]
+                    } else {
+                        next()
+                    };
+                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
+                })
+                .collect();
+            let poly_a: Vec<GF> = (0..a_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 7) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+            let poly_b: Vec<GF> = (0..b_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5 + 1) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+
+            let expected = [
+                generic_extension_base_dot_product(&values, &poly_a),
+                generic_extension_base_dot_product(&values, &poly_b),
+            ];
+            let expected_single = [
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &poly_a),
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &poly_b),
+            ];
+            let actual = <GF as Extendable<2>>::extension_base_dot_products_2(
+                &values,
+                [&poly_a, &poly_b],
+            );
+            for side in 0..2 {
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual[side].0[limb].to_canonical_u64(),
+                        expected[side].0[limb].to_canonical_u64(),
+                        "canonical limb {limb} side {side} at \
+                         (values={values_len}, a={a_len}, b={b_len})"
+                    );
+                    assert_eq!(
+                        actual[side].0[limb].0,
+                        expected_single[side].0[limb].0,
+                        "raw limb {limb} side {side} at \
+                         (values={values_len}, a={a_len}, b={b_len})"
+                    );
+                }
+            }
+        }
+        let empty: [&[GF]; 2] = [&[], &[]];
+        assert_eq!(
+            <GF as Extendable<2>>::extension_base_dot_products_2(&[], empty),
+            [Q2::ZERO, Q2::ZERO]
+        );
     }
 
     #[test]
