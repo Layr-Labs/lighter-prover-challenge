@@ -32,7 +32,7 @@ impl Extendable<2> for GoldilocksField {
         extension_values: &[QuadraticExtension<Self>],
         base_scalars: &[Self],
     ) -> QuadraticExtension<Self> {
-        ext2_base_scalar_dot_product(extension_values, base_scalars)
+        ext2_base_scalar_dot_product_ilp4(extension_values, base_scalars)
     }
 
     #[inline(always)]
@@ -240,6 +240,7 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
 /// path. The returned representative need not match reduce-per-term addition,
 /// but it represents the same field element.
 #[inline]
+#[cfg(test)]
 fn ext2_base_scalar_dot_product(
     extension_values: &[QuadraticExtension<GoldilocksField>],
     base_scalars: &[GoldilocksField],
@@ -266,6 +267,78 @@ fn ext2_base_scalar_dot_product(
         QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
             reduce160(lo1, hi1)
         }])
+    };
+
+    let first_end = len.min(MAX_TERMS_PER_REDUCTION);
+    let mut result = reduce_chunk(&extension_values[..first_end], &base_scalars[..first_end]);
+    let mut start = first_end;
+    while start < len {
+        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
+        result += reduce_chunk(&extension_values[start..end], &base_scalars[start..end]);
+        start = end;
+    }
+    result
+}
+
+/// Four-way independent form of [`ext2_base_scalar_dot_product`]. Splitting
+/// each limb's carry chain lets out-of-order cores overlap the widening
+/// products while preserving the same single `reduce160` per output limb.
+#[inline]
+fn ext2_base_scalar_dot_product_ilp4(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars: &[GoldilocksField],
+) -> QuadraticExtension<GoldilocksField> {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len = extension_values.len().min(base_scalars.len());
+    if len == 0 {
+        return QuadraticExtension::ZERO;
+    }
+
+    let reduce_chunk = |values: &[QuadraticExtension<GoldilocksField>],
+                        scalars: &[GoldilocksField]| {
+        debug_assert_eq!(values.len(), scalars.len());
+        debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
+        let mut lo0 = [0u128; 4];
+        let mut hi0 = [0u32; 4];
+        let mut lo1 = [0u128; 4];
+        let mut hi1 = [0u32; 4];
+
+        let mut value_chunks = values.chunks_exact(4);
+        let mut scalar_chunks = scalars.chunks_exact(4);
+        for (v, s) in value_chunks.by_ref().zip(scalar_chunks.by_ref()) {
+            for lane in 0..4 {
+                let QuadraticExtension([a0, a1]) = v[lane];
+                u160_add_product(&mut lo0[lane], &mut hi0[lane], a0.0, s[lane].0);
+                u160_add_product(&mut lo1[lane], &mut hi1[lane], a1.0, s[lane].0);
+            }
+        }
+        for (lane, (&QuadraticExtension([a0, a1]), &scalar)) in value_chunks
+            .remainder()
+            .iter()
+            .zip(scalar_chunks.remainder())
+            .enumerate()
+        {
+            u160_add_product(&mut lo0[lane], &mut hi0[lane], a0.0, scalar.0);
+            u160_add_product(&mut lo1[lane], &mut hi1[lane], a1.0, scalar.0);
+        }
+
+        let merge = |lo: [u128; 4], hi: [u32; 4]| {
+            let mut merged_lo = lo[0];
+            let mut merged_hi = u64::from(hi[0]);
+            for lane in 1..4 {
+                let (sum, carry) = merged_lo.overflowing_add(lo[lane]);
+                merged_lo = sum;
+                merged_hi += u64::from(hi[lane]) + u64::from(carry);
+            }
+            debug_assert!(merged_hi <= u64::from(u32::MAX));
+            // SAFETY: partitioning terms among four lanes and merging their
+            // exact 160-bit sums reconstructs the bound documented for the
+            // serial implementation above.
+            unsafe { reduce160(merged_lo, merged_hi as u32) }
+        };
+
+        QuadraticExtension([merge(lo0, hi0), merge(lo1, hi1)])
     };
 
     let first_end = len.min(MAX_TERMS_PER_REDUCTION);
@@ -897,6 +970,113 @@ mod tests {
         let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
+    }
+
+    #[test]
+    fn ext2_base_scalar_dot_product_ilp4_matches_serial_accumulator() {
+        let lengths = [0usize, 1, 2, 3, 4, 5, 15, 16, 17, 255, 256, 257, 4096, 4097];
+        let mut state = 0xD6E8_FEB8_6659_FD93u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for len in lengths {
+            let values = (0..len)
+                .map(|i| {
+                    let a0 = if i < 4 { u64::MAX - i as u64 } else { next() };
+                    let a1 = if i < 4 { GF::ORDER + i as u64 } else { next() };
+                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
+                })
+                .collect::<Vec<_>>();
+            let scalars = (0..len)
+                .map(|i| {
+                    GoldilocksField(if i < 4 {
+                        u64::MAX - (i * 3) as u64
+                    } else {
+                        next()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let expected = super::ext2_base_scalar_dot_product(&values, &scalars);
+            let actual = super::ext2_base_scalar_dot_product_ilp4(&values, &scalars);
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].to_canonical_u64(),
+                    expected.0[limb].to_canonical_u64(),
+                    "canonical limb {limb} mismatch at length {len}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual opening dot-product microbenchmark"]
+    fn ext2_base_scalar_dot_product_ilp4_microbench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for log_n in [14usize, 16, 18] {
+            let len = 1usize << log_n;
+            let mut state = 0xA076_1D64_78BD_642Fu64;
+            let mut next = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let values = (0..len)
+                .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+                .collect::<Vec<_>>();
+            let scalars = (0..len)
+                .map(|_| GoldilocksField(next()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                super::ext2_base_scalar_dot_product(&values, &scalars),
+                super::ext2_base_scalar_dot_product_ilp4(&values, &scalars)
+            );
+
+            let iters = ((1usize << 23) / len).max(1);
+            let mut serial = Vec::new();
+            let mut ilp4 = Vec::new();
+            for round in 0..9 {
+                let funcs: [fn(&[Q2], &[GF]) -> Q2; 2] = if round & 1 == 0 {
+                    [
+                        super::ext2_base_scalar_dot_product,
+                        super::ext2_base_scalar_dot_product_ilp4,
+                    ]
+                } else {
+                    [
+                        super::ext2_base_scalar_dot_product_ilp4,
+                        super::ext2_base_scalar_dot_product,
+                    ]
+                };
+                for (slot, f) in funcs.into_iter().enumerate() {
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        black_box(f(black_box(&values), black_box(&scalars)));
+                    }
+                    let ns = start.elapsed().as_secs_f64() * 1e9 / iters as f64;
+                    let is_serial = (round & 1 == 0) == (slot == 0);
+                    if is_serial {
+                        serial.push(ns);
+                    } else {
+                        ilp4.push(ns);
+                    }
+                }
+            }
+            serial.sort_by(f64::total_cmp);
+            ilp4.sort_by(f64::total_cmp);
+            let serial_ns = serial[serial.len() / 2];
+            let ilp4_ns = ilp4[ilp4.len() / 2];
+            eprintln!(
+                "degree=2^{log_n} serial_ns={serial_ns:.0} ilp4_ns={ilp4_ns:.0} speedup={:.4}x",
+                serial_ns / ilp4_ns
+            );
+        }
     }
 
     #[test]
