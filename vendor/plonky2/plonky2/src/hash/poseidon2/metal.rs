@@ -587,18 +587,22 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    // Publish only after the whole walk has finished. Stashing earlier lets a
+    // final block that arrives mid-walk take a buffer another thread is still
+    // writing; if that late `write_volatile(0)` lands after the block's LDE
+    // fill wrote the same location, the committed evaluation diverges from
+    // the coefficient polynomial and the quotient's vanishing identity fails
+    // intermittently. A consumer now receives either the fully walked buffer
+    // (no other CPU thread can mutate it) or the fresh-allocation fallback.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
@@ -2057,7 +2061,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // while an already-busy stream would just queue the absorb groups behind
     // another tree and stretch both.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        // Exclusive phases own an otherwise idle GPU stream (the pipelined
+        // chunk trees have retired), so the 2^17-leaf chain-step Zs and
+        // quotient trees can stream their CPU fill against GPU absorb
+        // instead of running fill-then-hash serially on the spine. The
+        // 2^20 gate was sized for the final block's wire tree; the measured
+        // GPU/CPU break-even for the mid-size shapes is far below 2^17.
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
