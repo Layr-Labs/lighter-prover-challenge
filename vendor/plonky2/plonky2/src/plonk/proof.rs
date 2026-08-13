@@ -381,18 +381,32 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)
         };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
-
-        // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
+        // Four independent zeta-dot batches. The tip ran them as sequential
+        // par_iters; join lets two pairs occupy the pool at once. Each batch
+        // still dots the same polynomials against the same powers table.
+        let (
+            (constants_sigmas_eval, wires),
+            (zs_partial_products_lookup_eval, quotient_polys),
+        ) = plonky2_maybe_rayon::join(
+            || {
+                plonky2_maybe_rayon::join(
+                    || eval_commitment(&zeta_pows, constants_sigmas_commitment),
+                    || eval_commitment(&zeta_pows, wires_commitment),
+                )
+            },
+            || {
+                plonky2_maybe_rayon::join(
+                    || eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment),
+                    || eval_commitment(&zeta_pows, quotient_polys_commitment),
+                )
+            },
+        );
         let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
+            wires,
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             // Partial-product polynomials are opened only at `zeta`, never at
             // `g * zeta`; evaluate only the shifted Z polynomials consumed by
