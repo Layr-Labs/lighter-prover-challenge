@@ -761,10 +761,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    // Each challenge has its own serial recurrence, but the two product
+    // buffers and output columns are disjoint. Run only those two conversions
+    // concurrently; tuple order preserves challenge zero before challenge one.
+    let (z_polynomials_0, z_polynomials_1) = plonky2_maybe_rayon::join(
+        || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    );
+    vec![z_polynomials_0, z_polynomials_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
