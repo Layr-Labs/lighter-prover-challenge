@@ -135,7 +135,7 @@ fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
 /// scheduling only: no work is added, moved, or reordered, and proof
 /// bytes are untouched. On non-macOS targets this is a no-op.
 #[cfg(target_os = "macos")]
-fn mark_spine_thread_latency_critical() {
+pub(crate) fn mark_spine_thread_latency_critical() {
     // `QOS_CLASS_USER_INTERACTIVE` is 0x21 in <sys/qos.h>.
     #[allow(non_camel_case_types)]
     type qos_class_t = u32;
@@ -150,7 +150,7 @@ fn mark_spine_thread_latency_critical() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mark_spine_thread_latency_critical() {}
+pub(crate) fn mark_spine_thread_latency_critical() {}
 
 /// Marks the calling thread `QOS_CLASS_USER_INITIATED` (0x19). Used for the
 /// transaction-proof threads: they hold the single GPU buffer set across
@@ -158,7 +158,7 @@ fn mark_spine_thread_latency_critical() {}
 /// preempted while every other tree build queues behind it — a classic
 /// priority inversion at the pipeline's one serialized station. Best-effort.
 #[cfg(target_os = "macos")]
-fn mark_thread_user_initiated() {
+pub(crate) fn mark_thread_user_initiated() {
     #[allow(non_camel_case_types)]
     type qos_class_t = u32;
     unsafe extern "C" {
@@ -170,7 +170,7 @@ fn mark_thread_user_initiated() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mark_thread_user_initiated() {}
+pub(crate) fn mark_thread_user_initiated() {}
 
 /// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
 /// walks prefer E-cores instead of competing with the light pipeline's
@@ -813,6 +813,11 @@ pub(crate) fn prove_block_after_pre(
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, || {
+                    // F3: single orchestration lane that also runs
+                    // `generate_tx_witness` inline; only its children were
+                    // latency-critical, leaving the parent eligible for an
+                    // efficiency core while the pool is saturated.
+                    mark_spine_thread_latency_critical();
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
@@ -832,6 +837,10 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    // F2: a single lane sitting directly on the tail — the main
+                    // thread joins it before the light join, while the light
+                    // pipeline saturates the machine.
+                    mark_spine_thread_latency_critical();
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
                         "final_block_build",
