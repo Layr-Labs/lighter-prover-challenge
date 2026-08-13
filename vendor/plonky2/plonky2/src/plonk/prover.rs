@@ -2504,11 +2504,15 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
+    // Scatter is a bandwidth-bound copy rather than gate evaluation. Give each
+    // Rayon task a full contiguous page of points so scheduling does not
+    // dominate the two streaming destination writes.
+    const QUOTIENT_SCATTER_POINTS: usize = 1 << 10;
     quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
+        .par_chunks(QUOTIENT_SCATTER_POINTS * num_challenges)
         .enumerate()
         .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
+            let base = QUOTIENT_SCATTER_POINTS * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
                     // SAFETY: `base + k` lies in this chunk's disjoint range.
@@ -2516,6 +2520,7 @@ fn compute_quotient_polys<
                 }
             }
         });
+
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
