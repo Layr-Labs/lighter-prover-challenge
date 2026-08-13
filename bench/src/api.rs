@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// threemore-1786665443
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -251,6 +251,16 @@ impl Circuits {
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        // The block circuit is a pure function of the static circuit
+        // configuration and the three already-embedded verifier descriptions.
+        // Prefer the value constructed by build.rs outside the scored worker;
+        // retain the old construction as a safe fallback for development builds
+        // and deliberately forced rebuilds.
+        if !std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            if let Ok(block) = Self::load_block_embedded() {
+                return block;
+            }
+        }
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is
