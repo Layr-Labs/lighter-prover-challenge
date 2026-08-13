@@ -663,7 +663,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
 
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     let product_count = subgroup.len() * num_chunks;
     // Same uninitialised-capacity handling as the per-challenge path: every
     // slot is written below before anything reads it, so zero-filling first is
@@ -793,7 +793,7 @@ fn wires_permutation_partial_products_and_zs<
     // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     // Every slot of this buffer is assigned below before anything reads it —
     // the inner loop writes `quotient_products[t * num_chunks + chunk]` for
     // every `t` in the batch and every `chunk`, which covers each sub-slice
