@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
@@ -684,9 +684,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail(
+            coset_fft_zero_tail_base_shift::<F, D>(
                 &lde_final_poly,
-                F::coset_shift().into(),
+                F::coset_shift(),
                 live_coeffs,
                 Some(fri_params.config.rate_bits),
                 None,
@@ -750,6 +750,47 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         unsafe { scaled.set_len(len) };
     } else {
         scaled.resize(len, F::ZERO);
+    }
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
+    } else {
+        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
+}
+
+/// Extension-field zero-tail FFT whose coset shift is known to lie in the
+/// base field. Scale each extension limb directly by the base-field power,
+/// avoiding a general extension multiplication by an embedded scalar at
+/// every live coefficient.
+pub(crate) fn coset_fft_zero_tail_base_shift<BF: Extendable<D>, const D: usize>(
+    coeffs: &PolynomialCoeffs<BF::Extension>,
+    shift: BF,
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<BF::Extension>>,
+) -> PolynomialValues<BF::Extension> {
+    let len = coeffs.len();
+    debug_assert!(live <= len);
+    let zero_tail_is_unread =
+        matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
+    debug_assert!(
+        zero_tail_is_unread || coeffs.coeffs[live..].iter().all(Field::is_zero)
+    );
+    let mut scaled = Vec::with_capacity(len);
+    scaled.extend(
+        shift
+            .powers()
+            .zip(&coeffs.coeffs[..live])
+            .map(|(r, c)| c.scalar_mul(r)),
+    );
+    if zero_tail_is_unread {
+        // SAFETY: identical zero-tail contract to `coset_fft_zero_tail` above.
+        // The FFT reads only the initialized live prefix before overwriting
+        // every tail slot.
+        unsafe { scaled.set_len(len) };
+    } else {
+        scaled.resize(len, BF::Extension::ZERO);
     }
     if crate::hash::poseidon2::is_exclusive_gpu_phase() {
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
