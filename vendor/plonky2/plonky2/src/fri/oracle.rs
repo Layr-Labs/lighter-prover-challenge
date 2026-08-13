@@ -497,6 +497,52 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    /// Copies a consecutive logical range from a power-of-two LDE domain,
+    /// wrapping once at the domain boundary, into PolyMajor output.
+    ///
+    /// This is the direct counterpart of gathering
+    /// `(index_start + k) & (domain_size - 1)` for `k in 0..n`. Quotient
+    /// batches have `n <= 32`, so at most two contiguous slices are needed.
+    pub(crate) fn fill_lde_batch_contiguous_wrapping(
+        &self,
+        index_start: usize,
+        n: usize,
+        domain_size: usize,
+        col_range: core::ops::Range<usize>,
+        out: &mut Vec<F>,
+    ) {
+        assert!(domain_size.is_power_of_two());
+        assert!(n <= domain_size);
+        let start = index_start & (domain_size - 1);
+        let first_len = n.min(domain_size - start);
+        let second_len = n - first_len;
+        let col_start = col_range.start;
+        let w = col_range.len();
+        out.resize(n * w, F::ZERO);
+
+        match &self.merkle_tree.leaves {
+            MerkleLeaves::Columns { columns, .. } => {
+                for ci in 0..w {
+                    let column = columns.col(col_start + ci);
+                    let destination = &mut out[ci * n..(ci + 1) * n];
+                    destination[..first_len].copy_from_slice(&column[start..start + first_len]);
+                    if second_len != 0 {
+                        destination[first_len..].copy_from_slice(&column[..second_len]);
+                    }
+                }
+            }
+            MerkleLeaves::Rows { .. } => {
+                for k in 0..n {
+                    let index = (start + k) & (domain_size - 1);
+                    let row = &self.get_lde_values(index, 1)[col_start..col_start + w];
+                    for (ci, &value) in row.iter().enumerate() {
+                        out[ci * n + k] = value;
+                    }
+                }
+            }
+        }
+    }
+
     /// Extracts the stride-`step` LDE values for a whole quotient domain of
     /// `q_domain` indices, column-major (`PolyMajor`): `out[c * q_domain + i]`
     /// = `columns[c][i * step]`. The constants/sigma columns are
@@ -756,6 +802,7 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
     } else {
         fft_in_place_with_options(&mut scaled, zero_factor, root_table);
     }
+
     PolynomialValues::new(scaled)
 }
 
@@ -1177,6 +1224,160 @@ mod tests {
                                  batch_i={batch_i} column={ci}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Exhaustive small-domain differential for BL's one-wrap contiguous
+    /// gather. It covers every masked start, every length through the quotient
+    /// batch size, both leaf-storage layouts, empty and partial column ranges,
+    /// and the generic step>1 / PointMajor fallbacks. Raw Goldilocks limbs are
+    /// compared so a canonicalizing rewrite cannot pass unnoticed.
+    #[test]
+    fn wrapping_contiguous_gather_matches_indexed_fallback_raw_words() {
+        use crate::field::types::{Field64, PrimeField64};
+
+        const D: usize = 2;
+        const DOMAIN: usize = 32;
+        const WIDTH: usize = 5;
+        const CAP_HEIGHT: usize = 1;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let columns = (0..WIDTH)
+            .map(|column| {
+                (0..DOMAIN)
+                    .map(|row| {
+                        let serial = column * DOMAIN + row;
+                        let raw = match serial % 7 {
+                            0 => 0,
+                            1 => 1,
+                            2 => F::ORDER - 1,
+                            3 => F::ORDER,
+                            4 => F::ORDER + 1,
+                            5 => u64::MAX,
+                            _ => (serial as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .wrapping_add(0xa5a5_a5a5_a5a5_a5a5),
+                        };
+                        GoldilocksField(raw)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let degree_log = DOMAIN.ilog2() as usize;
+        let column_batch = PolynomialBatch::<F, C, D> {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::new_columns(columns.clone(), CAP_HEIGHT),
+            degree_log,
+            rate_bits: 0,
+            blinding: false,
+        };
+        let rows = (0..DOMAIN)
+            .map(|leaf| {
+                let natural = crate::util::reverse_bits(leaf, degree_log);
+                columns
+                    .iter()
+                    .map(|column| column[natural])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let row_batch = PolynomialBatch::<F, C, D> {
+            polynomials: Vec::new(),
+            merkle_tree: MerkleTree::new(rows, CAP_HEIGHT),
+            degree_log,
+            rate_bits: 0,
+            blinding: false,
+        };
+
+        assert!(matches!(
+            &column_batch.merkle_tree.leaves,
+            MerkleLeaves::Columns { .. }
+        ));
+        assert!(matches!(
+            &row_batch.merkle_tree.leaves,
+            MerkleLeaves::Rows { .. }
+        ));
+
+        let raw = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>()
+        };
+        let ranges = [0..WIDTH, 1..4, 2..2, WIDTH - 1..WIDTH];
+
+        for storage in [&column_batch, &row_batch] {
+            for start in 0..2 * DOMAIN {
+                for n in 0..=DOMAIN.min(32) {
+                    let indices = (0..n)
+                        .map(|k| (start + k) & (DOMAIN - 1))
+                        .collect::<Vec<_>>();
+                    for range in ranges.clone() {
+                        let mut actual = Vec::new();
+                        storage.fill_lde_batch_contiguous_wrapping(
+                            start,
+                            n,
+                            DOMAIN,
+                            range.clone(),
+                            &mut actual,
+                        );
+                        let mut indexed = Vec::new();
+                        storage.fill_lde_batch(
+                            &indices,
+                            1,
+                            range.clone(),
+                            BatchLayout::PolyMajor,
+                            &mut indexed,
+                        );
+                        let expected = range
+                            .clone()
+                            .flat_map(|column| {
+                                let column_values = &columns[column];
+                                indices.iter().map(move |&i| column_values[i])
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(raw(&actual), raw(&expected));
+                        assert_eq!(raw(&actual), raw(&indexed));
+                    }
+                }
+            }
+
+            // Strided or PointMajor requests are intentionally ineligible for
+            // BL's direct route; exhaust their generic fallback over the full
+            // valid index domain for two representative strides.
+            for step in [2usize, 4] {
+                let indices = (0..DOMAIN / step).collect::<Vec<_>>();
+                for range in ranges.clone() {
+                    for layout in [BatchLayout::PolyMajor, BatchLayout::PointMajor] {
+                        let mut actual = Vec::new();
+                        storage.fill_lde_batch(
+                            &indices,
+                            step,
+                            range.clone(),
+                            layout,
+                            &mut actual,
+                        );
+                        let expected = match layout {
+                            BatchLayout::PolyMajor => range
+                                .clone()
+                                .flat_map(|column| {
+                                    let column_values = &columns[column];
+                                    indices.iter().map(move |&i| column_values[i * step])
+                                })
+                                .collect::<Vec<_>>(),
+                            BatchLayout::PointMajor => indices
+                                .iter()
+                                .flat_map(|&i| {
+                                    let columns = &columns;
+                                    range.clone().map(move |column| columns[column][i * step])
+                                })
+                                .collect::<Vec<_>>(),
+                        };
+                        assert_eq!(raw(&actual), raw(&expected));
                     }
                 }
             }

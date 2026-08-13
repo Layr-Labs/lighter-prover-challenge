@@ -533,7 +533,8 @@ fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
-    indices_batch: &[usize],
+    indices_batch: Option<&[usize]>,
+    contiguous_index_start: usize,
     xs_batch: &[F],
     vars_batch: EvaluationVarsBaseBatch<F>,
     perm: PermutationBatch<'_, F>,
@@ -556,7 +557,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 ) {
     let has_lookup = common_data.num_lookup_polys != 0;
 
-    let n = indices_batch.len();
+    let n = xs_batch.len();
+    if let Some(indices) = indices_batch {
+        assert_eq!(indices.len(), n);
+    }
+    let index_at = |k: usize| {
+        indices_batch
+            .map(|indices| indices[k])
+            .unwrap_or(contiguous_index_start + k)
+    };
     assert_eq!(xs_batch.len(), n);
     assert_eq!(vars_batch.len(), n);
     if has_lookup {
@@ -614,7 +623,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // barrier or changing an alpha exponent.
         assert_eq!(permutation_gate_scales.len(), num_challenges);
         for k in 0..n {
-            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
+            let l_0_x = z_h_on_coset.eval_l_0(index_at(k), xs_batch[k]);
             let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
             let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
             let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
@@ -689,10 +698,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
         l_0_xs.clear();
         l_0_xs.extend(
-            indices_batch
+            xs_batch
                 .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
+                .enumerate()
+                .map(|(k, &x)| z_h_on_coset.eval_l_0(index_at(k), x)),
         );
 
         let num_prod = &mut scratch.numerator_values;
@@ -867,7 +876,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     assert_eq!(s_sigmas_batch.len(), n);
 
     for k in 0..n {
-        let index = indices_batch[k];
+        let index = index_at(k);
         let x = xs_batch[k];
         let vars = vars_batch.view(k);
 

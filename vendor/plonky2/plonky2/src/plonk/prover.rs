@@ -1801,6 +1801,11 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+#[inline(always)]
+const fn quotient_indexless_gather_eligible(column_major: bool, step: usize) -> bool {
+    column_major && step == 1
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2107,14 +2112,23 @@ fn compute_quotient_polys<
                 );
 
                 let n = xs_batch.len();
-                scratch.indices.clear();
-                scratch
-                    .indices
-                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
-                scratch.indices_next.clear();
-                scratch
-                    .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+                let batch_start = BATCH_SIZE * batch_i;
+                // Production no-lookup proofs use column-major commitments at
+                // step one. Their current and next-point index sequences are
+                // contiguous (the latter modulo one power-of-two boundary),
+                // so materializing and refilling two 32-entry index vectors in
+                // every quotient batch is unnecessary. Lookup/row-major and
+                // strided routes retain the exact indexed fallback.
+                let indexless_contiguous =
+                    quotient_indexless_gather_eligible(col_major_perm, step);
+                if !indexless_contiguous {
+                    scratch.indices.clear();
+                    scratch.indices.extend(batch_start..batch_start + n);
+                    scratch.indices_next.clear();
+                    scratch
+                        .indices_next
+                        .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+                }
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -2128,7 +2142,7 @@ fn compute_quotient_polys<
                 // quotient-domain values were extracted once at circuit build
                 // time; copy them per batch instead of re-walking the strided
                 // LDE (which amplifies cache-line traffic 8x at step 8).
-                let cache_start = BATCH_SIZE * batch_i;
+                let cache_start = batch_start;
                 // The cache is column-major (`PolyMajor`); the per-point
                 // (`PointMajor`) path with lookups keeps the original gathers.
                 let constants_cache = if col_major_perm {
@@ -2162,13 +2176,22 @@ fn compute_quotient_polys<
                         }
                     }
                 } else {
-                    prover_data.constants_sigmas_commitment.fill_lde_batch(
-                        &scratch.indices,
-                        step,
-                        common_data.constants_range(),
-                        BatchLayout::PolyMajor,
-                        &mut scratch.local_constants,
-                    );
+                    if indexless_contiguous {
+                        prover_data.constants_sigmas_commitment.fill_lde_batch_contiguous(
+                            batch_start,
+                            n,
+                            common_data.constants_range(),
+                            &mut scratch.local_constants,
+                        );
+                    } else {
+                        prover_data.constants_sigmas_commitment.fill_lde_batch(
+                            &scratch.indices,
+                            step,
+                            common_data.constants_range(),
+                            BatchLayout::PolyMajor,
+                            &mut scratch.local_constants,
+                        );
+                    }
                     // Layout seam: the no-lookup column evaluator consumes the
                     // PolyMajor gathers as-is (and the "next" gather narrows to
                     // the Z columns, the only ones it reads); the per-point path
@@ -2181,6 +2204,13 @@ fn compute_quotient_polys<
 
                     if permutation_products_offloaded {
                         scratch.s_sigmas_flat.clear();
+                    } else if indexless_contiguous {
+                        prover_data.constants_sigmas_commitment.fill_lde_batch_contiguous(
+                            batch_start,
+                            n,
+                            common_data.sigmas_range(),
+                            &mut scratch.s_sigmas_flat,
+                        );
                     } else {
                         prover_data.constants_sigmas_commitment.fill_lde_batch(
                             &scratch.indices,
@@ -2208,29 +2238,52 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
-                wires_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    0..cpu_num_wires,
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_wires,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    zs_local_range,
-                    batch_layout,
-                    &mut scratch.zs_local_flat,
-                );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
-                    step,
-                    zs_next_range,
-                    batch_layout,
-                    &mut scratch.zs_next_flat,
-                );
+                if indexless_contiguous {
+                    wires_commitment.fill_lde_batch_contiguous(
+                        batch_start,
+                        n,
+                        0..cpu_num_wires,
+                        &mut scratch.local_wires,
+                    );
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch_contiguous(
+                        batch_start,
+                        n,
+                        zs_local_range,
+                        &mut scratch.zs_local_flat,
+                    );
+                    zs_partial_products_and_lookup_commitment
+                        .fill_lde_batch_contiguous_wrapping(
+                            (batch_start + next_step) & lde_mask,
+                            n,
+                            lde_size,
+                            zs_next_range,
+                            &mut scratch.zs_next_flat,
+                        );
+                } else {
+                    wires_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        0..cpu_num_wires,
+                        BatchLayout::PolyMajor,
+                        &mut scratch.local_wires,
+                    );
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        zs_local_range,
+                        batch_layout,
+                        &mut scratch.zs_local_flat,
+                    );
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices_next,
+                        step,
+                        zs_next_range,
+                        batch_layout,
+                        &mut scratch.zs_next_flat,
+                    );
+                }
 
-                let indices_batch = &scratch.indices;
+                let indices_batch = (!indexless_contiguous).then_some(scratch.indices.as_slice());
                 // Per-point row views over the PointMajor gathers, built only
                 // for the per-point path; the column path passes the flat
                 // buffers straight through, so these four allocations vanish
@@ -2313,6 +2366,7 @@ fn compute_quotient_polys<
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
+                    batch_start,
                     shifted_xs_batch,
                     vars_batch,
                     perm,
@@ -2334,10 +2388,13 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                for (k, quotient_values) in quotient_values_batch
+                    .chunks_exact_mut(num_challenges)
+                    .enumerate()
                 {
+                    let i = indices_batch
+                        .map(|indices| indices[k])
+                        .unwrap_or(batch_start + k);
                     let denominator_inv = z_h_on_coset.eval_inverse(i);
                     quotient_values
                         .iter_mut()
@@ -2658,7 +2715,9 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        precomputed, quotient_indexless_gather_eligible, BatchLayout, COMPARE_QUOTIENT_LAYOUTS,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
@@ -2695,6 +2754,15 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    #[test]
+    fn quotient_indexless_gather_route_is_fail_closed() {
+        assert!(quotient_indexless_gather_eligible(true, 1));
+        assert!(!quotient_indexless_gather_eligible(true, 2));
+        assert!(!quotient_indexless_gather_eligible(true, 8));
+        assert!(!quotient_indexless_gather_eligible(false, 1));
+        assert!(!quotient_indexless_gather_eligible(false, 2));
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
