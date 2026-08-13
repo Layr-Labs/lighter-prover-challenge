@@ -108,6 +108,12 @@ pub struct Forest {
 }
 
 impl Forest {
+    /// Marks a `parents` entry as holding a copy class's current tail rather than a parent
+    /// pointer, for the duration of [`Self::wire_partition`] only. Forest indices are bounded
+    /// by `num_wires * degree + num_virtual_targets`, which that function asserts stays below
+    /// `2^31`, so bit 31 is never part of a legitimate entry.
+    const TAIL_TAG: u32 = 1 << 31;
+
     pub fn new(
         num_wires: usize,
         num_routed_wires: usize,
@@ -249,23 +255,75 @@ impl Forest {
     /// `a->b->a`, then `a->b->c->a`, which is exactly the open successor chain built by the
     /// previous implementation plus its closing sweep. This deletes the whole-forest `first`
     /// array and the final serial sweep over every forest entry.
+    ///
+    /// The per-class tail pointer lives in `parents` itself rather than in a second
+    /// whole-forest array. `compress_paths` leaves every entry pointing directly at its class
+    /// root and every root pointing at itself, so a root's own slot carries no information
+    /// this pass still needs: it can hold that class's current tail, tagged with
+    /// `TAIL_TAG` to separate "tail stored here" from "untouched root". Two
+    /// consequences, both mechanical:
+    ///
+    /// * the `vec![u32::MAX; parents.len()]` allocation disappears. Its fill is not zero, so
+    ///   it could never be `calloc`-backed: it was a genuine eager write of `4 *
+    ///   parents.len()` bytes, plus that region's first-touch page faults, once per circuit.
+    /// * for a routed slot that is its own representative — the common case, and the reason
+    ///   `representative_map` delta-encodes to mostly zeros — the tail slot *is* the slot
+    ///   just read, so a lookup that was an unconditional random miss into a second large
+    ///   array becomes a hit on the line already in L1. Slots whose representative is
+    ///   elsewhere pay the same single random access they always did, so no shape regresses.
+    ///
+    /// Only roots are ever written, so the restoring sweep needs no record of which entries
+    /// were touched: a tagged entry is by construction a root, and a root's parent is itself.
+    ///
+    /// Value-exact. The splice order, the scan order, the `index` computed for each slot and
+    /// every `sigma` write are unchanged, so the emitted `sigma` is byte-identical to the
+    /// two-array form, and `parents` is restored entry-for-entry before it is observable.
+    /// Oracles: `u32_forest_matches_usize_reference` (which compares against a verbatim copy
+    /// of the two-array code) and `wire_partition_restores_representative_map`.
     pub fn wire_partition(&mut self) -> WirePartition {
-        let mut sigma = vec![0u32; self.degree * self.num_routed_wires];
-        let mut last = vec![u32::MAX; self.parents.len()];
+        let degree = self.degree;
+        let num_routed_wires = self.num_routed_wires;
+        let mut sigma = vec![0u32; degree * num_routed_wires];
 
-        for row in 0..self.degree {
-            for column in 0..self.num_routed_wires {
+        // Bit 31 must be free to carry the tag. `Forest::new` bounds the forest by
+        // `u32::MAX`; this tightens that to `2^31` and checks it rather than assuming it.
+        assert!(
+            self.parents.len() <= Self::TAIL_TAG as usize,
+            "forest of {} targets leaves no room for the tail tag in bit 31",
+            self.parents.len()
+        );
+
+        for row in 0..degree {
+            for column in 0..num_routed_wires {
                 let t = Target::Wire(Wire { row, column });
-                let parent = self.parents[self.target_index(t)] as usize;
-                let index = (column * self.degree + row) as u32;
-                let old_tail = last[parent];
-                if old_tail == u32::MAX {
+                let slot = self.target_index(t);
+                let stored = self.parents[slot];
+                // A tagged entry is a root already holding its own class's tail, so the
+                // representative is the slot itself; an untagged entry is the
+                // path-compressed pointer to the root.
+                let parent = if stored & Self::TAIL_TAG != 0 {
+                    slot
+                } else {
+                    stored as usize
+                };
+                let index = (column * degree + row) as u32;
+                let tail = self.parents[parent];
+                if tail & Self::TAIL_TAG == 0 {
                     sigma[index as usize] = index;
                 } else {
-                    sigma[index as usize] = sigma[old_tail as usize];
-                    sigma[old_tail as usize] = index;
+                    let old_tail = (tail & !Self::TAIL_TAG) as usize;
+                    sigma[index as usize] = sigma[old_tail];
+                    sigma[old_tail] = index;
                 }
-                last[parent] = index;
+                self.parents[parent] = index | Self::TAIL_TAG;
+            }
+        }
+
+        // Restore the representative map. Nothing but a root is ever written above, and
+        // `compress_paths` leaves a root pointing at itself.
+        for (slot, parent) in self.parents.iter_mut().enumerate() {
+            if *parent & Self::TAIL_TAG != 0 {
+                *parent = slot as u32;
             }
         }
 
@@ -816,6 +874,96 @@ mod tests {
         for i in 0..reference.parents.len() {
             assert_eq!(forest.find(i), reference.find(i), "find diverges at {i}");
             assert_eq!(parents_as_usize(&forest), reference.parents);
+        }
+    }
+
+    /// `wire_partition` borrows the `parents` entries of class roots as tail pointers, so it
+    /// must hand back a representative map that is bit-identical to the one it was given —
+    /// `into_parents` feeds `ProverOnlyCircuitData::representative_map` and
+    /// `fixed_routed_wire_mask` straight from it.
+    ///
+    /// Three obligations are checked together, against a verbatim copy of the two-array code:
+    /// the emitted sigma is unchanged, the map is restored entry-for-entry, and the pass is
+    /// idempotent (a second call reproduces the first sigma exactly — which can only hold if
+    /// the restore left no tag behind). Shapes are chosen so that class representatives land
+    /// on routed wires, on non-routed wires and on virtual targets, since those three cases
+    /// exercise different arms of the tag/restore logic: a routed representative is re-read as
+    /// `slot` later in the same scan, while non-routed and virtual representatives are only
+    /// ever reached indirectly and are restored solely by the closing sweep.
+    #[test]
+    fn wire_partition_restores_representative_map() {
+        // (num_wires, num_routed_wires, degree, num_virtual_targets, merges)
+        let configs = [
+            // Production-shaped: 80 routed of 136 wires, so most representatives are the
+            // slot itself (the L1-hit path) and the rest are spread across the forest.
+            (136usize, 80usize, 1usize << 10, 1200usize, 3 * (1 << 10)),
+            // Merge-saturated: almost nothing is a singleton, so nearly every lookup takes
+            // the remote-representative arm.
+            (136, 80, 1 << 9, 800, 136 * (1 << 9)),
+            // No merges at all: every routed slot is its own representative.
+            (136, 80, 1 << 8, 64, 0),
+            // Virtual-target heavy: representatives frequently sit past the wire block.
+            (9, 6, 300, 4000, 6000),
+            // Degenerate shapes.
+            (7, 5, 999, 41, 5000),
+            (3, 2, 1, 0, 0),
+        ];
+
+        for (num_wires, num_routed_wires, degree, num_virtual_targets, num_merges) in configs {
+            let mut rng =
+                Lcg(0xa11c_e5ed ^ ((degree as u64) << 16) ^ num_wires as u64);
+            let merges =
+                random_merges(&mut rng, num_wires, degree, num_virtual_targets, num_merges);
+
+            let mut forest = build_forest(
+                num_wires,
+                num_routed_wires,
+                degree,
+                num_virtual_targets,
+                &merges,
+            );
+            let mut reference = build_usize_forest(
+                num_wires,
+                num_routed_wires,
+                degree,
+                num_virtual_targets,
+                &merges,
+            );
+
+            forest.compress_paths();
+            reference.compress_paths();
+
+            // The map as every downstream consumer expects to receive it.
+            let expected_parents = forest.parents.clone();
+            assert_eq!(
+                parents_as_usize(&forest),
+                reference.parents,
+                "compressed parents diverge for num_wires {num_wires} degree {degree}"
+            );
+
+            let sigma = forest.wire_partition().sigma;
+            let expected_sigma = reference.wire_partition();
+            assert_eq!(sigma, expected_sigma, "sigma diverges for num_wires {num_wires} degree {degree}");
+
+            assert_eq!(
+                forest.parents, expected_parents,
+                "representative map not restored for num_wires {num_wires} degree {degree}"
+            );
+            assert!(
+                forest.parents.iter().all(|p| p & (1u32 << 31) == 0),
+                "a tail tag survived wire_partition for num_wires {num_wires} degree {degree}"
+            );
+
+            // Idempotence: only possible if the restore was complete.
+            let sigma_again = forest.wire_partition().sigma;
+            assert_eq!(
+                sigma_again, expected_sigma,
+                "second wire_partition diverges for num_wires {num_wires} degree {degree}"
+            );
+            assert_eq!(
+                forest.parents, expected_parents,
+                "representative map not restored on the second pass for num_wires {num_wires} degree {degree}"
+            );
         }
     }
 
