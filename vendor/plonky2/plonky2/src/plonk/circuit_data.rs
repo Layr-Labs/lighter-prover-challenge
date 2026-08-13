@@ -601,9 +601,9 @@ pub struct ProverOnlyCircuitData<
     /// position is the sole routed member of its copy-constraint component, hence its sigma
     /// permutation target is itself and its permutation factor cancels for every proof.
     ///
-    /// Runtime-only: this is derived from [`Self::representative_map`] during circuit construction
-    /// and reconstructed during deserialization, so it changes neither the serialized format nor
-    /// the circuit digest.
+    /// Runtime-only: this is derived from [`Self::representative_map`] during circuit construction.
+    /// The canonical circuit encoding reconstructs it, while the startup-optimized embedded format
+    /// may store the compact mask directly. It does not affect the circuit digest.
     pub fixed_routed_wires: Vec<u8>,
     /// Pre-computed roots for faster FFT.
     pub fft_root_table: Option<FftRootTable<F>>,
