@@ -982,39 +982,91 @@ fn fft_classic_simd_single_layer_neon_ext(
         let mut k = 0;
         while k + m <= values.len() {
             let mut j = 0;
-            while j + 1 <= half {
-                let v = *values.get_unchecked(k + half + j);
-                let w = *omega_row.get_unchecked(j);
-                let (c0, c1) = if base_subfield {
-                    // [w0, 0] * [v0, v1] = [w0*v0, w0*v1]: one paired mul.
+            if base_subfield {
+                // Two independent paired muls per iteration. Same butterflies
+                // as the scalar `j += 1` loop; just a wider issue window.
+                while j + 2 <= half {
+                    let v0 = *values.get_unchecked(k + half + j);
+                    let v1 = *values.get_unchecked(k + half + j + 1);
+                    let w0 = *omega_row.get_unchecked(j);
+                    let w1 = *omega_row.get_unchecked(j + 1);
+                    let p0 = NeonGoldilocksField([w0.0[0], w0.0[0]])
+                        * NeonGoldilocksField([v0.0[0], v0.0[1]]);
+                    let p1 = NeonGoldilocksField([w1.0[0], w1.0[0]])
+                        * NeonGoldilocksField([v1.0[0], v1.0[1]]);
+                    let u0 = *values.get_unchecked(k + j);
+                    let u1 = *values.get_unchecked(k + j + 1);
+                    let tv0 = vcombine_u64(vcreate_u64(p0.0[0].0), vcreate_u64(p0.0[1].0));
+                    let tv1 = vcombine_u64(vcreate_u64(p1.0[0].0), vcreate_u64(p1.0[1].0));
+                    let uv0 = vcombine_u64(vcreate_u64(u0.0[0].0), vcreate_u64(u0.0[1].0));
+                    let uv1 = vcombine_u64(vcreate_u64(u1.0[0].0), vcreate_u64(u1.0[1].0));
+                    let sum0 = gl_add_neon(uv0, tv0, eps);
+                    let diff0 = gl_sub_neon(uv0, tv0, eps);
+                    let sum1 = gl_add_neon(uv1, tv1, eps);
+                    let diff1 = gl_sub_neon(uv1, tv1, eps);
+                    *values.get_unchecked_mut(k + j) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(sum0, 0)),
+                        GoldilocksField(vgetq_lane_u64(sum0, 1)),
+                    ]);
+                    *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(diff0, 0)),
+                        GoldilocksField(vgetq_lane_u64(diff0, 1)),
+                    ]);
+                    *values.get_unchecked_mut(k + j + 1) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(sum1, 0)),
+                        GoldilocksField(vgetq_lane_u64(sum1, 1)),
+                    ]);
+                    *values.get_unchecked_mut(k + half + j + 1) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(diff1, 0)),
+                        GoldilocksField(vgetq_lane_u64(diff1, 1)),
+                    ]);
+                    j += 2;
+                }
+                while j < half {
+                    let v = *values.get_unchecked(k + half + j);
+                    let w = *omega_row.get_unchecked(j);
                     let p = NeonGoldilocksField([w.0[0], w.0[0]])
                         * NeonGoldilocksField([v.0[0], v.0[1]]);
-                    (p.0[0].0, p.0[1].0)
-                } else {
-                    // General extension product with the W = 7 conjugation.
+                    let tv = vcombine_u64(vcreate_u64(p.0[0].0), vcreate_u64(p.0[1].0));
+                    let u = *values.get_unchecked(k + j);
+                    let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
+                    let sum = gl_add_neon(uv, tv, eps);
+                    let diff = gl_sub_neon(uv, tv, eps);
+                    *values.get_unchecked_mut(k + j) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(sum, 0)),
+                        GoldilocksField(vgetq_lane_u64(sum, 1)),
+                    ]);
+                    *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(diff, 0)),
+                        GoldilocksField(vgetq_lane_u64(diff, 1)),
+                    ]);
+                    j += 1;
+                }
+            } else {
+                while j < half {
+                    let v = *values.get_unchecked(k + half + j);
+                    let w = *omega_row.get_unchecked(j);
                     let p = NeonGoldilocksField([w.0[0], w.0[1]])
                         * NeonGoldilocksField([v.0[0], v.0[1]]);
                     let q = NeonGoldilocksField([w.0[0], w.0[1]])
                         * NeonGoldilocksField([v.0[1], v.0[0]]);
                     let c0 = (p.0[0] + GoldilocksField(W) * p.0[1]).0;
                     let c1 = (q.0[0] + q.0[1]).0;
-                    (c0, c1)
-                };
-                let tv = vcombine_u64(vcreate_u64(c0), vcreate_u64(c1));
-
-                let u = *values.get_unchecked(k + j);
-                let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
-                let sum = gl_add_neon(uv, tv, eps);
-                let diff = gl_sub_neon(uv, tv, eps);
-                *values.get_unchecked_mut(k + j) = QuadraticExtension([
-                    GoldilocksField(vgetq_lane_u64(sum, 0)),
-                    GoldilocksField(vgetq_lane_u64(sum, 1)),
-                ]);
-                *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
-                    GoldilocksField(vgetq_lane_u64(diff, 0)),
-                    GoldilocksField(vgetq_lane_u64(diff, 1)),
-                ]);
-                j += 1;
+                    let tv = vcombine_u64(vcreate_u64(c0), vcreate_u64(c1));
+                    let u = *values.get_unchecked(k + j);
+                    let uv = vcombine_u64(vcreate_u64(u.0[0].0), vcreate_u64(u.0[1].0));
+                    let sum = gl_add_neon(uv, tv, eps);
+                    let diff = gl_sub_neon(uv, tv, eps);
+                    *values.get_unchecked_mut(k + j) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(sum, 0)),
+                        GoldilocksField(vgetq_lane_u64(sum, 1)),
+                    ]);
+                    *values.get_unchecked_mut(k + half + j) = QuadraticExtension([
+                        GoldilocksField(vgetq_lane_u64(diff, 0)),
+                        GoldilocksField(vgetq_lane_u64(diff, 1)),
+                    ]);
+                    j += 1;
+                }
             }
             k += m;
         }
