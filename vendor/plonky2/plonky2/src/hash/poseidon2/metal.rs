@@ -587,18 +587,19 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
+    // Walk first, then publish. Stashing before the page walk lets a
+    // final-block LDE take the buffer and write live values while this
+    // thread is still zeroing later pages, which corrupts the committed
+    // LDE and fails the vanishing identity intermittently.
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
