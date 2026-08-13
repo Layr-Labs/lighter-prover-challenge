@@ -2347,11 +2347,19 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    // The three offloaded GPU contributions each used to merge with their own
+    // full parallel pass over `quotient_values`, re-reading the buffer and
+    // re-fetching `z_h_on_coset.eval_inverse(i)` every time. Goldilocks
+    // addition is exact and canonicalizing, so accumulating the three addends
+    // in any association yields the identical field element. Finish all three
+    // jobs first (each keeping its own fallback-to-CPU error path), then merge
+    // them in a single traversal.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_poseidon_values: Option<&[F]> = match gpu_poseidon.as_ref() {
+        Some((_, job)) => match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                Some(values)
             }
             Err(error) => {
                 GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2378,26 +2386,16 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        },
+        None => None,
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values: Option<&[F]> = match gpu_range.as_ref() {
+        Some((_, job)) => match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                Some(values)
             }
             Err(error) => {
                 GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2427,24 +2425,14 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        },
+        None => None,
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
+    let gpu_permutation_values: Option<&[F]> = match gpu_permutation.as_ref() {
+        Some(job) => match job.finish() {
+            Ok(values) => Some(values),
             Err(error) => {
                 log::warn!(
                     "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
@@ -2464,18 +2452,34 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        },
+        None => None,
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        let contributions: [Option<&[F]>; 3] = [
+            gpu_poseidon_values,
+            gpu_range_values,
+            gpu_permutation_values,
+        ];
+        for gpu_values in contributions.iter().flatten() {
+            debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        }
+        if contributions.iter().any(Option::is_some) {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .enumerate()
+                .for_each(|(i, cpu_values)| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for gpu_values in contributions.iter().flatten() {
+                        let gpu = &gpu_values[i * num_challenges..(i + 1) * num_challenges];
+                        for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu) {
+                            *cpu += gpu * denominator_inv;
+                        }
+                    }
+                });
+        }
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
