@@ -602,6 +602,66 @@ pub fn prewarm_large_column_store(bytes: u64) {
     }
 }
 
+
+/// Local diagnostics only: logs fresh (pool-missing) buffer allocations when
+/// `LIGHTER_ALLOC_TRACE` is set. Inert in the scored sandbox (env cleared).
+fn alloc_trace(kind: &str, bytes: u64) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    if !*ENABLED
+        .get_or_init(|| std::env::var_os("LIGHTER_ALLOC_TRACE").is_some_and(|v| v != "0"))
+    {
+        return;
+    }
+    let start = START.get_or_init(std::time::Instant::now);
+    eprintln!(
+        "[alloc-miss] {kind} {bytes} t={:.3}",
+        start.elapsed().as_secs_f64()
+    );
+}
+
+/// Faults a fresh shared buffer's pages in parallel at allocation time.
+///
+/// A fresh allocation's first-touch zero-fill is otherwise paid serially by
+/// whatever fills or wires the buffer next — for the final block's ~134 MiB
+/// digest stores and ~33 MiB quotient outputs that lands inside the run's
+/// most serial window. Touching one word per page across a few lanes moves
+/// the same page-fault work onto the idle cores of that window. The calling
+/// thread participates via the parallel iterator, so a saturated pool
+/// degrades to today's serial walk, never worse. Scheduling-only: pages are
+/// zero either way, and every consumer fully writes its buffer before any
+/// read.
+///
+/// `min_bytes` is chosen per call site so only the final block's measured
+/// serial-tail allocations qualify: the steady pipeline's recurring shapes
+/// (2-8 MiB quotient outputs, ~33 MiB digest stores) fall below their site's
+/// threshold and keep today's lazy faulting, which their GPU wiring already
+/// overlaps. Column stores are not touched at all — their parallel CPU fill
+/// faults pages in parallel by itself, and an extra pass would only spend
+/// bandwidth twice.
+fn parallel_first_touch(buffer: &Buffer, bytes: u64, min_bytes: u64) {
+    if bytes < min_bytes {
+        return;
+    }
+    let base = buffer.contents() as usize;
+    if base == 0 {
+        return;
+    }
+    const PAGE: usize = 16 * 1024;
+    const LANES: usize = 8;
+    let pages = (bytes as usize).div_ceil(PAGE);
+    let per_lane = pages.div_ceil(LANES);
+    (0..LANES).into_par_iter().for_each(|lane| {
+        let start = lane * per_lane;
+        let end = (start + per_lane).min(pages);
+        for page in start..end {
+            // SAFETY: `page * PAGE` stays below `bytes`, inside the buffer.
+            unsafe { ((base + page * PAGE) as *mut u8).write_volatile(0) };
+        }
+    });
+}
+
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
 /// device allocation. Misses (including lock contention) fall through to the
 /// allocator; the pool is a best-effort page-warm cache, never a correctness
@@ -618,6 +678,7 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
             return slot.take().expect("checked above");
         }
     }
+    alloc_trace("column_store", bytes);
     autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
 }
 
@@ -2211,11 +2272,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take_best_fit(output_bytes as u64)
         .unwrap_or_else(|| {
-            autoreleasepool(|| {
+            alloc_trace("digest_streamed", output_bytes as u64);
+            let buffer = autoreleasepool(|| {
                 context
                     .device
                     .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            })
+            });
+            parallel_first_touch(&buffer, output_bytes as u64, 64 * 1024 * 1024);
+            buffer
         });
     let completed = core::mem::replace(output_buffer, replacement);
     drop(buffers);
@@ -2575,10 +2639,13 @@ impl MetalShared {
                 }
             }
         }
-        autoreleasepool(|| {
+        alloc_trace("quotient_output", bytes);
+        let buffer = autoreleasepool(|| {
             self.device
                 .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-        })
+        });
+        parallel_first_touch(&buffer, bytes, 16 * 1024 * 1024);
+        buffer
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2895,10 +2962,13 @@ impl MetalShared {
                     .take_best_fit(output_bytes as u64)
             })
             .unwrap_or_else(|| {
-                autoreleasepool(|| {
+                alloc_trace("digest_detached", output_bytes as u64);
+                let buffer = autoreleasepool(|| {
                     self.device
                         .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-                })
+                });
+                parallel_first_touch(&buffer, output_bytes as u64, 64 * 1024 * 1024);
+                buffer
             });
         let completed = set
             .output
