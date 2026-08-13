@@ -489,6 +489,115 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
             return H::two_to_one(left_digest, right_digest);
         }
 
+        // Whole synchronous 32-leaf subtree, level order: eight leaf quads,
+        // four then two then one quad of compressions, one level-4 pair.
+        // Layout of each 16-leaf child's 30-slot half is the 16-leaf special:
+        // [8-leaf 14 | 8-root | 8-root | 8-leaf 14]. Isolate marker: merkle32-1786650000.
+        if num_leaves == 32 {
+            let mut leaf_digests = [core::mem::MaybeUninit::<H::Hash>::uninit(); 32];
+            for q in 0..8 {
+                let quad_leaves = if q < 4 { left_leaves } else { right_leaves };
+                let base = (q & 3) * 4 * leaf_width;
+                let (leaf_a, rest) = quad_leaves[base..base + 4 * leaf_width].split_at(leaf_width);
+                let (leaf_b, rest2) = rest.split_at(leaf_width);
+                let (leaf_c, leaf_d) = rest2.split_at(leaf_width);
+                let (ha, hb, hc, hd) = H::hash_or_noop_quad(leaf_a, leaf_b, leaf_c, leaf_d);
+                leaf_digests[4 * q].write(ha);
+                leaf_digests[4 * q + 1].write(hb);
+                leaf_digests[4 * q + 2].write(hc);
+                leaf_digests[4 * q + 3].write(hd);
+            }
+            // SAFETY: all 32 entries were initialized above.
+            let h: [H::Hash; 32] = unsafe { core::mem::transmute_copy(&leaf_digests) };
+
+            let n1_0 = H::two_to_one_quad([(h[0], h[1]), (h[2], h[3]), (h[4], h[5]), (h[6], h[7])]);
+            let n1_1 = H::two_to_one_quad([
+                (h[8], h[9]),
+                (h[10], h[11]),
+                (h[12], h[13]),
+                (h[14], h[15]),
+            ]);
+            let n1_2 = H::two_to_one_quad([
+                (h[16], h[17]),
+                (h[18], h[19]),
+                (h[20], h[21]),
+                (h[22], h[23]),
+            ]);
+            let n1_3 = H::two_to_one_quad([
+                (h[24], h[25]),
+                (h[26], h[27]),
+                (h[28], h[29]),
+                (h[30], h[31]),
+            ]);
+
+            let n2_l = H::two_to_one_quad([
+                (n1_0[0], n1_0[1]),
+                (n1_0[2], n1_0[3]),
+                (n1_1[0], n1_1[1]),
+                (n1_1[2], n1_1[3]),
+            ]);
+            let n2_r = H::two_to_one_quad([
+                (n1_2[0], n1_2[1]),
+                (n1_2[2], n1_2[3]),
+                (n1_3[0], n1_3[1]),
+                (n1_3[2], n1_3[3]),
+            ]);
+            let n3 = H::two_to_one_quad([
+                (n2_l[0], n2_l[1]),
+                (n2_l[2], n2_l[3]),
+                (n2_r[0], n2_r[1]),
+                (n2_r[2], n2_r[3]),
+            ]);
+            let (left_digest, right_digest) = H::two_to_one_pair(n3[0], n3[1], n3[2], n3[3]);
+
+            // Each 16-leaf child's 30-slot buffer follows the 16-leaf special.
+            for half in 0..2 {
+                let buf: &mut [MaybeUninit<H::Hash>] = if half == 0 {
+                    &mut *left_digests_buf
+                } else {
+                    &mut *right_digests_buf
+                };
+                let h = &h[16 * half..16 * (half + 1)];
+                let n1_a = if half == 0 { &n1_0 } else { &n1_2 };
+                let n1_b = if half == 0 { &n1_1 } else { &n1_3 };
+                let n2 = if half == 0 { &n2_l } else { &n2_r };
+                let n3h = &n3[2 * half..2 * (half + 1)];
+                buf[0].write(h[0]);
+                buf[1].write(h[1]);
+                buf[2].write(n1_a[0]);
+                buf[3].write(n1_a[1]);
+                buf[4].write(h[2]);
+                buf[5].write(h[3]);
+                buf[6].write(n2[0]);
+                buf[7].write(n2[1]);
+                buf[8].write(h[4]);
+                buf[9].write(h[5]);
+                buf[10].write(n1_a[2]);
+                buf[11].write(n1_a[3]);
+                buf[12].write(h[6]);
+                buf[13].write(h[7]);
+                buf[14].write(n3h[0]);
+                buf[15].write(n3h[1]);
+                buf[16].write(h[8]);
+                buf[17].write(h[9]);
+                buf[18].write(n1_b[0]);
+                buf[19].write(n1_b[1]);
+                buf[20].write(h[10]);
+                buf[21].write(h[11]);
+                buf[22].write(n2[2]);
+                buf[23].write(n2[3]);
+                buf[24].write(h[12]);
+                buf[25].write(h[13]);
+                buf[26].write(n1_b[2]);
+                buf[27].write(n1_b[3]);
+                buf[28].write(h[14]);
+                buf[29].write(h[15]);
+            }
+            left_digest_mem.write(left_digest);
+            right_digest_mem.write(right_digest);
+            return H::two_to_one(left_digest, right_digest);
+        }
+
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
         let (left_digest, right_digest) = if num_leaves > 64 {
@@ -512,10 +621,10 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 /// Leaves materialized per gathered tile. This is exactly the size of
 /// [`fill_subtree_flat`]'s fully unrolled synchronous case, so one tile is
 /// consumed by one call and never outlives it.
-const GATHER_TILE_LEAVES: usize = 16;
+const GATHER_TILE_LEAVES: usize = 32;
 
 /// Widest leaf the gathering path keeps on the stack. The tile is
-/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (4 KiB at
+/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (8 KiB at
 /// `size_of::<F>() == 8`), and one tile is live per recursion frame, so the
 /// bound also bounds the recursion's stack growth. Wider leaves take the
 /// materializing path in [`MerkleTree::new_column_store`].
@@ -529,7 +638,7 @@ const GATHER_MAX_WIDTH: usize = 32;
 /// character for character those of [`fill_subtree_flat`]; the only difference
 /// is where the leaf bytes come from. At the bottom the tile is gathered and
 /// handed to [`fill_subtree_flat`] itself, so every hash — leaf sponge,
-/// interleaved pair/quad compressions, the whole 16-leaf unrolled block — is
+/// interleaved pair/quad compressions, the whole 32-leaf unrolled block — is
 /// the same code operating on the same leaf bytes in the same order. The
 /// gathered tile holds `columns[j][reverse_bits(start_leaf + leaf, log_rows)]`
 /// at offset `leaf * width + j`, which is by definition the row that
@@ -1119,6 +1228,34 @@ pub(crate) mod tests {
 
         verify_all_leaves::<F, C, D>(leaves, 1)?;
 
+        Ok(())
+    }
+
+    /// The 32-leaf unroll must be digest-identical to the recursive 16+16 path
+    /// and must serve a valid proof for every leaf. cap_height 0 forces the
+    /// whole tree through one `fill_subtree_flat(..., 32)` call.
+    #[test]
+    fn unrolled_32_leaf_matches_naive_and_proves() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        for &width in &[1usize, 4, 7, 12, 32] {
+            let leaves = random_data::<F>(32, width);
+            let tree = MerkleTree::<F, H>::new(leaves.clone(), 0);
+            let (levels, cap) = cpu_level_order::<F, H>(&leaves, 0);
+            assert_eq!(tree.cap.0, cap, "cap width={width}");
+            assert_eq!(
+                tree.digests,
+                levels.to_interleaved(),
+                "interleaved digests width={width}"
+            );
+            for (i, leaf) in leaves.into_iter().enumerate() {
+                let proof = tree.prove(i);
+                verify_merkle_proof_to_cap(leaf, i, &tree.cap, &proof)?;
+            }
+        }
         Ok(())
     }
 
