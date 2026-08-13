@@ -256,14 +256,24 @@ impl BlockCircuit {
         Ok(pw)
     }
 
+    /// The light-chain witness inputs for the retained recursive-proof target.
+    /// The split final-block pipeline releases all other `BlockTarget` fields
+    /// after its early and heavy inputs have been supplied.
+    pub fn witness_inputs_light_chain_target(
+        target: &ProofWithPublicInputsTarget<D>,
+        light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<PartialWitness<F>> {
+        let mut pw = PartialWitness::new();
+        pw.set_proof_with_pis_target(target, light_tx_chain_proof)?;
+        Ok(pw)
+    }
+
     /// The light-chain witness inputs, fed once the light transaction chain proof is available.
     pub fn witness_inputs_light_chain(
         target: &BlockTarget,
         light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
-        let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)?;
-        Ok(pw)
+        Self::witness_inputs_light_chain_target(&target.light_tx_chain_proof, light_tx_chain_proof)
     }
 
     /// The heavy-chain witness inputs, fed once the heavy transaction chain proof is available.

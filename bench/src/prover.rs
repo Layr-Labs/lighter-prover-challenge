@@ -785,7 +785,7 @@ pub(crate) fn prove_block_after_pre(
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
+    let (light_chain_proof, heavy_chain_proof, light_chain_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
@@ -887,7 +887,12 @@ pub(crate) fn prove_block_after_pre(
                             .expect("final block heavy-chain witness inputs failed"),
                         )
                         .expect("final block heavy-chain witness feed failed");
-                    (block_target, block_data, pending, heavy_chain_proof)
+                    // All target fields except the light recursive proof have
+                    // completed their sole witness write. Retain only that
+                    // final target while the light chain finishes, releasing
+                    // the native-block, pre-execution, and heavy target trees.
+                    let light_chain_target = block_target.light_tx_chain_proof;
+                    (light_chain_target, block_data, pending, heavy_chain_proof)
                 })
                 .expect("block circuit build thread must start");
             let light_chunks = std::mem::take(&mut light_chunks);
@@ -912,7 +917,7 @@ pub(crate) fn prove_block_after_pre(
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
+            let (light_chain_target, block_data, block_pending, heavy_chain_proof) =
                 block_circuit_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -936,7 +941,7 @@ pub(crate) fn prove_block_after_pre(
             (
                 light_chain_proof,
                 heavy_chain_proof,
-                block_target,
+                light_chain_target,
                 block_data,
                 block_pending,
             )
@@ -970,7 +975,7 @@ pub(crate) fn prove_block_after_pre(
         let _span = plonky2::util::profile::span("witness", "final_light_feed");
         block_pending
             .feed(
-                BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
+                BlockCircuit::witness_inputs_light_chain_target(&light_chain_target, light_chain_input)
                     .expect("final block light-chain witness inputs failed"),
             )
             .expect("final block light-chain witness feed failed");
