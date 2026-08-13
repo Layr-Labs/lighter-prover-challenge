@@ -170,30 +170,36 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         } else {
             None
         };
-        let mut folded = coeffs.coeffs[..live_chunks * arity]
-            .par_chunks_exact(arity)
-            .map(|chunk| match &beta_powers_16 {
-                Some(beta_powers) => {
-                    let terms: &[F::Extension; 16] = chunk
-                        .try_into()
-                        .expect("arity-16 FRI chunk must contain 16 terms");
-                    F::fri_fold_arity16(terms, beta, beta_powers)
-                }
-                None => reduce_with_powers(chunk, beta),
-            })
-            .collect::<Vec<_>>();
+        // The current evaluation codeword is dead after its independent flat
+        // leaf buffer has been committed above. Reuse that allocation for the
+        // folded coefficient vector instead of collecting an exact-size live
+        // prefix and then growing it by 8x (rate_bits = 3), which reallocates
+        // and relocates the prefix once per FRI round. The old codeword is
+        // longer than `n_chunks`, so it already has enough initialized slots
+        // and capacity; source coefficients remain in a disjoint allocation.
+        let mut folded = core::mem::take(&mut values.values);
+        folded[..live_chunks]
+            .par_iter_mut()
+            .zip(coeffs.coeffs[..live_chunks * arity].par_chunks_exact(arity))
+            .for_each(|(out, chunk)| {
+                *out = match &beta_powers_16 {
+                    Some(beta_powers) => {
+                        let terms: &[F::Extension; 16] = chunk
+                            .try_into()
+                            .expect("arity-16 FRI chunk must contain 16 terms");
+                        F::fri_fold_arity16(terms, beta, beta_powers)
+                    }
+                    None => reduce_with_powers(chunk, beta),
+                };
+            });
+        folded.truncate(n_chunks);
         // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
         // tail. Zeros are actually *read as values* only where the next
         // round's exact-`arity` chunking can reach past the live support —
         // at most `arity_next - 1` slots past `live` — because every other
         // tail consumer (the zero-tail coset FFT and the final truncation +
-        // transcript observation) reads only the live prefix. Extend the
-        // length without storing the rest.
-        let live = folded.len();
-        folded.reserve(n_chunks - live);
-        // SAFETY: length equals capacity; the slots beyond `pad_end` are
-        // never read (see above), and `F::Extension` is plain data.
-        unsafe { folded.set_len(n_chunks) };
+        // transcript observation) reads only the live prefix.
+        let live = live_chunks;
         let pad_end = if round + 1 < num_rounds {
             n_chunks.min(live + (1 << fri_params.reduction_arity_bits[round + 1]))
         } else {

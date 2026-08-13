@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
@@ -622,31 +622,58 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
-            // Collect the coefficients of all the polynomials in `polynomials`.
-            let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-            });
-            // The label is formatted unconditionally, but `timing`'s `push` is
-            // compiled out unless the `timing` feature is on — which it is not
-            // here — so the `String` is allocated, written and dropped without
-            // ever being read. A static label costs nothing and reads the same
-            // in a timing build.
-            let composition_poly = timed!(
-                timing,
-                "reduce batch of polynomials",
-                alpha.reduce_polys_base(polys_coeff)
-            );
-            // Fused (value-exact) form of:
-            //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
-            //   alpha.shift_poly(&mut final_poly);
-            //   final_poly += quotient;
-            // (where the in-place division runs the classic `divide_by_linear`
-            // Horner recurrence and leaves its top slot as the power-of-two
-            // pad), writing straight into `final_poly`'s reusable buffer
-            // instead of a division pass + shift pass + add pass.
-            let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+        for (batch_index, FriBatchInfo { point, polynomials }) in
+            instance.batches.iter().enumerate()
+        {
+            if batch_index == 0 {
+                // The first batch has no prior accumulator to shift. Adopt the
+                // composition allocation as `final_poly` and divide it in
+                // place, deleting a degree-sized zero allocation and one
+                // extension multiply/add by the (irrelevant) shift per slot.
+                let polys_coeff = polynomials.iter().map(|fri_poly| {
+                    &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+                });
+                let composition_poly = timed!(
+                    timing,
+                    "reduce batch of polynomials",
+                    alpha.reduce_polys_base(polys_coeff)
+                );
+                alpha.reset();
+                final_poly = linear_quotient_in_place(composition_poly, *point);
+            } else if let [first, second] = polynomials.as_slice() {
+                // Ranked proofs' shifted opening batch is exactly the two Z
+                // polynomials. Reduce each coefficient as the synthetic
+                // division consumes it instead of allocating, writing, and
+                // rereading a transient degree-sized composition polynomial.
+                let first =
+                    &oracles[first.oracle_index].polynomials[first.polynomial_index];
+                let second =
+                    &oracles[second.oracle_index].polynomials[second.polynomial_index];
+                timed!(
+                    timing,
+                    "reduce batch of polynomials",
+                    accumulate_pair_base_linear_quotient(
+                        &mut final_poly,
+                        first,
+                        second,
+                        *point,
+                        &mut alpha,
+                    )
+                );
+            } else {
+                // Preserve the general path for unusual multi-batch instances
+                // whose later batch is not the audited two-polynomial shape.
+                let polys_coeff = polynomials.iter().map(|fri_poly| {
+                    &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+                });
+                let composition_poly = timed!(
+                    timing,
+                    "reduce batch of polynomials",
+                    alpha.reduce_polys_base(polys_coeff)
+                );
+                let shift = alpha.shift_factor();
+                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            }
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -757,6 +784,71 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         fft_in_place_with_options(&mut scaled, zero_factor, root_table);
     }
     PolynomialValues::new(scaled)
+}
+
+/// Turn the first composition polynomial into its padded linear quotient
+/// without allocating a second degree-sized buffer. The descending recurrence
+/// retains the next original coefficient before overwriting its slot.
+fn linear_quotient_in_place<F: Field>(
+    mut composition_poly: PolynomialCoeffs<F>,
+    z: F,
+) -> PolynomialCoeffs<F> {
+    let d = composition_poly.len();
+    if d == 0 {
+        return composition_poly;
+    }
+
+    let coeffs = &mut composition_poly.coeffs;
+    let mut acc = F::ZERO;
+    let mut next_coefficient = coeffs[d - 1];
+    coeffs[d - 1] = F::ZERO;
+    for i in (0..d - 1).rev() {
+        acc = acc * z + next_coefficient;
+        next_coefficient = coeffs[i];
+        coeffs[i] = acc;
+    }
+    composition_poly
+}
+
+/// Fold the production two-polynomial shifted batch directly into the running
+/// quotient. Coefficient `i` is `p0[i] + alpha * p1[i]`; computing it on demand
+/// preserves the synthetic-division recurrence while eliminating the transient
+/// composition vector. Unequal lengths retain `reduce_polys_base`'s zero-tail
+/// semantics, although ranked polynomials have equal degree.
+fn accumulate_pair_base_linear_quotient<F: RichField + Extendable<D>, const D: usize>(
+    final_poly: &mut PolynomialCoeffs<F::Extension>,
+    p0: &PolynomialCoeffs<F>,
+    p1: &PolynomialCoeffs<F>,
+    z: F::Extension,
+    alpha: &mut ReducingFactor<F::Extension>,
+) {
+    let d = p0.len().max(p1.len());
+    let [_, second_weight] = alpha.take_pair_powers();
+    let shift = alpha.shift_factor();
+    let buf = &mut final_poly.coeffs;
+
+    for value in buf.iter_mut().skip(d) {
+        *value *= shift;
+    }
+    if buf.len() < d {
+        buf.resize(d, F::Extension::ZERO);
+    }
+    if d == 0 {
+        return;
+    }
+    buf[d - 1] *= shift;
+
+    let coefficient = |i: usize| {
+        let c0 = p0.coeffs.get(i).copied().unwrap_or(F::ZERO);
+        let c1 = p1.coeffs.get(i).copied().unwrap_or(F::ZERO);
+        F::Extension::from_basefield(c0)
+            + <F::Extension as FieldExtension<D>>::scalar_mul(&second_weight, c1)
+    };
+    let mut acc = F::Extension::ZERO;
+    for i in (0..d - 1).rev() {
+        acc = acc * z + coefficient(i + 1);
+        buf[i] = buf[i] * shift + acc;
+    }
 }
 
 /// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
@@ -1084,6 +1176,137 @@ mod tests {
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
         }
+    }
+
+    #[test]
+    fn first_and_pair_quotient_fusions_match_materialized_reference() {
+        use crate::field::types::PrimeField64;
+
+        type BF = GoldilocksField;
+        type EF = <BF as Extendable<2>>::Extension;
+
+        let canonical = |values: &[EF]| {
+            values
+                .iter()
+                .flat_map(|value| FieldExtension::<2>::to_basefield_array(value))
+                .map(|limb: GoldilocksField| limb.to_canonical_u64())
+                .collect::<Vec<_>>()
+        };
+
+        for &(first_len, old_len, p0_len, p1_len) in &[
+            (0usize, 0usize, 0usize, 0usize),
+            (1, 1, 1, 1),
+            (8, 3, 8, 5),
+            (8, 12, 5, 8),
+            (256, 256, 256, 256),
+        ] {
+            let z0 = EF::rand();
+            let first = PolynomialCoeffs::new(EF::rand_vec(first_len));
+            let mut expected_first = PolynomialCoeffs::empty();
+            accumulate_linear_quotient(&mut expected_first, &first, z0, EF::rand());
+            let actual_first = linear_quotient_in_place(first, z0);
+            assert_eq!(
+                canonical(&actual_first.coeffs),
+                canonical(&expected_first.coeffs),
+            );
+
+            let initial = PolynomialCoeffs::new(EF::rand_vec(old_len));
+            let p0 = PolynomialCoeffs::new(BF::rand_vec(p0_len));
+            let p1 = PolynomialCoeffs::new(BF::rand_vec(p1_len));
+            let z1 = EF::rand();
+            let reducing_challenge = EF::rand();
+
+            let mut expected = initial.clone();
+            let mut reference_alpha = ReducingFactor::new(reducing_challenge);
+            let composition =
+                reference_alpha.reduce_polys_base::<BF, 2>([&p0, &p1]);
+            let shift = reference_alpha.shift_factor();
+            accumulate_linear_quotient(&mut expected, &composition, z1, shift);
+
+            let mut actual = initial;
+            let mut fused_alpha = ReducingFactor::new(reducing_challenge);
+            accumulate_pair_base_linear_quotient::<BF, 2>(
+                &mut actual,
+                &p0,
+                &p1,
+                z1,
+                &mut fused_alpha,
+            );
+            assert_eq!(canonical(&actual.coeffs), canonical(&expected.coeffs));
+        }
+    }
+
+    /// Focused exact-shape A/B for the d14 chain opening path: the first
+    /// composition has already been reduced (common work), and the shifted
+    /// batch has the production width two. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn opening_quotient_allocation_bench_d14() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        type BF = GoldilocksField;
+        type EF = <BF as Extendable<2>>::Extension;
+        const DEGREE: usize = 1 << 14;
+        const ITERS: usize = 80;
+
+        let first = PolynomialCoeffs::new(EF::rand_vec(DEGREE));
+        let p0 = PolynomialCoeffs::new(BF::rand_vec(DEGREE));
+        let p1 = PolynomialCoeffs::new(BF::rand_vec(DEGREE));
+        let z0 = EF::rand();
+        let z1 = EF::rand();
+        let alpha = EF::rand();
+        let first_shift = alpha.exp_u64(258);
+
+        let run_old = || {
+            let mut final_poly = PolynomialCoeffs::empty();
+            let first_composition = black_box(first.clone());
+            accumulate_linear_quotient(
+                &mut final_poly,
+                &first_composition,
+                z0,
+                first_shift,
+            );
+            let mut reducing = ReducingFactor::new(alpha);
+            let second_composition = reducing.reduce_polys_base::<BF, 2>([&p0, &p1]);
+            let shift = reducing.shift_factor();
+            accumulate_linear_quotient(&mut final_poly, &second_composition, z1, shift);
+            black_box(final_poly);
+        };
+        let run_new = || {
+            let first_composition = black_box(first.clone());
+            let mut final_poly = linear_quotient_in_place(first_composition, z0);
+            let mut reducing = ReducingFactor::new(alpha);
+            accumulate_pair_base_linear_quotient::<BF, 2>(
+                &mut final_poly,
+                &p0,
+                &p1,
+                z1,
+                &mut reducing,
+            );
+            black_box(final_poly);
+        };
+
+        for _ in 0..8 {
+            run_old();
+            run_new();
+        }
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            run_old();
+        }
+        let old = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            run_new();
+        }
+        let new = start.elapsed();
+        println!(
+            "opening quotient d14: old={:?}/iter new={:?}/iter delta={:+.2}%",
+            old / ITERS as u32,
+            new / ITERS as u32,
+            100.0 * (new.as_secs_f64() - old.as_secs_f64()) / old.as_secs_f64(),
+        );
     }
 
     /// Differential oracle for skipping `constants_sigmas_quotient_cache` at
