@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_pair(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars_0: &[Self],
+        base_scalars_1: &[Self],
+    ) -> [QuadraticExtension<Self>; 2] {
+        ext2_base_scalar_dot_product_pair(extension_values, base_scalars_0, base_scalars_1)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -279,6 +288,62 @@ fn ext2_base_scalar_dot_product(
     result
 }
 
+/// Evaluate two equally shaped GF(p^2)-by-GF(p) dot products while reading
+/// the common extension table once. The two accumulator pairs are completely
+/// independent, so their reduction order and raw representatives match two
+/// calls to `ext2_base_scalar_dot_product` exactly. Unequal or extraordinarily
+/// large inputs retain the general two-call fallback.
+#[inline]
+fn ext2_base_scalar_dot_product_pair(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars_0: &[GoldilocksField],
+    base_scalars_1: &[GoldilocksField],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len_0 = extension_values.len().min(base_scalars_0.len());
+    let len_1 = extension_values.len().min(base_scalars_1.len());
+    if len_0 != len_1 || len_0 > MAX_TERMS_PER_REDUCTION {
+        return [
+            ext2_base_scalar_dot_product(extension_values, base_scalars_0),
+            ext2_base_scalar_dot_product(extension_values, base_scalars_1),
+        ];
+    }
+    if len_0 == 0 {
+        return [QuadraticExtension::ZERO; 2];
+    }
+
+    let (mut lo_00, mut hi_00) = (0u128, 0u32);
+    let (mut lo_01, mut hi_01) = (0u128, 0u32);
+    let (mut lo_10, mut hi_10) = (0u128, 0u32);
+    let (mut lo_11, mut hi_11) = (0u128, 0u32);
+    for ((&QuadraticExtension([a0, a1]), &scalar_0), &scalar_1) in extension_values
+        [..len_0]
+        .iter()
+        .zip(&base_scalars_0[..len_0])
+        .zip(&base_scalars_1[..len_0])
+    {
+        u160_add_product(&mut lo_00, &mut hi_00, a0.0, scalar_0.0);
+        u160_add_product(&mut lo_01, &mut hi_01, a1.0, scalar_0.0);
+        u160_add_product(&mut lo_10, &mut hi_10, a0.0, scalar_1.0);
+        u160_add_product(&mut lo_11, &mut hi_11, a1.0, scalar_1.0);
+    }
+
+    // SAFETY: each accumulator has exactly the same per-output bound as the
+    // single-dot helper above; interleaving their updates does not combine
+    // their values.
+    [
+        QuadraticExtension([
+            unsafe { reduce160(lo_00, hi_00) },
+            unsafe { reduce160(lo_01, hi_01) },
+        ]),
+        QuadraticExtension([
+            unsafe { reduce160(lo_10, hi_10) },
+            unsafe { reduce160(lo_11, hi_11) },
+        ]),
+    ]
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///
@@ -365,7 +430,52 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
-    for (i, o) in out.iter_mut().enumerate() {
+    // Adjacent output slots use the same reducing powers. Keep their four
+    // independent limb accumulators live together so each `full`/`partial`
+    // entry and power is loaded once for two coefficients. Each accumulator
+    // still receives products in the original polynomial order and is reduced
+    // exactly once, so raw representatives match the scalar-slot loop.
+    let paired = out.len() & !1;
+    for i in (0..paired).step_by(2) {
+        let (mut lo00, mut hi00) = (0u128, 0u32);
+        let (mut lo01, mut hi01) = (0u128, 0u32);
+        let (mut lo10, mut hi10) = (0u128, 0u32);
+        let (mut lo11, mut hi11) = (0u128, 0u32);
+        for &(p, QuadraticExtension([b0, b1])) in &full {
+            // SAFETY: every slice in `full` has length exactly `out.len()`.
+            let c0 = unsafe { p.get_unchecked(i).0 };
+            let c1 = unsafe { p.get_unchecked(i + 1).0 };
+            u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+            u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+            u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+            u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+        }
+        for &(p, QuadraticExtension([b0, b1])) in &partial {
+            if i < p.len() {
+                let c0 = p[i].0;
+                u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+                u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+            }
+            if i + 1 < p.len() {
+                let c1 = p[i + 1].0;
+                u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+                u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+            }
+        }
+        // SAFETY: the accumulator bound documented above — below
+        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
+        // precondition.
+        out[i] = QuadraticExtension([
+            unsafe { reduce160(lo00, hi00) },
+            unsafe { reduce160(lo01, hi01) },
+        ]);
+        out[i + 1] = QuadraticExtension([
+            unsafe { reduce160(lo10, hi10) },
+            unsafe { reduce160(lo11, hi11) },
+        ]);
+    }
+    if paired != out.len() {
+        let i = paired;
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
         for &(p, QuadraticExtension([b0, b1])) in &full {
@@ -381,10 +491,7 @@ pub fn ext2_base_scalar_dot_slots(
                 u160_add_product(&mut lo1, &mut hi1, b1.0, c);
             }
         }
-        // SAFETY: the accumulator bound documented above — below
-        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
-        // precondition.
-        *o = QuadraticExtension([
+        out[i] = QuadraticExtension([
             unsafe { reduce160(lo0, hi0) },
             unsafe { reduce160(lo1, hi1) },
         ]);
@@ -806,6 +913,206 @@ mod tests {
             <GF as Extendable<4>>::extension_base_dot_product(&[], &scalars),
             Q4::ZERO
         );
+        let scalars_1 = scalars.iter().rev().copied().collect::<Vec<_>>();
+        assert_eq!(
+            <GF as Extendable<4>>::extension_base_dot_product_pair(
+                &values,
+                &scalars,
+                &scalars_1,
+            ),
+            [
+                <GF as Extendable<4>>::extension_base_dot_product(&values, &scalars),
+                <GF as Extendable<4>>::extension_base_dot_product(&values, &scalars_1),
+            ]
+        );
+    }
+
+    #[test]
+    fn ext2_paired_base_dot_product_matches_two_single_raw_outputs() {
+        let raw_specials = [0, 1, GF::ORDER - 1, GF::ORDER, GF::ORDER + 1, u64::MAX];
+        let lengths = [0usize, 1, 2, 3, 15, 16, 17, 63, 64, 65, 255, 256, 257, 4096];
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for len in lengths {
+            let values = (0..len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[i]
+                        } else {
+                            next()
+                        }),
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[raw_specials.len() - 1 - i]
+                        } else {
+                            next()
+                        }),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let scalars_0 = (0..len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 3) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let scalars_1 = (0..len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5 + 1) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let expected = [
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars_0),
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars_1),
+            ];
+            let actual = <GF as Extendable<2>>::extension_base_dot_product_pair(
+                &values,
+                &scalars_0,
+                &scalars_1,
+            );
+            assert_eq!(actual, expected, "paired output diverged at len={len}");
+            for output in 0..2 {
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual[output].0[limb].to_noncanonical_u64(),
+                        expected[output].0[limb].to_noncanonical_u64(),
+                        "raw output {output} limb {limb} diverged at len={len}"
+                    );
+                }
+            }
+        }
+
+        // Unequal input lengths are a deliberate fallback and retain each
+        // single helper's independent zip-to-shorter semantics.
+        let values = vec![Q2::ONE; 17];
+        let short = vec![GF::ONE; 3];
+        let long = vec![GF::ONE; 19];
+        assert_eq!(
+            <GF as Extendable<2>>::extension_base_dot_product_pair(&values, &short, &long),
+            [
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &short),
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &long),
+            ]
+        );
+    }
+
+    #[test]
+    fn ext2_paired_reduction_slots_match_scalar_slot_raw_outputs() {
+        fn scalar_slots(
+            start: usize,
+            out_len: usize,
+            polys: &[&[GF]],
+            powers: &[Q2],
+        ) -> Vec<Q2> {
+            (0..out_len)
+                .map(|offset| {
+                    let slot = start + offset;
+                    let (mut lo0, mut hi0) = (0u128, 0u32);
+                    let (mut lo1, mut hi1) = (0u128, 0u32);
+                    for (&poly, &QuadraticExtension([b0, b1])) in
+                        polys.iter().zip(powers)
+                    {
+                        if let Some(c) = poly.get(slot) {
+                            super::u160_add_product(&mut lo0, &mut hi0, b0.0, c.0);
+                            super::u160_add_product(&mut lo1, &mut hi1, b1.0, c.0);
+                        }
+                    }
+                    QuadraticExtension([
+                        unsafe { super::reduce160(lo0, hi0) },
+                        unsafe { super::reduce160(lo1, hi1) },
+                    ])
+                })
+                .collect()
+        }
+
+        let raw_specials = [0, 1, GF::ORDER - 1, GF::ORDER, GF::ORDER + 1, u64::MAX];
+        let mut state = 0xbb67_ae85_84ca_a73bu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for (start, out_len) in [
+            (0usize, 0usize),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (7, 15),
+            (7, 16),
+            (7, 17),
+            (31, 255),
+            (31, 256),
+            (31, 257),
+        ] {
+            let full_len = start + out_len;
+            let polys_owned = (0..33)
+                .map(|poly| {
+                    let len = match poly % 6 {
+                        0 => full_len,
+                        1 => full_len.saturating_sub(1),
+                        2 => start,
+                        3 => start.saturating_add(out_len / 2),
+                        _ => full_len,
+                    };
+                    (0..len)
+                        .map(|i| {
+                            GoldilocksField(if i < raw_specials.len() {
+                                raw_specials[(i + poly) % raw_specials.len()]
+                            } else {
+                                next()
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let polys = polys_owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let powers = (0..polys.len())
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[(i * 3) % raw_specials.len()]
+                        } else {
+                            next()
+                        }),
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[(i * 5 + 1) % raw_specials.len()]
+                        } else {
+                            next()
+                        }),
+                    ])
+                })
+                .collect::<Vec<_>>();
+
+            let expected = scalar_slots(start, out_len, &polys, &powers);
+            let mut actual = vec![Q2::ZERO; out_len];
+            super::ext2_base_scalar_dot_slots(&mut actual, start, &polys, &powers);
+            assert_eq!(actual, expected, "value mismatch start={start} len={out_len}");
+            for (slot, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                for limb in 0..2 {
+                    assert_eq!(
+                        a.0[limb].to_noncanonical_u64(),
+                        e.0[limb].to_noncanonical_u64(),
+                        "raw mismatch start={start} len={out_len} slot={slot} limb={limb}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
