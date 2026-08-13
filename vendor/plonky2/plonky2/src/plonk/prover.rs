@@ -2347,8 +2347,8 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2378,23 +2378,14 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2405,9 +2396,7 @@ fn compute_quotient_polys<
                     "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
                 if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
+                    eprintln!("[gpu-range-quotient] runtime failure; falling back to CPU: {error}");
                 }
                 let result = compute_quotient_polys(
                     common_data,
@@ -2427,23 +2416,14 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
+        Some(match job.finish() {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2464,28 +2444,12 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
@@ -2504,18 +2468,122 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        const MERGE_SCATTER_BATCH: usize = 1 << 10;
+
+        #[cfg(feature = "diagnostic_profile")]
+        let _merge_profile =
+            crate::util::profile::span("quotient", "merge_gpu_outputs_and_scatter");
+
+        // Merge completed point-major Metal outputs directly into the final
+        // challenge columns. The previous fused form first wrote the merged
+        // values back to `quotient_values`, then immediately reread that whole
+        // buffer to scatter it. This producer-to-consumer pass removes that
+        // round trip and lets the CPU intermediate and all three Metal outputs
+        // die together before either IFFT begins. Coarse contiguous chunks
+        // also avoid one Rayon closure per quotient point.
+        macro_rules! merge_gpu_values_and_scatter {
+            ($($values:ident),+ $(,)?) => {{
+                $(debug_assert_eq!($values.len(), quotient_values.len());)+
+                quotient_values
+                    .par_chunks(MERGE_SCATTER_BATCH * num_challenges)
+                    .enumerate()
+                    .for_each(|(chunk_i, chunk)| {
+                        let base = MERGE_SCATTER_BATCH * chunk_i;
+                        for (k, cpu_values) in
+                            chunk.chunks_exact(num_challenges).enumerate()
+                        {
+                            let i = base + k;
+                            let denominator_inv = z_h_on_coset.eval_inverse(i);
+                            let offset = i * num_challenges;
+                            for (challenge, &cpu) in cpu_values.iter().enumerate() {
+                                let mut value = cpu;
+                                $(
+                                    value +=
+                                        $values[offset + challenge] * denominator_inv;
+                                )+
+                                // SAFETY: this parallel chunk owns the
+                                // disjoint destination point `i` in every
+                                // challenge column.
+                                unsafe { *column_ptrs[challenge].0.add(i) = value };
+                            }
+                        }
+                    });
+            }};
+        }
+
+        // Select the producer set once, outside the hot point loop, so the
+        // common three-producer path is straight-line arithmetic. Preserve
+        // the former multiply-then-add order for each producer; factoring the
+        // common multiplier is field-equivalent but changes raw Goldilocks
+        // representatives and breaks byte-for-byte proof determinism.
+        match (
+            gpu_poseidon_values,
+            gpu_range_values,
+            gpu_permutation_values,
+        ) {
+            (Some(poseidon), Some(range), Some(permutation)) => {
+                merge_gpu_values_and_scatter!(poseidon, range, permutation)
+            }
+            (Some(poseidon), Some(range), None) => {
+                merge_gpu_values_and_scatter!(poseidon, range)
+            }
+            (Some(poseidon), None, Some(permutation)) => {
+                merge_gpu_values_and_scatter!(poseidon, permutation)
+            }
+            (None, Some(range), Some(permutation)) => {
+                merge_gpu_values_and_scatter!(range, permutation)
+            }
+            (Some(poseidon), None, None) => merge_gpu_values_and_scatter!(poseidon),
+            (None, Some(range), None) => merge_gpu_values_and_scatter!(range),
+            (None, None, Some(permutation)) => {
+                merge_gpu_values_and_scatter!(permutation)
+            }
+            (None, None, None) => quotient_values
+                .par_chunks(MERGE_SCATTER_BATCH * num_challenges)
+                .enumerate()
+                .for_each(|(chunk_i, chunk)| {
+                    let base = MERGE_SCATTER_BATCH * chunk_i;
+                    for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                        let i = base + k;
+                        for (challenge, &value) in point_values.iter().enumerate() {
+                            // SAFETY: this parallel chunk owns point `i`.
+                            unsafe { *column_ptrs[challenge].0.add(i) = value };
+                        }
+                    }
+                }),
+        }
+        #[cfg(feature = "diagnostic_profile")]
+        drop(_merge_profile);
+
+        // `finish()` slices borrow the job-owned buffers; after the direct
+        // merge/scatter, return the recurring d14/d16 outputs to the bounded
+        // two-slot pool before the IFFT consumer starts allocating scratch.
+        drop(gpu_poseidon);
+        drop(gpu_range);
+        drop(gpu_permutation);
+    }
+
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     quotient_values
         .par_chunks(BATCH_SIZE * num_challenges)
         .enumerate()
         .for_each(|(chunk_i, chunk)| {
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                let i = base + k;
+                for (challenge, &value) in point_values.iter().enumerate() {
+                    // SAFETY: this parallel chunk owns point `i`.
+                    unsafe { *column_ptrs[challenge].0.add(i) = value };
                 }
             }
         });
+
+    // The columns are now the sole consumer of the interleaved CPU buffer.
+    // Release it before allocating any IFFT scratch or coefficient vectors.
+    drop(quotient_values);
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
