@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
     FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    ifft_with_options_and_prescaled_postscale,
 };
 use crate::types::Field;
 
@@ -78,6 +79,18 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Same as [`Self::coset_ifft_with_powers`], except the caller's powers
+    /// already contain the IFFT's `1/n` normalization. The post-pass then
+    /// performs one multiply per output slot instead of two; the values are
+    /// identical to the two-multiply form because the factors are equal and
+    /// field multiplication is commutative.
+    pub fn coset_ifft_with_prescaled_powers(
+        self,
+        prescaled_inverse_shift_powers: &[F],
+    ) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_prescaled_postscale(self, None, None, prescaled_inverse_shift_powers)
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -543,6 +556,43 @@ mod tests {
 
             let expected = evals.clone().coset_ifft(shift);
             let actual = evals.coset_ifft_with_powers(&inverse_powers);
+
+            assert_eq!(
+                actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected
+                    .coeffs
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_coset_ifft_with_prescaled_powers_matches_postscale() {
+        type F = GoldilocksField;
+
+        for k in [1usize, 3, 8] {
+            let n = 1 << k;
+            let evals = PolynomialValues::new(
+                (0..n)
+                    .map(|i| {
+                        F::from_noncanonical_u64(
+                            u64::MAX.wrapping_sub((i as u64 + 1) * 0x1234_5678),
+                        )
+                    })
+                    .collect(),
+            );
+            let shift = F::coset_shift();
+            let n_inv = F::inverse_2exp(k);
+            let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
+            let prescaled = inverse_powers
+                .iter()
+                .map(|&power| n_inv * power)
+                .collect::<Vec<_>>();
+
+            let expected = evals.clone().coset_ifft_with_powers(&inverse_powers);
+            let actual = evals.coset_ifft_with_prescaled_powers(&prescaled);
 
             assert_eq!(
                 actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
