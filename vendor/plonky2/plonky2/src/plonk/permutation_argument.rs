@@ -279,6 +279,31 @@ pub struct WirePartition {
 }
 
 impl WirePartition {
+    /// Derives the row-major fixed-routed-wire mask directly from the sigma
+    /// successor table.
+    ///
+    /// A routed position is the only routed member of its copy component iff
+    /// the closed sigma cycle maps that position to itself. Loaders that have
+    /// already built `WirePartition` can therefore avoid two additional walks
+    /// over the much larger representative map and its cardinality scratch.
+    pub fn fixed_routed_wire_mask(&self, degree: usize) -> Option<Vec<u8>> {
+        if degree == 0 || self.sigma.len() % degree != 0 {
+            return None;
+        }
+        let num_routed_wires = self.sigma.len() / degree;
+        let mut fixed = vec![0u8; self.sigma.len().div_ceil(8)];
+        for (column, successors) in self.sigma.chunks_exact(degree).enumerate() {
+            let column_base = column * degree;
+            for (row, &successor) in successors.iter().enumerate() {
+                if successor as usize == column_base + row {
+                    let row_major = row * num_routed_wires + column;
+                    fixed[row_major >> 3] |= 1 << (row_major & 7);
+                }
+            }
+        }
+        Some(fixed)
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
@@ -924,6 +949,10 @@ mod tests {
             degree,
         )
         .expect("valid compressed representative map");
+        let partition = WirePartition {
+            sigma: sigma.clone(),
+        };
+        assert_eq!(partition.fixed_routed_wire_mask(degree).unwrap(), mask);
         assert_eq!(mask.len(), (degree * num_routed_wires).div_ceil(8));
 
         for row in 0..degree {
