@@ -1873,7 +1873,7 @@ fn compute_quotient_polys<
     let lde_mask = lde_size - 1;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_poseidon = allow_gpu_poseidon
+    let mut gpu_poseidon = allow_gpu_poseidon
         .then(|| {
             start_gpu_poseidon_gate_quotient(
                 common_data,
@@ -1886,7 +1886,7 @@ fn compute_quotient_polys<
         })
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range = allow_gpu_poseidon
+    let mut gpu_range = allow_gpu_poseidon
         .then(|| {
             start_gpu_range_check_gate_quotient(
                 common_data,
@@ -1899,7 +1899,7 @@ fn compute_quotient_polys<
         })
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_permutation = (allow_gpu_poseidon && col_major_perm)
+    let mut gpu_permutation = (allow_gpu_poseidon && col_major_perm)
         .then(|| {
             start_gpu_permutation_quotient(
                 common_data,
@@ -2347,135 +2347,165 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
+    {
+        // Keep this schedule shape-fixed: ranked hosts may have different
+        // absolute throughput, but producer ordering must remain deterministic.
+        // The tile boundary likewise depends only on quotient shape.
+        // It is independent of worker admission and host load.
+        // Ranked-machine throughput therefore cannot alter quotient semantics.
+        const MERGE_BATCH: usize = 1 << 10;
+
+        // Merge coarse contiguous tiles. The multiply-then-add order stays
+        // identical to the former producer-at-a-time path, preserving raw
+        // Goldilocks representatives as well as field values.
+        macro_rules! merge_gpu_values {
+            ($($values:ident),+ $(,)?) => {{
+                $(debug_assert_eq!($values.len(), quotient_values.len());)+
+                quotient_values
+                    .par_chunks_mut(MERGE_BATCH * num_challenges)
+                    .enumerate()
+                    .for_each(|(chunk_i, chunk)| {
+                        let base = MERGE_BATCH * chunk_i;
+                        for (k, cpu_values) in chunk.chunks_exact_mut(num_challenges).enumerate() {
+                            let i = base + k;
+                            let denominator_inv = z_h_on_coset.eval_inverse(i);
+                            let offset = i * num_challenges;
+                            for (challenge, cpu) in cpu_values.iter_mut().enumerate() {
+                                $(
+                                    *cpu +=
+                                        $values[offset + challenge] * denominator_inv;
+                                )+
+                            }
+                        }
+                    });
+            }};
+        }
+
+        // The Poseidon job is first in the single FIFO Metal queue. Consume it
+        // as soon as it completes, so this CPU merge overlaps the queued range
+        // and permutation kernels. Waiting for every job before a three-way
+        // fusion removed that producer-consumer overlap on the ranked host.
+        if let Some((_, poseidon_job)) = gpu_poseidon.take() {
+            match poseidon_job.finish() {
+                Ok(poseidon) => {
+                    GPU_POSEIDON_QUOTIENT_COMPLETED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    merge_gpu_values!(poseidon);
+                }
+                Err(error) => {
+                    GPU_POSEIDON_QUOTIENT_FALLBACKS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    log::warn!(
+                        "Metal Poseidon2 gate quotient failed; recomputing quotient on CPU: {error}"
+                    );
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!(
+                            "[gpu-poseidon-quotient] runtime failure; falling back to CPU: {error}"
+                        );
+                    }
+                    return compute_quotient_polys(
+                        common_data,
+                        prover_data,
+                        public_inputs_hash,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        betas,
+                        gammas,
+                        beta_k_is,
+                        deltas,
+                        alphas,
+                        col_major_perm,
+                        false,
                     );
                 }
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+            // Return the completed output before waiting for the remaining
+            // jobs and before allocating the challenge-column/IFFT buffers.
+            drop(poseidon_job);
+        }
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
-            Ok(values) => {
-                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
-            }
-            Err(error) => {
-                GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                log::warn!(
-                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
-                );
-                if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
+        let range_job = gpu_range.take().map(|(_, job)| job);
+        let range_values = if let Some(job) = range_job.as_ref() {
+            Some(match job.finish() {
+                Ok(values) => {
+                    GPU_RANGE_QUOTIENT_COMPLETED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    values
+                }
+                Err(error) => {
+                    GPU_RANGE_QUOTIENT_FALLBACKS
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    log::warn!(
+                        "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
+                    );
+                    if gpu_poseidon_quotient_diagnostics_enabled() {
+                        eprintln!(
+                            "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
+                        );
+                    }
+                    let result = compute_quotient_polys(
+                        common_data,
+                        prover_data,
+                        public_inputs_hash,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        betas,
+                        gammas,
+                        beta_k_is,
+                        deltas,
+                        alphas,
+                        col_major_perm,
+                        false,
+                    );
+                    #[cfg(test)]
+                    job.mark_cpu_recompute_completed_for_tests();
+                    return result;
+                }
+            })
+        } else {
+            None
+        };
+
+        let permutation_job = gpu_permutation.take();
+        let permutation_values = if let Some(job) = permutation_job.as_ref() {
+            Some(match job.finish() {
+                Ok(values) => values,
+                Err(error) => {
+                    log::warn!(
+                        "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
+                    );
+                    return compute_quotient_polys(
+                        common_data,
+                        prover_data,
+                        public_inputs_hash,
+                        wires_commitment,
+                        zs_partial_products_and_lookup_commitment,
+                        betas,
+                        gammas,
+                        beta_k_is,
+                        deltas,
+                        alphas,
+                        col_major_perm,
+                        false,
                     );
                 }
-                let result = compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-                #[cfg(test)]
-                job.mark_cpu_recompute_completed_for_tests();
-                return result;
-            }
+            })
+        } else {
+            None
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
-            Err(error) => {
-                log::warn!(
-                    "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
-                );
-                return compute_quotient_polys(
-                    common_data,
-                    prover_data,
-                    public_inputs_hash,
-                    wires_commitment,
-                    zs_partial_products_and_lookup_commitment,
-                    betas,
-                    gammas,
-                    beta_k_is,
-                    deltas,
-                    alphas,
-                    col_major_perm,
-                    false,
-                );
-            }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        // The two trailing producers are adjacent in queue order. Merge them
+        // in one sweep when both exist, deleting one full quotient-buffer RMW
+        // pass while keeping the earlier Poseidon/Metal overlap intact.
+        match (range_values, permutation_values) {
+            (Some(range), Some(permutation)) => merge_gpu_values!(range, permutation),
+            (Some(range), None) => merge_gpu_values!(range),
+            (None, Some(permutation)) => merge_gpu_values!(permutation),
+            (None, None) => {}
+        }
+
+        drop(range_job);
+        drop(permutation_job);
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2516,6 +2546,7 @@ fn compute_quotient_polys<
                 }
             }
         });
+
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
