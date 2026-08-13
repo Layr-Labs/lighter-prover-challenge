@@ -105,11 +105,13 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// shader cache does not pay the MSL front end. Regenerate whenever
 /// `poseidon2.metal` changes (see `MetalShared::new`); the
 /// `metallib_matches_shader_source` test enforces it.
-const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
+/// Device fatlib when `build.rs` could talk to Metal (ranked M4 Pro, or this
+/// Mac). Otherwise the committed fallback copied into `OUT_DIR`.
+const SHADER_METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2.metallib"));
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "4dd8d6db80b99f0bcf2251c19158f367909b160319dd1fca236b793b6c66f696";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -203,6 +205,10 @@ struct MetalShared {
     /// Deterministic shifted quotient-domain points, uploaded once per size and
     /// reused by every no-lookup permutation job in this worker.
     permutation_points: Mutex<HashMap<u32, Buffer>>,
+    /// `1 / Z_H` table and `rate_mask` for the live quotient. Defaults to a
+    /// single `1` with mask 0 (no scale) so unit tests that launch kernels
+    /// without a bind stay bit-identical to the unscaled CPU gate eval.
+    zh_scale: Mutex<(Buffer, u32)>,
 }
 
 struct NttRoots {
@@ -1492,6 +1498,19 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
     }
 }
 
+/// Uploads the live `Z_H^{-1}` table so subsequent quotient kernels scale
+/// their outputs. `rate_mask` must be `inverses.len() - 1`.
+pub(crate) fn bind_zh_inverses<F: RichField>(inverses: &[F], rate_mask: u32) -> bool {
+    if F::ORDER != 0xffff_ffff_0000_0001 || size_of::<F>() != size_of::<u64>() {
+        return false;
+    }
+    let words: Vec<u64> = inverses.iter().map(|inv| inv.to_canonical_u64()).collect();
+    let Some(context) = shared_context() else {
+        return false;
+    };
+    context.bind_zh_inverses_words(&words, rate_mask).is_ok()
+}
+
 /// Starts a whole-domain Poseidon2Gate evaluation over retained natural-order
 /// LDE columns. `alpha_offset` is the number of non-gate vanishing terms that
 /// precede the gate constraints in the global alpha reduction.
@@ -2522,6 +2541,12 @@ impl MetalShared {
                 size_of_val(parameter_values.as_slice()) as u64,
                 MTLResourceOptions::StorageModeShared,
             );
+            let zh_one = 1u64;
+            let zh_ones = device.new_buffer_with_data(
+                (&zh_one as *const u64).cast::<c_void>(),
+                size_of::<u64>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
 
             Ok(Self {
                 queue: device.new_command_queue(),
@@ -2548,6 +2573,7 @@ impl MetalShared {
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
                 permutation_points: Mutex::new(HashMap::new()),
+                zh_scale: Mutex::new((zh_ones, 0)),
             })
         })
     }
@@ -2565,6 +2591,36 @@ impl MetalShared {
             .ok_or("Metal column size overflow")?;
         let buffer = take_or_new_column_buffer(&self.device, bytes as u64);
         Ok(MetalColumns::with_buffer(buffer, rows, cols))
+    }
+
+    fn bind_zh_inverses_words(&self, words: &[u64], rate_mask: u32) -> Result<(), String> {
+        if words.is_empty() || !words.len().is_power_of_two() {
+            return Err("Z_H inverse table must be a non-empty power of two".to_string());
+        }
+        if rate_mask as usize != words.len() - 1 {
+            return Err("Z_H rate_mask does not match inverse table".to_string());
+        }
+        let bytes = words
+            .len()
+            .checked_mul(size_of::<u64>())
+            .ok_or("Z_H inverse table overflow")?;
+        let buffer = self.device.new_buffer_with_data(
+            words.as_ptr().cast::<c_void>(),
+            bytes as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        *self
+            .zh_scale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = (buffer, rate_mask);
+        Ok(())
+    }
+
+    fn zh_scale(&self) -> (Buffer, u32) {
+        self.zh_scale
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
@@ -2625,6 +2681,9 @@ impl MetalShared {
             set_u32(encoder, 10, group.start as u32);
             set_u32(encoder, 11, group.end as u32);
             set_u32(encoder, 12, include_unused_selector as u32);
+            let (zh_inverses, zh_rate_mask) = self.zh_scale();
+            encoder.set_buffer(13, Some(&zh_inverses), 0);
+            set_u32(encoder, 14, zh_rate_mask);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -2697,6 +2756,9 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
+            let (zh_inverses, zh_rate_mask) = self.zh_scale();
+            encoder.set_buffer(11, Some(&zh_inverses), 0);
+            set_u32(encoder, 12, zh_rate_mask);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -2794,6 +2856,9 @@ impl MetalShared {
             set_u32(encoder, 13, num_partial_products as u32);
             set_u32(encoder, 14, chunk_size as u32);
             set_u32(encoder, 15, alpha_stride as u32);
+            let (zh_inverses, zh_rate_mask) = self.zh_scale();
+            encoder.set_buffer(16, Some(&zh_inverses), 0);
+            set_u32(encoder, 17, zh_rate_mask);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]

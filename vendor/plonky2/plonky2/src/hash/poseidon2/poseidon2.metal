@@ -461,6 +461,8 @@ kernel void poseidon2_gate_quotient(
     constant uint& group_start [[buffer(10)]],
     constant uint& group_end [[buffer(11)]],
     constant uint& include_unused_selector [[buffer(12)]],
+    constant ulong* zh_inverses [[buffer(13)]],
+    constant uint& zh_rate_mask [[buffer(14)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -575,8 +577,11 @@ kernel void poseidon2_gate_quotient(
             constraint_index);
     }
 
-    output[(ulong)gid * 2] = gl_canonicalize(gl_mul(filter, accumulators[0]));
-    output[(ulong)gid * 2 + 1] = gl_canonicalize(gl_mul(filter, accumulators[1]));
+    ulong zh_inv = zh_inverses[gid & zh_rate_mask];
+    output[(ulong)gid * 2] =
+        gl_canonicalize(gl_mul(gl_mul(filter, accumulators[0]), zh_inv));
+    output[(ulong)gid * 2 + 1] =
+        gl_canonicalize(gl_mul(gl_mul(filter, accumulators[1]), zh_inv));
 }
 
 // Evaluates the no-lookup permutation partial-product constraints at one
@@ -599,6 +604,8 @@ kernel void permutation_quotient(
     constant uint& num_partial_products [[buffer(13)]],
     constant uint& chunk_size [[buffer(14)]],
     constant uint& alpha_stride [[buffer(15)]],
+    constant ulong* zh_inverses [[buffer(16)]],
+    constant uint& zh_rate_mask [[buffer(17)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -679,8 +686,9 @@ kernel void permutation_quotient(
             term1, alpha_powers[alpha_stride + alpha_index1], totals[1]);
     }
 
-    output[(ulong)gid * 2u] = gl_canonicalize(totals[0]);
-    output[(ulong)gid * 2u + 1u] = gl_canonicalize(totals[1]);
+    ulong zh_inv = zh_inverses[gid & zh_rate_mask];
+    output[(ulong)gid * 2u] = gl_canonicalize(gl_mul(totals[0], zh_inv));
+    output[(ulong)gid * 2u + 1u] = gl_canonicalize(gl_mul(totals[1], zh_inv));
 }
 
 // Deferred-reduction accumulator for one alpha-weighted constraint sum.
@@ -839,6 +847,8 @@ kernel void range_check_gate_quotient(
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
     constant uint& u32_count [[buffer(10)]],
+    constant ulong* zh_inverses [[buffer(11)]],
+    constant uint& zh_rate_mask [[buffer(12)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
@@ -1598,8 +1608,9 @@ kernel void range_check_gate_quotient(
             filter, alpha_acc_materialize(gate_accumulators[1]), total[1]);
     }
 
-    output[(ulong)gid * 2] = gl_canonicalize(total[0]);
-    output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
+    ulong zh_inv = zh_inverses[gid & zh_rate_mask];
+    output[(ulong)gid * 2] = gl_canonicalize(gl_mul(total[0], zh_inv));
+    output[(ulong)gid * 2 + 1] = gl_canonicalize(gl_mul(total[1], zh_inv));
 }
 
 kernel void poseidon2_hash_leaves(

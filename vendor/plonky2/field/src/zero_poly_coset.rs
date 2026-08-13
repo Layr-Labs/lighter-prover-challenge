@@ -65,6 +65,16 @@ impl<F: Field> ZeroPolyOnCoset<F> {
         self.inverses[i & self.rate_mask]
     }
 
+    /// The `rate - 1` mask used by [`Self::eval_inverse`].
+    pub fn rate_mask(&self) -> usize {
+        self.rate_mask
+    }
+
+    /// Cached `1 / Z_H` table, length `rate_mask + 1`.
+    pub fn inverses(&self) -> &[F] {
+        &self.inverses
+    }
+
     /// Like `eval_inverse`, but for a range of indices starting with `i_start`.
     pub fn eval_inverse_packed<P: PackedField<Scalar = F>>(&self, i_start: usize) -> P {
         let mut packed = P::ZEROS;
