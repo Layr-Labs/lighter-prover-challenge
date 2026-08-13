@@ -1953,6 +1953,15 @@ fn compute_quotient_polys<
     };
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
+    // When at least one Metal quotient job is active, CPU and GPU producers
+    // keep raw numerators over the same Z_H. Merge additively, then apply
+    // Z_H(i)^-1 once inside the already-required challenge-column scatter.
+    // CPU-only shapes keep the established batch-local scale (no new join).
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let any_gpu_quotient =
+        gpu_poseidon.is_some() || gpu_range.is_some() || gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let any_gpu_quotient = false;
     // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
     // `(degree_bits, quotient_degree_bits, coset shift)` — not on any challenge — so they are
     // computed once per circuit shape for the process and shared across proofs. Each cached
@@ -2334,14 +2343,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if !any_gpu_quotient {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2383,11 +2394,9 @@ fn compute_quotient_polys<
         quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(cpu_values, gpu_values)| {
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2432,11 +2441,9 @@ fn compute_quotient_polys<
         quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(cpu_values, gpu_values)| {
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2469,11 +2476,9 @@ fn compute_quotient_polys<
         quotient_values
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(cpu_values, gpu_values)| {
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2504,15 +2509,24 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
+    let z_h_on_coset = &z_h_on_coset;
     quotient_values
         .par_chunks(BATCH_SIZE * num_challenges)
         .enumerate()
         .for_each(|(chunk_i, chunk)| {
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                let i = base + k;
+                // One common Z_H scale for the summed numerators when GPU
+                // jobs contributed; CPU-only path already scaled in-batch.
+                let scale = if any_gpu_quotient {
+                    z_h_on_coset.eval_inverse(i)
+                } else {
+                    F::ONE
+                };
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    // SAFETY: `i` lies in this chunk's disjoint range.
+                    unsafe { *column.0.add(i) = value * scale };
                 }
             }
         });

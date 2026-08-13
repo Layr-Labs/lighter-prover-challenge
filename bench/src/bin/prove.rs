@@ -1,4 +1,5 @@
 // Copyright (c) Elliot Technologies, Inc.
+// Isolate marker bot1-onescale-finalscatter-1786590702
 // SPDX-License-Identifier: BUSL-1.1
 
 #![feature(stmt_expr_attributes)]
@@ -255,3 +256,4 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+// Isolate marker bot1-onescale-finalscatter-1786590702
