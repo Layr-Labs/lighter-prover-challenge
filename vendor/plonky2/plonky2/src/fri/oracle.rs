@@ -751,11 +751,11 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
     } else {
         scaled.resize(len, F::ZERO);
     }
-    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
-        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
-    } else {
-        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
-    }
+    // FRI fold calls this on the serial spine (not inside a column par_iter).
+    // Exclusive-phase already used the parallel in-place FFT; pipelined
+    // rounds were left serial. Same kernels, bit-identical layers.
+    // Not quotient IFFT dispatch (4db249a).
+    fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
     PolynomialValues::new(scaled)
 }
 
