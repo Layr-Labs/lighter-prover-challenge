@@ -589,6 +589,37 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+/// Visit the non-singleton routed wires in one quotient chunk, in increasing
+/// wire order. Full byte-aligned chunks consume the already-authoritative
+/// fixed-wire mask one byte at a time; every other layout retains the scalar
+/// bit probe. The callback order is therefore identical to `start..end`.
+#[inline(always)]
+fn for_each_active_routed_wire(
+    fixed_mask: &[u8],
+    routed_base: usize,
+    start: usize,
+    end: usize,
+    mut visit: impl FnMut(usize),
+) {
+    let absolute_start = routed_base + start;
+    if end - start == 8 && absolute_start & 7 == 0 {
+        if let Some(&fixed) = fixed_mask.get(absolute_start >> 3) {
+            let mut active = !fixed;
+            while active != 0 {
+                let bit = active.trailing_zeros() as usize;
+                visit(start + bit);
+                active &= active - 1;
+            }
+            return;
+        }
+    }
+    for j in start..end {
+        if !fixed_routed_wire(fixed_mask, routed_base + j) {
+            visit(j);
+        }
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -709,24 +740,48 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut numerator_1 = F::ONE;
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
-                            for j in start..end {
-                                // A singleton routed copy component maps this position to itself:
-                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
-                                // therefore identical for both challenges and cancel symbolically,
-                                // including when that common factor evaluates to zero. Check the
-                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
-                                if fixed_routed_wire(
-                                    &prover_data.fixed_routed_wires,
-                                    routed_base + j,
-                                ) {
-                                    continue;
+                            // A singleton routed copy component maps this position to itself:
+                            // sigma(i,j) = k_j * x. Its numerator and denominator factors are
+                            // identical for both challenges and cancel symbolically, including
+                            // when that common factor evaluates to zero. At the production shape,
+                            // each eight-wire chunk is one mask byte; visit its active bits in the
+                            // same increasing-j multiplication order without eight scalar probes.
+                            macro_rules! accumulate_active_wire {
+                                ($j:expr) => {{
+                                    let j = $j;
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }};
+                            }
+                            let absolute_start = routed_base + start;
+                            let fixed_byte = if end - start == 8 && absolute_start & 7 == 0 {
+                                prover_data
+                                    .fixed_routed_wires
+                                    .get(absolute_start >> 3)
+                                    .copied()
+                            } else {
+                                None
+                            };
+                            if let Some(fixed) = fixed_byte {
+                                let mut active = !fixed;
+                                while active != 0 {
+                                    let bit = active.trailing_zeros() as usize;
+                                    accumulate_active_wire!(start + bit);
+                                    active &= active - 1;
                                 }
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                            } else {
+                                for j in start..end {
+                                    if !fixed_routed_wire(
+                                        &prover_data.fixed_routed_wires,
+                                        routed_base + j,
+                                    ) {
+                                        accumulate_active_wire!(j);
+                                    }
+                                }
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -3308,7 +3363,8 @@ mod permutation_pairing_tests {
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        all_wires_permutation_partial_products, for_each_active_routed_wire,
+        paired_permutation_batch_count,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
     };
@@ -3635,6 +3691,67 @@ mod permutation_pairing_tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Exhaust all 256 possible bytes at the production eight-wire seam. The
+    /// candidate must visit exactly the scalar loop's active indices in the
+    /// same order, and four independent Goldilocks products must retain their
+    /// raw representatives, not merely their canonical field values.
+    #[test]
+    fn active_routed_byte_scan_matches_scalar_loop_exhaustive_raw() {
+        let raw_factors = [
+            1,
+            2,
+            F::ORDER - 1,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        for fixed in u8::MIN..=u8::MAX {
+            // Exercise a nonzero byte offset, with unrelated neighbour bytes
+            // proving the optimized path consumes exactly one authoritative
+            // byte for this aligned chunk.
+            let mask = [0xa5, fixed, 0x5a];
+            let start = 8usize;
+            let end = 16usize;
+            let scalar = (start..end)
+                .filter(|&j| !fixed_routed_wire(&mask, j))
+                .collect::<Vec<_>>();
+            let mut scanned = Vec::new();
+            for_each_active_routed_wire(&mask, 0, start, end, |j| scanned.push(j));
+            assert_eq!(scanned, scalar, "index/order mismatch for fixed byte {fixed:#04x}");
+
+            let mut expected = [F::ONE; 4];
+            for &j in &scalar {
+                for lane in 0..4 {
+                    expected[lane] *= F::from_noncanonical_u64(
+                        raw_factors[(j + lane) % raw_factors.len()],
+                    );
+                }
+            }
+            let mut actual = [F::ONE; 4];
+            for_each_active_routed_wire(&mask, 0, start, end, |j| {
+                for lane in 0..4 {
+                    actual[lane] *= F::from_noncanonical_u64(
+                        raw_factors[(j + lane) % raw_factors.len()],
+                    );
+                }
+            });
+            for lane in 0..4 {
+                assert_eq!(
+                    actual[lane].to_noncanonical_u64(),
+                    expected[lane].to_noncanonical_u64(),
+                    "raw accumulator {lane} mismatch for fixed byte {fixed:#04x}"
+                );
+            }
+
+            // A non-aligned partial chunk must retain the scalar fallback.
+            let partial_scalar = (9..16)
+                .filter(|&j| !fixed_routed_wire(&mask, j))
+                .collect::<Vec<_>>();
+            let mut partial_scanned = Vec::new();
+            for_each_active_routed_wire(&mask, 0, 9, 16, |j| partial_scanned.push(j));
+            assert_eq!(partial_scanned, partial_scalar);
         }
     }
 
