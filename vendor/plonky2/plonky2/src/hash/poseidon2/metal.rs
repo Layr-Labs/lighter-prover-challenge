@@ -99,7 +99,11 @@ fn profile_command_buffer(
     command_buffer.add_completed_handler(&completed_handler);
 }
 
-const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
+const SHADER_SOURCE: &str = concat!(
+    include_str!("poseidon2.metal"),
+    "\n",
+    include_str!("static_roster_quotient_r2.metal")
+);
 
 /// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
 /// shader cache does not pay the MSL front end. Regenerate whenever
@@ -110,12 +114,16 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+/// SHA-256 of the exact747 split-roster source compiled into
+/// [`SHADER_METALLIB`].
+const STATIC_ROSTER_R2_SOURCE_SHA256: &str =
+    "dba6c1bcea4e1e72da53cfab104af765efa28ac0207b4ccb390510e78f0ecf90";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 12] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -126,6 +134,8 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
     "permutation_quotient",
+    "range_check_gate_quotient_static_chain_d14_r2",
+    "range_check_gate_quotient_static_tx_d16_r2",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -1083,10 +1093,19 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    /// Returns a pipeline only if its detached builder has already published
+    /// it. Unlike [`Self::get`], this never locks, takes or joins the builder;
+    /// an optional specialization must not extend the proving critical path.
+    fn try_get(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static STATIC_TX_RANGE_QUOTIENT_R2_PIPELINE: LazyPipeline = LazyPipeline::new();
+static STATIC_CHAIN_RANGE_QUOTIENT_R2_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
@@ -1098,6 +1117,54 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
     RANGE_CHECK_GATE_QUOTIENT_PIPELINE.get()
 }
 
+fn static_tx_range_quotient_r2_pipeline_ready() -> Option<&'static ComputePipelineState> {
+    STATIC_TX_RANGE_QUOTIENT_R2_PIPELINE.try_get()
+}
+
+fn static_chain_range_quotient_r2_pipeline_ready() -> Option<&'static ComputePipelineState> {
+    STATIC_CHAIN_RANGE_QUOTIENT_R2_PIPELINE.try_get()
+}
+
+const STATIC_CHAIN_RANGE_METADATA: [[u32; 10]; 8] = [
+    [0, 3, 0, 7, 1, 10, 26, 4, 0, 0],
+    [0, 4, 0, 7, 1, 11, 63, 2, 0, 0],
+    [0, 5, 0, 7, 1, 8, 22, 4, 0, 0],
+    [0, 6, 0, 7, 1, 9, 33, 1, 0, 0],
+    [1, 7, 7, 12, 1, 9, 44, 0, 0, 0],
+    [1, 8, 7, 12, 1, 12, 20, 0, 0, 0],
+    [2, 12, 12, 15, 1, 3, 3, 8, 0, 0],
+    [2, 13, 12, 15, 1, 6, 4, 4, 2, 4],
+];
+
+const STATIC_TX_RANGE_METADATA: [[u32; 10]; 18] = [
+    [2, 14, 12, 17, 1, 15, 8, 4, 0, 0],
+    [2, 15, 12, 17, 1, 5, 24, 4, 0, 0],
+    [2, 16, 12, 17, 1, 8, 16, 4, 0, 0],
+    [0, 2, 0, 7, 1, 10, 26, 6, 0, 0],
+    [0, 3, 0, 7, 1, 11, 63, 2, 0, 0],
+    [0, 4, 0, 7, 1, 8, 22, 6, 0, 0],
+    [0, 5, 0, 7, 1, 4, 5, 0, 0, 0],
+    [0, 6, 0, 7, 1, 5, 6, 0, 0, 0],
+    [1, 7, 7, 12, 1, 12, 20, 0, 0, 0],
+    [1, 10, 7, 12, 1, 11, 16, 4, 0, 0],
+    [1, 11, 7, 12, 1, 3, 3, 8, 0, 0],
+    [2, 13, 12, 17, 1, 6, 8, 3, 0, 6],
+    [3, 17, 17, 22, 1, 1, 10, 0, 8, 0],
+    [3, 18, 17, 22, 1, 2, 5, 6, 16, 2],
+    [3, 19, 17, 22, 1, 0, 3, 0, 16, 0],
+    [3, 20, 17, 22, 1, 1, 6, 0, 16, 0],
+    [3, 21, 17, 22, 1, 1, 4, 0, 24, 0],
+    [4, 22, 22, 24, 1, 6, 4, 4, 2, 6],
+];
+
+fn metadata_matches(metadata: &[u32], expected: &[[u32; 10]]) -> bool {
+    metadata.len() == expected.len() * 10
+        && metadata
+            .iter()
+            .copied()
+            .eq(expected.iter().flat_map(|record| record.iter().copied()))
+}
+
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     PERMUTATION_QUOTIENT_PIPELINE.get()
 }
@@ -1106,22 +1173,18 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+/// Starts optional pipeline builds off the context's blocking path.
 ///
-/// One thread each rather than one for both: they are the two slowest kernels
-/// in the shader, so serializing them would keep the GPU quotient path on the
-/// CPU for the sum of their lowerings instead of the larger of the two.
-///
-/// Scheduling only. The pipelines are the same objects the blocking build
-/// produced, lowered from the same library, so nothing they later compute can
-/// differ; only the instant at which they become available does.
+/// The current generic Range/U32 PSO is published before either exact-roster
+/// specialization is lowered. The generic builder then launches one detached
+/// successor that lowers transaction and chain R2 serially and returns
+/// immediately, so a caller joining it never waits for an optional R2 PSO. A
+/// proof therefore always has the current generic PSO available and only
+/// observes an R2 PSO after its `OnceLock` is populated; specialization never
+/// adds a caller join or concurrent R2 compiler requests.
 fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
-        (
-            "range_check_gate_quotient",
-            &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
-        ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
@@ -1153,6 +1216,90 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+
+    let device = device.clone();
+    let library = library.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-range-check-gate-quotient-family".to_owned())
+        .spawn(move || {
+            let lower = |name: &str| {
+                autoreleasepool(|| {
+                    library.get_function(name, None).ok().and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+                })
+            };
+
+            let generic = lower("range_check_gate_quotient");
+            let generic_available = generic.is_some();
+            if !generic_available {
+                log::debug!(
+                    "range_check_gate_quotient pipeline unavailable; evaluating those gates on the CPU"
+                );
+            }
+            let _ = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.built.set(generic);
+            if !generic_available {
+                let _ = STATIC_TX_RANGE_QUOTIENT_R2_PIPELINE.built.set(None);
+                let _ = STATIC_CHAIN_RANGE_QUOTIENT_R2_PIPELINE.built.set(None);
+                return;
+            }
+
+            // Do not keep the generic builder alive while optional static PSOs
+            // lower: `LazyPipeline::get` may join that handle. The successor is
+            // intentionally detached because static access is ready-only and
+            // never joins a builder. Its two Metal requests remain serial.
+            let static_device = device.clone();
+            let static_library = library.clone();
+            let static_spawned = std::thread::Builder::new()
+                .name("poseidon2-metal-range-static-r2".to_owned())
+                .spawn(move || {
+                    let lower_static = |name: &str| {
+                        autoreleasepool(|| {
+                            static_library.get_function(name, None).ok().and_then(|function| {
+                                static_device
+                                    .new_compute_pipeline_state_with_function(&function)
+                                    .ok()
+                            })
+                        })
+                    };
+                    for (name, slot) in [
+                        (
+                            "range_check_gate_quotient_static_tx_d16_r2",
+                            &STATIC_TX_RANGE_QUOTIENT_R2_PIPELINE,
+                        ),
+                        (
+                            "range_check_gate_quotient_static_chain_d14_r2",
+                            &STATIC_CHAIN_RANGE_QUOTIENT_R2_PIPELINE,
+                        ),
+                    ] {
+                        let pipeline = lower_static(name);
+                        if pipeline.is_none() {
+                            log::debug!(
+                                "{name} pipeline unavailable; retaining generic Range/U32 route"
+                            );
+                        }
+                        let _ = slot.built.set(pipeline);
+                    }
+                });
+            if static_spawned.is_err() {
+                let _ = STATIC_TX_RANGE_QUOTIENT_R2_PIPELINE.built.set(None);
+                let _ = STATIC_CHAIN_RANGE_QUOTIENT_R2_PIPELINE.built.set(None);
+            }
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.built.set(None);
+            let _ = STATIC_TX_RANGE_QUOTIENT_R2_PIPELINE.built.set(None);
+            let _ = STATIC_CHAIN_RANGE_QUOTIENT_R2_PIPELINE.built.set(None);
         }
     }
 }
@@ -2659,13 +2806,42 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
+        let is_static_chain = quotient_rows == (1 << 17)
+            && wires.rows == (1 << 17)
+            && step == 1
+            && alpha_stride == 123
+            && range_count == 0
+            && u32_count == 8
+            && metadata_matches(metadata, &STATIC_CHAIN_RANGE_METADATA);
+        let is_static_tx = quotient_rows == (1 << 19)
+            && wires.rows == (1 << 19)
+            && step == 1
+            && alpha_stride == 136
+            && range_count == 3
+            && u32_count == 15
+            && metadata_matches(metadata, &STATIC_TX_RANGE_METADATA);
+        let specialized = if is_static_chain {
+            static_chain_range_quotient_r2_pipeline_ready()
+                .map(|pipeline| (pipeline, "range_u32_quotient_static_chain_r2"))
+        } else if is_static_tx {
+            static_tx_range_quotient_r2_pipeline_ready()
+                .map(|pipeline| (pipeline, "range_u32_quotient_static_tx_r2"))
+        } else {
+            None
+        };
+        let (pipeline, profile_name) = match specialized {
+            Some(specialized) => specialized,
+            None => (
+                range_check_gate_quotient_pipeline()
+                    .ok_or("RangeCheck gate quotient pipeline unavailable")?,
+                "range_u32_quotient",
+            ),
+        };
         let len = quotient_rows
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
@@ -2702,7 +2878,7 @@ impl MetalShared {
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
                 command_buffer,
-                "range_u32_quotient",
+                profile_name,
                 (quotient_rows * (range_count + u32_count)) as u64,
             );
             command_buffer.commit();
@@ -3960,20 +4136,26 @@ mod tests {
     #[test]
     fn metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
-        let output = std::process::Command::new("/usr/bin/shasum")
-            .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
-            .output()
-            .expect("shasum must be available to verify the metallib is current");
-        assert!(output.status.success(), "shasum failed");
-        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
-        let digest = digest.split_whitespace().next().expect("empty shasum output");
-        assert_eq!(
-            digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
-             then update SHADER_SOURCE_SHA256 to {digest}."
-        );
+        for (name, expected) in [
+            ("poseidon2.metal", SHADER_SOURCE_SHA256),
+            (
+                "static_roster_quotient_r2.metal",
+                STATIC_ROSTER_R2_SOURCE_SHA256,
+            ),
+        ] {
+            let output = std::process::Command::new("/usr/bin/shasum")
+                .args(["-a", "256", &format!("{dir}/{name}")])
+                .output()
+                .expect("shasum must be available to verify the metallib is current");
+            assert!(output.status.success(), "shasum failed for {name}");
+            let digest =
+                String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+            let digest = digest.split_whitespace().next().expect("empty shasum output");
+            assert_eq!(
+                digest, expected,
+                "{name} changed but poseidon2.metallib was not regenerated"
+            );
+        }
     }
 
     /// The fallback in `MetalShared::new` hides a broken artifact behind a
