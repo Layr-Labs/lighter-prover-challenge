@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
     FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    ifft_with_options_and_prescaled_postscale,
 };
 use crate::types::Field;
 
@@ -78,6 +79,18 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Same as [`Self::coset_ifft_with_powers`], except the caller's powers
+    /// already contain the IFFT's `1/n` normalization. The post-pass then
+    /// performs one multiply per output slot instead of two; the values are
+    /// identical to the two-multiply form because the factors are equal and
+    /// field multiplication is commutative.
+    pub fn coset_ifft_with_prescaled_powers(
+        self,
+        prescaled_inverse_shift_powers: &[F],
+    ) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_prescaled_postscale(self, None, None, prescaled_inverse_shift_powers)
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
