@@ -2347,8 +2347,8 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2378,23 +2378,14 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        Some(match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2405,9 +2396,7 @@ fn compute_quotient_polys<
                     "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
                 if gpu_poseidon_quotient_diagnostics_enabled() {
-                    eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
-                    );
+                    eprintln!("[gpu-range-quotient] runtime failure; falling back to CPU: {error}");
                 }
                 let result = compute_quotient_polys(
                     common_data,
@@ -2427,23 +2416,14 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        })
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
+        Some(match job.finish() {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2464,16 +2444,43 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        })
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        // All three jobs share the single FIFO Metal queue and have already
+        // completed above.  Merge their point-major outputs in one parallel
+        // sweep instead of walking `quotient_values` once per job.  The old
+        // path also evaluated the same `Z_H(x)^{-1}` once per job. Keep the
+        // original multiply-then-add sequence for each producer so the raw
+        // Goldilocks representation is bit-for-bit identical to the former
+        // three-pass path; factoring the common multiplier is field-equivalent
+        // but can select a different non-canonical u64 representative. This
+        // still deletes two full read/modify/write passes in the common
+        // three-job case (16 MiB each at d16, 64 MiB each at d18 for the
+        // two-challenge input/output traffic) and two inverse-table lookups per
+        // quotient point without changing arithmetic order.
+        let gpu_values = [
+            gpu_poseidon_values,
+            gpu_range_values,
+            gpu_permutation_values,
+        ];
+        for values in gpu_values.iter().flatten() {
+            debug_assert_eq!(values.len(), quotient_values.len());
+        }
         quotient_values
             .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
+            .for_each(|(i, cpu_values)| {
                 let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                let offset = i * num_challenges;
+                for (challenge, cpu) in cpu_values.iter_mut().enumerate() {
+                    for values in gpu_values.iter().flatten() {
+                        *cpu += values[offset + challenge] * denominator_inv;
+                    }
                 }
             });
     }
