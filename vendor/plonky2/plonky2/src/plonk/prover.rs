@@ -1801,6 +1801,41 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Fold any number of point-major GPU quotient contributions into the CPU
+/// buffer with a single `Z_H^{-1}` multiply per point.
+///
+/// Algebraically identical to scaling each source on its own walk:
+/// `(p + r + perm) * inv == p*inv + r*inv + perm*inv`. One parallel pass
+/// instead of one pass per Metal job, and one `eval_inverse` instead of three.
+/// Does not change kernel outputs or the committed metallib.
+fn add_zh_scaled_gpu_terms<F: Field>(
+    quotient_values: &mut [F],
+    sources: &[&[F]],
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+    num_challenges: usize,
+) {
+    if sources.is_empty() {
+        return;
+    }
+    debug_assert!(num_challenges > 0);
+    debug_assert_eq!(quotient_values.len() % num_challenges, 0);
+    debug_assert!(sources.iter().all(|src| src.len() == quotient_values.len()));
+    quotient_values
+        .par_chunks_exact_mut(num_challenges)
+        .enumerate()
+        .for_each(|(i, cpu_values)| {
+            let base = i * num_challenges;
+            let inv = z_h_on_coset.eval_inverse(i);
+            for c in 0..num_challenges {
+                let mut extra = F::ZERO;
+                for src in sources {
+                    extra += src[base + c];
+                }
+                cpu_values[c] += extra * inv;
+            }
+        });
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2347,6 +2382,9 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let mut gpu_zh_sources: Vec<&[F]> = Vec::with_capacity(3);
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
         let gpu_values = match job.finish() {
             Ok(values) => {
@@ -2380,16 +2418,7 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_zh_sources.push(gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2429,16 +2458,7 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_zh_sources.push(gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2466,17 +2486,16 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_zh_sources.push(gpu_values);
     }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    add_zh_scaled_gpu_terms(
+        &mut quotient_values,
+        &gpu_zh_sources,
+        &z_h_on_coset,
+        num_challenges,
+    );
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
@@ -2663,6 +2682,7 @@ mod quotient_layout_tests {
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64};
+    use crate::field::zero_poly_coset::ZeroPolyOnCoset;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2709,6 +2729,42 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    #[test]
+    fn add_zh_scaled_gpu_terms_matches_per_source_scale() {
+        let z_h = ZeroPolyOnCoset::<F>::new(4, 3);
+        let n_points = (1 << 4) * (1 << 3);
+        let num_challenges = 2;
+        let len = n_points * num_challenges;
+        let mut cpu = vec![F::from_canonical_u64(7); len];
+        let poseidon: Vec<F> = (0..len)
+            .map(|i| F::from_canonical_u64((3 * i + 1) as u64))
+            .collect();
+        let range: Vec<F> = (0..len)
+            .map(|i| F::from_canonical_u64((5 * i + 2) as u64))
+            .collect();
+        let perm: Vec<F> = (0..len)
+            .map(|i| F::from_canonical_u64((11 * i + 3) as u64))
+            .collect();
+
+        let mut expected = cpu.clone();
+        for i in 0..n_points {
+            let inv = z_h.eval_inverse(i);
+            let base = i * num_challenges;
+            for c in 0..num_challenges {
+                expected[base + c] +=
+                    (poseidon[base + c] + range[base + c] + perm[base + c]) * inv;
+            }
+        }
+
+        super::add_zh_scaled_gpu_terms(
+            &mut cpu,
+            &[&poseidon, &range, &perm],
+            &z_h,
+            num_challenges,
+        );
+        assert_eq!(cpu, expected);
     }
 
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
