@@ -11,7 +11,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _}
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::fri::oracle::PolynomialBatch;
-use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::circuit_data::{CircuitData, GeneratorWatchIndex};
 use plonky2::plonk::proof::ProofWithPublicInputs;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
@@ -25,6 +25,25 @@ pub const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Releases every heap-backed field that is needed only while proving a circuit.
+/// `common` and `verifier_only` remain available to recursive circuit construction.
+pub(crate) fn release_prover_runtime_metadata(data: &mut CircuitData<F, C, D>) {
+    let prover = &mut data.prover_only;
+    prover.generators = Vec::new();
+    prover.generator_indices_by_watches = GeneratorWatchIndex::from_parts(vec![0], Vec::new());
+    prover.generator_watch_counts = Vec::new();
+    prover.constants_sigmas_commitment = PolynomialBatch::default();
+    prover.sigmas = Vec::new();
+    prover.subgroup = Vec::new();
+    prover.public_inputs = Vec::new();
+    prover.representative_map = Vec::new();
+    prover.fixed_routed_wires = Vec::new();
+    prover.fft_root_table = None;
+    prover.lookup_rows = Vec::new();
+    prover.lut_to_lookups = Vec::new();
+    prover.constants_sigmas_quotient_cache = None;
+}
 
 pub struct Circuits {
     pub heavy_tx_target: BlockTxTarget,
@@ -282,6 +301,21 @@ mod tests {
 
     use super::*;
 
+    fn allocated_pre_prover_payload_bytes(data: &CircuitData<F, C, D>) -> usize {
+        let prover = &data.prover_only;
+        std::mem::size_of_val(prover.generators.as_slice())
+            + std::mem::size_of_val(prover.generator_watch_counts.as_slice())
+            + std::mem::size_of_val(prover.generator_indices_by_watches.offsets())
+            + std::mem::size_of_val(prover.generator_indices_by_watches.watchers())
+            + prover.sigmas.iter().map(|v| std::mem::size_of_val(v.as_slice())).sum::<usize>()
+            + std::mem::size_of_val(prover.subgroup.as_slice())
+            + std::mem::size_of_val(prover.public_inputs.as_slice())
+            + std::mem::size_of_val(prover.representative_map.as_slice())
+            + std::mem::size_of_val(prover.fixed_routed_wires.as_slice())
+            + std::mem::size_of_val(prover.lookup_rows.as_slice())
+            + prover.lut_to_lookups.iter().map(|v| std::mem::size_of_val(v.as_slice())).sum::<usize>()
+    }
+
     #[test]
     fn production_mixed_circuit_parameters_are_fixed() {
         assert_eq!(CHAIN_ID, 304);
@@ -298,6 +332,51 @@ mod tests {
             .expect("embedded heavy dummy proof is invalid");
         let _: Proof = bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
             .expect("embedded light dummy proof is invalid");
+    }
+
+    #[test]
+    fn pre_prover_metadata_release_preserves_recursive_inputs() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let (_, mut pre_data) = Circuits::load_pre().expect("embedded pre circuit must load");
+                let common = pre_data.common.clone();
+                let verifier_only = pre_data.verifier_only.clone();
+                let released_payload = allocated_pre_prover_payload_bytes(&pre_data);
+                release_prover_runtime_metadata(&mut pre_data);
+                assert_eq!(pre_data.common, common);
+                assert_eq!(pre_data.verifier_only, verifier_only);
+                assert_eq!(allocated_pre_prover_payload_bytes(&pre_data), std::mem::size_of::<u32>());
+                assert!(released_payload >= 8 * 1024 * 1024);
+                eprintln!("released pre-prover payload lower bound: {released_payload} bytes");
+            })
+            .expect("pre metadata test thread must start")
+            .join()
+            .expect("pre metadata test thread must finish");
+    }
+
+    #[test]
+    #[ignore = "builds the final block circuit twice"]
+    fn pre_prover_metadata_release_preserves_final_circuit() {
+        let _ = rayon::ThreadPoolBuilder::new().stack_size(PROVER_THREAD_STACK_BYTES).build_global();
+        std::thread::Builder::new()
+            .stack_size(4 * PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let baseline = Circuits::from_embedded().expect("embedded baseline must load");
+                let (_, baseline_data) = baseline.build_block_circuit();
+                let expected_common = baseline_data.common.clone();
+                let expected_verifier = baseline_data.verifier_only.clone();
+                drop(baseline_data);
+                drop(baseline);
+                let mut released = Circuits::from_embedded().expect("embedded release case must load");
+                release_prover_runtime_metadata(&mut released.pre_data);
+                let (_, released_data) = released.build_block_circuit();
+                assert_eq!(released_data.common, expected_common);
+                assert_eq!(released_data.verifier_only, expected_verifier);
+            })
+            .expect("final circuit release test thread must start")
+            .join()
+            .expect("final circuit release test thread must finish");
     }
 }
 

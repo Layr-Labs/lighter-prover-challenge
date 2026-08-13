@@ -15,13 +15,12 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 
 use api::{
-    Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
-    PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
+    release_prover_runtime_metadata, Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF,
+    PROVER_THREAD_STACK_BYTES, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
 use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
 use circuit::types::config::{C, F};
-use plonky2::fri::oracle::PolynomialBatch;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -137,27 +136,11 @@ fn main() {
                 let (pre_target, mut pre_data) = pre_circuits;
                 let pre_proof =
                     prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
-                // The pre-execution circuit is proven exactly once, here, and this
-                // is that proof's last instruction. Its rate-2^3 constants/sigmas
-                // low-degree extension — 2^17 rows x 86 columns = 86 MiB, held in a
-                // CPU-visible Metal shared buffer whose release returns the pages to
-                // the OS immediately — is read only by proofs *of this circuit*
-                // (`fill_lde_batch` for the quotient and the FRI query openings), so
-                // it is unreachable from here on. The only later uses of `pre_data`
-                // are as an input to the final block circuit's construction, which
-                // reads `common` and `verifier_only` only (`BlockCircuit::define` ->
-                // `handle_proofs`: `constant_verifier_data(&..verifier_only)` and
-                // `verify_proof(.., &..common)`), and
-                // `release_finished_circuit_extensions`, which assigns the same
-                // empty value again.
-                //
-                // Without this the buffer stays resident from the first second of
-                // the process until the pipeline joins, i.e. across the entire
-                // transaction/chain phase, which is where five concurrent workers
-                // contend for the machine's memory. Value-exact and free: no
-                // quantity is computed differently and no work is added — storage
-                // that no subsequent read can reach is returned earlier.
-                pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+                // This circuit is proven exactly once. The final recursive circuit
+                // later reads only `common` and `verifier_only`, so its generators,
+                // watch index, sigma/subgroup values, routed-target maps, FFT roots,
+                // lookup placement and preprocessed extension are all dead now.
+                release_prover_runtime_metadata(&mut pre_data);
                 (pre_target, pre_data, pre_proof)
             })
             .expect("pre-execution startup thread must start");
