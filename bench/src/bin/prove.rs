@@ -44,6 +44,70 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+/// P-core logical CPU count on Apple Silicon (`hw.perflevel0.logicalcpu`).
+/// The ranked host is an M4 Pro (10P+4E); `available_parallelism()` is 14 and
+/// includes the E-cores. Rayon default-sizes to that 14, so every fork-join
+/// in the light spine can wait on a leaf the scheduler parked on an E-core.
+/// Isolate marker: qos-pool-1786670000.
+fn performance_core_count() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn sysctlbyname(
+                name: *const core::ffi::c_char,
+                oldp: *mut core::ffi::c_void,
+                oldlenp: *mut usize,
+                newp: *mut core::ffi::c_void,
+                newlen: usize,
+            ) -> i32;
+        }
+        let mut n: u32 = 0;
+        let mut len = core::mem::size_of::<u32>();
+        let rc = unsafe {
+            sysctlbyname(
+                b"hw.perflevel0.logicalcpu\0".as_ptr().cast(),
+                (&mut n as *mut u32).cast(),
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && n >= 2 {
+            return n as usize;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+}
+
+/// Pin a Rayon worker to `QOS_CLASS_USER_INITIATED` (0x19).
+///
+/// Same class as the GPU-holding transaction-proof threads
+/// (`mark_thread_user_initiated`). Not `USER_INTERACTIVE` (0x21): the spine
+/// thread uses that class specifically to outrank the pool, and raising the
+/// pool to 0x21 would invert that stack and let join leaves preempt the
+/// thread that holds the single Metal buffer set. `USER_INITIATED` is still
+/// a P-core-preferring class; `DEFAULT` is the one eligible for E-core
+/// demotion under contention. Best-effort: a nonzero return leaves the
+/// previous class, which is the tip's default-QoS behaviour.
+fn pin_rayon_worker_qos() {
+    #[cfg(target_os = "macos")]
+    {
+        #[allow(non_camel_case_types)]
+        type qos_class_t = u32;
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(
+                qos_class: qos_class_t,
+                relative_priority: i32,
+            ) -> i32;
+        }
+        unsafe {
+            let _ = pthread_set_qos_class_self_np(0x19, 0);
+        }
+    }
+}
+
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
@@ -64,8 +128,30 @@ fn main() {
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
+    // Size the global pool to the P-core cluster and pin every worker to
+    // USER_INITIATED. The harness launches via sandbox-exec with env_clear
+    // (TMPDIR only) — no taskpolicy, no process QoS ceiling, no
+    // RAYON_NUM_THREADS — so the tip's builder inherited 14 DEFAULT threads
+    // and every join completed at the speed of its slowest, possibly E-core,
+    // leaf. Scheduling only: the same closures run, proof bytes unchanged.
+    let p_cores = performance_core_count();
     rayon::ThreadPoolBuilder::new()
+        .num_threads(p_cores)
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn_handler(move |thread| {
+            let mut builder = std::thread::Builder::new();
+            if let Some(name) = thread.name() {
+                builder = builder.name(name.to_owned());
+            }
+            if let Some(stack_size) = thread.stack_size() {
+                builder = builder.stack_size(stack_size);
+            }
+            builder.spawn(move || {
+                pin_rayon_worker_qos();
+                thread.run();
+            })?;
+            Ok(())
+        })
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
