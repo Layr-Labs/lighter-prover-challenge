@@ -2334,15 +2334,8 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
+                // Numerators stay raw. Common Z_H(i)^-1 is applied once
+                // in the challenge-column scatter below.
             },
         );
 
@@ -2385,9 +2378,8 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2434,9 +2426,8 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2471,9 +2462,8 @@ fn compute_quotient_polys<
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
             .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2510,9 +2500,11 @@ fn compute_quotient_polys<
         .for_each(|(chunk_i, chunk)| {
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                let idx = base + k;
+                let scale = z_h_on_coset.eval_inverse(idx);
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    // SAFETY: `idx` lies in this chunk's disjoint range.
+                    unsafe { *column.0.add(idx) = value * scale };
                 }
             }
         });
