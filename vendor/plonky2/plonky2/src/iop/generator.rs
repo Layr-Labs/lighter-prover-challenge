@@ -121,7 +121,7 @@ fn run_generator_worklist<
 >(
     witness: &mut PartitionWitness<F>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
-    unresolved_watches: &mut [usize],
+    unresolved_watches: &mut [u32],
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
     mut pending_generator_indices: Vec<usize>,
@@ -165,7 +165,7 @@ fn run_generator_worklist<
             // records its generators in ready-set order, so the merge below observes ascending
             // generator-index order regardless of thread count.
             let round_witness: &PartitionWitness<F> = witness;
-            let round_unresolved_watches: &[usize] = unresolved_watches;
+            let round_unresolved_watches: &[u32] = unresolved_watches;
             let round_generator_is_expired: &[bool] = generator_is_expired;
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
@@ -294,16 +294,17 @@ fn run_generator_worklist<
 /// here by decrementing each watcher of a representative at the moment that representative is
 /// *first* populated. `set_target_returning_rep` returns the representative only on first
 /// population, so aliased or duplicated inputs decrement at most once and no counter can
-/// underflow. This is the exact complement of the previous initialization, which instead walked
+/// underflow. The `u32` representation matches the checked circuit-build and decode bounds on
+/// this count. This is the exact complement of the previous initialization, which instead walked
 /// the entire representative-keyed watcher map on every proof and counted the unpopulated
 /// entries — an O(total watch edges) traversal of prover data that is identical for every proof of
 /// a given circuit, repeated once per proof.
 fn seed_inputs_and_unresolved_watches<F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
-    generator_watch_counts: &[usize],
+    generator_watch_counts: &[u32],
     generator_indices_by_watches: &GeneratorWatchIndex,
-) -> Result<Vec<usize>> {
+) -> Result<Vec<u32>> {
     let mut unresolved_watches = generator_watch_counts.to_vec();
 
     for (t, v) in inputs.target_values.into_iter() {
@@ -329,7 +330,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
 /// inputs decrement at most once and no counter can underflow.
 pub struct PartitionSeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
+    unresolved_watches: &'b mut [u32],
     generator_indices_by_watches: &'b GeneratorWatchIndex,
 }
 
@@ -366,7 +367,7 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
 /// worklist; expired generators are skipped.
 pub struct PartitionFeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
+    unresolved_watches: &'b mut [u32],
     generator_is_expired: &'b [bool],
     pending_generator_indices: &'b mut Vec<usize>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
@@ -415,7 +416,7 @@ pub struct PendingPartitionWitness<
     const D: usize,
 > {
     witness: PartitionWitness<'a, F>,
-    unresolved_watches: Vec<usize>,
+    unresolved_watches: Vec<u32>,
     generator_is_expired: Vec<bool>,
     remaining_generators: usize,
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
@@ -1240,7 +1241,11 @@ mod tests {
             }
         }
         assert_eq!(
-            prover_data.generator_watch_counts, occurrences,
+            prover_data.generator_watch_counts,
+            occurrences
+                .into_iter()
+                .map(|count| u32::try_from(count).unwrap())
+                .collect::<Vec<_>>(),
             "builder-derived watch counts disagree with the watcher index"
         );
 
@@ -1282,7 +1287,11 @@ mod tests {
             )?;
 
             assert_eq!(
-                new_counts, legacy_counts,
+                new_counts,
+                legacy_counts
+                    .into_iter()
+                    .map(|count| u32::try_from(count).unwrap())
+                    .collect::<Vec<_>>(),
                 "unresolved-watch counts diverge from the legacy map scan"
             );
             assert_eq!(new_witness.set_bitmap, legacy_witness.set_bitmap);
