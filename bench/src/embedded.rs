@@ -14,6 +14,8 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use std::path::PathBuf;
+
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +30,30 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+
+const CS_MERKLE_OUT_DIR: &str = env!("OUT_DIR");
+
+/// Load a compile-time CS Merkle sidecar. Prefer `dirname(exe)/csmerkle/`
+/// (sandbox-readable: the profile allowlists the worker's directory) and
+/// fall back to the baked `OUT_DIR` (a subdirectory of that same tree).
+/// Missing / empty files return `None` and the loader hashes as today.
+fn load_cs_merkle_sidecar(name: &str) -> Option<Vec<u8>> {
+    let file = format!("{name}.csmerkle");
+    let mut candidates = Vec::with_capacity(2);
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("csmerkle").join(&file));
+        }
+    }
+    candidates.push(PathBuf::from(CS_MERKLE_OUT_DIR).join(&file));
+    for path in candidates {
+        match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => return Some(bytes),
+            _ => {}
+        }
+    }
+    None
+}
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -76,7 +102,8 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         !blob.is_empty(),
         "embedded circuit blob {name} is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
     );
-    deserialize_embedded::<T>(blob)
+    let sidecar = load_cs_merkle_sidecar(name);
+    deserialize_embedded::<T>(blob, sidecar.as_deref())
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
