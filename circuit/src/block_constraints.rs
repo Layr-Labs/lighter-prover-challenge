@@ -256,14 +256,34 @@ impl BlockCircuit {
         Ok(pw)
     }
 
+    /// Writes the light-chain proof directly into any writable witness. This
+    /// is the map-free form used by the split final-block witness pipeline.
+    pub fn witness_inputs_light_chain_into<W: Witness<F> + WitnessWrite<F>>(
+        target: &BlockTarget,
+        light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)
+    }
+
     /// The light-chain witness inputs, fed once the light transaction chain proof is available.
     pub fn witness_inputs_light_chain(
         target: &BlockTarget,
         light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.light_tx_chain_proof, light_tx_chain_proof)?;
+        Self::witness_inputs_light_chain_into(target, light_tx_chain_proof, &mut pw)?;
         Ok(pw)
+    }
+
+    /// Writes the heavy-chain proof directly into any writable witness. This
+    /// is the map-free form used by the split final-block witness pipeline.
+    pub fn witness_inputs_heavy_chain_into<W: Witness<F> + WitnessWrite<F>>(
+        target: &BlockTarget,
+        heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.heavy_tx_chain_proof, heavy_tx_chain_proof)
     }
 
     /// The heavy-chain witness inputs, fed once the heavy transaction chain proof is available.
@@ -272,7 +292,7 @@ impl BlockCircuit {
         heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
-        pw.set_proof_with_pis_target(&target.heavy_tx_chain_proof, heavy_tx_chain_proof)?;
+        Self::witness_inputs_heavy_chain_into(target, heavy_tx_chain_proof, &mut pw)?;
         Ok(pw)
     }
 
