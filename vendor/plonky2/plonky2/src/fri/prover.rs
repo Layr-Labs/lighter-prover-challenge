@@ -285,7 +285,7 @@ pub(crate) fn fri_proof_of_work<
     // obtaining our duplex's post-state which contains the PoW response.
     let mut duplex_intermediate_state = challenger.sponge_state;
     let witness_input_pos = challenger.input_buffer.len();
-    duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
+    duplex_intermediate_state.set_from_slice(&challenger.input_buffer, 0);
 
     let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
         .into_par_iter()

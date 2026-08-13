@@ -892,12 +892,10 @@ fn compute_lookup_polys<
         final_poly_vecs.push(PolynomialValues::<F>::new(vec![F::ZERO; degree]));
     }
 
-    for LookupWire {
-        last_lu_gate: last_lu_row,
-        last_lut_gate: last_lut_row,
-        first_lut_gate: first_lut_row,
-    } in prover_data.lookup_rows.clone()
-    {
+    for wire in &prover_data.lookup_rows {
+        let last_lu_row = wire.last_lu_gate;
+        let last_lut_row = wire.last_lut_gate;
+        let first_lut_row = wire.first_lut_gate;
         // Set values for partial Sums and RE.
         for row in (last_lut_row..(first_lut_row + 1)).rev() {
             // Get combos for Sum.
