@@ -299,20 +299,17 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
         }
         Some(scales) => {
             assert_eq!(scales.len(), n);
-            // Fuse the caller's coefficient scaling into the same writes as
-            // IFFT reversal and normalization, preserving multiplication order.
-            buffer[0] *= n_inv;
-            buffer[n / 2] *= n_inv;
+            // Caller supplies the full per-coefficient postscale, including
+            // 1/n when this is a coset IFFT. One multiply per slot.
+            let _ = n_inv;
             buffer[0] *= scales[0];
             if n > 1 {
                 buffer[n / 2] *= scales[n / 2];
             }
             for i in 1..(n / 2) {
                 let j = n - i;
-                let mut coeffs_i = buffer[j] * n_inv;
-                let mut coeffs_j = buffer[i] * n_inv;
-                coeffs_i *= scales[i];
-                coeffs_j *= scales[j];
+                let coeffs_i = buffer[j] * scales[i];
+                let coeffs_j = buffer[i] * scales[j];
                 buffer[i] = coeffs_i;
                 buffer[j] = coeffs_j;
             }
@@ -1336,6 +1333,90 @@ fn fft_classic_simd_layers_parallel<P, M>(
 {
     let lg_packed_width = log2_strict(P::WIDTH);
     let scalar_len = packed_values.len() * P::WIDTH;
+
+    // Large Goldilocks transforms already take this parallel entry. The
+    // serial path fuses stage pairs with the 4-wide NEON kernel; this
+    // path was still one whole-buffer layer at a time. Same kernels,
+    // same 4q block size, parallelized over those blocks.
+    #[cfg(target_arch = "aarch64")]
+    if start + 2 <= end
+        && scalar_len >= PARALLEL_FFT_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<WideGoldilocksField>()
+    {
+        let mut lg_half_m = start;
+        {
+            // SAFETY: TypeId proves P is WideGoldilocksField, so the packed
+            // slice is 4 * len contiguous Goldilocks scalars. Same cast as
+            // the serial fused-pair path.
+            let scalars = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            while lg_half_m + 2 <= end {
+                let w1_row = unsafe {
+                    let row = &root_table[lg_half_m];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    let row = &root_table[lg_half_m + 1];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                let q = 1usize << lg_half_m;
+                let block_scalars = 4 * q;
+                let block_count = scalars.len() / block_scalars;
+                if block_count >= 2 {
+                    MaybeParChunksMut::par_chunks_mut(scalars, block_scalars).for_each(
+                        |block| {
+                            fft_classic_simd_two_layers_neon_w4(
+                                block, lg_half_m, w1_row, w2_row,
+                            );
+                        },
+                    );
+                } else {
+                    fft_classic_simd_two_layers_neon_w4(
+                        scalars, lg_half_m, w1_row, w2_row,
+                    );
+                }
+                lg_half_m += 2;
+            }
+        }
+        if lg_half_m < end {
+            let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
+            let block_count = packed_values.len() / packed_m;
+            if block_count >= 2 {
+                MaybeParChunksMut::par_chunks_mut(packed_values, packed_m).for_each(
+                    |block| {
+                        fft_classic_simd_single_layer_with::<P, M>(
+                            block,
+                            lg_half_m,
+                            lg_packed_width,
+                            root_table,
+                        );
+                    },
+                );
+            } else {
+                fft_classic_simd_single_layer_with::<P, M>(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+            }
+        }
+        return;
+    }
+
     for lg_half_m in start..end {
         let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
         let block_count = packed_values.len() / packed_m;
