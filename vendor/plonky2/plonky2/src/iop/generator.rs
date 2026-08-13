@@ -105,6 +105,102 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+/// The first witness round always visits every generator in index order. Keep that dense range
+/// implicit on the sequential production paths; sparse resume rounds still own their exact queue.
+enum GeneratorWorklist {
+    All,
+    Sparse(Vec<usize>),
+}
+
+// Archive retry fingerprint: the implicit initial range is unchanged.
+
+#[cfg(test)]
+std::thread_local! {
+    /// Test-only oracle switch restoring exact747's materialized dense first queue.
+    static LEGACY_DENSE_INITIAL_WORKLIST: core::cell::Cell<bool> = const {
+        core::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+fn legacy_dense_initial_worklist_enabled() -> bool {
+    LEGACY_DENSE_INITIAL_WORKLIST.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+struct LegacyDenseInitialWorklistGuard {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl LegacyDenseInitialWorklistGuard {
+    fn new() -> Self {
+        Self {
+            previous: LEGACY_DENSE_INITIAL_WORKLIST.with(|flag| flag.replace(true)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for LegacyDenseInitialWorklistGuard {
+    fn drop(&mut self) {
+        LEGACY_DENSE_INITIAL_WORKLIST.with(|flag| flag.set(self.previous));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_sequential_generator_round<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    generator_indices: impl IntoIterator<Item = usize>,
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &mut [usize],
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    buffer: &mut GeneratedValues<F>,
+    next_pending_generator_indices: &mut Vec<usize>,
+) -> Result<()> {
+    let generators = &prover_data.generators;
+    let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+
+    for generator_idx in generator_indices {
+        if generator_is_expired[generator_idx] {
+            continue;
+        }
+
+        let finished = generators[generator_idx].0.run_with_ready_hint(
+            witness,
+            buffer,
+            unresolved_watches[generator_idx] == 0,
+        );
+        if finished {
+            generator_is_expired[generator_idx] = true;
+            *remaining_generators -= 1;
+        }
+
+        // Merge any generated values into our witness and, for each newly populated target's
+        // representative, immediately enqueue the unfinished generators watching it.
+        for (t, v) in buffer.target_values.drain(..) {
+            if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                    for &watching_generator_idx in watchers {
+                        if !generator_is_expired[watching_generator_idx] {
+                            debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
+                            unresolved_watches[watching_generator_idx] -= 1;
+                            next_pending_generator_indices.push(watching_generator_idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -124,7 +220,7 @@ fn run_generator_worklist<
     unresolved_watches: &mut [usize],
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
-    mut pending_generator_indices: Vec<usize>,
+    initial_worklist: GeneratorWorklist,
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
@@ -132,6 +228,31 @@ fn run_generator_worklist<
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
+
+    let (mut pending_generator_indices, mut initial_all_generators) = match initial_worklist {
+        GeneratorWorklist::All => (Vec::new(), true),
+        GeneratorWorklist::Sparse(indices) => (indices, false),
+    };
+
+    // Preserve the existing parallel first-round behavior exactly. Only sequential starts avoid
+    // materializing the dense 0..N queue.
+    let mut materialize_initial_all = parallel_rounds && generators.len() >= parallel_threshold;
+    #[cfg(test)]
+    {
+        materialize_initial_all |= legacy_dense_initial_worklist_enabled();
+    }
+    if initial_all_generators {
+        if materialize_initial_all {
+            pending_generator_indices = (0..generators.len()).collect();
+            initial_all_generators = false;
+        } else {
+            // Retain exact747's N-entry allocation/capacity without initializing or scanning the
+            // dense indices. After the first round's swap this buffer again backs the following
+            // sparse queue, so CM deletes only the dense write/read pass and cannot add a later
+            // geometric-growth chain.
+            pending_generator_indices = Vec::with_capacity(generators.len());
+        }
+    }
 
     // The two round queues are swapped rather than reallocated. Every round used
     // to start from a fresh `Vec::new()` and end by *moving* it over the old
@@ -147,8 +268,27 @@ fn run_generator_worklist<
     let mut next_pending_generator_indices = Vec::new();
 
     // Keep running generators until we fail to make progress.
-    while !pending_generator_indices.is_empty() {
+    while initial_all_generators || !pending_generator_indices.is_empty() {
         next_pending_generator_indices.clear();
+
+        if initial_all_generators {
+            run_sequential_generator_round(
+                0..generators.len(),
+                witness,
+                prover_data,
+                unresolved_watches,
+                generator_is_expired,
+                remaining_generators,
+                &mut buffer,
+                &mut next_pending_generator_indices,
+            )?;
+            initial_all_generators = false;
+            core::mem::swap(
+                &mut pending_generator_indices,
+                &mut next_pending_generator_indices,
+            );
+            continue;
+        }
 
         if parallel_rounds && pending_generator_indices.len() >= parallel_threshold {
             // A generator can be enqueued once per newly populated watch, and may have expired
@@ -239,42 +379,16 @@ fn run_generator_worklist<
             continue;
         }
 
-        for &generator_idx in &pending_generator_indices {
-            if generator_is_expired[generator_idx] {
-                continue;
-            }
-
-            let finished = generators[generator_idx].0.run_with_ready_hint(
-                witness,
-                &mut buffer,
-                unresolved_watches[generator_idx] == 0,
-            );
-            if finished {
-                generator_is_expired[generator_idx] = true;
-                *remaining_generators -= 1;
-            }
-
-            // Merge any generated values into our witness and, for each newly populated
-            // target's representative, immediately enqueue the unfinished generators watching
-            // it. The witness merge (`witness`) and the watcher bookkeeping
-            // (`generator_indices_by_watches`, `generator_is_expired`, `unresolved_watches`)
-            // touch disjoint state, so fusing the two passes deletes the per-run intermediate
-            // rep Vec while preserving both the `set_target_returning_rep` call order and the
-            // pending-queue push order exactly.
-            for (t, v) in buffer.target_values.drain(..) {
-                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
-                    if let Some(watchers) = generator_indices_by_watches.get(&watch) {
-                        for &watching_generator_idx in watchers {
-                            if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        run_sequential_generator_round(
+            pending_generator_indices.iter().copied(),
+            witness,
+            prover_data,
+            unresolved_watches,
+            generator_is_expired,
+            remaining_generators,
+            &mut buffer,
+            &mut next_pending_generator_indices,
+        )?;
 
         core::mem::swap(
             &mut pending_generator_indices,
@@ -482,7 +596,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            GeneratorWorklist::All,
             parallel_threshold,
         )?;
 
@@ -531,7 +645,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            GeneratorWorklist::All,
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
@@ -572,7 +686,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut self.unresolved_watches,
             &mut self.generator_is_expired,
             &mut self.remaining_generators,
-            pending_generator_indices,
+            GeneratorWorklist::Sparse(pending_generator_indices),
             self.parallel_threshold,
         )
     }
@@ -601,7 +715,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut self.unresolved_watches,
             &mut self.generator_is_expired,
             &mut self.remaining_generators,
-            pending_generator_indices,
+            GeneratorWorklist::Sparse(pending_generator_indices),
             self.parallel_threshold,
         )
     }
@@ -1536,6 +1650,99 @@ mod tests {
             &mut crate::util::timing::TimingTree::default(),
         )?;
         outer.verify(proof)
+    }
+
+    /// CM differential: the implicit initial `0..N` range must reach the same scheduler state as
+    /// exact747's materialized dense Vec, while later sparse feed and contradiction behavior stay
+    /// byte-for-byte equivalent. Two implicit runs isolate the circuit's random-generator slots.
+    #[test]
+    fn implicit_all_matches_legacy_dense_initial_worklist() -> Result<()> {
+        use crate::field::types::PrimeField64;
+
+        let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
+        let num_random_generators = count_random_generators(&outer.prover_only);
+
+        let mut implicit =
+            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
+        let mut implicit_repeat =
+            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
+        let mut legacy = {
+            let _legacy = LegacyDenseInitialWorklistGuard::new();
+            assert!(legacy_dense_initial_worklist_enabled());
+            PendingPartitionWitness::start(
+                early_inputs.clone(),
+                &outer.prover_only,
+                &outer.common,
+            )?
+        };
+
+        let compare = |reference: &PendingPartitionWitness<'_, F, C, D>,
+                       repeat: &PendingPartitionWitness<'_, F, C, D>,
+                       actual: &PendingPartitionWitness<'_, F, C, D>| {
+            assert_eq!(reference.witness.set_bitmap, actual.witness.set_bitmap);
+            assert_eq!(reference.unresolved_watches, actual.unresolved_watches);
+            assert_eq!(reference.generator_is_expired, actual.generator_is_expired);
+            assert_eq!(reference.remaining_generators, actual.remaining_generators);
+
+            let mut nondeterministic_positions = 0usize;
+            for rep in 0..reference.witness.values.len() {
+                if !reference.witness.is_set_by_rep_index(rep) {
+                    continue;
+                }
+                let reference_raw = reference.witness.values[rep].to_noncanonical_u64();
+                let repeat_raw = repeat.witness.values[rep].to_noncanonical_u64();
+                if reference_raw == repeat_raw {
+                    assert_eq!(
+                        reference_raw,
+                        actual.witness.values[rep].to_noncanonical_u64(),
+                        "legacy dense initial queue changed raw witness slot {rep}"
+                    );
+                } else {
+                    nondeterministic_positions += 1;
+                }
+            }
+            assert!(
+                nondeterministic_positions <= num_random_generators,
+                "{nondeterministic_positions} nondeterministic positions exceed the {num_random_generators} random generators"
+            );
+        };
+
+        compare(&implicit, &implicit_repeat, &legacy);
+        implicit.feed(late_inputs.clone())?;
+        implicit_repeat.feed(late_inputs.clone())?;
+        legacy.feed(late_inputs)?;
+        compare(&implicit, &implicit_repeat, &legacy);
+
+        let (&conflict_target, &conflict_value) = early_inputs
+            .target_values
+            .iter()
+            .next()
+            .expect("recursive fixture has early inputs");
+        let mut contradictory = PartialWitness::new();
+        contradictory.set_target(conflict_target, conflict_value + F::ONE)?;
+
+        let implicit_error = {
+            let mut pending = PendingPartitionWitness::start(
+                early_inputs.clone(),
+                &outer.prover_only,
+                &outer.common,
+            )?;
+            pending.feed(contradictory.clone()).unwrap_err().to_string()
+        };
+        let legacy_error = {
+            let mut pending = {
+                let _legacy = LegacyDenseInitialWorklistGuard::new();
+                PendingPartitionWitness::start(
+                    early_inputs,
+                    &outer.prover_only,
+                    &outer.common,
+                )?
+            };
+            pending.feed(contradictory).unwrap_err().to_string()
+        };
+        assert_eq!(implicit_error, legacy_error, "conflict error/order changed");
+
+        Ok(())
     }
 
     #[test]
