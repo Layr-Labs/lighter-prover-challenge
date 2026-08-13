@@ -845,7 +845,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         params: &[F],
         constants: &[F],
     ) -> (usize, usize) {
-        let num_gates = self.num_gates();
         // One `Gate::id()` rendering for the whole call. The previous body allocated a `GateRef`
         // (an `Arc`) and probed `current_slots` twice with it; because `GateRef`'s `Hash` and
         // `Eq` are both `Gate::id()` — `format!("{self:?}")` — each probe re-rendered the gate's
@@ -860,23 +859,35 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         // gates share this entry exactly when their `id()`s — `Debug` renderings of all of those
         // fields — agree, so the cached value is the one the uncached call would have returned.
         let num_ops = *gate_slot.num_ops.get_or_insert_with(|| gate.num_ops());
-        let slot = gate_slot.current_slot.get(params);
-        let (gate_idx, slot_idx) = if let Some(&s) = slot {
-            s
+        let slot = gate_slot.current_slot.get(params).copied();
+        if let Some((gate_idx, slot_idx)) = slot {
+            let current_slot = &mut self.current_slots.get_mut(&id).unwrap().current_slot;
+            if slot_idx == num_ops - 1 {
+                // We've filled up the slots at this index.
+                current_slot.remove(params);
+            } else {
+                // The key already exists. Update its slot in place instead of allocating a fresh
+                // `params.to_vec()` which `HashMap::insert` would immediately discard in favour
+                // of the equal stored key.
+                *current_slot
+                    .get_mut(params)
+                    .expect("current slot disappeared during an allocation-free update") =
+                    (gate_idx, slot_idx + 1);
+            }
+            (gate_idx, slot_idx)
         } else {
-            self.add_gate(gate, constants.to_vec());
-            (num_gates, 0)
-        };
-        let current_slot = &mut self.current_slots.get_mut(&id).unwrap().current_slot;
-        if slot_idx == num_ops - 1 {
-            // We've filled up the slots at this index.
-            current_slot.remove(params);
-        } else {
-            // Increment the slot operation index.
-            current_slot.insert(params.to_vec(), (gate_idx, slot_idx + 1));
+            // A constants/parameter vector is owned only by a newly-created packed gate row.
+            // Calls which reuse that row stay entirely on borrowed stack slices.
+            let gate_idx = self.add_gate(gate, constants.to_vec());
+            if num_ops > 1 {
+                self.current_slots
+                    .get_mut(&id)
+                    .unwrap()
+                    .current_slot
+                    .insert(params.to_vec(), (gate_idx, 1));
+            }
+            (gate_idx, 0)
         }
-
-        (gate_idx, slot_idx)
     }
 
     fn fri_params(&self, degree_bits: usize) -> FriParams {

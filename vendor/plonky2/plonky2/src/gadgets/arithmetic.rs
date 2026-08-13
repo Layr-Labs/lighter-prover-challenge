@@ -121,7 +121,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
     fn add_base_addition_operation(&mut self, operation: BaseAdditionOperation<F>) -> Target {
         let gate = AdditionGate::new_from_config(&self.config);
-        let constants = vec![operation.const_0, operation.const_1];
+        let constants = [operation.const_0, operation.const_1];
         let (gate, i) = self.find_slot(gate, &constants, &constants);
         let wires_addend_0 = Target::wire(gate, AdditionGate::wire_ith_addend_0(i));
         let wires_addend_1 = Target::wire(gate, AdditionGate::wire_ith_addend_1(i));
@@ -137,7 +137,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         operation: BaseMultiplicationOperation<F>,
     ) -> Target {
         let gate = MultiplicationGate::new_from_config(&self.config);
-        let constants = vec![operation.const_0];
+        let constants = [operation.const_0];
         let (gate, i) = self.find_slot(gate, &constants, &constants);
         let wires_multiplicand_0 =
             Target::wire(gate, MultiplicationGate::wire_ith_multiplicand_0(i));
@@ -152,7 +152,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
     fn add_base_arithmetic_operation(&mut self, operation: BaseArithmeticOperation<F>) -> Target {
         let gate = ArithmeticGate::new_from_config(&self.config);
-        let constants = vec![operation.const_0, operation.const_1];
+        let constants = [operation.const_0, operation.const_1];
         let (gate, i) = self.find_slot(gate, &constants, &constants);
         let wires_multiplicand_0 = Target::wire(gate, ArithmeticGate::wire_ith_multiplicand_0(i));
         let wires_multiplicand_1 = Target::wire(gate, ArithmeticGate::wire_ith_multiplicand_1(i));
@@ -427,7 +427,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         if self.config.equality_gate_enable() {
             let gate = EqualityGate::new_from_config(&self.config);
             let gate_ref = gate.clone();
-            let constants = vec![F::ONE];
+            let constants = [F::ONE];
             let (gate, i) = self.find_slot(gate, &constants, &constants);
 
             let wires_x = Target::wire(gate, gate_ref.wire_ith_element_0(i));
