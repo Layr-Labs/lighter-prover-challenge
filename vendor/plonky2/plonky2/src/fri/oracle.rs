@@ -782,6 +782,28 @@ fn accumulate_linear_quotient<F: Field>(
     let d = composition_poly.len();
     let coeffs = &composition_poly.coeffs;
     let buf = &mut final_poly.coeffs;
+    // The first opening batch starts with an empty accumulator. Its shifted
+    // contribution is therefore identically zero, so write the synthetic
+    // quotient directly instead of zero-filling `d` slots and evaluating
+    // `ZERO * shift + quotient_i` in every one. The top slot is the same
+    // explicit zero pad as the general path, and the recurrence below uses
+    // the same multiply-add order as the general path.
+    if buf.is_empty() {
+        buf.reserve(d);
+        let spare = &mut buf.spare_capacity_mut()[..d];
+        if d != 0 {
+            spare[d - 1].write(F::ZERO);
+            let mut acc = F::ZERO;
+            for i in (0..d - 1).rev() {
+                acc = acc * z + coeffs[i + 1];
+                spare[i].write(acc);
+            }
+        }
+        // SAFETY: the branch above writes every slot in `0..d`: the explicit
+        // pad at `d - 1` and every lower coefficient in the descending loop.
+        unsafe { buf.set_len(d) };
+        return;
+    }
     // Entries past the padded quotient's length only see the shift.
     for l in buf.iter_mut().skip(d) {
         *l *= shift;
@@ -809,6 +831,22 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    type TestExtension = <GoldilocksField as Extendable<2>>::Extension;
+
+    /// Keeps the exact empty-accumulator production call shape visible in an
+    /// optimized libtest assembly artifact. This is diagnostic only; the raw
+    /// differential below is the correctness oracle.
+    #[inline(never)]
+    fn first_opening_direct_codegen_probe(
+        composition_poly: &PolynomialCoeffs<TestExtension>,
+        z: TestExtension,
+        shift: TestExtension,
+    ) -> PolynomialCoeffs<TestExtension> {
+        let mut final_poly = PolynomialCoeffs::empty();
+        accumulate_linear_quotient(&mut final_poly, composition_poly, z, shift);
+        final_poly
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
@@ -1083,6 +1121,120 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+        }
+    }
+
+    /// The direct first-opening path must be raw-word identical to the exact
+    /// generic path it bypasses at every production degree. Inputs deliberately
+    /// contain noncanonical Goldilocks limbs. A second call at the same degree
+    /// proves that the later nonempty accumulator still takes the unchanged
+    /// shift-plus-quotient path.
+    #[test]
+    fn first_opening_direct_matches_generic_production_lengths_raw_words() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::PrimeField64;
+
+        type F = TestExtension;
+        const GOLDILOCKS_ORDER: u64 = 0xffff_ffff_0000_0001;
+
+        fn next_word(state: &mut u64, word_index: &mut usize) -> u64 {
+            *state ^= state.wrapping_shl(13);
+            *state ^= state.wrapping_shr(7);
+            *state ^= state.wrapping_shl(17);
+            let random = *state;
+            let result = match *word_index % 11 {
+                0 => GOLDILOCKS_ORDER,
+                1 => GOLDILOCKS_ORDER + 1,
+                2 => u64::MAX,
+                3 => GOLDILOCKS_ORDER + (random & 0xffff_fffe),
+                _ => random,
+            };
+            *word_index += 1;
+            result
+        }
+
+        fn next_extension(state: &mut u64, word_index: &mut usize) -> F {
+            F::from_basefield_array([
+                GoldilocksField(next_word(state, word_index)),
+                GoldilocksField(next_word(state, word_index)),
+            ])
+        }
+
+        fn raw(values: &[F]) -> Vec<u64> {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .collect()
+        }
+
+        fn exact_generic_path(
+            final_poly: &mut PolynomialCoeffs<F>,
+            composition_poly: &PolynomialCoeffs<F>,
+            z: F,
+            shift: F,
+        ) {
+            let d = composition_poly.len();
+            let coeffs = &composition_poly.coeffs;
+            let buf = &mut final_poly.coeffs;
+            for value in buf.iter_mut().skip(d) {
+                *value *= shift;
+            }
+            if buf.len() < d {
+                buf.resize(d, F::ZERO);
+            }
+            if d == 0 {
+                return;
+            }
+            buf[d - 1] *= shift;
+            let mut acc = F::ZERO;
+            for i in (0..d - 1).rev() {
+                acc = acc * z + coeffs[i + 1];
+                buf[i] = buf[i] * shift + acc;
+            }
+        }
+
+        for d in [1usize << 14, 1usize << 16, 1usize << 18] {
+            let mut state = 0xd1b5_4a32_d192_ed03u64 ^ d as u64;
+            let mut word_index = 0usize;
+            let first = PolynomialCoeffs::new(
+                (0..d)
+                    .map(|_| next_extension(&mut state, &mut word_index))
+                    .collect(),
+            );
+            let first_z = next_extension(&mut state, &mut word_index);
+            let first_shift = next_extension(&mut state, &mut word_index);
+
+            let mut expected = PolynomialCoeffs::empty();
+            exact_generic_path(&mut expected, &first, first_z, first_shift);
+            let actual = first_opening_direct_codegen_probe(&first, first_z, first_shift);
+            assert_eq!(
+                raw(&actual.coeffs),
+                raw(&expected.coeffs),
+                "empty accumulator at degree {d}"
+            );
+
+            let second = PolynomialCoeffs::new(
+                (0..d)
+                    .map(|_| next_extension(&mut state, &mut word_index))
+                    .collect(),
+            );
+            let second_z = next_extension(&mut state, &mut word_index);
+            let second_shift = next_extension(&mut state, &mut word_index);
+            let mut actual_nonempty = actual;
+            exact_generic_path(&mut expected, &second, second_z, second_shift);
+            accumulate_linear_quotient(
+                &mut actual_nonempty,
+                &second,
+                second_z,
+                second_shift,
+            );
+            assert_eq!(
+                raw(&actual_nonempty.coeffs),
+                raw(&expected.coeffs),
+                "nonempty accumulator at degree {d}"
+            );
+            assert!(word_index / 11 > 0, "noncanonical input schedule engaged");
         }
     }
 
