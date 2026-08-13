@@ -677,6 +677,11 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // The streamed sponge also grows its inter-pass state from the
+                // recurring d16 allocation to 12 lanes over the final 2^21
+                // LDE rows. Its first absorb pass overwrites every lane, so
+                // page-fault it here rather than in the serial final proof.
+                plonky2::hash::poseidon2::prewarm_streamed_state(1 << 21);
             })
             .ok();
     }

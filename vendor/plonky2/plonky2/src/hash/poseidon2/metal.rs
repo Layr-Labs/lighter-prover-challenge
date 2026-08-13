@@ -568,6 +568,17 @@ impl ColumnStorePool {
 /// mismatch simply misses and falls through to a fresh allocation.
 static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
 
+/// One-shot, pre-faulted inter-pass state for the final streamed commitment.
+///
+/// Kept separate from [`STREAMED_BUFFERS`] so the background page walk never
+/// takes the lock held by an active d16 streamed build. The final build takes
+/// this buffer only when it outgrows the resident state; a size mismatch or
+/// lock race simply falls through to the normal allocator.
+static PREWARMED_STREAMED_STATE: Mutex<Option<Buffer>> = Mutex::new(None);
+
+/// Poseidon2's streamed sponge parks all twelve state lanes between passes.
+const STREAMED_STATE_LANES: usize = 12;
+
 /// Allocates a `bytes`-sized shared buffer, touches one word per page so the
 /// kernel's zero-fill happens here (off the critical path) rather than under
 /// the final block's LDE fill, and stashes it for the next oversized
@@ -599,6 +610,65 @@ pub fn prewarm_large_column_store(bytes: u64) {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+}
+
+/// Pre-faults a streamed-sponge state buffer for `leaf_count` leaves.
+///
+/// The first absorb pass initializes a local zero state and overwrites every
+/// lane in this buffer without reading it. Touching the pages ahead of time is
+/// therefore unobservable to the commitment while moving unified-memory page
+/// faults out of the final proof's serial window. Best-effort throughout: the
+/// dedicated stash is never allowed to block an active or arriving build.
+pub fn prewarm_streamed_state(leaf_count: usize) {
+    let Some(bytes) = leaf_count
+        .checked_mul(STREAMED_STATE_LANES)
+        .and_then(|words| words.checked_mul(size_of::<u64>()))
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return;
+    };
+    let Some(context) = shared_context() else {
+        return;
+    };
+    let buffer = autoreleasepool(|| {
+        context
+            .device
+            .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+    });
+    let base = buffer.contents().cast::<u8>();
+    if base.is_null() {
+        return;
+    }
+    const PAGE: usize = 16 * 1024;
+    for offset in (0..bytes as usize).step_by(PAGE) {
+        // SAFETY: `offset < bytes == buffer.length()` and a shared Metal
+        // buffer is CPU-visible for its whole lifetime.
+        unsafe { base.add(offset).write_volatile(0) };
+    }
+
+    if let Ok(mut slot) = PREWARMED_STREAMED_STATE.try_lock() {
+        if slot
+            .as_ref()
+            .map_or(true, |resident| resident.length() < bytes)
+        {
+            *slot = Some(buffer);
+        }
+    }
+}
+
+/// Takes a stashed buffer only when it covers the requested byte length.
+/// Mismatches remain stashed and lock contention is a cache miss, never a
+/// reason to delay the scored path.
+fn take_fitting_buffer(slot: &Mutex<Option<Buffer>>, bytes: u64) -> Option<Buffer> {
+    let mut slot = slot.try_lock().ok()?;
+    if slot
+        .as_ref()
+        .is_some_and(|buffer| buffer.length() >= bytes)
+    {
+        slot.take()
+    } else {
+        None
     }
 }
 
@@ -2081,7 +2151,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let total_node_count = 2 * leaf_count - cap_count;
     let output_len = total_node_count.checked_mul(4)?;
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
-    let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
+    let state_bytes = leaf_count
+        .checked_mul(STREAMED_STATE_LANES)?
+        .checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
     let mut buffers = STREAMED_BUFFERS.lock().ok()?;
@@ -2089,18 +2161,33 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
     if needs_new {
-        *buffers = Some(autoreleasepool(|| {
-            (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-            )
-        }));
+        let (old_state, old_output) = buffers
+            .take()
+            .map_or((None, None), |(state, output)| (Some(state), Some(output)));
+        let state = old_state
+            .filter(|state| state.length() >= state_bytes as u64)
+            .or_else(|| {
+                take_fitting_buffer(&PREWARMED_STREAMED_STATE, state_bytes as u64)
+            })
+            .unwrap_or_else(|| {
+                autoreleasepool(|| {
+                    context.device.new_buffer(
+                        state_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                })
+            });
+        let output = old_output
+            .filter(|output| output.length() >= output_bytes as u64)
+            .unwrap_or_else(|| {
+                autoreleasepool(|| {
+                    context.device.new_buffer(
+                        output_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                })
+            });
+        *buffers = Some((state, output));
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
@@ -4024,6 +4111,75 @@ mod tests {
 
         pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
         assert!(pool.free.is_empty(), "oversized output must not be cached");
+    }
+
+    #[test]
+    fn prewarmed_streamed_state_take_is_sized_and_nonblocking() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = |bytes| {
+            autoreleasepool(|| {
+                device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            })
+        };
+
+        let fitting = buffer(128);
+        let fitting_ptr = fitting.contents();
+        let slot = Mutex::new(Some(fitting));
+        let taken = take_fitting_buffer(&slot, 64).expect("larger state must be reusable");
+        assert_eq!(taken.contents(), fitting_ptr);
+        assert!(slot.lock().unwrap().is_none(), "a fitting state is consumed");
+
+        let too_small = buffer(32);
+        let too_small_ptr = too_small.contents();
+        *slot.lock().unwrap() = Some(too_small);
+        assert!(take_fitting_buffer(&slot, 64).is_none());
+        assert_eq!(
+            slot.lock().unwrap().as_ref().unwrap().contents(),
+            too_small_ptr,
+            "a size mismatch must remain a cache miss without losing ownership"
+        );
+
+        let guard = slot.lock().unwrap();
+        assert!(
+            take_fitting_buffer(&slot, 16).is_none(),
+            "stash contention must not block the scored caller"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn streamed_first_pass_overwrites_state_without_reading_it() {
+        let body = SHADER_SOURCE
+            .split_once("kernel void poseidon2_absorb_pass(")
+            .expect("streamed absorb kernel")
+            .1
+            .split("\nkernel void ")
+            .next()
+            .expect("streamed absorb kernel body");
+        let zero_state = body.find("ulong st[12] = { 0 };").expect("zero state");
+        let read_guard = body
+            .find("if (first_pass == 0u)")
+            .expect("first-pass read guard");
+        let state_read = body
+            .find("st[i] = state[")
+            .expect("inter-pass state read");
+        let state_write = body
+            .find("state[(ulong)i * leaf_count + gid] = st[i]")
+            .expect("inter-pass state overwrite");
+
+        assert!(zero_state < read_guard && read_guard < state_read);
+        assert!(state_read < state_write);
+        assert_eq!(
+            body.matches("st[i] = state[").count(),
+            1,
+            "all streamed-state reads must remain behind the first-pass guard"
+        );
+        assert!(
+            body.contains("for (uint i = 0; i < 12; ++i)"),
+            "the guarded read and final write cover all parked lanes"
+        );
     }
 
     #[test]
