@@ -1626,11 +1626,27 @@ kernel void poseidon2_hash_leaves(
         return;
     }
 
+    // Width eight is the recurring one-block commitment shape. Fixed bounds
+    // let the Metal compiler unroll the absorb and keep its addressing scalar.
+    if (leaf_width == 8) {
+        ulong state[12] = { 0 };
+        for (uint i = 0; i < 8; ++i) {
+            state[i] = input[i];
+        }
+        poseidon2(state, parameters);
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(state[i]);
+        }
+        return;
+    }
+
     ulong state[12] = { 0 };
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(input[offset + i]);
+            // All following arithmetic is residue-exact for an arbitrary u64
+            // representative, so canonicalizing every absorb load is dead.
+            state[i] = input[offset + i];
         }
         poseidon2(state, parameters);
     }
@@ -1749,11 +1765,23 @@ kernel void poseidon2_hash_leaves_colmajor(
         return;
     }
 
+    if (leaf_width == 8) {
+        ulong state[12] = { 0 };
+        for (uint i = 0; i < 8; ++i) {
+            state[i] = leaves[(ulong)i * leaf_count + gid];
+        }
+        poseidon2(state, parameters);
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(state[i]);
+        }
+        return;
+    }
+
     ulong state[12] = { 0 };
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+            state[i] = leaves[(ulong)(offset + i) * leaf_count + gid];
         }
         poseidon2(state, parameters);
     }
@@ -1815,7 +1843,7 @@ kernel void poseidon2_absorb_pass(
         }
     }
     for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        st[i] = leaves[(ulong)(col_start + i) * leaf_count + gid];
     }
     poseidon2(st, parameters);
     if (final_pass != 0u) {
