@@ -89,6 +89,11 @@ impl<F: Extendable<2>> Field for QuadraticExtension<F> {
         ))
     }
 
+    #[inline]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        F::extension_multiply_accumulate(*self, x, y)
+    }
+
     // Algorithm 11.3.4 in Handbook of Elliptic and Hyperelliptic Curve Cryptography.
     fn try_inverse(&self) -> Option<Self> {
         if self.is_zero() {

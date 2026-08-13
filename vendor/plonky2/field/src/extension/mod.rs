@@ -99,6 +99,18 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// `acc + x * y` in the extension. Default is two operations; a base
+    /// field may fuse the multiply-add and delay reduction.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_multiply_accumulate(
+        acc: Self::Extension,
+        x: Self::Extension,
+        y: Self::Extension,
+    ) -> Self::Extension {
+        acc + x * y
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

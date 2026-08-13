@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_multiply_accumulate(
+        acc: QuadraticExtension<Self>,
+        x: QuadraticExtension<Self>,
+        y: QuadraticExtension<Self>,
+    ) -> QuadraticExtension<Self> {
+        ext2_multiply_accumulate(acc, x, y)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -217,6 +226,33 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     let (sum, carry) = lo.overflowing_add((a as u128) * (b as u128));
     *lo = sum;
     *hi += carry as u32;
+}
+
+/// `acc + x * y` in GF(p^2) with one reduction per limb.
+/// c0 = acc0 + a0*b0 + 7*a1*b1; c1 = acc1 + a0*b1 + a1*b0.
+#[inline]
+fn ext2_multiply_accumulate(
+    acc: QuadraticExtension<GoldilocksField>,
+    x: QuadraticExtension<GoldilocksField>,
+    y: QuadraticExtension<GoldilocksField>,
+) -> QuadraticExtension<GoldilocksField> {
+    let QuadraticExtension([acc0, acc1]) = acc;
+    let QuadraticExtension([a0, a1]) = x;
+    let QuadraticExtension([b0, b1]) = y;
+    let (mut c0l, mut c0h) = (acc0.0 as u128, 0u32);
+    let (mut c0w_l, mut c0w_h) = (0u128, 0u32);
+    let (mut c1l, mut c1h) = (acc1.0 as u128, 0u32);
+    u160_add_product(&mut c0l, &mut c0h, a0.0, b0.0);
+    u160_add_product(&mut c0w_l, &mut c0w_h, a1.0, b1.0);
+    let (c0w_l, c0w_h) = u160_times_7(c0w_l, c0w_h);
+    let (c0l, carry) = c0l.overflowing_add(c0w_l);
+    let c0h = c0h + c0w_h + carry as u32;
+    u160_add_product(&mut c1l, &mut c1h, a0.0, b1.0);
+    u160_add_product(&mut c1l, &mut c1h, a1.0, b0.0);
+    QuadraticExtension([
+        unsafe { reduce160(c0l, c0h) },
+        unsafe { reduce160(c1l, c1h) },
+    ])
 }
 
 /// Compute `sum_i extension_values[i].scalar_mul(base_scalars[i])` in

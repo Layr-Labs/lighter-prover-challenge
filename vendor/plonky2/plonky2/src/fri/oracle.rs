@@ -798,8 +798,8 @@ fn accumulate_linear_quotient<F: Field>(
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
     let mut acc = F::ZERO;
     for i in (0..d - 1).rev() {
-        acc = acc * z + coeffs[i + 1];
-        buf[i] = buf[i] * shift + acc;
+        acc = coeffs[i + 1].multiply_accumulate(acc, z);
+        buf[i] = acc.multiply_accumulate(buf[i], shift);
     }
 }
 
