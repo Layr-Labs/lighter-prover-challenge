@@ -680,11 +680,23 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    #[inline]
+    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        inputs.map(Self::permute)
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    #[inline]
+    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        let [a, b, c, d] = inputs;
+        let (a, b, c, d) = <F as Poseidon2>::poseidon2_x4(a, b, c, d);
+        [a, b, c, d]
     }
 }
 
@@ -726,6 +738,15 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    #[inline]
+    fn permute_quad(states: &mut [Self; 4]) {
+        let inputs = (*states).map(|permutation| permutation.state);
+        let outputs = T::permute_quad(inputs);
+        for (state, output) in states.iter_mut().zip(outputs) {
+            state.state = output;
+        }
     }
 
     fn squeeze(&self) -> &[T] {
@@ -1214,6 +1235,32 @@ mod pair_hash_tests {
 
     use super::*;
     use crate::plonk::config::Hasher;
+
+    #[test]
+    fn permutation_quad_matches_scalar_in_all_four_lanes() {
+        let base =
+            Poseidon2Permutation::<F>::new((0..WIDTH).map(|i| F::from_canonical_usize(10_000 + i)));
+        let candidates = [17_u64, 29, 41, 53];
+        let witness_input_pos = 6;
+        let mut quad = [base; 4];
+        for (state, candidate) in quad.iter_mut().zip(candidates) {
+            state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+        }
+
+        let mut scalar = quad;
+        for state in &mut scalar {
+            state.permute();
+        }
+        Poseidon2Permutation::<F>::permute_quad(&mut quad);
+
+        for lane in 0..4 {
+            assert_eq!(
+                quad[lane].as_ref(),
+                scalar[lane].as_ref(),
+                "quad permutation changed lane {lane}"
+            );
+        }
+    }
 
     /// `add_rc` calls `add_canonical_u64`, whose safety and single-correction
     /// argument both require canonical round constants.
