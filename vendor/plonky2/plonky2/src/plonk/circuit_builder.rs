@@ -1272,6 +1272,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             self.sigma_vecs(&k_is, &subgroup)
         );
 
+        // The representative forest now contains the complete copy-constraint relation. No later
+        // preprocessing phase reads the construction-time edge list, so release it before commit.
+        drop(core::mem::take(&mut self.copy_constraints));
+
         // Precompute FFT roots.
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
         let fft_root_table = fft_root_table(max_fft_points);
@@ -1321,6 +1325,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 })
                 .collect(),
         );
+
+        // All constant/selector/sigma columns and gate generators have been materialized. The
+        // concrete construction rows are no longer needed by the remaining indexing passes.
+        drop(core::mem::take(&mut self.gate_instances));
 
         // Index generator indices by their watched targets.
         //
