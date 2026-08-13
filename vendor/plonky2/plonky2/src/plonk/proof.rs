@@ -312,6 +312,45 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+const OPENING_EVAL_GROUP_WIDTH: usize = 4;
+
+/// Evaluate ordered batches at one extension-field point, four polynomials at
+/// a time when a complete group is available. The grouped path gives a field
+/// implementation one shared powers-table stream while preserving the exact
+/// one-polynomial dot-product operation for every lane and for the tail.
+fn eval_polynomial_groups<F: RichField + Extendable<D>, const D: usize>(
+    pows: &[F::Extension],
+    batches: &[&[PolynomialCoeffs<F>]],
+) -> Vec<F::Extension> {
+    let polynomials: Vec<&PolynomialCoeffs<F>> =
+        batches.iter().flat_map(|batch| batch.iter()).collect();
+    let mut evaluations = vec![F::Extension::ZERO; polynomials.len()];
+
+    evaluations
+        .par_chunks_mut(OPENING_EVAL_GROUP_WIDTH)
+        .zip(polynomials.par_chunks(OPENING_EVAL_GROUP_WIDTH))
+        .for_each(|(output_group, polynomial_group)| {
+            if output_group.len() == OPENING_EVAL_GROUP_WIDTH {
+                let grouped = F::extension_base_dot_product_four(
+                    pows,
+                    [
+                        &polynomial_group[0].coeffs,
+                        &polynomial_group[1].coeffs,
+                        &polynomial_group[2].coeffs,
+                        &polynomial_group[3].coeffs,
+                    ],
+                );
+                output_group.copy_from_slice(&grouped);
+            } else {
+                for (output, polynomial) in output_group.iter_mut().zip(polynomial_group) {
+                    *output = F::extension_base_dot_product(pows, &polynomial.coeffs);
+                }
+            }
+        });
+
+    evaluations
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -378,21 +417,38 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
                 .collect::<Vec<_>>()
         };
-        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
-            eval_polynomials(pows, &c.polynomials)
-        };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
+        // The zeta opening contains four independent commitment batches. Its
+        // polynomials all consume the same zeta table, so evaluate the
+        // concatenated ordered stream in four-lane groups. This is distinct
+        // from changing the field arithmetic: each lane still uses the
+        // field's established delayed-reduction dot product.
+        let constants_sigmas_len = constants_sigmas_commitment.polynomials.len();
+        let wires_len = wires_commitment.polynomials.len();
+        let zs_partial_products_lookup_len =
+            zs_partial_products_lookup_commitment.polynomials.len();
+        let quotient_offset = constants_sigmas_len + wires_len + zs_partial_products_lookup_len;
+        let mut zeta_evals = eval_polynomial_groups(
+            &zeta_pows,
+            &[
+                &constants_sigmas_commitment.polynomials,
+                &wires_commitment.polynomials,
+                &zs_partial_products_lookup_commitment.polynomials,
+                &quotient_polys_commitment.polynomials,
+            ],
+        );
+        let quotient_polys = zeta_evals.split_off(quotient_offset);
+        let zs_partial_products_lookup_eval =
+            zeta_evals.split_off(constants_sigmas_len + wires_len);
+        let wires = zeta_evals.split_off(constants_sigmas_len);
+        let constants_sigmas_eval = zeta_evals;
 
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
         let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
+            wires,
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             // Partial-product polynomials are opened only at `zeta`, never at
             // `g * zeta`; evaluate only the shifted Z polynomials consumed by
@@ -521,7 +577,7 @@ mod tests {
 
     use anyhow::Result;
     use itertools::Itertools;
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{Field, PrimeField64, Sample};
 
     use super::*;
     use crate::fri::reduction_strategies::FriReductionStrategy;
@@ -532,6 +588,88 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn opening_group_evaluation_matches_per_polynomial_raw_limbs() {
+        type F = crate::field::goldilocks_field::GoldilocksField;
+        type E = <F as Extendable<2>>::Extension;
+
+        fn next_u64(state: &mut u64) -> u64 {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            *state
+        }
+
+        fn raw(value: E) -> [u64; 2] {
+            <E as FieldExtension<2>>::to_basefield_array(&value)
+                .map(|limb| limb.to_noncanonical_u64())
+        }
+
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        let zeta = <E as FieldExtension<2>>::from_basefield_array([
+            F::from_noncanonical_u64(u64::MAX - 11),
+            F::from_noncanonical_u64(next_u64(&mut state)),
+        ]);
+        let pows: Vec<E> = zeta.powers().take(32).collect();
+
+        for (batch_sizes, ragged) in [
+            (vec![86, 136, 20, 16], false),
+            (vec![1, 7, 32, 5], true),
+            (vec![0, 0, 0, 0], true),
+        ] {
+            let mut polynomial_index = 0;
+            let batches: Vec<Vec<PolynomialCoeffs<F>>> = batch_sizes
+                .iter()
+                .map(|&batch_size| {
+                    (0..batch_size)
+                        .map(|_| {
+                            let coefficient_count = if ragged {
+                                [0, 1, 7, 31, 32, 39][polynomial_index % 6]
+                            } else {
+                                pows.len()
+                            };
+                            polynomial_index += 1;
+                            PolynomialCoeffs::new(
+                                (0..coefficient_count)
+                                    .map(|coefficient_index| {
+                                        let random = next_u64(&mut state);
+                                        let value = if coefficient_index % 3 == 0 {
+                                            u64::MAX - (random & 0xffff)
+                                        } else {
+                                            random
+                                        };
+                                        F::from_noncanonical_u64(value)
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .collect()
+                })
+                .collect();
+            let batch_slices: Vec<&[PolynomialCoeffs<F>]> =
+                batches.iter().map(Vec::as_slice).collect();
+
+            let expected: Vec<E> = batches
+                .iter()
+                .flat_map(|batch| batch.iter())
+                .map(|polynomial| {
+                    <F as Extendable<2>>::extension_base_dot_product(&pows, &polynomial.coeffs)
+                })
+                .collect();
+            let actual = eval_polynomial_groups::<F, 2>(&pows, &batch_slices);
+
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    raw(actual),
+                    raw(expected),
+                    "raw mismatch for batches {batch_sizes:?} at ordered polynomial {index}"
+                );
+            }
+        }
+        assert_ne!(state, 0, "the deterministic seed must stay nonzero");
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {

@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_four(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars: [&[Self]; 4],
+    ) -> [QuadraticExtension<Self>; 4] {
+        ext2_base_scalar_dot_product_four(extension_values, base_scalars)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -274,6 +282,74 @@ fn ext2_base_scalar_dot_product(
     while start < len {
         let end = len.min(start + MAX_TERMS_PER_REDUCTION);
         result += reduce_chunk(&extension_values[start..end], &base_scalars[start..end]);
+        start = end;
+    }
+    result
+}
+
+/// Compute four Ext2-by-base dot products with a common extension-value table.
+///
+/// The production opening path evaluates several degree-sized polynomials at
+/// one point. Each lane retains `ext2_base_scalar_dot_product`'s delayed
+/// reduction and representative, while the shared powers table is read once
+/// for all four lanes. If a lane is shorter than the table, fall back to the
+/// single-lane implementation so the trait's independent zip semantics are
+/// preserved exactly.
+#[inline]
+fn ext2_base_scalar_dot_product_four(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars: [&[GoldilocksField]; 4],
+) -> [QuadraticExtension<GoldilocksField>; 4] {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    if base_scalars
+        .iter()
+        .any(|scalars| scalars.len() < extension_values.len())
+    {
+        return base_scalars.map(|scalars| ext2_base_scalar_dot_product(extension_values, scalars));
+    }
+    if extension_values.is_empty() {
+        return [QuadraticExtension::ZERO; 4];
+    }
+
+    let reduce_chunk = |values: &[QuadraticExtension<GoldilocksField>],
+                        scalars: [&[GoldilocksField]; 4]| {
+        debug_assert!(scalars.iter().all(|scalars| scalars.len() >= values.len()));
+        let (mut lo0, mut hi0) = ([0u128; 4], [0u32; 4]);
+        let (mut lo1, mut hi1) = ([0u128; 4], [0u32; 4]);
+
+        for (index, &QuadraticExtension([a0, a1])) in values.iter().enumerate() {
+            for lane in 0..4 {
+                let scalar = scalars[lane][index];
+                u160_add_product(&mut lo0[lane], &mut hi0[lane], a0.0, scalar.0);
+                u160_add_product(&mut lo1[lane], &mut hi1[lane], a1.0, scalar.0);
+            }
+        }
+
+        // SAFETY: every lane has at most `MAX_TERMS_PER_REDUCTION` products,
+        // so the same bound used by the one-lane routine applies separately.
+        core::array::from_fn(|lane| {
+            QuadraticExtension([unsafe { reduce160(lo0[lane], hi0[lane]) }, unsafe {
+                reduce160(lo1[lane], hi1[lane])
+            }])
+        })
+    };
+
+    let first_end = extension_values.len().min(MAX_TERMS_PER_REDUCTION);
+    let mut result = reduce_chunk(
+        &extension_values[..first_end],
+        core::array::from_fn(|lane| &base_scalars[lane][..first_end]),
+    );
+    let mut start = first_end;
+    while start < extension_values.len() {
+        let end = extension_values.len().min(start + MAX_TERMS_PER_REDUCTION);
+        let next = reduce_chunk(
+            &extension_values[start..end],
+            core::array::from_fn(|lane| &base_scalars[lane][start..end]),
+        );
+        for lane in 0..4 {
+            result[lane] += next[lane];
+        }
         start = end;
     }
     result
@@ -760,6 +836,7 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 
 #[cfg(test)]
 mod tests {
+    use super::{ext2_base_scalar_dot_product, ext2_base_scalar_dot_product_four};
     use crate::extension::quadratic::QuadraticExtension;
     use crate::extension::quartic::QuarticExtension;
     use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
@@ -884,6 +961,69 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_base_scalar_dot_product_four_matches_single_lane_raw() {
+        let mut state = 0xC6BC_2796_92B5_CC83u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let raw = |value: Q2| value.0.map(|limb| limb.0);
+
+        for len in [0, 1, 2, 7, 31, 32, 33, 127, 257] {
+            let values: Vec<Q2> = (0..len)
+                .map(|_| {
+                    QuadraticExtension([
+                        GF::from_noncanonical_u64(next()),
+                        GF::from_noncanonical_u64(next()),
+                    ])
+                })
+                .collect();
+            let scalars: [Vec<GF>; 4] = core::array::from_fn(|lane| {
+                (0..len)
+                    .map(|index| {
+                        GF::from_noncanonical_u64(next().wrapping_add((lane + index) as u64))
+                    })
+                    .collect()
+            });
+            let scalar_slices: [&[GF]; 4] = core::array::from_fn(|lane| scalars[lane].as_slice());
+
+            let expected: [Q2; 4] = core::array::from_fn(|lane| {
+                ext2_base_scalar_dot_product(&values, scalar_slices[lane])
+            });
+            let actual = ext2_base_scalar_dot_product_four(&values, scalar_slices);
+            for lane in 0..4 {
+                assert_eq!(
+                    raw(actual[lane]),
+                    raw(expected[lane]),
+                    "raw lane {lane} mismatch for shared length {len}"
+                );
+            }
+
+            if len > 1 {
+                let ragged = [
+                    &scalars[0][..len],
+                    &scalars[1][..len - 1],
+                    &scalars[2][..1],
+                    &scalars[3][..0],
+                ];
+                let expected: [Q2; 4] = core::array::from_fn(|lane| {
+                    ext2_base_scalar_dot_product(&values, ragged[lane])
+                });
+                let actual = ext2_base_scalar_dot_product_four(&values, ragged);
+                for lane in 0..4 {
+                    assert_eq!(
+                        raw(actual[lane]),
+                        raw(expected[lane]),
+                        "raw lane {lane} mismatch for ragged shared length {len}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
