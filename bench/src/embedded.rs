@@ -3,7 +3,7 @@
 
 //! Embedded startup circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
+//! `build.rs` constructs the five startup circuits and final block circuit during the untimed compile
 //! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
 //! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
 //! exact `Circuits` value `Circuits::new` builds, several times faster than
@@ -14,6 +14,7 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -81,6 +83,14 @@ fn load_blob<T: serde::de::DeserializeOwned>(
 }
 
 impl Circuits {
+    /// Loads the final block circuit built in the untimed compile job. Unlike
+    /// the five startup circuits this value is not retained in `Circuits`: it
+    /// is handed directly to the final-witness lane, preserving its lifetime
+    /// and early-release behavior while deleting repeated runtime construction.
+    pub(crate) fn load_block_embedded() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockTarget>("block", BLOCK_BLOB)
+    }
+
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
     /// behind the remaining circuit loads.
@@ -261,13 +271,102 @@ mod tests {
             rebuilt_data.common == embedded_data.common,
             "{name}: common circuit data diverges"
         );
-
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
-        assert!(
-            rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
+        assert_eq!(
+            rebuilt_data.prover_only.fixed_routed_wires,
+            embedded_data.prover_only.fixed_routed_wires,
+            "{name}: fixed-routed mask diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.generator_indices_by_watches,
+            embedded_data.prover_only.generator_indices_by_watches,
+            "{name}: generator watch index diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.generator_watch_counts,
+            embedded_data.prover_only.generator_watch_counts,
+            "{name}: generator watch counts diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.sigmas,
+            embedded_data.prover_only.sigmas,
+            "{name}: sigmas diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.subgroup,
+            embedded_data.prover_only.subgroup,
+            "{name}: subgroup diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.public_inputs,
+            embedded_data.prover_only.public_inputs,
+            "{name}: public inputs diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.representative_map,
+            embedded_data.prover_only.representative_map,
+            "{name}: representative map diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.fft_root_table,
+            embedded_data.prover_only.fft_root_table,
+            "{name}: FFT root table diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.lookup_rows,
+            embedded_data.prover_only.lookup_rows,
+            "{name}: lookup rows diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.lut_to_lookups,
+            embedded_data.prover_only.lut_to_lookups,
+            "{name}: lookup values diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_cache,
+            embedded_data.prover_only.constants_sigmas_quotient_cache,
+            "{name}: constants/sigmas quotient cache diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_step,
+            embedded_data.prover_only.constants_sigmas_quotient_step,
+            "{name}: constants/sigmas quotient step diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_domain,
+            embedded_data.prover_only.constants_sigmas_quotient_domain,
+            "{name}: constants/sigmas quotient domain diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.circuit_digest,
+            embedded_data.prover_only.circuit_digest,
+            "{name}: circuit digest diverges"
+        );
+        let rebuilt_commitment = &rebuilt_data.prover_only.constants_sigmas_commitment;
+        let embedded_commitment = &embedded_data.prover_only.constants_sigmas_commitment;
+        assert_eq!(
+            rebuilt_commitment.polynomials,
+            embedded_commitment.polynomials,
+            "{name}: constants/sigmas polynomials diverge"
+        );
+        assert_eq!(
+            rebuilt_commitment.merkle_tree.num_leaves,
+            embedded_commitment.merkle_tree.num_leaves,
+            "{name}: constants/sigmas leaf count diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.degree_log,
+            embedded_commitment.degree_log,
+            "{name}: constants/sigmas degree diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.rate_bits,
+            embedded_commitment.rate_bits,
+            "{name}: constants/sigmas rate diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.blinding,
+            embedded_commitment.blinding,
+            "{name}: constants/sigmas blinding diverges"
         );
     }
 
@@ -424,11 +523,67 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),
                 "embedded circuit blob {name} is an empty stub"
             );
         }
+    }
+
+    /// Loading the separately embedded final circuit exercises every encoded
+    /// section and the verifier-cap check without running a proof.
+    #[test]
+    fn embedded_block_loads() {
+        on_big_stack(|| {
+            let (target, data) = Circuits::load_block_embedded()
+                .expect("embedded final block circuit must deserialize");
+            assert!(!bincode::serialize(&target).unwrap().is_empty());
+            assert!(!data.prover_only.generators.is_empty());
+            assert!(!data.verifier_only.constants_sigmas_cap.0.is_empty());
+        });
+    }
+
+    /// Manual bounded A/B for the scored final-circuit lane. This constructs
+    /// circuit data but never creates a witness or runs the prover.
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn embedded_block_load_timing() {
+        use std::time::Instant;
+
+        use circuit::block_constraints::{BlockCircuit, Circuit as _};
+        use circuit::types::config::CIRCUIT_CONFIG;
+        use crate::api::ON_CHAIN_OPERATIONS_LIMIT;
+
+        on_big_stack(|| {
+            let circuits = Circuits::from_embedded().expect("startup circuits must load");
+
+            let started = Instant::now();
+            let embedded = Circuits::load_block_embedded().expect("block embedding must load");
+            let embedded_elapsed = started.elapsed();
+
+            let heavy = circuits.heavy_chain_data.read().unwrap();
+            let light = circuits.light_chain_data.read().unwrap();
+            let started = Instant::now();
+            let block = BlockCircuit::define(
+                CIRCUIT_CONFIG,
+                &circuits.pre_data,
+                &light,
+                &heavy,
+                ON_CHAIN_OPERATIONS_LIMIT,
+            );
+            let rebuilt = (block.target, block.builder.build::<C>());
+            let rebuilt_elapsed = started.elapsed();
+
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt.0, &rebuilt.1),
+                (&embedded.0, &embedded.1),
+            );
+
+            println!("embedded final block load: {embedded_elapsed:.3?}");
+            println!("runtime final block build: {rebuilt_elapsed:.3?}");
+        });
     }
 }
