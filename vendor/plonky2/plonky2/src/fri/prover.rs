@@ -6,6 +6,8 @@ use alloc::vec::Vec;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
+use anyhow::Result;
+
 use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::oracle::coset_fft_zero_tail;
@@ -20,6 +22,29 @@ use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
+
+/// FRI proof components at the earliest points where they are final.
+///
+/// Each component is borrowed from the same allocation later moved into the
+/// returned [`FriProof`]. In particular, the commit-phase caps and final
+/// polynomial are final before proof-of-work and query construction begin.
+#[derive(Debug)]
+pub enum FriProofStage<'a, F, H, const D: usize>
+where
+    F: RichField + Extendable<D>,
+    H: crate::plonk::config::Hasher<F>,
+{
+    CommitPhase {
+        commit_phase_merkle_caps: &'a [crate::hash::merkle_tree::MerkleCap<F, H>],
+        final_poly: &'a PolynomialCoeffs<F::Extension>,
+    },
+    PowWitness(F),
+    QueryRoundBatch {
+        sequence: usize,
+        indexed_rounds: &'a [(usize, FriQueryRound<F, H, D>)],
+    },
+    QueryRounds(&'a [FriQueryRound<F, H, D>]),
+}
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -68,6 +93,83 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
         final_poly: final_coeffs,
         pow_witness,
     }
+}
+
+/// [`fri_proof`] with an ordered callback when each FRI component becomes
+/// authoritative. Callback failure aborts proof construction without changing
+/// the ordinary no-observer API.
+#[allow(clippy::too_many_arguments)]
+pub fn fri_proof_staged<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+    S,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    lde_polynomial_values: PolynomialValues<F::Extension>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    final_poly_coeff_len: Option<usize>,
+    max_num_query_steps: Option<usize>,
+    timing: &mut TimingTree,
+    mut on_stage: S,
+) -> Result<FriProof<F, C::Hasher, D>>
+where
+    S: for<'stage> FnMut(FriProofStage<'stage, F, C::Hasher, D>) -> Result<()>,
+{
+    let n = lde_polynomial_values.len();
+    assert_eq!(lde_polynomial_coeffs.len(), n);
+
+    // Commit phase
+    let (trees, final_coeffs) = timed!(
+        timing,
+        "fold codewords in the commitment phase",
+        fri_committed_trees::<F, C, D>(
+            lde_polynomial_coeffs,
+            lde_polynomial_values,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+        )
+    );
+    let commit_phase_merkle_caps = trees.iter().map(|t| t.cap.clone()).collect::<Vec<_>>();
+    on_stage(FriProofStage::CommitPhase {
+        commit_phase_merkle_caps: &commit_phase_merkle_caps,
+        final_poly: &final_coeffs,
+    })?;
+
+    // PoW phase
+    let pow_witness = timed!(
+        timing,
+        "find proof-of-work witness",
+        fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
+    );
+    on_stage(FriProofStage::PowWitness(pow_witness))?;
+
+    // Query phase
+    let query_round_proofs = fri_prover_query_rounds_staged::<F, C, D, _>(
+        initial_merkle_trees,
+        &trees,
+        challenger,
+        n,
+        fri_params,
+        |sequence, indexed_rounds| {
+            on_stage(FriProofStage::QueryRoundBatch {
+                sequence,
+                indexed_rounds,
+            })
+        },
+    )?;
+    on_stage(FriProofStage::QueryRounds(&query_round_proofs))?;
+
+    Ok(FriProof {
+        commit_phase_merkle_caps,
+        query_round_proofs,
+        final_poly: final_coeffs,
+        pow_witness,
+    })
 }
 
 pub(crate) type FriCommitedTrees<F, C, const D: usize> = (
@@ -308,6 +410,27 @@ pub(crate) fn fri_proof_of_work<
     pow_witness
 }
 
+const FRI_QUERY_STREAM_BATCH_SIZE: usize = 4;
+
+#[cfg(test)]
+static STAGED_QUERY_BATCH_CALLBACKS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Focused scoped-observer oracle only. Production code has no global census.
+#[cfg(test)]
+pub(crate) fn reset_staged_query_batch_callbacks_for_test() {
+    STAGED_QUERY_BATCH_CALLBACKS.store(0, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Focused scoped-observer oracle only. Production code has no global census.
+#[cfg(test)]
+pub(crate) fn staged_query_batch_callbacks_for_test() -> usize {
+    STAGED_QUERY_BATCH_CALLBACKS.load(core::sync::atomic::Ordering::SeqCst)
+}
+
+/// Exact promoted ordinary query scheduler. `IndexedParallelIterator::collect`
+/// preserves challenge ordinal without a completion channel, sorting, or
+/// reconstruction. The staged chain-only helper is deliberately separate.
 fn fri_prover_query_rounds<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -327,6 +450,89 @@ fn fri_prover_query_rounds<
             fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
         })
         .collect()
+}
+
+fn fri_prover_query_rounds_staged<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+    S,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    trees: &[MerkleTree<F, C::Hasher>],
+    challenger: &mut Challenger<F, C::Hasher>,
+    n: usize,
+    fri_params: &FriParams,
+    mut on_batch: S,
+) -> Result<Vec<FriQueryRound<F, C::Hasher, D>>>
+where
+    S: FnMut(usize, &[(usize, FriQueryRound<F, C::Hasher, D>)]) -> Result<()>,
+{
+    let challenges = challenger.get_n_challenges(fri_params.config.num_query_rounds);
+    let query_round_count = challenges.len();
+    let mut rounds_by_ordinal = (0..query_round_count)
+        .map(|_| None)
+        .collect::<Vec<Option<FriQueryRound<F, C::Hasher, D>>>>();
+    let (completed_sender, completed_receiver) = std::sync::mpsc::channel();
+
+    plonky2_maybe_rayon::rayon::in_place_scope(|scope| {
+        for (ordinal, rand) in challenges.into_iter().enumerate() {
+            let completed_sender = completed_sender.clone();
+            scope.spawn(move |_| {
+                let x_index = rand.to_canonical_u64() as usize % n;
+                let round = fri_prover_query_round::<F, C, D>(
+                    initial_merkle_trees,
+                    trees,
+                    x_index,
+                    fri_params,
+                );
+                completed_sender
+                    .send((ordinal, round))
+                    .expect("FRI query completion receiver must remain live");
+            });
+        }
+        drop(completed_sender);
+
+        let mut sequence = 0;
+        let mut batch = Vec::with_capacity(FRI_QUERY_STREAM_BATCH_SIZE);
+        for completed in completed_receiver {
+            batch.push(completed);
+            if batch.len() == FRI_QUERY_STREAM_BATCH_SIZE {
+                batch.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+                #[cfg(test)]
+                STAGED_QUERY_BATCH_CALLBACKS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+                on_batch(sequence, &batch)?;
+                for (ordinal, round) in batch.drain(..) {
+                    let slot = rounds_by_ordinal
+                        .get_mut(ordinal)
+                        .expect("FRI query ordinal must be in range");
+                    assert!(slot.replace(round).is_none(), "duplicate FRI query ordinal");
+                }
+                sequence += 1;
+            }
+        }
+        if !batch.is_empty() {
+            batch.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+            #[cfg(test)]
+            STAGED_QUERY_BATCH_CALLBACKS.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            on_batch(sequence, &batch)?;
+            for (ordinal, round) in batch.drain(..) {
+                let slot = rounds_by_ordinal
+                    .get_mut(ordinal)
+                    .expect("FRI query ordinal must be in range");
+                assert!(slot.replace(round).is_none(), "duplicate FRI query ordinal");
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(rounds_by_ordinal
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, round)| {
+            round.unwrap_or_else(|| panic!("missing FRI query ordinal {ordinal}"))
+        })
+        .collect())
 }
 
 fn fri_prover_query_round<

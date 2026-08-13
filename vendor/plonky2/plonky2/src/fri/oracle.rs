@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
 
+use anyhow::Result;
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
@@ -14,7 +15,7 @@ use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof;
+use crate::fri::prover::{FriProofStage, fri_proof, fri_proof_staged};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
@@ -708,6 +709,123 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         fri_proof
+    }
+
+    /// [`Self::prove_openings`] with an ordered callback at each authoritative
+    /// FRI proof-component boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prove_openings_staged<S>(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+        on_stage: S,
+    ) -> Result<FriProof<F, C::Hasher, D>>
+    where
+        S: for<'stage> FnMut(FriProofStage<'stage, F, C::Hasher, D>) -> Result<()>,
+    {
+        assert!(D > 1, "Not implemented for D=1.");
+        let alpha = challenger.get_extension_challenge::<D>();
+        let mut alpha = ReducingFactor::new(alpha);
+
+        // Final low-degree polynomial that goes into FRI.
+        let mut final_poly = PolynomialCoeffs::empty();
+
+        // Each batch `i` consists of an opening point `z_i` and polynomials `{f_ij}_j` to be opened at that point.
+        // For each batch, we compute the composition polynomial `F_i = sum alpha^j f_ij`,
+        // where `alpha` is a random challenge in the extension field.
+        // The final polynomial is then computed as `final_poly = sum_i alpha^(k_i) (F_i(X) - F_i(z_i))/(X-z_i)`
+        // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
+        // There are usually two batches for the openings at `zeta` and `g * zeta`.
+        // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
+        for FriBatchInfo { point, polynomials } in &instance.batches {
+            // Collect the coefficients of all the polynomials in `polynomials`.
+            let polys_coeff = polynomials.iter().map(|fri_poly| {
+                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+            });
+            // The label is formatted unconditionally, but `timing`'s `push` is
+            // compiled out unless the `timing` feature is on — which it is not
+            // here — so the `String` is allocated, written and dropped without
+            // ever being read. A static label costs nothing and reads the same
+            // in a timing build.
+            let composition_poly = timed!(
+                timing,
+                "reduce batch of polynomials",
+                alpha.reduce_polys_base(polys_coeff)
+            );
+            // Fused (value-exact) form of:
+            //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
+            //   alpha.shift_poly(&mut final_poly);
+            //   final_poly += quotient;
+            // (where the in-place division runs the classic `divide_by_linear`
+            // Horner recurrence and leaves its top slot as the power-of-two
+            // pad), writing straight into `final_poly`'s reusable buffer
+            // instead of a division pass + shift pass + add pass.
+            let shift = alpha.shift_factor();
+            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+        }
+
+        // `final_poly` is dead after this point, so pad it in place instead of
+        // the clone-then-resize that `lde(&self)` performs.
+        let mut lde_final_poly = final_poly;
+        let live_coeffs = lde_final_poly.len();
+        let lde_len = live_coeffs << fri_params.config.rate_bits;
+        // Only a prefix of the padded tail is ever read. `coset_fft_zero_tail`
+        // consumes `[..live_coeffs]`; the first commit round then folds
+        // `[..live_chunks * arity]`, i.e. `live_coeffs` rounded up to the first
+        // round's arity, after which `coeffs` is replaced wholesale by the
+        // folded vector and this buffer is dropped. Zero-fill exactly that read
+        // window instead of the whole `8x` buffer — for a d18 block proof the
+        // deleted memset is 28 MiB per proof (~7 MiB at d16), all of it either
+        // immediately overwritten or never touched.
+        let first_arity = 1usize
+            << fri_params
+                .reduction_arity_bits
+                .first()
+                .copied()
+                .unwrap_or(0);
+        let read_bound = live_coeffs.next_multiple_of(first_arity).min(lde_len);
+        lde_final_poly.coeffs.reserve_exact(lde_len - live_coeffs);
+        lde_final_poly.coeffs.resize(read_bound, F::Extension::ZERO);
+        // SAFETY: `reserve_exact` guarantees capacity `lde_len`, and every
+        // element in `[0, read_bound)` is initialized above. Elements beyond
+        // `read_bound` are never read: the zero-tail FFT consumes only the live
+        // prefix, and the fold consumes only `[..live_chunks * arity]`, which is
+        // `<= read_bound`. Same pattern as the promoted `lde_values` fast path.
+        unsafe { lde_final_poly.coeffs.set_len(lde_len) };
+        let lde_final_values = timed!(
+            timing,
+            "perform final FFT",
+            // The top (1 - 1/2^rate_bits) of the padded coefficients are the
+            // zeros written by the `resize` just above, so the FFT's zero-run
+            // shortcut applies and the coset scaling over that tail is a
+            // multiply-by-zero: scale only the `live_coeffs` prefix.
+            coset_fft_zero_tail(
+                &lde_final_poly,
+                F::coset_shift().into(),
+                live_coeffs,
+                Some(fri_params.config.rate_bits),
+                None,
+            )
+        );
+
+        fri_proof_staged::<F, C, D, _>(
+            &oracles
+                .par_iter()
+                .map(|c| &c.merkle_tree)
+                .collect::<Vec<_>>(),
+            lde_final_poly,
+            lde_final_values,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+            on_stage,
+        )
     }
 }
 

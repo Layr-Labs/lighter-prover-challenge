@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::Arc;
 
+use anyhow::{anyhow, ensure, Result};
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
@@ -20,13 +22,22 @@ use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
+use plonky2::field::polynomial::PolynomialCoeffs;
+use plonky2::fri::proof::FriQueryRound;
+use plonky2::fri::witness_util::{
+    set_fri_commit_phase_target, set_fri_pow_witness_target,
+    set_fri_query_round_target_at,
+};
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
+use plonky2::hash::merkle_tree::MerkleCap;
 use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
-use plonky2::iop::witness::{PartitionWitness, Witness};
+use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::CircuitData;
-use plonky2::plonk::prover::prove_with_partition_witness;
+use plonky2::plonk::config::GenericConfig;
+use plonky2::plonk::proof::{OpeningSet, ProofWithPublicInputsTarget};
+use plonky2::plonk::prover::{ProofStage, prove_with_partition_witness};
 use plonky2::util::timing::TimingTree;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
@@ -190,9 +201,370 @@ fn mark_thread_utility() {
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_utility() {}
 
+const CHAIN_QUERY_ROUND_COUNT: usize = 28;
+const CHAIN_QUERY_BATCH_SIZE: usize = 4;
+const CHAIN_QUERY_BATCH_COUNT: usize = CHAIN_QUERY_ROUND_COUNT / CHAIN_QUERY_BATCH_SIZE;
+const CHAIN_PROOF_STAGE_COUNT: usize = 1 + CHAIN_QUERY_BATCH_COUNT;
+
+/// One owned cross-thread batch of every predecessor component final before
+/// query construction. Delaying the pre-FRI and commit components until PoW
+/// leaves the native query phase as the overlap window while making the
+/// successor resume its generator worklist exactly once per boundary.
+enum ChainProofStage {
+    LatePrefix {
+        public_inputs: Vec<F>,
+        wires_cap: MerkleCap<F, <C as GenericConfig<D>>::Hasher>,
+        plonk_zs_partial_products_cap: MerkleCap<F, <C as GenericConfig<D>>::Hasher>,
+        quotient_polys_cap: MerkleCap<F, <C as GenericConfig<D>>::Hasher>,
+        openings: OpeningSet<F, D>,
+        commit_phase_merkle_caps: Vec<MerkleCap<F, <C as GenericConfig<D>>::Hasher>>,
+        final_poly: PolynomialCoeffs<<F as plonky2::field::extension::Extendable<D>>::Extension>,
+        pow_witness: F,
+    },
+    QueryBatch {
+        sequence: usize,
+        indexed_rounds: Vec<(usize, FriQueryRound<F, <C as GenericConfig<D>>::Hasher, D>)>,
+    },
+}
+
+impl ChainProofStage {
+    fn ordinal(&self) -> usize {
+        match self {
+            Self::LatePrefix { .. } => 0,
+            Self::QueryBatch { sequence, .. } => 1 + sequence,
+        }
+    }
+
+    fn prefix_from_proof(proof: &Proof) -> Result<Vec<Self>> {
+        let query_rounds = &proof.proof.opening_proof.query_round_proofs;
+        ensure!(
+            query_rounds.len() == CHAIN_QUERY_ROUND_COUNT,
+            "chain proof has {} query rounds, expected {}",
+            query_rounds.len(),
+            CHAIN_QUERY_ROUND_COUNT,
+        );
+        let mut stages = Vec::with_capacity(CHAIN_PROOF_STAGE_COUNT);
+        stages.push(Self::LatePrefix {
+            public_inputs: proof.public_inputs.clone(),
+            wires_cap: proof.proof.wires_cap.clone(),
+            plonk_zs_partial_products_cap: proof
+                .proof
+                .plonk_zs_partial_products_cap
+                .clone(),
+            quotient_polys_cap: proof.proof.quotient_polys_cap.clone(),
+            openings: proof.proof.openings.clone(),
+            commit_phase_merkle_caps: proof
+                .proof
+                .opening_proof
+                .commit_phase_merkle_caps
+                .clone(),
+            final_poly: proof.proof.opening_proof.final_poly.clone(),
+            pow_witness: proof.proof.opening_proof.pow_witness,
+        });
+        for (sequence, chunk) in query_rounds.chunks_exact(CHAIN_QUERY_BATCH_SIZE).enumerate() {
+            stages.push(Self::QueryBatch {
+                sequence,
+                indexed_rounds: chunk
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(|(offset, round)| {
+                        (sequence * CHAIN_QUERY_BATCH_SIZE + offset, round)
+                    })
+                    .collect(),
+            });
+        }
+        ensure!(stages.len() == CHAIN_PROOF_STAGE_COUNT);
+        Ok(stages)
+    }
+}
+
+/// Accumulates the native eight-stage callback into the single production
+/// publication epoch above. Every source stage is still checked in exact
+/// order; batching changes only transport and witness-resume granularity.
+#[derive(Default)]
+struct ChainProofStageBatcher {
+    public_inputs: Option<Vec<F>>,
+    wires_cap: Option<MerkleCap<F, <C as GenericConfig<D>>::Hasher>>,
+    plonk_zs_partial_products_cap: Option<MerkleCap<F, <C as GenericConfig<D>>::Hasher>>,
+    quotient_polys_cap: Option<MerkleCap<F, <C as GenericConfig<D>>::Hasher>>,
+    openings: Option<OpeningSet<F, D>>,
+    commit_phase_merkle_caps: Option<Vec<MerkleCap<F, <C as GenericConfig<D>>::Hasher>>>,
+    final_poly:
+        Option<PolynomialCoeffs<<F as plonky2::field::extension::Extendable<D>>::Extension>>,
+    emitted: usize,
+    next_query_sequence: usize,
+    query_bitmap: u32,
+}
+
+impl ChainProofStageBatcher {
+    fn observe(&mut self, stage: ProofStage<'_, F, C, D>) -> Result<Option<ChainProofStage>> {
+        let batch = match stage {
+            ProofStage::PublicInputs(values) => {
+                ensure!(self.public_inputs.is_none(), "duplicate public-input stage");
+                self.public_inputs = Some(values.to_vec());
+                return Ok(None);
+            }
+            ProofStage::WiresCap(cap) => {
+                ensure!(
+                    self.public_inputs.is_some() && self.wires_cap.is_none(),
+                    "wires-cap stage out of order",
+                );
+                self.wires_cap = Some(cap.clone());
+                return Ok(None);
+            }
+            ProofStage::PlonkZsPartialProductsCap(cap) => {
+                ensure!(
+                    self.wires_cap.is_some() && self.plonk_zs_partial_products_cap.is_none(),
+                    "Z/partial-products cap stage out of order",
+                );
+                self.plonk_zs_partial_products_cap = Some(cap.clone());
+                return Ok(None);
+            }
+            ProofStage::QuotientPolysCap(cap) => {
+                ensure!(
+                    self.plonk_zs_partial_products_cap.is_some()
+                        && self.quotient_polys_cap.is_none(),
+                    "quotient cap stage out of order",
+                );
+                self.quotient_polys_cap = Some(cap.clone());
+                return Ok(None);
+            }
+            ProofStage::Openings(openings) => {
+                ensure!(
+                    self.quotient_polys_cap.is_some() && self.openings.is_none(),
+                    "openings stage out of order",
+                );
+                self.openings = Some(openings.clone());
+                return Ok(None);
+            }
+            ProofStage::FriCommitPhase {
+                commit_phase_merkle_caps,
+                final_poly,
+            } => {
+                ensure!(
+                    self.openings.is_some() && self.commit_phase_merkle_caps.is_none(),
+                    "FRI commit stage out of order",
+                );
+                self.commit_phase_merkle_caps = Some(commit_phase_merkle_caps.to_vec());
+                self.final_poly = Some(final_poly.clone());
+                return Ok(None);
+            }
+            ProofStage::FriPowWitness(pow_witness) => ChainProofStage::LatePrefix {
+                public_inputs: self
+                    .public_inputs
+                    .take()
+                    .ok_or_else(|| anyhow!("PoW preceded public inputs"))?,
+                wires_cap: self
+                    .wires_cap
+                    .take()
+                    .ok_or_else(|| anyhow!("PoW preceded wires cap"))?,
+                plonk_zs_partial_products_cap: self
+                    .plonk_zs_partial_products_cap
+                    .take()
+                    .ok_or_else(|| anyhow!("PoW preceded Z/partial-products cap"))?,
+                quotient_polys_cap: self
+                    .quotient_polys_cap
+                    .take()
+                    .ok_or_else(|| anyhow!("PoW preceded quotient cap"))?,
+                openings: self
+                    .openings
+                    .take()
+                    .ok_or_else(|| anyhow!("PoW preceded openings"))?,
+                commit_phase_merkle_caps: self
+                    .commit_phase_merkle_caps
+                    .take()
+                    .ok_or_else(|| anyhow!("PoW preceded FRI commit caps"))?,
+                final_poly: self
+                    .final_poly
+                    .take()
+                    .ok_or_else(|| anyhow!("PoW preceded final polynomial"))?,
+                pow_witness,
+            },
+            ProofStage::FriQueryRoundBatch {
+                sequence,
+                indexed_rounds,
+            } => {
+                ensure!(
+                    self.emitted > 0,
+                    "query batch arrived before the late prefix",
+                );
+                ensure!(
+                    sequence == self.next_query_sequence,
+                    "query batch sequence mismatch: expected {}, got {sequence}",
+                    self.next_query_sequence,
+                );
+                ensure!(
+                    indexed_rounds.len() == CHAIN_QUERY_BATCH_SIZE,
+                    "query batch {sequence} has {} rounds, expected {}",
+                    indexed_rounds.len(),
+                    CHAIN_QUERY_BATCH_SIZE,
+                );
+                let mut previous = None;
+                for (ordinal, _) in indexed_rounds {
+                    ensure!(
+                        *ordinal < CHAIN_QUERY_ROUND_COUNT,
+                        "query ordinal {ordinal} is out of range",
+                    );
+                    ensure!(
+                        previous.is_none_or(|prior| prior < *ordinal),
+                        "query batch {sequence} is not strictly ordinal-sorted",
+                    );
+                    let bit = 1u32 << ordinal;
+                    ensure!(
+                        self.query_bitmap & bit == 0,
+                        "duplicate query ordinal {ordinal}",
+                    );
+                    self.query_bitmap |= bit;
+                    previous = Some(*ordinal);
+                }
+                self.next_query_sequence += 1;
+                ChainProofStage::QueryBatch {
+                    sequence,
+                    indexed_rounds: indexed_rounds.to_vec(),
+                }
+            }
+            ProofStage::FriQueryRounds(query_rounds) => {
+                ensure!(
+                    self.emitted == CHAIN_PROOF_STAGE_COUNT,
+                    "query rounds arrived after only {} production batches",
+                    self.emitted,
+                );
+                ensure!(
+                    query_rounds.len() == CHAIN_QUERY_ROUND_COUNT,
+                    "canonical query stage has {} rounds, expected {}",
+                    query_rounds.len(),
+                    CHAIN_QUERY_ROUND_COUNT,
+                );
+                ensure!(
+                    self.next_query_sequence == CHAIN_QUERY_BATCH_COUNT,
+                    "canonical query stage arrived after {} query batches",
+                    self.next_query_sequence,
+                );
+                ensure!(
+                    self.query_bitmap == (1u32 << CHAIN_QUERY_ROUND_COUNT) - 1,
+                    "canonical query stage arrived with incomplete bitmap {:#x}",
+                    self.query_bitmap,
+                );
+                return Ok(None);
+            }
+        };
+        ensure!(
+            batch.ordinal() == self.emitted,
+            "production batch order mismatch: expected {}, got {}",
+            self.emitted,
+            batch.ordinal(),
+        );
+        self.emitted += 1;
+        Ok(Some(batch))
+    }
+}
+
+fn feed_chain_proof_stage(
+    pending: &mut PendingPartitionWitness<'_, F, C, D>,
+    target: &ProofWithPublicInputsTarget<D>,
+    stage: &ChainProofStage,
+) -> Result<()> {
+    pending.feed_seeded(|feeder| {
+        match stage {
+            ChainProofStage::LatePrefix {
+                public_inputs,
+                wires_cap,
+                plonk_zs_partial_products_cap,
+                quotient_polys_cap,
+                openings,
+                commit_phase_merkle_caps,
+                final_poly,
+                pow_witness,
+            } => {
+                ensure!(
+                    target.public_inputs.len() == public_inputs.len(),
+                    "chain proof PI stage has {} values for {} targets",
+                    public_inputs.len(),
+                    target.public_inputs.len(),
+                );
+                feeder.set_target_arr(&target.public_inputs, public_inputs)?;
+                ensure!(target.proof.wires_cap.0.len() == wires_cap.0.len());
+                feeder.set_cap_target::<<C as GenericConfig<D>>::Hasher>(
+                    &target.proof.wires_cap,
+                    wires_cap,
+                )?;
+                ensure!(
+                    target.proof.plonk_zs_partial_products_cap.0.len()
+                        == plonk_zs_partial_products_cap.0.len()
+                );
+                feeder.set_cap_target::<<C as GenericConfig<D>>::Hasher>(
+                    &target.proof.plonk_zs_partial_products_cap,
+                    plonk_zs_partial_products_cap,
+                )?;
+                ensure!(
+                    target.proof.quotient_polys_cap.0.len() == quotient_polys_cap.0.len()
+                );
+                feeder.set_cap_target::<<C as GenericConfig<D>>::Hasher>(
+                    &target.proof.quotient_polys_cap,
+                    quotient_polys_cap,
+                )?;
+                let targets = &target.proof.openings;
+                ensure!(targets.constants.len() == openings.constants.len());
+                ensure!(targets.plonk_sigmas.len() == openings.plonk_sigmas.len());
+                ensure!(targets.wires.len() == openings.wires.len());
+                ensure!(targets.plonk_zs.len() == openings.plonk_zs.len());
+                ensure!(targets.plonk_zs_next.len() == openings.plonk_zs_next.len());
+                ensure!(targets.lookup_zs.len() == openings.lookup_zs.len());
+                ensure!(targets.next_lookup_zs.len() == openings.lookup_zs_next.len());
+                ensure!(targets.partial_products.len() == openings.partial_products.len());
+                ensure!(targets.quotient_polys.len() == openings.quotient_polys.len());
+                feeder.set_extension_targets(&targets.constants, &openings.constants)?;
+                feeder.set_extension_targets(&targets.plonk_sigmas, &openings.plonk_sigmas)?;
+                feeder.set_extension_targets(&targets.wires, &openings.wires)?;
+                feeder.set_extension_targets(&targets.plonk_zs, &openings.plonk_zs)?;
+                feeder.set_extension_targets(&targets.plonk_zs_next, &openings.plonk_zs_next)?;
+                feeder.set_extension_targets(&targets.lookup_zs, &openings.lookup_zs)?;
+                feeder.set_extension_targets(&targets.next_lookup_zs, &openings.lookup_zs_next)?;
+                feeder.set_extension_targets(&targets.partial_products, &openings.partial_products)?;
+                feeder.set_extension_targets(&targets.quotient_polys, &openings.quotient_polys)?;
+                set_fri_commit_phase_target(
+                    feeder,
+                    &target.proof.opening_proof,
+                    commit_phase_merkle_caps,
+                    final_poly,
+                )?;
+                set_fri_pow_witness_target(
+                    feeder,
+                    &target.proof.opening_proof,
+                    *pow_witness,
+                )?;
+            }
+            ChainProofStage::QueryBatch {
+                sequence: _,
+                indexed_rounds,
+            } => {
+                for (ordinal, query_round) in indexed_rounds {
+                    set_fri_query_round_target_at(
+                        feeder,
+                        &target.proof.opening_proof,
+                        *ordinal,
+                        query_round,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn join_chain_handle(handle: std::thread::ScopedJoinHandle<'_, Proof>) -> Proof {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 enum ChainState<'scope> {
     Ready(Proof),
-    InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
+    InFlight {
+        handle: std::thread::ScopedJoinHandle<'scope, Proof>,
+        stages: Receiver<ChainProofStage>,
+    },
 }
 
 impl ChainState<'_> {
@@ -201,9 +573,55 @@ impl ChainState<'_> {
         let _wait = plonky2::util::profile::span("wait", "chain_predecessor_join");
         match self {
             ChainState::Ready(proof) => proof,
-            ChainState::InFlight(handle) => handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            ChainState::InFlight { handle, stages } => {
+                // A terminal consumer has no successor to use the prefix, but
+                // it must drain it before joining so a future bounded stream
+                // extension cannot block the producer.
+                while stages.recv().is_ok() {}
+                join_chain_handle(handle)
+            }
+        }
+    }
+
+    /// Feed each predecessor component as soon as its producer makes it
+    /// available, running the newly-ready generator cone synchronously while
+    /// the predecessor continues into its later proof phases. The full proof
+    /// is fed after the join as a completeness oracle; equal duplicate values
+    /// are accepted by `PendingPartitionWitness` and only the remaining FRI
+    /// targets wake new generators.
+    fn feed_prefix_and_wait(
+        self,
+        pending: &mut PendingPartitionWitness<'_, F, C, D>,
+        target: &ProofWithPublicInputsTarget<D>,
+    ) -> Result<Proof> {
+        match self {
+            ChainState::Ready(proof) => {
+                for stage in ChainProofStage::prefix_from_proof(&proof)? {
+                    feed_chain_proof_stage(pending, target, &stage)?;
+                }
+                Ok(proof)
+            }
+            ChainState::InFlight { handle, stages } => {
+                let feed_result = (|| {
+                    for expected in 0..CHAIN_PROOF_STAGE_COUNT {
+                        let stage = stages.recv().map_err(|error| {
+                            anyhow!(
+                                "chain proof stage stream closed before stage {expected}: {error}"
+                            )
+                        })?;
+                        ensure!(
+                            stage.ordinal() == expected,
+                            "chain proof stage order mismatch: expected {expected}, got {}",
+                            stage.ordinal(),
+                        );
+                        feed_chain_proof_stage(pending, target, &stage)?;
+                    }
+                    Ok(())
+                })();
+                let proof = join_chain_handle(handle);
+                feed_result?;
+                Ok(proof)
+            }
         }
     }
 }
@@ -218,6 +636,7 @@ fn chain_step_proof(
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    stage_sender: SyncSender<ChainProofStage>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -249,7 +668,13 @@ fn chain_step_proof(
         )?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
-        let previous_proof = previous.map(ChainState::wait);
+        let previous_proof = match previous {
+            Some(previous) => Some(previous.feed_prefix_and_wait(
+                &mut pending,
+                &chain_target.cyclic_proof,
+            )?),
+            None => None,
+        };
         pending.feed_seeded(|feeder| {
             BlockTxChainCircuit::witness_inputs_cyclic_into(
                 chain_target,
@@ -257,7 +682,15 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        let mut stage_batcher = ChainProofStageBatcher::default();
+        BlockTxChainCircuit::prove_prepared_staged(pending, chain_data, move |stage| {
+            if let Some(stage) = stage_batcher.observe(stage)? {
+                stage_sender
+                    .send(stage)
+                    .map_err(|error| anyhow!("chain proof stage receiver closed: {error}"))?;
+            }
+            Ok(())
+        })
     })();
     // This step is no longer part of the runnable backlog (see the matching
     // spine_backlog_add(1) at all spawn sites).
@@ -476,6 +909,8 @@ fn prove_path(
                 // the laggard and its GPU trees take priority (see
                 // spine_backlog_add). Decremented inside chain_step_proof.
                 plonky2::hash::poseidon2::spine_backlog_add(1);
+                let (stage_sender, stage_receiver) =
+                    std::sync::mpsc::sync_channel(CHAIN_PROOF_STAGE_COUNT);
                 let handle = std::thread::Builder::new()
                     .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -489,10 +924,14 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            stage_sender,
                         )
                     })
                     .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
+                chain = Some(ChainState::InFlight {
+                    handle,
+                    stages: stage_receiver,
+                });
             }
 
             let witness = current_witness;
@@ -569,6 +1008,8 @@ fn prove_path(
             // backlog in `chain_step_proof`, exactly like both spawn loops.
             plonky2::hash::poseidon2::spine_backlog_add(1);
             let previous = chain.take();
+            let (stage_sender, stage_receiver) =
+                std::sync::mpsc::sync_channel(CHAIN_PROOF_STAGE_COUNT);
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-step-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -582,10 +1023,14 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        stage_sender,
                     )
                 })
                 .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
+            chain = Some(ChainState::InFlight {
+                handle,
+                stages: stage_receiver,
+            });
         }
         // Past this point the pipeline spawns no new chunk work: the drain
         // below is the strictly sequential chain tail, so its mid-size
@@ -628,6 +1073,8 @@ fn prove_path(
             // above is unchanged.
             let previous = chain.take();
             plonky2::hash::poseidon2::spine_backlog_add(1);
+            let (stage_sender, stage_receiver) =
+                std::sync::mpsc::sync_channel(CHAIN_PROOF_STAGE_COUNT);
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-drain-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -641,10 +1088,14 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        stage_sender,
                     )
                 })
                 .expect("chain drain thread must start");
-            chain = Some(ChainState::InFlight(handle));
+            chain = Some(ChainState::InFlight {
+                handle,
+                stages: stage_receiver,
+            });
         }
         let chain_proof = chain
             .map(ChainState::wait)
@@ -1282,6 +1733,8 @@ mod tests {
             // path. The reference above keeps the old PartialWitness map
             // path solely for this manual timing harness.
             let direct_start = Instant::now();
+            let (stage_sender, stage_receiver) =
+                std::sync::mpsc::sync_channel(CHAIN_PROOF_STAGE_COUNT);
             let direct_proof = chain_step_proof(
                 TxPath::Light,
                 &circuits.chain_target,
@@ -1291,6 +1744,11 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                stage_sender,
+            );
+            assert_eq!(
+                stage_receiver.into_iter().count(),
+                CHAIN_PROOF_STAGE_COUNT,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);

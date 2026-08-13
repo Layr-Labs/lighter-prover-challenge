@@ -15,11 +15,14 @@ use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
+use crate::fri::proof::FriQueryRound;
+use crate::fri::prover::FriProofStage;
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::poseidon2::Poseidon2Gate;
 use crate::gates::selectors::LookupSelectors;
 use crate::hash::hash_types::RichField;
+use crate::hash::merkle_tree::MerkleCap;
 use crate::iop::challenger::Challenger;
 use crate::iop::generator::generate_partial_witness;
 use crate::iop::target::Target;
@@ -38,6 +41,38 @@ use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil};
+
+/// Proof components whose witness targets can be consumed by a recursive
+/// successor before the complete proof is returned.
+///
+/// The callback receives borrowed values, so observing a stage does not add a
+/// clone to ordinary proving. A caller that crosses a thread boundary can
+/// clone only these comparatively small components. Stages are emitted once,
+/// in variant order, and every value is the same value later moved into the
+/// returned [`ProofWithPublicInputs`].
+#[derive(Debug)]
+pub enum ProofStage<'a, F, C, const D: usize>
+where
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    C::Hasher: Hasher<F>,
+{
+    PublicInputs(&'a [F]),
+    WiresCap(&'a MerkleCap<F, C::Hasher>),
+    PlonkZsPartialProductsCap(&'a MerkleCap<F, C::Hasher>),
+    QuotientPolysCap(&'a MerkleCap<F, C::Hasher>),
+    Openings(&'a OpeningSet<F, D>),
+    FriCommitPhase {
+        commit_phase_merkle_caps: &'a [MerkleCap<F, C::Hasher>],
+        final_poly: &'a PolynomialCoeffs<F::Extension>,
+    },
+    FriPowWitness(F),
+    FriQueryRoundBatch {
+        sequence: usize,
+        indexed_rounds: &'a [(usize, FriQueryRound<F, C::Hasher, D>)],
+    },
+    FriQueryRounds(&'a [FriQueryRound<F, C::Hasher, D>]),
+}
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -502,6 +537,428 @@ where
             timing,
         )
     );
+
+    let proof = Proof::<F, C, D> {
+        wires_cap: wires_commitment.merkle_tree.cap,
+        plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
+        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        openings,
+        opening_proof,
+    };
+    Ok(ProofWithPublicInputs::<F, C, D> {
+        proof,
+        public_inputs,
+    })
+}
+
+
+/// [`prove_with_partition_witness`] with an ordered callback at each
+/// authoritative proof-component boundary.
+pub fn prove_with_partition_witness_staged<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+    S,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    mut partition_witness: PartitionWitness<F>,
+    timing: &mut TimingTree,
+    mut on_stage: S,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+    S: for<'stage> FnMut(ProofStage<'stage, F, C, D>) -> Result<()>,
+{
+    let has_lookup = !common_data.luts.is_empty();
+    let config = &common_data.config;
+    let num_challenges = config.num_challenges;
+    let quotient_degree = common_data.quotient_degree();
+    let degree = common_data.degree();
+
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_context = {
+        let digest_bytes =
+            crate::plonk::config::GenericHashOut::to_bytes(&prover_data.circuit_digest);
+        let mut digest_prefix = [0u8; 8];
+        let prefix_len = digest_bytes.len().min(digest_prefix.len());
+        digest_prefix[..prefix_len].copy_from_slice(&digest_bytes[..prefix_len]);
+        crate::util::profile::enter_proof(
+            u64::from_le_bytes(digest_prefix),
+            common_data.degree_bits(),
+            config.num_wires,
+            config.num_routed_wires,
+            common_data.quotient_degree_factor,
+            num_challenges,
+            common_data.num_gate_constraints,
+            common_data.num_lookup_polys,
+        )
+    };
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_proof = crate::util::profile::span("proof", "prove_with_partition_witness");
+    #[cfg(feature = "diagnostic_profile")]
+    {
+        let count = |name, value: usize| {
+            crate::util::profile::counter("shape", name, value as u64);
+        };
+        count("degree_rows", degree);
+        count("lde_rows", common_data.lde_size());
+        count("wire_values", degree * config.num_wires);
+        count(
+            "routed_wire_values",
+            degree * config.num_routed_wires,
+        );
+        count(
+            "quotient_domain_points",
+            degree * common_data.quotient_degree_factor,
+        );
+        count("fri_query_rounds", config.fri_config.num_query_rounds);
+    }
+
+    set_lookup_wires(prover_data, common_data, &mut partition_witness)?;
+
+    let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
+    let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
+    on_stage(ProofStage::PublicInputs(&public_inputs))?;
+
+    let mut witness = timed!(
+        timing,
+        "compute full witness",
+        partition_witness.full_witness()
+    );
+
+    // Only the routed columns are read again after this point (the
+    // permutation argument covers wires `j < num_routed_wires`; nothing else
+    // consumes the matrix). Non-routed columns are moved out and IFFT'd in
+    // place; routed columns are IFFT'd from the borrowed witness column
+    // (`ifft_borrowed` fuses the former clone with the FFT's initial
+    // bit-reversal gather), so no witness column is copied.
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
+        timing,
+        "compute wire polynomials (IFFT)",
+        witness
+            .wire_values
+            .par_iter_mut()
+            .enumerate()
+            .map(|(j, column)| {
+                if j < num_routed_wires {
+                    ifft_borrowed(column)
+                } else {
+                    PolynomialValues::new(core::mem::take(column)).ifft()
+                }
+            })
+            .collect()
+    );
+
+    let wires_commitment = timed!(
+        timing,
+        "compute wires commitment",
+        PolynomialBatch::<F, C, D>::from_coeffs(
+            wires_coeffs,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::WIRES.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+    );
+    on_stage(ProofStage::WiresCap(&wires_commitment.merkle_tree.cap))?;
+
+    let mut challenger = Challenger::<F, C::Hasher>::new();
+
+    // Observe the FRI config
+    common_data.fri_params.observe(&mut challenger);
+
+    // Observe the instance.
+    challenger.observe_hash::<C::Hasher>(prover_data.circuit_digest);
+    challenger.observe_hash::<C::InnerHasher>(public_inputs_hash);
+
+    challenger.observe_cap::<C::Hasher>(&wires_commitment.merkle_tree.cap);
+
+    // We need 4 values per challenge: 2 for the combos, 1 for (X-combo) in the accumulators and 1 to prove that the lookup table was computed correctly.
+    // We can reuse betas and gammas for two of them.
+    let num_lookup_challenges = NUM_COINS_LOOKUP * num_challenges;
+
+    let betas = challenger.get_n_challenges(num_challenges);
+    let gammas = challenger.get_n_challenges(num_challenges);
+    // The quotient numerator uses `beta_i * (k_j * x)` for every routed wire
+    // and quotient point. Reassociate this finite-field product once per
+    // challenge and wire; the resulting coefficient is reused across all
+    // quotient batches.
+    let beta_k_is: Vec<F> = betas
+        .iter()
+        .flat_map(|&beta| common_data.k_is.iter().map(move |&k_i| beta * k_i))
+        .collect();
+
+    let deltas = if has_lookup {
+        let mut delts = Vec::with_capacity(2 * num_challenges);
+        let num_additional_challenges = num_lookup_challenges - 2 * num_challenges;
+        let additional = challenger.get_n_challenges(num_additional_challenges);
+        delts.extend(&betas);
+        delts.extend(&gammas);
+        delts.extend(additional);
+        delts
+    } else {
+        vec![]
+    };
+
+    assert!(
+        common_data.quotient_degree_factor < common_data.config.num_routed_wires,
+        "When the number of routed wires is smaller that the degree, we should change the logic to avoid computing partial products."
+    );
+    let mut partial_products_and_zs = timed!(
+        timing,
+        "compute partial products",
+        all_wires_permutation_partial_products(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            prover_data,
+            common_data,
+        )
+    );
+
+    // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
+    let plonk_z_vecs: Vec<_> = partial_products_and_zs
+        .iter_mut()
+        .map(|partial_products_and_z| partial_products_and_z.pop().unwrap())
+        .collect();
+    let partial_products_len = partial_products_and_zs.iter().map(Vec::len).sum::<usize>();
+    let mut zs_partial_products = Vec::with_capacity(plonk_z_vecs.len() + partial_products_len);
+    zs_partial_products.extend(plonk_z_vecs);
+    zs_partial_products.extend(partial_products_and_zs.into_iter().flatten());
+
+    // All lookup polys: RE and partial SLDCs.
+    let lookup_polys =
+        compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
+
+    // The permutation argument and lookup polys were the last readers of the
+    // witness matrix (non-routed columns were already moved out into
+    // `wires_values`). Free the ~80 routed columns now, before the ZS
+    // commitment, quotient evaluation, and FRI phases raise memory pressure.
+    drop(witness);
+
+    if has_lookup {
+        zs_partial_products.extend(lookup_polys);
+    }
+
+    let partial_products_zs_and_lookup_commitment = timed!(
+        timing,
+        "commit to partial products, Z's and, if any, lookup polynomials",
+        PolynomialBatch::from_values(
+            zs_partial_products,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+    );
+    on_stage(ProofStage::PlonkZsPartialProductsCap(
+        &partial_products_zs_and_lookup_commitment.merkle_tree.cap,
+    ))?;
+
+    challenger.observe_cap::<C::Hasher>(&partial_products_zs_and_lookup_commitment.merkle_tree.cap);
+
+    let alphas = challenger.get_n_challenges(num_challenges);
+
+    let quotient_polys = timed!(
+        timing,
+        "compute quotient polys",
+        compute_quotient_polys::<F, C, D>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            &betas,
+            &gammas,
+            &beta_k_is,
+            &deltas,
+            &alphas,
+            // Layout seam: flat column-major permutation data when the
+            // circuit has no lookups; the per-point path otherwise.
+            !has_lookup,
+            true,
+        )
+    );
+
+    // Opt-in production validation for the Metal Poseidon2 quotient seam.
+    // Reuse the optimized column-major CPU path and only disable the GPU gate,
+    // so any mismatch is attributable to the offloaded contribution itself.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if !has_lookup && gpu_poseidon_quotient_differential_enabled() {
+        let reference = compute_quotient_polys::<F, C, D>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            &betas,
+            &gammas,
+            &beta_k_is,
+            &deltas,
+            &alphas,
+            true,
+            false,
+        );
+        assert_eq!(quotient_polys.len(), reference.len());
+        for (p, (actual, expected)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(actual.coeffs.len(), expected.coeffs.len());
+            for (i, (actual, expected)) in
+                actual.coeffs.iter().zip(expected.coeffs.iter()).enumerate()
+            {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "GPU Poseidon2 quotient divergence: poly {p}, coeff {i}"
+                );
+            }
+        }
+        let stats = gpu_poseidon_quotient_stats();
+        log::info!("Metal Poseidon2 quotient differential passed: {stats:?}");
+        if gpu_poseidon_quotient_diagnostics_enabled() {
+            eprintln!("[gpu-poseidon-quotient] differential passed {stats:?}");
+        }
+    }
+
+    // Differential gate for the layout seam: recompute the quotient through
+    // the per-point reference path on the same witness, commitments and
+    // challenges, and require value-identical polynomials.
+    #[cfg(test)]
+    if !has_lookup && COMPARE_QUOTIENT_LAYOUTS.load(core::sync::atomic::Ordering::Relaxed) {
+        let reference = compute_quotient_polys::<F, C, D>(
+            common_data,
+            prover_data,
+            &public_inputs_hash,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            &betas,
+            &gammas,
+            &beta_k_is,
+            &deltas,
+            &alphas,
+            false,
+            false,
+        );
+        assert_eq!(quotient_polys.len(), reference.len());
+        for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+            assert_eq!(a.coeffs.len(), b.coeffs.len());
+            for (i, (x, y)) in a.coeffs.iter().zip(b.coeffs.iter()).enumerate() {
+                assert_eq!(
+                    x.to_canonical_u64(),
+                    y.to_canonical_u64(),
+                    "quotient layout divergence: poly {p}, coeff {i}"
+                );
+            }
+        }
+    }
+
+    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
+        timing,
+        "split up quotient polys",
+        quotient_polys
+            .into_par_iter()
+            .flat_map(|mut quotient_poly| {
+                quotient_poly.trim_to_len(quotient_degree).expect(
+                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                );
+                // Split quotient into degree-n chunks.
+                quotient_poly.chunks(degree)
+            })
+            .collect()
+    );
+
+    let quotient_polys_commitment = timed!(
+        timing,
+        "commit to quotient polys",
+        PolynomialBatch::<F, C, D>::from_coeffs(
+            all_quotient_poly_chunks,
+            config.fri_config.rate_bits,
+            config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
+            config.fri_config.cap_height,
+            timing,
+            prover_data.fft_root_table.as_ref(),
+        )
+    );
+    on_stage(ProofStage::QuotientPolysCap(
+        &quotient_polys_commitment.merkle_tree.cap,
+    ))?;
+
+    challenger.observe_cap::<C::Hasher>(&quotient_polys_commitment.merkle_tree.cap);
+
+    let zeta = challenger.get_extension_challenge::<D>();
+    // To avoid leaking witness data, we want to ensure that our opening locations, `zeta` and
+    // `g * zeta`, are not in our subgroup `H`. It suffices to check `zeta` only, since
+    // `(g * zeta)^n = zeta^n`, where `n` is the order of `g`.
+    let g = F::Extension::primitive_root_of_unity(common_data.degree_bits());
+    ensure!(
+        zeta.exp_power_of_2(common_data.degree_bits()) != F::Extension::ONE,
+        "Opening point is in the subgroup."
+    );
+
+    let openings = timed!(
+        timing,
+        "construct the opening set, including lookups",
+        OpeningSet::new(
+            zeta,
+            g,
+            &prover_data.constants_sigmas_commitment,
+            &wires_commitment,
+            &partial_products_zs_and_lookup_commitment,
+            &quotient_polys_commitment,
+            common_data
+        )
+    );
+    on_stage(ProofStage::Openings(&openings))?;
+    challenger.observe_openings(&openings.to_fri_openings());
+    let instance = common_data.get_fri_instance(zeta);
+
+    let opening_proof = timed!(
+        timing,
+        "compute opening proofs",
+        PolynomialBatch::<F, C, D>::prove_openings_staged(
+            &instance,
+            &[
+                &prover_data.constants_sigmas_commitment,
+                &wires_commitment,
+                &partial_products_zs_and_lookup_commitment,
+                &quotient_polys_commitment,
+            ],
+            &mut challenger,
+            &common_data.fri_params,
+            None,
+            None,
+            timing,
+            |stage| {
+                on_stage(match stage {
+                    FriProofStage::CommitPhase {
+                        commit_phase_merkle_caps,
+                        final_poly,
+                    } => ProofStage::FriCommitPhase {
+                        commit_phase_merkle_caps,
+                        final_poly,
+                    },
+                    FriProofStage::PowWitness(pow_witness) => {
+                        ProofStage::FriPowWitness(pow_witness)
+                    }
+                    FriProofStage::QueryRoundBatch {
+                        sequence,
+                        indexed_rounds,
+                    } => ProofStage::FriQueryRoundBatch {
+                        sequence,
+                        indexed_rounds,
+                    },
+                    FriProofStage::QueryRounds(query_rounds) => {
+                        ProofStage::FriQueryRounds(query_rounds)
+                    }
+                })
+            },
+        )
+    )?;
 
     let proof = Proof::<F, C, D> {
         wires_cap: wires_commitment.merkle_tree.cap,
@@ -2695,6 +3152,170 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    /// The streaming seam is observational: its eight borrowed components are
+    /// emitted in dependency order and are value-identical to the fields of
+    /// the final proof.
+    #[test]
+    fn staged_prover_prefix_matches_returned_proof() -> Result<()> {
+        crate::fri::prover::reset_staged_query_batch_callbacks_for_test();
+        let (data, pw) = small_circuit();
+        let partition_witness = crate::iop::generator::generate_partial_witness(
+            pw,
+            &data.prover_only,
+            &data.common,
+        )?;
+
+        let mut stage_index = 0;
+        let mut staged_public_inputs = None;
+        let mut staged_wires_cap = None;
+        let mut staged_zs_cap = None;
+        let mut staged_quotient_cap = None;
+        let mut staged_openings = None;
+        let mut staged_fri_caps = None;
+        let mut staged_final_poly = None;
+        let mut staged_pow_witness = None;
+        let mut staged_query_batches = Vec::new();
+        let mut staged_query_rounds = None;
+        let proof = super::prove_with_partition_witness_staged(
+            &data.prover_only,
+            &data.common,
+            partition_witness,
+            &mut crate::util::timing::TimingTree::default(),
+            |stage| {
+                match stage {
+                    super::ProofStage::PublicInputs(values) => {
+                        assert_eq!(stage_index, 0);
+                        staged_public_inputs = Some(values.to_vec());
+                    }
+                    super::ProofStage::WiresCap(cap) => {
+                        assert_eq!(stage_index, 1);
+                        staged_wires_cap = Some(cap.clone());
+                    }
+                    super::ProofStage::PlonkZsPartialProductsCap(cap) => {
+                        assert_eq!(stage_index, 2);
+                        staged_zs_cap = Some(cap.clone());
+                    }
+                    super::ProofStage::QuotientPolysCap(cap) => {
+                        assert_eq!(stage_index, 3);
+                        staged_quotient_cap = Some(cap.clone());
+                    }
+                    super::ProofStage::Openings(openings) => {
+                        assert_eq!(stage_index, 4);
+                        staged_openings = Some(openings.clone());
+                    }
+                    super::ProofStage::FriCommitPhase {
+                        commit_phase_merkle_caps,
+                        final_poly,
+                    } => {
+                        assert_eq!(stage_index, 5);
+                        staged_fri_caps = Some(commit_phase_merkle_caps.to_vec());
+                        staged_final_poly = Some(final_poly.clone());
+                    }
+                    super::ProofStage::FriPowWitness(pow_witness) => {
+                        assert_eq!(stage_index, 6);
+                        staged_pow_witness = Some(pow_witness);
+                    }
+                    super::ProofStage::FriQueryRoundBatch {
+                        sequence,
+                        indexed_rounds,
+                    } => {
+                        assert_eq!(stage_index, 7 + sequence);
+                        assert_eq!(sequence, staged_query_batches.len());
+                        assert!(!indexed_rounds.is_empty());
+                        assert!(indexed_rounds.len() <= 4);
+                        assert!(indexed_rounds
+                            .windows(2)
+                            .all(|pair| pair[0].0 < pair[1].0));
+                        staged_query_batches.push(indexed_rounds.to_vec());
+                    }
+                    super::ProofStage::FriQueryRounds(query_rounds) => {
+                        assert_eq!(stage_index, 7 + staged_query_batches.len());
+                        staged_query_rounds = Some(query_rounds.to_vec());
+                    }
+                }
+                stage_index += 1;
+                Ok(())
+            },
+        )?;
+
+        assert_eq!(staged_query_batches.len(), 7);
+        assert_eq!(
+            crate::fri::prover::staged_query_batch_callbacks_for_test(),
+            7,
+            "the explicit staged chain path must transport exactly seven query batches",
+        );
+        assert_eq!(stage_index, 15);
+        assert_eq!(staged_public_inputs.unwrap(), proof.public_inputs);
+        assert_eq!(staged_wires_cap.unwrap(), proof.proof.wires_cap);
+        assert_eq!(
+            staged_zs_cap.unwrap(),
+            proof.proof.plonk_zs_partial_products_cap,
+        );
+        assert_eq!(
+            staged_quotient_cap.unwrap(),
+            proof.proof.quotient_polys_cap,
+        );
+        assert_eq!(staged_openings.unwrap(), proof.proof.openings);
+        assert_eq!(
+            staged_fri_caps.unwrap(),
+            proof.proof.opening_proof.commit_phase_merkle_caps,
+        );
+        assert_eq!(
+            staged_final_poly.unwrap(),
+            proof.proof.opening_proof.final_poly,
+        );
+        assert_eq!(
+            staged_pow_witness.unwrap(),
+            proof.proof.opening_proof.pow_witness,
+        );
+        assert_eq!(
+            staged_query_rounds.unwrap(),
+            proof.proof.opening_proof.query_round_proofs,
+        );
+        let mut indexed_rounds = staged_query_batches
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        indexed_rounds.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+        assert_eq!(indexed_rounds.len(), 28);
+        for (expected, (ordinal, round)) in indexed_rounds.into_iter().enumerate() {
+            assert_eq!(ordinal, expected);
+            assert_eq!(
+                round,
+                proof.proof.opening_proof.query_round_proofs[expected],
+            );
+        }
+        data.verify(proof)?;
+        Ok(())
+    }
+
+    /// The ordinary entrypoint must retain the exact promoted indexed Rayon
+    /// query scheduler. No staged completion batch may be created when the
+    /// caller did not request an observer.
+    #[test]
+    fn ordinary_prover_emits_zero_staged_query_batches() -> Result<()> {
+        crate::fri::prover::reset_staged_query_batch_callbacks_for_test();
+        let (data, pw) = small_circuit();
+        let partition_witness = crate::iop::generator::generate_partial_witness(
+            pw,
+            &data.prover_only,
+            &data.common,
+        )?;
+        let proof = super::prove_with_partition_witness(
+            &data.prover_only,
+            &data.common,
+            partition_witness,
+            &mut crate::util::timing::TimingTree::default(),
+        )?;
+        assert_eq!(
+            crate::fri::prover::staged_query_batch_callbacks_for_test(),
+            0,
+            "ordinary prove must not enter staged FRI query transport",
+        );
+        data.verify(proof)?;
+        Ok(())
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]

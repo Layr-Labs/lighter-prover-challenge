@@ -18,7 +18,7 @@ use plonky2::plonk::circuit_data::{
 };
 use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::proof::{ProofWithPublicInputs, ProofWithPublicInputsTarget};
-use plonky2::plonk::prover::prove_with_partition_witness;
+use plonky2::plonk::prover::{ProofStage, prove_with_partition_witness_staged};
 use plonky2::timed;
 use plonky2::util::timing::TimingTree;
 
@@ -319,14 +319,29 @@ impl BlockTxChainCircuit {
         pending: PendingPartitionWitness<'_, F, C, D>,
         circuit_data: &CircuitData<F, C, D>,
     ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        Self::prove_prepared_staged(pending, circuit_data, |_| Ok(()))
+    }
+
+    /// Proves a prepared chain step and exposes each completed pre-FRI proof
+    /// component to a recursive successor. The ordinary entry point above is
+    /// deliberately a no-op wrapper, so non-pipelined callers remain exact.
+    pub fn prove_prepared_staged<S>(
+        pending: PendingPartitionWitness<'_, F, C, D>,
+        circuit_data: &CircuitData<F, C, D>,
+        on_stage: S,
+    ) -> Result<ProofWithPublicInputs<F, C, D>>
+    where
+        S: for<'stage> FnMut(ProofStage<'stage, F, C, D>) -> Result<()>,
+    {
         let partition_witness = pending.finish()?;
         let proof = {
             let mut prove_timing = TimingTree::new("BlockTxChainProve", Level::Debug);
-            let proof = prove_with_partition_witness(
+            let proof = prove_with_partition_witness_staged(
                 &circuit_data.prover_only,
                 &circuit_data.common,
                 partition_witness,
                 &mut prove_timing,
+                on_stage,
             )?;
             prove_timing.print();
             proof
