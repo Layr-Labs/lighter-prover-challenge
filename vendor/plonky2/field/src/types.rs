@@ -157,10 +157,12 @@ pub trait Field:
 
         // Higher WIDTH increases instruction-level parallelism, but too high a value will cause us
         // to run out of registers.
-        const WIDTH: usize = 4;
-        // JN note: WIDTH is 4. The code is specialized to this value and will need
-        // modification if it is changed. I tried to make it more generic, but Rust's const
-        // generics are not yet good enough.
+        const WIDTH: usize = 8;
+        // WIDTH 8: eight independent Montgomery product chains. The meet
+        // tree is the 4-wide tree duplicated once more; INV_BATCH=128 on
+        // the prove path is a multiple of 8 so the ragged serial tail
+        // below is not the scored case. Register pressure is the risk
+        // (historical note kept WIDTH at 4); aarch64 has the GPRs.
 
         // Handle special cases. Paradoxically, below is repetitive but concise.
         // The branches should be very predictable.
@@ -184,21 +186,29 @@ pub trait Field:
             let x01inv = x012inv * x[2];
             buf.extend([x01inv * x[1], x01inv * x[0], x012inv * x01]);
             return;
+        } else if n < WIDTH {
+            // Classic single-chain Montgomery for 4..7. Not the INV_BATCH=128
+            // prove path; kept so field_testing / tiny benches stay exact.
+            let mut acc = x[0];
+            buf.push(acc);
+            for &xi in &x[1..] {
+                acc *= xi;
+                buf.push(acc);
+            }
+            let mut inv = buf[n - 1].inverse();
+            for i in (1..n).rev() {
+                buf[i] = buf[i - 1] * inv;
+                inv *= x[i];
+            }
+            buf[0] = inv;
+            return;
         }
         debug_assert!(n >= WIDTH);
 
         // Buf is reused for a few things to save allocations.
-        // Fill buf with cumulative product of x, only taking every 4th value. Concretely, buf will
-        // be [
-        //   x[0], x[1], x[2], x[3],
-        //   x[0] * x[4], x[1] * x[5], x[2] * x[6], x[3] * x[7],
-        //   x[0] * x[4] * x[8], x[1] * x[5] * x[9], x[2] * x[6] * x[10], x[3] * x[7] * x[11],
-        //   ...
-        // ].
-        // If n is not a multiple of WIDTH, the result is truncated from the end. For example,
-        // for n == 5, we get [x[0], x[1], x[2], x[3], x[0] * x[4]].
-        // cumul_prod holds the last WIDTH elements of buf. This is redundant, but it's how we
-        // convince LLVM to keep the values in the registers.
+        // Fill buf with cumulative product of x, only taking every WIDTH-th value.
+        // cumul_prod holds the last WIDTH elements of buf so LLVM keeps them
+        // in registers.
         let mut cumul_prod: [Self; WIDTH] = x[..WIDTH].try_into().unwrap();
         buf.extend(cumul_prod);
         for (i, &xi) in x[WIDTH..].iter().enumerate() {
@@ -208,19 +218,30 @@ pub trait Field:
         debug_assert_eq!(buf.len(), n);
 
         let mut a_inv = {
-            // This is where the four dependency chains meet.
-            // Take the last four elements of buf and invert them all.
+            // Eight dependency chains meet here.
             let c01 = cumul_prod[0] * cumul_prod[1];
             let c23 = cumul_prod[2] * cumul_prod[3];
+            let c45 = cumul_prod[4] * cumul_prod[5];
+            let c67 = cumul_prod[6] * cumul_prod[7];
             let c0123 = c01 * c23;
-            let c0123inv = c0123.inverse();
+            let c4567 = c45 * c67;
+            let c01234567 = c0123 * c4567;
+            let c01234567inv = c01234567.inverse();
+            let c0123inv = c01234567inv * c4567;
+            let c4567inv = c01234567inv * c0123;
             let c01inv = c0123inv * c23;
             let c23inv = c0123inv * c01;
+            let c45inv = c4567inv * c67;
+            let c67inv = c4567inv * c45;
             [
                 c01inv * cumul_prod[1],
                 c01inv * cumul_prod[0],
                 c23inv * cumul_prod[3],
                 c23inv * cumul_prod[2],
+                c45inv * cumul_prod[5],
+                c45inv * cumul_prod[4],
+                c67inv * cumul_prod[7],
+                c67inv * cumul_prod[6],
             ]
         };
 
