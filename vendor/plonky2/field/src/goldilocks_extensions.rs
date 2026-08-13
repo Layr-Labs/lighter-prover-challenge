@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[QuadraticExtension<Self>],
+        base_a: &[Self],
+        base_b: &[Self],
+    ) -> (QuadraticExtension<Self>, QuadraticExtension<Self>) {
+        ext2_base_scalar_dot_products_2(extension_values, base_a, base_b)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +286,48 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+/// Two independent `ext2_base_scalar_dot_product`s sharing the power walk.
+/// Four delayed-reduction accumulators; each has the same term-count bound
+/// as the single-dot kernel. Field-identical to two singles.
+#[inline]
+fn ext2_base_scalar_dot_products_2(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_a: &[GoldilocksField],
+    base_b: &[GoldilocksField],
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    let len_a = extension_values.len().min(base_a.len());
+    let len_b = extension_values.len().min(base_b.len());
+    let shared = len_a.min(len_b);
+    let (mut a0l, mut a0h) = (0u128, 0u32);
+    let (mut a1l, mut a1h) = (0u128, 0u32);
+    let (mut b0l, mut b0h) = (0u128, 0u32);
+    let (mut b1l, mut b1h) = (0u128, 0u32);
+    for i in 0..shared {
+        let QuadraticExtension([p0, p1]) = extension_values[i];
+        u160_add_product(&mut a0l, &mut a0h, p0.0, base_a[i].0);
+        u160_add_product(&mut a1l, &mut a1h, p1.0, base_a[i].0);
+        u160_add_product(&mut b0l, &mut b0h, p0.0, base_b[i].0);
+        u160_add_product(&mut b1l, &mut b1h, p1.0, base_b[i].0);
+    }
+    for i in shared..len_a {
+        let QuadraticExtension([p0, p1]) = extension_values[i];
+        u160_add_product(&mut a0l, &mut a0h, p0.0, base_a[i].0);
+        u160_add_product(&mut a1l, &mut a1h, p1.0, base_a[i].0);
+    }
+    for i in shared..len_b {
+        let QuadraticExtension([p0, p1]) = extension_values[i];
+        u160_add_product(&mut b0l, &mut b0h, p0.0, base_b[i].0);
+        u160_add_product(&mut b1l, &mut b1h, p1.0, base_b[i].0);
+    }
+    (
+        QuadraticExtension([unsafe { reduce160(a0l, a0h) }, unsafe { reduce160(a1l, a1h) }]),
+        QuadraticExtension([unsafe { reduce160(b0l, b0h) }, unsafe { reduce160(b1l, b1h) }]),
+    )
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction

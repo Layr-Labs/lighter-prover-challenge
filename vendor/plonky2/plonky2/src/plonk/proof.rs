@@ -373,10 +373,28 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             }
         }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
+            // Pair adjacent polynomials so two dots share one walk of `pows`.
+            // Odd tail uses the single-dot hook. Bit-identical to one call
+            // per polynomial: the paired Goldilocks kernel is two independent
+            // delayed-reduction dots.
+            let n = polynomials.len();
+            let mut out = vec![F::Extension::ZERO; n];
+            out.par_chunks_mut(2)
+                .zip(polynomials.par_chunks(2))
+                .for_each(|(dst, src)| {
+                    if src.len() == 2 {
+                        let (x, y) = F::extension_base_dot_products_2(
+                            pows,
+                            &src[0].coeffs,
+                            &src[1].coeffs,
+                        );
+                        dst[0] = x;
+                        dst[1] = y;
+                    } else {
+                        dst[0] = F::extension_base_dot_product(pows, &src[0].coeffs);
+                    }
+                });
+            out
         };
         let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
             eval_polynomials(pows, &c.polynomials)
