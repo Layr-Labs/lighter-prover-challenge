@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -208,12 +208,110 @@ impl ChainState<'_> {
     }
 }
 
+/// Orders the allocation-heavy, predecessor-independent half of recursive
+/// chain witness generation.
+///
+/// A chain step may prepare while its immediate predecessor proves, but a
+/// farther step must not allocate another [`PendingPartitionWitness`] yet.
+/// `Condvar` wakeups are not FIFO, so admission is keyed by the chain step
+/// rather than delegated to wake order. The permit advances the gate from its
+/// `Drop` implementation: an error or panic in preparation/predecessor joining
+/// cannot strand every later chain thread asleep.
+struct OrderedChainPrepGate {
+    state: Mutex<OrderedChainPrepState>,
+    ready: Condvar,
+}
+
+struct OrderedChainPrepState {
+    next_step: u64,
+    active: bool,
+    waiters: usize,
+}
+
+impl OrderedChainPrepGate {
+    fn new(first_step: u64) -> Self {
+        Self {
+            state: Mutex::new(OrderedChainPrepState {
+                next_step: first_step,
+                active: false,
+                waiters: 0,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self, step: u64) -> OrderedChainPrepPermit<'_> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counted_waiter = false;
+        loop {
+            assert!(
+                step >= state.next_step,
+                "chain preparation step {step} arrived after step {} was released",
+                state.next_step,
+            );
+            if step == state.next_step && !state.active {
+                if counted_waiter {
+                    state.waiters -= 1;
+                }
+                state.active = true;
+                return OrderedChainPrepPermit { gate: self, step };
+            }
+            if !counted_waiter {
+                state.waiters += 1;
+                counted_waiter = true;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> (u64, bool, usize) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.next_step, state.active, state.waiters)
+    }
+}
+
+struct OrderedChainPrepPermit<'a> {
+    gate: &'a OrderedChainPrepGate,
+    step: u64,
+}
+
+impl Drop for OrderedChainPrepPermit<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .gate
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Avoid an assertion here: this destructor is the unwind-safety path,
+        // and a second panic would abort the process rather than open the gate.
+        if state.active && state.next_step == self.step {
+            state.active = false;
+            state.next_step = state.next_step.wrapping_add(1);
+        }
+        drop(state);
+        // All waiters must re-check their explicit step. `notify_one` can wake
+        // a farther, non-FIFO waiter and leave the immediate successor asleep.
+        self.gate.ready.notify_all();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chain_step_proof(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
     chain_data: &CircuitData<F, C, D>,
     chain_step: u64,
+    prep_gate: &OrderedChainPrepGate,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
     dummy_proof: &Proof,
@@ -229,6 +327,10 @@ fn chain_step_proof(
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "chain_step");
     let result = (|| {
+        // At most the immediate successor may own an allocation-heavy pending
+        // witness while the preceding proof is in flight. Farther steps wait
+        // here, before `PartitionWitness::new` reserves its column storage.
+        let prep_permit = prep_gate.acquire(chain_step);
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
@@ -257,6 +359,9 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
+        // This step's witness is complete and it is about to become the proving
+        // head; its immediate successor may now prepare concurrently.
+        drop(prep_permit);
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
     // This step is no longer part of the runnable backlog (see the matching
@@ -458,9 +563,10 @@ fn prove_path(
     );
     jump = next_jump;
 
-
+    let prep_gate = OrderedChainPrepGate::new(0);
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
+        let prep_gate = &prep_gate;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -485,6 +591,7 @@ fn prove_path(
                             chain_target,
                             chain_data,
                             chain_step,
+                            prep_gate,
                             previous,
                             base,
                             dummy_proof,
@@ -578,6 +685,7 @@ fn prove_path(
                         chain_target,
                         chain_data,
                         chain_step,
+                        prep_gate,
                         previous,
                         base,
                         dummy_proof,
@@ -637,6 +745,7 @@ fn prove_path(
                         chain_target,
                         chain_data,
                         chain_step,
+                        prep_gate,
                         previous,
                         base,
                         dummy_proof,
@@ -1010,6 +1119,85 @@ mod tests {
     }
 
     #[test]
+    fn ordered_chain_prep_admits_out_of_order_waiters_by_step() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        fn wait_for_waiters(gate: &OrderedChainPrepGate, expected: usize) {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while gate.snapshot().2 != expected {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {expected} chain-prep waiters; state {:?}",
+                    gate.snapshot(),
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        let gate = Arc::new(OrderedChainPrepGate::new(0));
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_one_tx, release_one_rx) = mpsc::channel();
+        let (release_two_tx, release_two_rx) = mpsc::channel();
+
+        // Insert step 2 before step 1 to model a non-FIFO waiter/wakeup order.
+        let step_two_gate = Arc::clone(&gate);
+        let step_two_acquired = acquired_tx.clone();
+        let step_two = std::thread::spawn(move || {
+            let _permit = step_two_gate.acquire(2);
+            step_two_acquired.send(2).unwrap();
+            release_two_rx.recv().unwrap();
+        });
+        wait_for_waiters(&gate, 1);
+
+        let step_one_gate = Arc::clone(&gate);
+        let step_one_acquired = acquired_tx.clone();
+        let step_one = std::thread::spawn(move || {
+            let _permit = step_one_gate.acquire(1);
+            step_one_acquired.send(1).unwrap();
+            release_one_rx.recv().unwrap();
+        });
+        wait_for_waiters(&gate, 2);
+
+        let step_zero = gate.acquire(0);
+        assert_eq!(gate.snapshot(), (0, true, 2));
+        drop(step_zero);
+
+        assert_eq!(
+            acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            1,
+            "the immediate successor must win even when a farther waiter arrived first",
+        );
+        assert!(
+            acquired_rx.recv_timeout(Duration::from_millis(25)).is_err(),
+            "step 2 prepared before step 1 released its permit",
+        );
+        release_one_tx.send(()).unwrap();
+        assert_eq!(acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2,);
+        release_two_tx.send(()).unwrap();
+
+        step_one.join().unwrap();
+        step_two.join().unwrap();
+        assert_eq!(gate.snapshot(), (3, false, 0));
+    }
+
+    #[test]
+    fn ordered_chain_prep_panic_releases_successor() {
+        let gate = OrderedChainPrepGate::new(0);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = gate.acquire(0);
+            panic!("synthetic chain preparation failure");
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(gate.snapshot(), (1, false, 0));
+        let successor = gate.acquire(1);
+        assert_eq!(gate.snapshot(), (1, true, 0));
+        drop(successor);
+        assert_eq!(gate.snapshot(), (2, false, 0));
+    }
+
+    #[test]
     fn parsed_mixed_chunks_have_expected_paths() {
         std::thread::Builder::new()
             .stack_size(32 * 1024 * 1024)
@@ -1211,6 +1399,7 @@ mod tests {
             old_delta_root,
         );
 
+        let prep_gate = OrderedChainPrepGate::new(0);
         let mut previous: Option<Proof> = None;
         for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
@@ -1287,6 +1476,7 @@ mod tests {
                 &circuits.chain_target,
                 &circuits.chain_data,
                 chain_step,
+                &prep_gate,
                 previous.clone().map(ChainState::Ready),
                 &base_proof,
                 &circuits.dummy_proof,
