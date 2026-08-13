@@ -2334,17 +2334,15 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
             },
         );
+
+    // Keep GPU numerators in their producer-owned buffers until the mandatory
+    // point-major -> challenge-major scatter. This avoids three full
+    // read/modify/write walks over `quotient_values`; the scatter below adds
+    // contributions in the same Poseidon/Range/Permutation order and applies
+    // the common Z_H inverse exactly once to the completed numerator.
+    let mut gpu_contributions: [Option<&[F]>; 3] = [None, None, None];
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
@@ -2380,16 +2378,7 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_contributions[0] = Some(gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2429,16 +2418,7 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_contributions[1] = Some(gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2466,16 +2446,7 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        gpu_contributions[2] = Some(gpu_values);
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
@@ -2510,9 +2481,24 @@ fn compute_quotient_polys<
         .for_each(|(chunk_i, chunk)| {
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
+                let point = base + k;
+                let denominator_inv = z_h_on_coset.eval_inverse(point);
+                for (challenge, (column, &cpu_value)) in
+                    column_ptrs.iter().zip(point_values).enumerate()
+                {
+                    let source = point * num_challenges + challenge;
+                    let mut numerator = cpu_value;
+                    if let Some(values) = gpu_contributions[0] {
+                        numerator += values[source];
+                    }
+                    if let Some(values) = gpu_contributions[1] {
+                        numerator += values[source];
+                    }
+                    if let Some(values) = gpu_contributions[2] {
+                        numerator += values[source];
+                    }
                     // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    unsafe { *column.0.add(point) = numerator * denominator_inv };
                 }
             }
         });
