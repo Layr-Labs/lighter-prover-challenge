@@ -11,6 +11,7 @@ use anyhow::Result;
 
 use crate::field::extension::Extendable;
 use crate::field::ops::Square;
+use crate::field::packable::Packable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
@@ -144,11 +145,90 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
-        self.eval_unfiltered_base_batch_accumulate_packed(
-            vars_base,
-            filters,
-            combined_gate_constraints,
-        );
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
+
+        // This gate has 68 constraints in production and is deliberately kept
+        // on the CPU. The generic packed accumulator materializes every packed
+        // constraint into a temporary 68 x WIDTH matrix, then immediately
+        // reads that matrix back to multiply by the selector filter. Accumulate
+        // each constraint directly instead: the packed arithmetic and emission
+        // order are identical, but the scratch write/read pass disappears.
+        let width = <<F as Packable>::Packing as PackedField>::WIDTH;
+        let (vars_packed_iter, vars_leftovers_iter) =
+            vars_base.pack::<<F as Packable>::Packing>();
+        let leftovers_start = n - vars_leftovers_iter.len();
+
+        for (group, vars) in vars_packed_iter.enumerate() {
+            type P<F> = <F as Packable>::Packing;
+            let offset = group * width;
+            let mut filter = P::<F>::ZEROS;
+            filter
+                .as_slice_mut()
+                .copy_from_slice(&filters[offset..offset + width]);
+
+            let base = vars.local_wires[self.wire_base()];
+            let power_bits = vars
+                .local_wires
+                .view(self.wire_power_bit(0)..self.wire_power_bit(0) + self.num_power_bits);
+            let intermediate_values = vars.local_wires.view(
+                self.wire_intermediate_value(0)
+                    ..self.wire_intermediate_value(0) + self.num_power_bits,
+            );
+            let base_minus_one = base - P::<F>::ONES;
+
+            for i in 0..self.num_power_bits {
+                let prev = if i == 0 {
+                    P::<F>::ONES
+                } else {
+                    intermediate_values[i - 1].square()
+                };
+                let bit = power_bits[self.num_power_bits - i - 1];
+                let mul_by = P::<F>::ONES.multiply_accumulate(bit, base_minus_one);
+                let constraint = prev * mul_by - intermediate_values[i];
+                let combined = &mut combined_gate_constraints[i * n + offset..][..width];
+                let mut acc = P::<F>::ZEROS;
+                acc.as_slice_mut().copy_from_slice(combined);
+                combined.copy_from_slice(acc.multiply_accumulate(constraint, filter).as_slice());
+            }
+
+            let constraint =
+                vars.local_wires[self.wire_output()] - intermediate_values[self.num_power_bits - 1];
+            let combined =
+                &mut combined_gate_constraints[self.num_power_bits * n + offset..][..width];
+            let mut acc = P::<F>::ZEROS;
+            acc.as_slice_mut().copy_from_slice(combined);
+            combined.copy_from_slice(acc.multiply_accumulate(constraint, filter).as_slice());
+        }
+
+        for (lane, vars) in vars_leftovers_iter.enumerate() {
+            let point = leftovers_start + lane;
+            let filter = filters[point];
+            let base = vars.local_wires[self.wire_base()];
+            let power_bits = vars
+                .local_wires
+                .view(self.wire_power_bit(0)..self.wire_power_bit(0) + self.num_power_bits);
+            let intermediate_values = vars.local_wires.view(
+                self.wire_intermediate_value(0)
+                    ..self.wire_intermediate_value(0) + self.num_power_bits,
+            );
+            let base_minus_one = base - F::ONE;
+            for i in 0..self.num_power_bits {
+                let prev = if i == 0 {
+                    F::ONE
+                } else {
+                    intermediate_values[i - 1].square()
+                };
+                let bit = power_bits[self.num_power_bits - i - 1];
+                let mul_by = F::ONE.multiply_accumulate(bit, base_minus_one);
+                let constraint = prev * mul_by - intermediate_values[i];
+                combined_gate_constraints[i * n + point] += constraint * filter;
+            }
+            let constraint =
+                vars.local_wires[self.wire_output()] - intermediate_values[self.num_power_bits - 1];
+            combined_gate_constraints[self.num_power_bits * n + point] += constraint * filter;
+        }
     }
 
     fn eval_unfiltered_circuit(
@@ -420,6 +500,61 @@ mod tests {
         let gate = ExponentiationGate::new_from_config(&config);
         assert_eq!(gate.num_power_bits, 67);
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn direct_filtered_accumulation_matches_materialized_production_gate() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        use crate::field::batch_util::batch_multiply_add_inplace;
+        use crate::field::types::{Field64, PrimeField64};
+
+        fn value(i: usize) -> F {
+            let small = ((i as u64).wrapping_mul(0x9e37_79b9) ^ 0x5a5a_a5a5) & 0xffff;
+            if i % 3 == 0 {
+                GoldilocksField(F::ORDER + small)
+            } else {
+                F::from_canonical_u64(small)
+            }
+        }
+
+        let config = CircuitConfig {
+            num_wires: 136,
+            num_routed_wires: 80,
+            ..CircuitConfig::standard_recursion_config()
+        };
+        let gate = ExponentiationGate::<F, D>::new_from_config(&config);
+        assert_eq!(gate.num_power_bits, 67);
+        for n in [1, 3, 4, 5, 7, 11, 31, 32, 33] {
+            let wires = (0..gate.num_wires() * n)
+                .map(|i| value(i + 1))
+                .collect::<Vec<_>>();
+            let filters = (0..n)
+                .map(|i| if i % 5 == 0 { F::ZERO } else { value(i + 10_001) })
+                .collect::<Vec<_>>();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &hash);
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            let initial = (0..gate.num_constraints() * n)
+                .map(|i| value(i + 20_001))
+                .collect::<Vec<_>>();
+            let mut expected = initial.clone();
+            for (acc, constraints) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+            let mut actual = initial;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    actual.to_noncanonical_u64(),
+                    expected.to_noncanonical_u64(),
+                    "n={n}, output={i}"
+                );
+            }
+        }
     }
 
     #[test]
