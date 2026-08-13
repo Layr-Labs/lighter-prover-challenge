@@ -22,6 +22,8 @@ use crate::plonk::circuit_data::{CommonCircuitData, GeneratorWatchIndex, ProverO
 use crate::plonk::config::GenericConfig;
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
+// Archive retry fingerprint: the watcher-index representation remains unchanged.
+
 /// Given a `PartitionWitness` that has only inputs set, populates the rest of the witness using the
 /// given set of generators.
 pub fn generate_partial_witness<
@@ -170,7 +172,7 @@ fn run_generator_worklist<
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
+                Vec<(Target, F, Option<&[u32]>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -221,6 +223,7 @@ fn run_generator_worklist<
                         }
                         if let Some(watchers) = watchers {
                             for &watching_generator_idx in watchers {
+                                let watching_generator_idx = watching_generator_idx as usize;
                                 if !generator_is_expired[watching_generator_idx] {
                                     debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
                                     unresolved_watches[watching_generator_idx] -= 1;
@@ -265,6 +268,7 @@ fn run_generator_worklist<
                 if let Some(watch) = witness.set_target_returning_rep(t, v)? {
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
+                            let watching_generator_idx = watching_generator_idx as usize;
                             if !generator_is_expired[watching_generator_idx] {
                                 debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
                                 unresolved_watches[watching_generator_idx] -= 1;
@@ -310,6 +314,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
         if let Some(watch) = witness.set_target_returning_rep(t, v)? {
             if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     debug_assert_ne!(unresolved_watches[generator_idx], 0);
                     unresolved_watches[generator_idx] -= 1;
                 }
@@ -344,6 +349,7 @@ impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
                     self.unresolved_watches[generator_idx] -= 1;
                 }
@@ -383,6 +389,7 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &watching_generator_idx in watchers {
+                    let watching_generator_idx = watching_generator_idx as usize;
                     if !self.generator_is_expired[watching_generator_idx] {
                         debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
                         self.unresolved_watches[watching_generator_idx] -= 1;
@@ -556,6 +563,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
                 if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                     for &watching_generator_idx in watchers {
+                        let watching_generator_idx = watching_generator_idx as usize;
                         if !self.generator_is_expired[watching_generator_idx] {
                             debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
                             self.unresolved_watches[watching_generator_idx] -= 1;
@@ -1216,6 +1224,7 @@ mod tests {
         for (watch, watchers) in prover_data.generator_indices_by_watches.iter() {
             if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     unresolved_watches[generator_idx] += 1;
                 }
             }
@@ -1236,6 +1245,7 @@ mod tests {
         let mut occurrences = vec![0usize; prover_data.generators.len()];
         for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
             for &generator_idx in watchers {
+                let generator_idx = generator_idx as usize;
                 occurrences[generator_idx] += 1;
             }
         }
