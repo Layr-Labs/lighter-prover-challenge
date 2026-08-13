@@ -589,6 +589,45 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+/// Divide the two production permutation challenge vectors with one
+/// Montgomery batch inversion. The paired path already computes both
+/// numerator/denominator streams in the same point traversal; combining the
+/// two disjoint denominator batches leaves every individual ratio unchanged
+/// while replacing two expensive field inversions with one.
+///
+/// The cumulative-product tree is intentionally different from two independent
+/// batches. The dedicated differential test covers all helper branches by raw
+/// field limb, while the paired-path test and proof verification cover the
+/// complete permutation argument.
+#[inline]
+fn divide_paired_chunk_products<F: Field>(
+    numerator_products_0: &mut [F],
+    numerator_products_1: &mut [F],
+    denominators_0: &mut Vec<F>,
+    denominators_1: &[F],
+    inverse_scratch: &mut Vec<F>,
+) {
+    let first_len = denominators_0.len();
+    debug_assert_eq!(numerator_products_0.len(), first_len);
+    debug_assert_eq!(numerator_products_1.len(), denominators_1.len());
+    denominators_0.extend_from_slice(denominators_1);
+    F::batch_multiplicative_inverse_into(denominators_0, inverse_scratch);
+    debug_assert_eq!(inverse_scratch.len(), denominators_0.len());
+
+    for (product, &inverse) in numerator_products_0
+        .iter_mut()
+        .zip(&inverse_scratch[..first_len])
+    {
+        *product *= inverse;
+    }
+    for (product, &inverse) in numerator_products_1
+        .iter_mut()
+        .zip(&inverse_scratch[first_len..])
+    {
+        *product *= inverse;
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -688,9 +727,9 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
@@ -747,8 +786,13 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    divide_paired_chunk_products(
+                        products_0,
+                        products_1,
+                        denominators_0,
+                        denominators_1,
+                        denominator_inverses,
+                    );
                 },
             );
     }
@@ -3308,7 +3352,8 @@ mod permutation_pairing_tests {
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        all_wires_permutation_partial_products, divide_chunk_products,
+        divide_paired_chunk_products, paired_permutation_batch_count,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
     };
@@ -3361,6 +3406,62 @@ mod permutation_pairing_tests {
                     return x;
                 }
             }
+        }
+    }
+
+    /// A shared Montgomery inversion has a different cumulative-product tree
+    /// from two independent batches. This verifies the final divided products
+    /// by raw representative across every small-width branch in the generic
+    /// inversion helper, a short final batch, and the production 128 x 10
+    /// quotient-product batch.
+    #[test]
+    fn paired_inverse_batch_matches_separate_batches_by_raw_product() {
+        let mut rng = Rng::new(0x6f20_8af1_59d3_147b);
+        for len in [1usize, 2, 3, 4, 7, 31, 127, 128, 1_280] {
+            let mut separate_0 = (0..len).map(|_| rng.next_field()).collect::<Vec<_>>();
+            let mut separate_1 = (0..len).map(|_| rng.next_field()).collect::<Vec<_>>();
+            let mut paired_0 = separate_0.clone();
+            let mut paired_1 = separate_1.clone();
+            let mut denominators_0 = (0..len)
+                .map(|_| rng.next_nonzero_field())
+                .collect::<Vec<_>>();
+            let denominators_1 = (0..len)
+                .map(|_| rng.next_nonzero_field())
+                .collect::<Vec<_>>();
+
+            let mut scratch = Vec::new();
+            divide_chunk_products(&mut separate_0, &denominators_0, &mut scratch);
+            divide_chunk_products(&mut separate_1, &denominators_1, &mut scratch);
+            divide_paired_chunk_products(
+                &mut paired_0,
+                &mut paired_1,
+                &mut denominators_0,
+                &denominators_1,
+                &mut scratch,
+            );
+
+            assert_eq!(
+                paired_0
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                separate_0
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                "first challenge raw product length {len}"
+            );
+            assert_eq!(
+                paired_1
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                separate_1
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                "second challenge raw product length {len}"
+            );
         }
     }
 
