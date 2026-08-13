@@ -606,6 +606,79 @@ pub fn prewarm_large_column_store(bytes: u64) {
 /// device allocation. Misses (including lock contention) fall through to the
 /// allocator; the pool is a best-effort page-warm cache, never a correctness
 /// dependency.
+/// Recurring column-store sizes first-touched after the Metal context is
+/// up (see `bench` startup comments and `CIRCUIT_CONFIG.num_wires`).
+/// Isolate marker: pool-prefill-1786674000.
+const PREFILL_COLUMN_STORE_SHAPES: &[u64] = &[
+    88 * (1 << 19) * 8,  // tx constants/sigmas LDE
+    88 * (1 << 19) * 8,  // second tx circuit
+    136 * (1 << 19) * 8, // tx wires LDE
+    136 * (1 << 19) * 8, // second tx path
+    86 * (1 << 17) * 8,  // chain / pre-exec constants/sigmas
+    86 * (1 << 17) * 8,
+];
+
+/// Page-walk a shared buffer so the kernel zero-fill happens here.
+fn page_walk_shared_buffer(buffer: &Buffer) {
+    let bytes = buffer.length();
+    let base = buffer.contents().cast::<u8>();
+    if base.is_null() {
+        return;
+    }
+    const PAGE: isize = 16 * 1024;
+    let mut offset: isize = 0;
+    while (offset as u64) < bytes {
+        // SAFETY: offset stays within the buffer's allocated length.
+        unsafe { base.offset(offset).write_volatile(0) };
+        offset += PAGE;
+    }
+}
+
+/// Allocate the recurring column-store shapes, walk every page, then
+/// publish into [`COLUMN_STORE_POOL`]. Walk-then-publish: no consumer
+/// exists until the first `from_values` after context-ready, so a
+/// half-warm insert would only recreate the fault on the critical path.
+/// Best-effort: lock or size misses drop the buffer.
+fn prefill_column_store_pool(device: &Device) {
+    for &bytes in PREFILL_COLUMN_STORE_SHAPES {
+        if bytes == 0 || bytes > MAX_CACHED_COLUMN_STORE_BYTES {
+            continue;
+        }
+        let buffer = autoreleasepool(|| {
+            device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+        });
+        page_walk_shared_buffer(&buffer);
+        if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
+            pool.recycle(buffer);
+        }
+    }
+}
+
+/// UTILITY-class prefill overlapping AIR→ISA lowering. Lands on E-cores.
+fn spawn_column_store_prefill() {
+    let _ = std::thread::Builder::new()
+        .name("column-store-prefill".to_owned())
+        .spawn(|| {
+            #[allow(non_camel_case_types)]
+            {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+            }
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            prefill_column_store_pool(&device);
+        });
+}
+
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
         if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
@@ -2369,6 +2442,11 @@ impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
             let device = Device::system_default().ok_or("no Metal device")?;
+            // Device exists; pipelines do not. Prefill the column-store pool
+            // on a UTILITY thread while this thread lowers AIR→ISA. Walk
+            // finishes before any insert, so the first post-compile
+            // `take_or_new_column_buffer` hits already-resident pages.
+            spawn_column_store_prefill();
             let options = CompileOptions::new();
             // Prefer the prebuilt AIR library over compiling the MSL source.
             //
