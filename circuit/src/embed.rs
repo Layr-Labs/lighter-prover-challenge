@@ -399,6 +399,10 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
                 .map_err(|e| anyhow::anyhow!("deserializing generator: {e:?}"))?,
         );
     }
+    let generator_readiness_is_authoritative = generators
+        .iter()
+        .map(|generator| generator.0.readiness_is_authoritative())
+        .collect();
 
     // watch index
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -581,6 +585,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         constants_sigmas_quotient_step,
         constants_sigmas_quotient_domain,
         generators,
+        generator_readiness_is_authoritative,
         generator_indices_by_watches,
         generator_watch_counts,
         constants_sigmas_commitment,

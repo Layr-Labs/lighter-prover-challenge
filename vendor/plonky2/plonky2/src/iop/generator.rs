@@ -128,6 +128,8 @@ fn run_generator_worklist<
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
+    let generator_readiness_is_authoritative =
+        &prover_data.generator_readiness_is_authoritative;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
 
     let parallel_rounds = parallel_rounds_enabled();
@@ -222,9 +224,12 @@ fn run_generator_worklist<
                         if let Some(watchers) = watchers {
                             for &watching_generator_idx in watchers {
                                 if !generator_is_expired[watching_generator_idx] {
-                                    debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                    unresolved_watches[watching_generator_idx] -= 1;
-                                    next_pending_generator_indices.push(watching_generator_idx);
+                                    enqueue_generator_after_watch(
+                                        watching_generator_idx,
+                                        generator_readiness_is_authoritative,
+                                        unresolved_watches,
+                                        &mut next_pending_generator_indices,
+                                    );
                                 }
                             }
                         }
@@ -266,9 +271,12 @@ fn run_generator_worklist<
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
                             if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
+                                enqueue_generator_after_watch(
+                                    watching_generator_idx,
+                                    generator_readiness_is_authoritative,
+                                    unresolved_watches,
+                                    &mut next_pending_generator_indices,
+                                );
                             }
                         }
                     }
@@ -283,6 +291,51 @@ fn run_generator_worklist<
     }
 
     Ok(())
+}
+
+/// Updates a generator's unresolved-watch count after one of its watched representatives first
+/// receives a value, and queues it when that generator may make progress.
+///
+/// General [`WitnessGenerator`]s retain the legacy wake-up-on-every-watch behavior: they may
+/// emit partial values before all their dependencies are available. A generator that declares its
+/// readiness predicate authoritative, on the other hand, cannot make progress until this counter
+/// reaches zero. It is therefore queued only at that transition. This moves the readiness decision
+/// to the one-time dependency update, rather than repeatedly dispatching an unready generator
+/// through the worklist's hot loop.
+#[inline]
+fn enqueue_generator_after_watch(
+    generator_idx: usize,
+    generator_readiness_is_authoritative: &[bool],
+    unresolved_watches: &mut [usize],
+    pending_generator_indices: &mut Vec<usize>,
+) {
+    debug_assert_ne!(unresolved_watches[generator_idx], 0);
+    unresolved_watches[generator_idx] -= 1;
+    if !generator_readiness_is_authoritative[generator_idx]
+        || unresolved_watches[generator_idx] == 0
+    {
+        pending_generator_indices.push(generator_idx);
+    }
+}
+
+/// Builds the initial worklist after seeding inputs.
+///
+/// An authoritative-readiness generator with unresolved watches cannot produce a value, while a
+/// general generator may. Retaining the latter in the initial queue preserves support for partial
+/// generators such as ones that emit a value before their trigger arrives.
+fn initial_pending_generator_indices<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &[usize],
+) -> Vec<usize> {
+    let mut pending_generator_indices = Vec::with_capacity(prover_data.generators.len());
+    for generator_idx in 0..prover_data.generators.len() {
+        if !prover_data.generator_readiness_is_authoritative[generator_idx]
+            || unresolved_watches[generator_idx] == 0
+        {
+            pending_generator_indices.push(generator_idx);
+        }
+    }
+    pending_generator_indices
 }
 
 /// Seeds `inputs` into `witness` and returns, per generator, the number of distinct
@@ -368,6 +421,7 @@ pub struct PartitionFeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
     unresolved_watches: &'b mut [usize],
     generator_is_expired: &'b [bool],
+    generator_readiness_is_authoritative: &'b [bool],
     pending_generator_indices: &'b mut Vec<usize>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
 }
@@ -384,9 +438,12 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &watching_generator_idx in watchers {
                     if !self.generator_is_expired[watching_generator_idx] {
-                        debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                        self.unresolved_watches[watching_generator_idx] -= 1;
-                        self.pending_generator_indices.push(watching_generator_idx);
+                        enqueue_generator_after_watch(
+                            watching_generator_idx,
+                            self.generator_readiness_is_authoritative,
+                            self.unresolved_watches,
+                            self.pending_generator_indices,
+                        );
                     }
                 }
             }
@@ -474,15 +531,18 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let pending_generator_indices =
+            initial_pending_generator_indices(prover_data, &unresolved_watches);
 
-        // Initially, all generators are queued.
+        // General generators run once initially because they can emit partial values. Generators
+        // with authoritative readiness wait until every distinct watch is populated.
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            pending_generator_indices,
             parallel_threshold,
         )?;
 
@@ -499,8 +559,8 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// Like [`Self::start`], but the initial inputs are written by `seed`
     /// directly into the partition through a [`PartitionSeeder`] — no
     /// intermediate `PartialWitness` map is built or replayed. Worklist
-    /// initialization is unchanged: all generators are queued, gated by the
-    /// same unresolved-watch counters the map-seeded path would produce.
+    /// initialization uses the same unresolved-watch counters as the map-seeded path: general
+    /// generators are queued, while authoritative-readiness generators wait for all watches.
     pub fn start_seeded(
         prover_data: &'a ProverOnlyCircuitData<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
@@ -523,15 +583,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let pending_generator_indices =
+            initial_pending_generator_indices(prover_data, &unresolved_watches);
 
-        // Initially, all generators are queued.
+        // Keep the same initial scheduling semantics as the map-seeded path.
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            pending_generator_indices,
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
@@ -550,6 +612,8 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// run to quiescence and cannot make progress without new values.
     pub fn feed(&mut self, inputs: PartialWitness<F>) -> Result<()> {
         let generator_indices_by_watches = &self.prover_data.generator_indices_by_watches;
+        let generator_readiness_is_authoritative =
+            &self.prover_data.generator_readiness_is_authoritative;
 
         let mut pending_generator_indices = Vec::new();
         for (t, v) in inputs.target_values.into_iter() {
@@ -557,9 +621,12 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                     for &watching_generator_idx in watchers {
                         if !self.generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                            self.unresolved_watches[watching_generator_idx] -= 1;
-                            pending_generator_indices.push(watching_generator_idx);
+                            enqueue_generator_after_watch(
+                                watching_generator_idx,
+                                generator_readiness_is_authoritative,
+                                &mut self.unresolved_watches,
+                                &mut pending_generator_indices,
+                            );
                         }
                     }
                 }
@@ -591,6 +658,9 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             witness: &mut self.witness,
             unresolved_watches: &mut self.unresolved_watches,
             generator_is_expired: &self.generator_is_expired,
+            generator_readiness_is_authoritative: &self
+                .prover_data
+                .generator_readiness_is_authoritative,
             pending_generator_indices: &mut pending_generator_indices,
             generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
         })?;
@@ -633,6 +703,18 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// flag is true, the generator will never be run again, otherwise it will be queued for another
     /// run next time a target in its watch list is populated.
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool;
+
+    /// Whether this generator can make progress only once every distinct watched representative
+    /// has been populated.
+    ///
+    /// The default is deliberately conservative: general generators may emit intermediate values
+    /// before all watches are present, and must retain the legacy wake-up-on-every-watch schedule.
+    /// Implementations returning `true` promise that they never need to run while any watch is
+    /// unresolved; the worklist may then omit those unready dispatches entirely.
+    #[doc(hidden)]
+    fn readiness_is_authoritative(&self) -> bool {
+        false
+    }
 
     /// Scheduler entry point carrying a hint that every watched representative is populated.
     ///
@@ -791,6 +873,10 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         } else {
             false
         }
+    }
+
+    fn readiness_is_authoritative(&self) -> bool {
+        true
     }
 
     fn run_with_ready_hint(
@@ -1083,6 +1169,57 @@ mod tests {
                     .unwrap();
                 false
             }
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
+    /// A general `WitnessGenerator` whose contract is the same as a simple generator's: it must
+    /// not run until every listed dependency is present. Keeping it separate from
+    /// `CountingSimpleGenerator` exercises the opt-in scheduling contract directly rather than
+    /// relying on the adapter implementation.
+    #[derive(Debug)]
+    struct CountingAuthoritativeGenerator {
+        dependencies: Vec<Target>,
+        output: Target,
+        run_calls: Arc<AtomicUsize>,
+    }
+
+    impl WitnessGenerator<F, D> for CountingAuthoritativeGenerator {
+        fn id(&self) -> String {
+            "CountingAuthoritativeGenerator".to_string()
+        }
+
+        fn watch_list(&self) -> Vec<Target> {
+            self.dependencies.clone()
+        }
+
+        fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool {
+            self.run_calls.fetch_add(1, Ordering::Relaxed);
+            let value = self
+                .dependencies
+                .iter()
+                .map(|&target| witness.get_target(target))
+                .sum();
+            out_buffer.set_target(self.output, value).unwrap();
+            true
+        }
+
+        fn readiness_is_authoritative(&self) -> bool {
+            true
         }
 
         fn serialize(
@@ -1793,5 +1930,70 @@ mod tests {
         assert_eq!(witness.get_target(early_output), F::from_canonical_u64(7));
         assert_eq!(witness.get_target(final_output), F::from_canonical_u64(11));
         assert_eq!(run_calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn authoritative_generator_waits_for_all_watches_across_seed_and_feed_paths() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let first = builder.add_virtual_target();
+        let second = builder.add_virtual_target();
+        let output = builder.add_virtual_target();
+        let run_calls = Arc::new(AtomicUsize::new(0));
+
+        builder.add_generators(vec![WitnessGeneratorRef::new(CountingAuthoritativeGenerator {
+            dependencies: vec![first, second],
+            output,
+            run_calls: Arc::clone(&run_calls),
+        })]);
+        builder.register_public_input(output);
+        let circuit = builder.build::<C>();
+        let generator_idx = circuit
+            .prover_only
+            .generators
+            .iter()
+            .position(|generator| generator.0.id() == "CountingAuthoritativeGenerator")
+            .expect("test generator missing");
+
+        assert!(
+            circuit.prover_only.generator_readiness_is_authoritative[generator_idx],
+            "the authoritative scheduling contract was not derived at build time"
+        );
+
+        // Neither the initial worklist nor the first watched value may dispatch this generator.
+        // Its `run` implementation deliberately reads both dependencies without a readiness
+        // check, so an accidental eager dispatch would fail this test instead of being hidden by
+        // an inner guard.
+        let mut pending =
+            PendingPartitionWitness::start(PartialWitness::new(), &circuit.prover_only, &circuit.common)?;
+        assert_eq!(run_calls.load(Ordering::Relaxed), 0);
+        let mut first_input = PartialWitness::new();
+        first_input.set_target(first, F::from_canonical_u64(4))?;
+        pending.feed(first_input)?;
+        assert_eq!(run_calls.load(Ordering::Relaxed), 0);
+        let mut second_input = PartialWitness::new();
+        second_input.set_target(second, F::from_canonical_u64(9))?;
+        pending.feed(second_input)?;
+        assert_eq!(run_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            pending.finish()?.get_target(output),
+            F::from_canonical_u64(13)
+        );
+
+        // `PartitionSeeder` and `PartitionFeeder` have their own wake-up path. Seed one watch
+        // directly, then feed the other directly; this must have the identical single dispatch.
+        let mut pending = PendingPartitionWitness::start_seeded(
+            &circuit.prover_only,
+            &circuit.common,
+            |seeder| seeder.set_target(first, F::from_canonical_u64(4)),
+        )?;
+        assert_eq!(run_calls.load(Ordering::Relaxed), 1);
+        pending.feed_seeded(|feeder| feeder.set_target(second, F::from_canonical_u64(9)))?;
+        assert_eq!(run_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            pending.finish()?.get_target(output),
+            F::from_canonical_u64(13)
+        );
+
+        Ok(())
     }
 }

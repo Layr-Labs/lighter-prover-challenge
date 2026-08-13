@@ -1348,6 +1348,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 &generator_watch_representatives,
                 &generator_watch_counts,
             );
+        let generator_readiness_is_authoritative = self
+            .generators
+            .iter()
+            .map(|generator| generator.0.readiness_is_authoritative())
+            .collect();
         drop(generator_watch_representatives);
         drop(generator_representatives);
 
@@ -1464,6 +1469,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
+            generator_readiness_is_authoritative,
             generator_indices_by_watches,
             generator_watch_counts,
             constants_sigmas_commitment,

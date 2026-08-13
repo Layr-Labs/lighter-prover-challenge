@@ -569,6 +569,11 @@ pub struct ProverOnlyCircuitData<
     const D: usize,
 > {
     pub generators: Vec<WitnessGeneratorRef<F, D>>,
+    /// For each generator (indexed as in `generators`), whether its readiness condition is
+    /// authoritative: it cannot emit a value before every distinct watched representative is
+    /// populated. Runtime-only: this is derived from each generator implementation and
+    /// reconstructed after deserialization, so the serialized format is unchanged.
+    pub generator_readiness_is_authoritative: Vec<bool>,
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: GeneratorWatchIndex,
