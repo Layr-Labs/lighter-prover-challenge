@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_scaled(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars: &[Self],
+        extra_scales: &[Self],
+    ) -> QuadraticExtension<Self> {
+        ext2_base_scalar_dot_product_scaled(extension_values, base_scalars, extra_scales)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +286,49 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+/// `sum_i extension_values[i].scalar_mul(base_scalars[i] * extra_scales[i])`
+/// in GF(p^2). Each pair of base factors is reduced by one Goldilocks
+/// multiply (the product of two raw u64 limbs does not fit a later
+/// `reduce160` three-factor product), then the already-specialized
+/// delayed-reduction base-scalar dot consumes the scaled lane.
+///
+/// Zip-to-shortest-length matches the trait default. Field-equal to
+/// building `value_i.scalar_mul(scale_i)` and then calling the unscaled
+/// dot; the raw representative may differ from a reduce-per-term form.
+#[inline]
+fn ext2_base_scalar_dot_product_scaled(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars: &[GoldilocksField],
+    extra_scales: &[GoldilocksField],
+) -> QuadraticExtension<GoldilocksField> {
+    let len = extension_values
+        .len()
+        .min(base_scalars.len())
+        .min(extra_scales.len());
+    if len == 0 {
+        return QuadraticExtension::ZERO;
+    }
+    // Stack-sized prefix: the production shifted-opening degree is far
+    // larger, but the empty/short paths and unit tests stay allocation-free.
+    // Longer inputs take one exact-length scratch of reduced scales.
+    const STACK: usize = 64;
+    if len <= STACK {
+        let mut scaled = [GoldilocksField::ZERO; STACK];
+        for i in 0..len {
+            scaled[i] = base_scalars[i] * extra_scales[i];
+        }
+        return ext2_base_scalar_dot_product(extension_values, &scaled[..len]);
+    }
+    let mut scaled = Vec::with_capacity(len);
+    scaled.extend(
+        base_scalars[..len]
+            .iter()
+            .zip(&extra_scales[..len])
+            .map(|(&c, &g)| c * g),
+    );
+    ext2_base_scalar_dot_product(&extension_values[..len], &scaled)
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
@@ -806,6 +858,67 @@ mod tests {
             <GF as Extendable<4>>::extension_base_dot_product(&[], &scalars),
             Q4::ZERO
         );
+    }
+
+    #[test]
+    fn extension_base_dot_product_scaled_matches_materialized_table() {
+        // Quartic uses the trait default (no Goldilocks fuse). Ext2 uses
+        // the delayed-reduction specialization. Both must be field-equal
+        // to `sum value_i * (scalar_i * scale_i)` and to the materialized
+        // `g*zeta` table path: value_i.scalar_mul(scale_i) then unscaled
+        // dot against the scalars.
+        let mut state = 0xC2B2_AE3D_27D4_EB4Fu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let lengths = [0, 1, 2, 15, 16, 17, 63, 64, 65, 255, 256, 257, 2048, 2049];
+        for n in lengths {
+            let values2: Vec<Q2> = (0..n)
+                .map(|_| QuadraticExtension([GF::from_noncanonical_u64(next()), GF::from_noncanonical_u64(next())]))
+                .collect();
+            let scalars: Vec<GF> = (0..n).map(|_| GF::from_noncanonical_u64(next())).collect();
+            let scales: Vec<GF> = (0..n).map(|_| GF::from_noncanonical_u64(next())).collect();
+            let expected2: Q2 = values2
+                .iter()
+                .zip(&scalars)
+                .zip(&scales)
+                .map(|((&v, &c), &g)| <Q2 as FieldExtension<2>>::scalar_mul(&v, c * g))
+                .sum();
+            let materialized2: Vec<Q2> = values2
+                .iter()
+                .zip(&scales)
+                .map(|(&v, &g)| <Q2 as FieldExtension<2>>::scalar_mul(&v, g))
+                .collect();
+            let via_table = generic_extension_base_dot_product(&materialized2, &scalars);
+            let actual2 = <GF as Extendable<2>>::extension_base_dot_product_scaled(
+                &values2, &scalars, &scales,
+            );
+            for limb in 0..2 {
+                assert_eq!(
+                    actual2.0[limb].to_canonical_u64(),
+                    expected2.0[limb].to_canonical_u64(),
+                    "ext2 scaled limb {limb} at n={n}"
+                );
+                assert_eq!(
+                    actual2.0[limb].to_canonical_u64(),
+                    via_table.0[limb].to_canonical_u64(),
+                    "ext2 vs materialized limb {limb} at n={n}"
+                );
+            }
+        }
+        // Unequal zip: extra scale/scalar/value lanes are ignored.
+        let values = [Q2::ONE, Q2::ONE];
+        let scalars = [GF::TWO];
+        let scales = [GF::TWO, GF::ONE, GF::ONE];
+        let actual = <GF as Extendable<2>>::extension_base_dot_product_scaled(
+            &values, &scalars, &scales,
+        );
+        let expected = <Q2 as FieldExtension<2>>::scalar_mul(&Q2::ONE, GF::TWO * GF::TWO);
+        assert_eq!(actual.0[0].to_canonical_u64(), expected.0[0].to_canonical_u64());
+        assert_eq!(actual.0[1].to_canonical_u64(), expected.0[1].to_canonical_u64());
     }
 
     #[test]

@@ -99,6 +99,28 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// `sum_i value_i * (scalar_i * scale_i)` with the same zip-to-shortest
+    /// rule as `extension_base_dot_product`. The default reduces the two
+    /// base factors first, then scalar-multiplies. A base field may fuse
+    /// the extra scale into a delayed-reduction accumulator instead of
+    /// materializing a second extension-power table.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_scaled(
+        extension_values: &[Self::Extension],
+        base_scalars: &[Self],
+        extra_scales: &[Self],
+    ) -> Self::Extension {
+        extension_values
+            .iter()
+            .zip(base_scalars)
+            .zip(extra_scales)
+            .map(|((&value, &scalar), &scale)| {
+                <Self::Extension as FieldExtension<D>>::scalar_mul(&value, scalar * scale)
+            })
+            .sum()
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
