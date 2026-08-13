@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "36c7f3038c07a980a57de6c1d83f65342443de93036ef8ea6e299c6a2a19a680";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1701,6 +1701,51 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         return None;
     }
 
+    // Find the selector group whose division-free Lagrange filter is rebuilt
+    // most often. The shader caches at most one group and marks its records in
+    // metadata bit 1; bit 0 remains `include_unused_selector`. This is useful
+    // for the repeated production selector groups; the score chooses whichever
+    // group deletes the most multiplications for the current circuit shape.
+    let mut filter_groups: Vec<((usize, usize, usize, bool), usize)> = Vec::new();
+    let mut count_filter_group =
+        |selector_column: usize, group: &core::ops::Range<usize>, include_unused: bool| {
+            let key = (selector_column, group.start, group.end, include_unused);
+            if let Some((_, count)) = filter_groups.iter_mut().find(|(seen, _)| *seen == key) {
+                *count += 1;
+            } else {
+                filter_groups.push((key, 1));
+            }
+        };
+    for spec in specs {
+        count_filter_group(
+            spec.selector_column,
+            &spec.group,
+            spec.include_unused_selector,
+        );
+    }
+    for spec in u32_specs {
+        count_filter_group(
+            spec.selector_column,
+            &spec.group,
+            spec.include_unused_selector,
+        );
+    }
+    let cached_filter = filter_groups
+        .into_iter()
+        .filter(|((_, start, end, _), _)| end.saturating_sub(*start) <= 8)
+        .filter_map(|(key @ (_, start, end, include_unused), count)| {
+            let group_len = end.saturating_sub(start);
+            let multiplies_per_record = group_len
+                .saturating_sub(1)
+                .saturating_add(include_unused as usize);
+            let saved = count
+                .saturating_mul(multiplies_per_record)
+                .saturating_sub(3 * group_len);
+            (saved > 0).then_some((key, saved))
+        })
+        .max_by_key(|(_, saved)| *saved)
+        .map(|(key, _)| key);
+
     let mut alpha_stride = 0usize;
     let mut metadata = Vec::with_capacity(spec_count * SPEC_WORDS);
     for spec in specs {
@@ -1728,7 +1773,15 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             spec.gate_index as u32,
             spec.group.start as u32,
             spec.group.end as u32,
-            spec.include_unused_selector as u32,
+            spec.include_unused_selector as u32
+                | ((cached_filter
+                    == Some((
+                        spec.selector_column,
+                        spec.group.start,
+                        spec.group.end,
+                        spec.include_unused_selector,
+                    ))) as u32)
+                    << 1,
             spec.num_ops as u32,
             num_aux as u32,
             if spec.bit_size & 1 == 1 { 2 } else { 4 },
@@ -1941,7 +1994,15 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             spec.gate_index as u32,
             spec.group.start as u32,
             spec.group.end as u32,
-            spec.include_unused_selector as u32,
+            spec.include_unused_selector as u32
+                | ((cached_filter
+                    == Some((
+                        spec.selector_column,
+                        spec.group.start,
+                        spec.group.end,
+                        spec.include_unused_selector,
+                    ))) as u32)
+                    << 1,
             kind as u32,
             spec.num_ops as u32,
             num_addends as u32,
@@ -1978,6 +2039,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         u32_specs.len(),
         &alpha_powers,
         alpha_stride,
+        cached_filter.unwrap_or((0, 0, 0, false)),
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -2658,6 +2720,7 @@ impl MetalShared {
         u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
+        cached_filter: (usize, usize, usize, bool),
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
@@ -2697,6 +2760,10 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
+            set_u32(encoder, 11, cached_filter.0 as u32);
+            set_u32(encoder, 12, cached_filter.1 as u32);
+            set_u32(encoder, 13, cached_filter.2 as u32);
+            set_u32(encoder, 14, cached_filter.3 as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]

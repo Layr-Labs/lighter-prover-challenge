@@ -839,12 +839,44 @@ kernel void range_check_gate_quotient(
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
     constant uint& u32_count [[buffer(10)]],
+    constant uint& cached_selector_column [[buffer(11)]],
+    constant uint& cached_group_start [[buffer(12)]],
+    constant uint& cached_group_end [[buffer(13)]],
+    constant uint& cached_include_unused [[buffer(14)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
     }
 
     uint source_row = gid * step;
+
+    // Several production gate families share one selector group. Build every
+    // division-free Lagrange filter for the most profitable group once per row,
+    // rather than rebuilding the same product in every family. Rust marks the
+    // records that use this cache in metadata bit 1; bit 0 remains the UNUSED
+    // selector flag. Groups wider than eight are never selected for caching.
+    ulong cached_filters[8];
+    uint cached_group_len = cached_group_end - cached_group_start;
+    if (cached_group_len != 0u) {
+        ulong selector = constants[
+            (ulong)cached_selector_column * lde_rows + source_row];
+        ulong prefix[9];
+        prefix[0] = 1;
+        for (uint j = 0; j < cached_group_len; ++j) {
+            prefix[j + 1u] = gl_mul(
+                prefix[j], gl_sub((ulong)(cached_group_start + j), selector));
+        }
+        ulong suffix = cached_include_unused != 0u
+            ? gl_sub(0xffffffffUL, selector)
+            : 1;
+        for (uint remaining = cached_group_len; remaining > 0u; --remaining) {
+            uint j = remaining - 1u;
+            cached_filters[j] = gl_mul(prefix[j], suffix);
+            suffix = gl_mul(
+                suffix, gl_sub((ulong)(cached_group_start + j), selector));
+        }
+    }
+
     ulong total[2] = { 0, 0 };
     for (uint range_index = 0; range_index < range_count; ++range_index) {
         constant uint* spec = metadata + range_index * 10u;
@@ -852,45 +884,48 @@ kernel void range_check_gate_quotient(
         uint gate_index = spec[1];
         uint group_start = spec[2];
         uint group_end = spec[3];
-        uint include_unused_selector = spec[4];
+        uint filter_flags = spec[4];
+        uint include_unused_selector = filter_flags & 1u;
         uint num_ops = spec[5];
         uint num_aux = spec[6];
         uint final_limb_range = spec[7];
 
-        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
-        ulong filter = 1;
-        for (uint i = group_start; i < group_end; ++i) {
-            if (i != gate_index) {
-                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+        ulong filter;
+        if ((filter_flags & 2u) != 0u) {
+            filter = cached_filters[gate_index - cached_group_start];
+        } else {
+            ulong selector = constants[
+                (ulong)selector_column * lde_rows + source_row];
+            filter = 1;
+            for (uint i = group_start; i < group_end; ++i) {
+                if (i != gate_index) {
+                    filter = gl_mul(filter, gl_sub((ulong)i, selector));
+                }
             }
-        }
-        if (include_unused_selector != 0u) {
-            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            if (include_unused_selector != 0u) {
+                filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            }
         }
 
         alpha_acc_t gate_accumulators[2] = {
             { { 0, 0 }, { 0, 0 } },
             { { 0, 0 }, { 0, 0 } },
         };
-        uint constraint_index = 0;
         for (uint op = 0; op < num_ops; ++op) {
             ulong input = wires[(ulong)op * lde_rows + source_row];
             ulong aux_base = (ulong)num_ops + (ulong)num_aux * op;
-            ulong computed = wires[(aux_base + num_aux - 1u) * lde_rows + source_row];
-            for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
+            uint constraint_base = op * (num_aux + 1u);
+            ulong computed = 0;
+            // Recompose and range-check in one reverse walk. The deferred
+            // alpha accumulator is a carry-free integer limb sum, so emitting
+            // constraints out of row order at their explicit alpha indices is
+            // bit-exact while avoiding a second read of every aux wire.
+            for (uint remaining = num_aux; remaining > 0u; --remaining) {
                 uint j = remaining - 1u;
-                ulong limb = wires[(aux_base + j) * lde_rows + source_row];
-                computed = gl_add(gl_quadruple(computed), limb);
-            }
-            range_check_gate_emit(
-                gl_sub(computed, input),
-                alpha_powers,
-                alpha_stride,
-                gate_accumulators,
-                constraint_index++);
-
-            for (uint j = 0; j < num_aux; ++j) {
                 ulong x = wires[(aux_base + j) * lde_rows + source_row];
+                computed = j + 1u == num_aux
+                    ? x
+                    : gl_add(gl_quadruple(computed), x);
                 ulong constraint;
                 if (j + 1u == num_aux && final_limb_range == 2u) {
                     constraint = gl_mul(x, gl_sub(x, 1));
@@ -905,8 +940,14 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
-                    constraint_index++);
+                    constraint_base + 1u + j);
             }
+            range_check_gate_emit(
+                gl_sub(computed, input),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                constraint_base);
         }
 
         total[0] = gl_mul_add(
@@ -922,7 +963,8 @@ kernel void range_check_gate_quotient(
         uint gate_index = spec[1];
         uint group_start = spec[2];
         uint group_end = spec[3];
-        uint include_unused_selector = spec[4];
+        uint filter_flags = spec[4];
+        uint include_unused_selector = filter_flags & 1u;
         uint kind = spec[5];
         uint num_ops = spec[6];
         uint num_addends = spec[7];
@@ -931,15 +973,21 @@ kernel void range_check_gate_quotient(
         // Overflow weight of the recomposed word: 2^16, 2^32 or 2^48.
         ulong word_base = 1UL << (2u * result_limbs);
 
-        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
-        ulong filter = 1;
-        for (uint i = group_start; i < group_end; ++i) {
-            if (i != gate_index) {
-                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+        ulong filter;
+        if ((filter_flags & 2u) != 0u) {
+            filter = cached_filters[gate_index - cached_group_start];
+        } else {
+            ulong selector = constants[
+                (ulong)selector_column * lde_rows + source_row];
+            filter = 1;
+            for (uint i = group_start; i < group_end; ++i) {
+                if (i != gate_index) {
+                    filter = gl_mul(filter, gl_sub((ulong)i, selector));
+                }
             }
-        }
-        if (include_unused_selector != 0u) {
-            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            if (include_unused_selector != 0u) {
+                filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            }
         }
 
         alpha_acc_t gate_accumulators[2] = {
@@ -1130,24 +1178,28 @@ kernel void range_check_gate_quotient(
                 ulong routed_base = (ulong)op * routed_per_op;
                 ulong aux_base =
                     (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
-                for (uint j = 0; j < aux_per_op; ++j) {
-                    ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
-                }
+                uint constraint_base =
+                    op * (aux_per_op + num_limbs + 1u);
+                // Fold each byte's four aux limbs during the same reverse walk
+                // that emits their range constraints. Explicit alpha indices
+                // preserve the CPU constraint-row mapping without reloading the
+                // aux columns in a second pass.
                 for (uint byte_index = 0; byte_index < num_limbs; ++byte_index) {
                     ulong chunk = aux_base + (ulong)byte_index * 4u;
-                    ulong recomposed = wires[(chunk + 3u) * lde_rows + source_row];
-                    for (uint remaining = 3u; remaining > 0u; --remaining) {
+                    ulong recomposed = 0;
+                    for (uint remaining = 4u; remaining > 0u; --remaining) {
                         uint k = remaining - 1u;
-                        recomposed = gl_add(
-                            gl_quadruple(recomposed),
-                            wires[(chunk + k) * lde_rows + source_row]);
+                        ulong x = wires[(chunk + k) * lde_rows + source_row];
+                        recomposed = k == 3u
+                            ? x
+                            : gl_add(gl_quadruple(recomposed), x);
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        range_check_gate_emit(
+                            gl_mul(y, gl_add(y, 2)),
+                            alpha_powers,
+                            alpha_stride,
+                            gate_accumulators,
+                            constraint_base + 4u * byte_index + k);
                     }
                     ulong byte_value =
                         wires[(routed_base + 1u + byte_index) * lde_rows + source_row];
@@ -1156,7 +1208,7 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
-                        constraint_index++);
+                        constraint_base + aux_per_op + byte_index);
                 }
                 ulong recomposed_sum =
                     wires[(routed_base + num_limbs) * lde_rows + source_row];
@@ -1172,7 +1224,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
-                    constraint_index++);
+                    constraint_base + aux_per_op + num_limbs);
             }
         } else if (kind == 4u) {
             ulong strict_accumulators[2] = { 0, 0 };
@@ -1541,18 +1593,14 @@ kernel void range_check_gate_quotient(
             // arithmetic one. Keep the multiply.
             ulong base = num_addends;
             ulong computed = 0;
+            // Recompose and range-check each limb in one reverse walk. Keep
+            // the generic multiply proven above, but avoid reloading all 63 or
+            // 16 production limbs. Explicit indices preserve constraint row 0
+            // for reconstruction and row 1+limb for the range constraint.
             for (uint remaining = num_ops; remaining > 0u; --remaining) {
                 uint limb = remaining - 1u;
-                computed = gl_add(
-                    gl_mul(computed, base),
-                    wires[((ulong)1u + limb) * lde_rows + source_row]);
-            }
-            range_check_gate_emit(
-                gl_sub(computed, wires[source_row]),
-                alpha_powers, alpha_stride, gate_accumulators,
-                constraint_index++);
-            for (uint limb = 0; limb < num_ops; ++limb) {
                 ulong x = wires[((ulong)1u + limb) * lde_rows + source_row];
+                computed = gl_add(gl_mul(computed, base), x);
                 ulong constraint;
                 if (base == 2u) {
                     constraint = gl_mul(x, gl_sub(x, 1));
@@ -1563,8 +1611,12 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     constraint,
                     alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
+                    1u + limb);
             }
+            range_check_gate_emit(
+                gl_sub(computed, wires[source_row]),
+                alpha_powers, alpha_stride, gate_accumulators,
+                0u);
         } else if (kind == 12u) {
             // SelectionGate: four routed wires per operation followed by one
             // temporary wire per operation.
