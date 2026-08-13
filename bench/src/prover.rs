@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -21,7 +21,9 @@ use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
+use plonky2::iop::generator::{
+    ParallelWitnessGuard, PendingPartitionWitness, SeedPlan, SeedPlanBuilder,
+};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
 use plonky2::iop::witness::{PartitionWitness, Witness};
@@ -208,6 +210,44 @@ impl ChainState<'_> {
     }
 }
 
+#[derive(Debug)]
+struct ChainSeedPlans {
+    early: SeedPlan,
+    cyclic: SeedPlan,
+}
+
+impl ChainSeedPlans {
+    fn build(
+        chain_target: &BlockTxChainTarget,
+        chain_data: &CircuitData<F, C, D>,
+        chain_step: u64,
+        dummy_proof: &Proof,
+        tx_proof: &Proof,
+        cyclic_proof: &Proof,
+    ) -> anyhow::Result<Self> {
+        let mut early_targets = SeedPlanBuilder::new();
+        BlockTxChainCircuit::witness_inputs_early_into(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            &mut early_targets,
+        )?;
+        let early = early_targets.build(&chain_data.prover_only, &chain_data.common)?;
+
+        let mut cyclic_targets = SeedPlanBuilder::new();
+        BlockTxChainCircuit::witness_inputs_cyclic_into(
+            chain_target,
+            cyclic_proof,
+            &mut cyclic_targets,
+        )?;
+        let cyclic = cyclic_targets.build(&chain_data.prover_only, &chain_data.common)?;
+
+        Ok(Self { early, cyclic })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chain_step_proof(
     path: TxPath,
@@ -218,6 +258,7 @@ fn chain_step_proof(
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    seed_plans: &OnceLock<ChainSeedPlans>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -229,6 +270,18 @@ fn chain_step_proof(
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "chain_step");
     let result = (|| {
+        let seed_plans = seed_plans.get_or_init(|| {
+            ChainSeedPlans::build(
+                chain_target,
+                chain_data,
+                chain_step,
+                dummy_proof,
+                tx_proof,
+                base_proof,
+            )
+            .unwrap_or_else(|error| panic!("failed to build chain seed plans: {error:?}"))
+        });
+
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
@@ -237,25 +290,29 @@ fn chain_step_proof(
             &chain_data.prover_only,
             &chain_data.common,
             |seeder| {
+                let mut planned = seeder.planned(&seed_plans.early);
                 BlockTxChainCircuit::witness_inputs_early_into(
                     chain_target,
                     chain_data,
                     chain_step,
                     dummy_proof,
                     tx_proof,
-                    seeder,
-                )
+                    &mut planned,
+                )?;
+                planned.finish()
             },
         )?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
         let previous_proof = previous.map(ChainState::wait);
         pending.feed_seeded(|feeder| {
+            let mut planned = feeder.planned(&seed_plans.cyclic);
             BlockTxChainCircuit::witness_inputs_cyclic_into(
                 chain_target,
                 previous_proof.as_ref().unwrap_or(base_proof),
-                feeder,
-            )
+                &mut planned,
+            )?;
+            planned.finish()
         })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
@@ -443,6 +500,7 @@ fn prove_path(
         old_account_delta_tree_root,
     );
     let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
+    let chain_seed_plans = OnceLock::new();
     let mut chunks = chunks.into_iter();
     let (mut current_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
@@ -461,6 +519,7 @@ fn prove_path(
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
+        let seed_plans = &chain_seed_plans;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -489,6 +548,7 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            seed_plans,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -582,6 +642,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        seed_plans,
                     )
                 })
                 .expect("chain step pipeline thread must start");
@@ -641,6 +702,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        seed_plans,
                     )
                 })
                 .expect("chain drain thread must start");
@@ -1212,6 +1274,7 @@ mod tests {
         );
 
         let mut previous: Option<Proof> = None;
+        let seed_plans = OnceLock::new();
         for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
 
@@ -1291,6 +1354,7 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                &seed_plans,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);
