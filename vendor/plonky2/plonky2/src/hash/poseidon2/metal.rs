@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -180,9 +180,11 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
-    ntt_prepare_pipeline: ComputePipelineState,
-    ntt_stage_pipeline: ComputePipelineState,
-    ifft_finalize_pipeline: ComputePipelineState,
+    /// The ranked path keeps GPU NTT commitments disabled after their official
+    /// regression, so do not lower these kernels in every scored worker. The
+    /// dormant API and its differential tests still get identical pipelines,
+    /// compiled on their first actual use.
+    ntt_pipelines: OnceLock<Result<NttPipelines, String>>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     /// Small, nonblocking cache for completed gate-quotient output buffers.
@@ -203,6 +205,12 @@ struct MetalShared {
     /// Deterministic shifted quotient-domain points, uploaded once per size and
     /// reused by every no-lookup permutation job in this worker.
     permutation_points: Mutex<HashMap<u32, Buffer>>,
+}
+
+struct NttPipelines {
+    prepare: ComputePipelineState,
+    stage: ComputePipelineState,
+    ifft_finalize: ComputePipelineState,
 }
 
 struct NttRoots {
@@ -2409,18 +2417,17 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
-            // Build the compute pipelines concurrently, one thread each.
+            // Build only the three pipelines used by the ranked path,
+            // concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
-            // AIR to a GPU binary through MTLCompilerService, and the three
-            // Poseidon2 permutation kernels plus the two gate-quotient kernels
-            // are large enough that each takes hundreds of milliseconds when the
-            // result is not already in the OS shader cache. The benchmark
-            // sandbox denies writes to that cache, which disables it outright —
-            // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
+            // AIR to a GPU binary through MTLCompilerService. The benchmark
+            // sandbox disables the OS shader cache, so every scored worker pays
+            // for every pipeline requested here. Only the row/column leaf and
+            // parent kernels are unconditional on the ranked path: optional
+            // quotient/absorb pipelines are started in the background below,
+            // while GPU NTT commitments are hard-disabled after an official
+            // regression and now compile only if that dormant API is called.
             //
             // This is a scheduling change only: the pipelines, and therefore
             // every value the GPU later computes, are identical. `Device`,
@@ -2442,61 +2449,38 @@ impl MetalShared {
                     })
                 }
             };
-            // The two gate-quotient kernels are the two most expensive to lower
-            // and the only two the context can do without: every caller already
-            // treats an absent pipeline as "run this on the CPU". Lowering them
-            // on the blocking path makes the whole context wait for the slowest
-            // kernel in the shader; measured cold under the benchmark's sandbox
-            // profile, where the OS shader cache is disabled:
+            // The optional quotient pipelines are the most expensive to lower,
+            // and every caller already treats an absent pipeline as "run this on
+            // the CPU". Measured cold under the benchmark's sandbox profile:
             //
             //     range_check_gate_quotient   679 ms
             //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
+            //     the formerly required NTT kernels 491 ms and below
             //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
-            // maximum and add contention on MTLCompilerService. Building them
-            // off the blocking path instead leaves the context ready in 838 ms
-            // rather than 1270 ms, and they land shortly after, long before the
-            // first quotient evaluation of a proof asks for them.
+            // Extra kernels both raise the maximum and add contention on
+            // MTLCompilerService. Building optional kernels off the blocking
+            // path lets the context become usable after the three hash kernels;
+            // the quotient pipelines land before their first proof use.
             //
-            // Started below, once the required six have finished, so they do not
+            // Started below, once the required three have finished, so they do not
             // simply move their MTLCompilerService contention onto the path they
             // are being taken off.
-            let (
-                leaf_pipeline,
-                leaf_colmajor_pipeline,
-                parent_pipeline,
-                ntt_prepare_pipeline,
-                ntt_stage_pipeline,
-                ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                // A panic inside a pipeline build is a bug, not a runtime
-                // condition; propagate it rather than papering over it.
-                (
-                    leaf.join().expect("leaf pipeline thread panicked"),
-                    leaf_colmajor
-                        .join()
-                        .expect("col-major leaf pipeline thread panicked"),
-                    parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
-                )
-            });
+            let (leaf_pipeline, leaf_colmajor_pipeline, parent_pipeline) =
+                std::thread::scope(|scope| {
+                    let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
+                    let leaf_colmajor =
+                        scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
+                    let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
+                    // A panic inside a pipeline build is a bug, not a runtime
+                    // condition; propagate it rather than papering over it.
+                    (
+                        leaf.join().expect("leaf pipeline thread panicked"),
+                        leaf_colmajor
+                            .join()
+                            .expect("col-major leaf pipeline thread panicked"),
+                        parent.join().expect("parent pipeline thread panicked"),
+                    )
+                });
             // Surfaced in kernel order, so a single missing or unbuildable
             // kernel yields the same error string the sequential construction
             // produced. Only the tie-break between two simultaneous failures
@@ -2506,9 +2490,6 @@ impl MetalShared {
             let leaf_pipeline = leaf_pipeline?;
             let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
             let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
             spawn_optional_pipelines(&device, &library);
 
@@ -2529,9 +2510,7 @@ impl MetalShared {
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
-                ntt_prepare_pipeline,
-                ntt_stage_pipeline,
-                ifft_finalize_pipeline,
+                ntt_pipelines: OnceLock::new(),
                 parameters,
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
@@ -2550,6 +2529,75 @@ impl MetalShared {
                 permutation_points: Mutex::new(HashMap::new()),
             })
         })
+    }
+
+    /// Lowers the dormant GPU-NTT pipelines only if that path is explicitly
+    /// used. Ranked proving has `GPU_NTT_COMMITMENTS = false`, so normal
+    /// workers never enter this initializer and avoid three cold compiler
+    /// requests. Keeping the initializer here preserves the experimental API
+    /// and its CPU/GPU differential tests without taxing every fixture.
+    fn ntt_pipelines(&self) -> Result<&NttPipelines, String> {
+        self.ntt_pipelines
+            .get_or_init(|| {
+                // Reloading the small precompiled library here keeps it out of
+                // the ranked context's lifetime. This branch is dormant in
+                // production, while experimental GPU-NTT users retain the same
+                // source fallback as context initialization.
+                let options = CompileOptions::new();
+                let library = self
+                    .device
+                    .new_library_with_data(SHADER_METALLIB)
+                    .ok()
+                    .filter(|library| {
+                        METALLIB_REQUIRED_KERNELS
+                            .iter()
+                            .all(|name| library.get_function(name, None).is_ok())
+                    })
+                    .map_or_else(
+                        || {
+                            self.device
+                                .new_library_with_source(SHADER_SOURCE, &options)
+                                .map_err(|error| format!("shader compilation failed: {error}"))
+                        },
+                        Ok,
+                    )?;
+                let device_ref = &self.device;
+                let library_ref = &library;
+                let build = |name: &'static str, kind: &'static str| {
+                    move || -> Result<ComputePipelineState, String> {
+                        autoreleasepool(|| {
+                            let function = library_ref
+                                .get_function(name, None)
+                                .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                            device_ref
+                                .new_compute_pipeline_state_with_function(&function)
+                                .map_err(|error| {
+                                    format!("{kind} pipeline creation failed: {error}")
+                                })
+                        })
+                    }
+                };
+                let (prepare, stage, ifft_finalize) = std::thread::scope(|scope| {
+                    let prepare = scope.spawn(build("ntt_prepare", "ntt prepare"));
+                    let stage = scope.spawn(build("ntt_stage", "ntt stage"));
+                    let ifft_finalize =
+                        scope.spawn(build("ifft_finalize", "ifft finalize"));
+                    (
+                        prepare.join().expect("ntt prepare pipeline thread panicked"),
+                        stage.join().expect("ntt stage pipeline thread panicked"),
+                        ifft_finalize
+                            .join()
+                            .expect("ifft finalize pipeline thread panicked"),
+                    )
+                });
+                Ok(NttPipelines {
+                    prepare: prepare?,
+                    stage: stage?,
+                    ifft_finalize: ifft_finalize?,
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     fn allocate_columns<F: RichField>(
@@ -3076,6 +3124,7 @@ impl MetalShared {
         ),
         String,
     > {
+        let ntt = self.ntt_pipelines()?;
         let cols = value_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -3173,7 +3222,7 @@ impl MetalShared {
                 // column buffer serves as scratch; it is dead once the IFFT
                 // finalize gather has produced the coefficients.
                 let gather = command_buffer.new_compute_command_encoder();
-                gather.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                gather.set_compute_pipeline_state(&ntt.prepare);
                 gather.set_buffer(0, Some(input_buffer), 0);
                 gather.set_buffer(1, Some(&ones_buffer), 0);
                 gather.set_buffer(2, Some(&column_buffer), 0);
@@ -3181,12 +3230,12 @@ impl MetalShared {
                 set_u32(gather, 4, degree_u32);
                 set_u32(gather, 5, log_degree_u32);
                 set_u32(gather, 6, 0);
-                dispatch2d(gather, &self.ntt_prepare_pipeline, degree, cols);
+                dispatch2d(gather, &ntt.prepare, degree, cols);
                 gather.end_encoding();
 
                 for stage in 0..log_degree_u32 {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(&ntt.stage);
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -3196,12 +3245,12 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, degree_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, 0);
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, degree / 2, cols);
+                    dispatch2d(stage_encoder, &ntt.stage, degree / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
                 let finalize = command_buffer.new_compute_command_encoder();
-                finalize.set_compute_pipeline_state(&self.ifft_finalize_pipeline);
+                finalize.set_compute_pipeline_state(&ntt.ifft_finalize);
                 finalize.set_buffer(0, Some(&column_buffer), 0);
                 finalize.set_buffer(1, Some(&coeffs_buffer), 0);
                 set_u32(finalize, 2, degree_u32);
@@ -3210,12 +3259,12 @@ impl MetalShared {
                     size_of::<u64>() as NSUInteger,
                     (&n_inv as *const u64).cast::<c_void>(),
                 );
-                dispatch2d(finalize, &self.ifft_finalize_pipeline, degree, cols);
+                dispatch2d(finalize, &ntt.ifft_finalize, degree, cols);
                 finalize.end_encoding();
 
                 // Coset LDE of the coefficients, exactly as build_from_coeffs.
                 let prepare = command_buffer.new_compute_command_encoder();
-                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_compute_pipeline_state(&ntt.prepare);
                 prepare.set_buffer(0, Some(&coeffs_buffer), 0);
                 prepare.set_buffer(1, Some(&shift_buffer), 0);
                 prepare.set_buffer(2, Some(&column_buffer), 0);
@@ -3223,12 +3272,12 @@ impl MetalShared {
                 set_u32(prepare, 4, lde_size_u32);
                 set_u32(prepare, 5, log_degree_u32);
                 set_u32(prepare, 6, rate_bits_u32);
-                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+                dispatch2d(prepare, &ntt.prepare, lde_size, cols);
                 prepare.end_encoding();
 
                 for stage in rate_bits as u32..log_lde {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(&ntt.stage);
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -3238,7 +3287,7 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, lde_size_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    dispatch2d(stage_encoder, &ntt.stage, lde_size / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
@@ -3422,6 +3471,7 @@ impl MetalShared {
         output_len: usize,
         output_bytes: usize,
     ) -> Result<TreeReadback<'_, F>, String> {
+        let ntt = self.ntt_pipelines()?;
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -3475,7 +3525,7 @@ impl MetalShared {
             let command_buffer = self.queue.new_command_buffer();
 
             let prepare = command_buffer.new_compute_command_encoder();
-            prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+            prepare.set_compute_pipeline_state(&ntt.prepare);
             prepare.set_buffer(0, Some(input_buffer), 0);
             prepare.set_buffer(1, Some(shift_buffer), 0);
             prepare.set_buffer(2, Some(column_buffer), 0);
@@ -3483,12 +3533,12 @@ impl MetalShared {
             set_u32(prepare, 4, lde_size_u32);
             set_u32(prepare, 5, log_degree_u32);
             set_u32(prepare, 6, rate_bits_u32);
-            dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+            dispatch2d(prepare, &ntt.prepare, lde_size, cols);
             prepare.end_encoding();
 
             for stage in rate_bits as u32..log_lde {
                 let stage_encoder = command_buffer.new_compute_command_encoder();
-                stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                stage_encoder.set_compute_pipeline_state(&ntt.stage);
                 stage_encoder.set_buffer(0, Some(column_buffer), 0);
                 stage_encoder.set_buffer(
                     1,
@@ -3502,7 +3552,7 @@ impl MetalShared {
                     4,
                     u32::from(stage == log_lde - 1),
                 );
-                dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                dispatch2d(stage_encoder, &ntt.stage, lde_size / 2, cols);
                 stage_encoder.end_encoding();
             }
 
@@ -3993,6 +4043,21 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
+    }
+
+    /// Initializing the ranked Metal backend must not lower the dormant NTT
+    /// pipelines. The NTT differential tests below exercise their lazy first
+    /// use separately.
+    #[test]
+    fn ranked_context_defers_ntt_pipelines() {
+        let Some(_) = Device::system_default() else {
+            return;
+        };
+        let context = MetalShared::new().expect("Metal context must initialize");
+        assert!(
+            context.ntt_pipelines.get().is_none(),
+            "ranked context eagerly lowered disabled GPU NTT pipelines"
+        );
     }
 
     #[test]
