@@ -89,8 +89,11 @@ fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
         == TX_LIGHT
 }
 
-fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
-    (light, heavy)
+/// Only the light-chain proof remains an external final-block input. The
+/// heavy-chain proof is consumed by the prepared witness in the build lane,
+/// so retaining its owned proof object across the light path is unnecessary.
+fn final_light_chain_input<T>(light: &T) -> &T {
+    light
 }
 
 /// Whether the calling transaction path may claim the process-global exclusive
@@ -785,7 +788,7 @@ pub(crate) fn prove_block_after_pre(
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
+    let (light_chain_proof, block_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
@@ -872,8 +875,8 @@ pub(crate) fn prove_block_after_pre(
                     // this lane dropped its own guard when `build_block_circuit`
                     // returned above. Nothing reads those two circuits again:
                     // the light pipeline uses the light pair, and the final
-                    // block proof uses only `block_data`, the three finished
-                    // proofs and the block. Retire their preprocessed
+                    // block proof uses only `block_data`, the pending witness,
+                    // the light proof, and the block. Retire their preprocessed
                     // extensions here — 438 MiB of Metal shared buffers whose
                     // release returns the pages to the OS immediately — instead
                     // of holding them across the whole light phase.
@@ -887,7 +890,12 @@ pub(crate) fn prove_block_after_pre(
                             .expect("final block heavy-chain witness inputs failed"),
                         )
                         .expect("final block heavy-chain witness feed failed");
-                    (block_target, block_data, pending, heavy_chain_proof)
+                    // `feed` copies every heavy-chain proof target into the
+                    // pending partition and resolves the newly ready
+                    // generators. The owned proof is no longer needed by the
+                    // final block, so dropping it here lowers the live memory
+                    // set while the light path finishes.
+                    (block_target, block_data, pending)
                 })
                 .expect("block circuit build thread must start");
             let light_chunks = std::mem::take(&mut light_chunks);
@@ -912,7 +920,7 @@ pub(crate) fn prove_block_after_pre(
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
+            let (block_target, block_data, block_pending) =
                 block_circuit_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -927,15 +935,14 @@ pub(crate) fn prove_block_after_pre(
             // light transaction and chain circuits are gone, and the block lane
             // dropped its own light-chain guard when `build_block_circuit`
             // returned long ago. Nothing reads the light pair again: the final
-            // block proof uses only `block_data`, the three finished proofs and
-            // the block. Retire their preprocessed extensions here — 438 MiB of
+            // block proof uses only `block_data`, its prepared witness and the
+            // light-chain proof. Retire their preprocessed extensions here — 438 MiB of
             // Metal shared buffers whose release returns the pages to the OS
             // immediately — instead of holding them through the final witness
             // setup until the backstop below.
             circuits.release_light_circuit_extensions();
             (
                 light_chain_proof,
-                heavy_chain_proof,
                 block_target,
                 block_data,
                 block_pending,
@@ -954,8 +961,7 @@ pub(crate) fn prove_block_after_pre(
         plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "final_block_tail");
-    let (light_chain_input, heavy_chain_input) =
-        final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
+    let light_chain_input = final_light_chain_input(&light_chain_proof);
     // The final block witness runs on the serial tail with nothing else proving, so it alone
     // opts into parallel worklist rounds; tx-proof and chain witness generation run concurrently
     // with proving and stay sequential.
@@ -975,7 +981,6 @@ pub(crate) fn prove_block_after_pre(
             )
             .expect("final block light-chain witness feed failed");
     }
-    let _ = heavy_chain_input;
     let final_proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "final_block_proof");
@@ -1101,11 +1106,10 @@ mod tests {
     }
 
     #[test]
-    fn final_block_chain_inputs_are_light_then_heavy() {
+    fn final_block_light_chain_input_is_borrowed() {
         let light = "light";
-        let heavy = "heavy";
 
-        assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
+        assert_eq!(final_light_chain_input(&light), &light);
     }
 
     /// Manual timing harness for the two-phase chain-step witness split. Run with:
