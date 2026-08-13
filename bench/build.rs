@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
+use circuit::cs_merkle;
 use circuit::embed::serialize_embedded;
 use circuit::types::config::{C, CIRCUIT_CONFIG};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
@@ -44,6 +45,14 @@ const BLOB_NAMES: [&str; 5] = [
     "light_chain.embed",
 ];
 
+const CS_MERKLE_NAMES: [&str; 5] = [
+    "pre.csmerkle",
+    "heavy_tx.csmerkle",
+    "heavy_chain.csmerkle",
+    "light_tx.csmerkle",
+    "light_chain.csmerkle",
+];
+
 fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     let path = out_dir.join(name);
     std::fs::write(&path, bytes).unwrap_or_else(|error| {
@@ -55,7 +64,26 @@ fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     );
 }
 
-fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
+/// `OUT_DIR` is `target/{profile}/build/{pkg}-{hash}/out`. Walk up to the
+/// profile directory so the worker can read sidecars next to the binary
+/// (`target/release/csmerkle/`), which the ranked sandbox allowlists as
+/// `dirname(worker)`.
+fn sidecar_dir(out_dir: &Path) -> PathBuf {
+    out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .map(|profile| profile.join("csmerkle"))
+        .unwrap_or_else(|| out_dir.join("csmerkle"))
+}
+
+fn write_cs_merkle(out_dir: &Path, sidecars: &Path, name: &str, bytes: &[u8]) {
+    write_blob(out_dir, name, bytes);
+    let _ = std::fs::create_dir_all(sidecars);
+    write_blob(sidecars, name, bytes);
+}
+
+fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> ((Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>)) {
     // Same construction as `PathCircuits::new`.
     let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
     let tx_target: BlockTxTarget = tx.target;
@@ -69,7 +97,11 @@ fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
         .expect("serializing block transaction circuit for embedding");
     let chain_blob = serialize_embedded(&chain_target, &chain_data)
         .expect("serializing block transaction chain circuit for embedding");
-    (tx_blob, chain_blob)
+    let tx_cs = cs_merkle::encode(&tx_data.prover_only.constants_sigmas_commitment.merkle_tree)
+        .expect("encoding transaction constants/sigmas Merkle sidecar");
+    let chain_cs = cs_merkle::encode(&chain_data.prover_only.constants_sigmas_commitment.merkle_tree)
+        .expect("encoding chain constants/sigmas Merkle sidecar");
+    ((tx_blob, tx_cs), (chain_blob, chain_cs))
 }
 
 fn main() {
@@ -82,9 +114,13 @@ fn main() {
     let out_dir =
         PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR must be set for build scripts"));
 
+    let sidecars = sidecar_dir(&out_dir);
     if std::env::var_os("LIGHTER_SKIP_EMBED").is_some_and(|v| v == "1") {
         for name in BLOB_NAMES {
             write_blob(&out_dir, name, &[]);
+        }
+        for name in CS_MERKLE_NAMES {
+            write_cs_merkle(&out_dir, &sidecars, name, &[]);
         }
         println!("cargo:warning=LIGHTER_SKIP_EMBED=1: embedded circuit blobs are empty stubs");
         return;
@@ -103,13 +139,18 @@ fn main() {
         .spawn(move || {
             // Same layout as `Circuits::new`: pre-execution circuit in
             // parallel with the heavy and light transaction paths.
-            let (pre_blob, (heavy_blobs, light_blobs)) = rayon::join(
+            let (pre, (heavy, light)) = rayon::join(
                 || {
                     let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
                     let pre_target = pre.target;
                     let pre_data = pre.builder.build::<C>();
-                    serialize_embedded(&pre_target, &pre_data)
-                        .expect("serializing block pre-execution circuit for embedding")
+                    let embed = serialize_embedded(&pre_target, &pre_data)
+                        .expect("serializing block pre-execution circuit for embedding");
+                    let cs = cs_merkle::encode(
+                        &pre_data.prover_only.constants_sigmas_commitment.merkle_tree,
+                    )
+                    .expect("encoding pre-execution constants/sigmas Merkle sidecar");
+                    (embed, cs)
                 },
                 || {
                     rayon::join(
@@ -119,11 +160,16 @@ fn main() {
                 },
             );
 
-            write_blob(&out_dir, "pre.embed", &pre_blob);
-            write_blob(&out_dir, "heavy_tx.embed", &heavy_blobs.0);
-            write_blob(&out_dir, "heavy_chain.embed", &heavy_blobs.1);
-            write_blob(&out_dir, "light_tx.embed", &light_blobs.0);
-            write_blob(&out_dir, "light_chain.embed", &light_blobs.1);
+            write_blob(&out_dir, "pre.embed", &pre.0);
+            write_cs_merkle(&out_dir, &sidecars, "pre.csmerkle", &pre.1);
+            write_blob(&out_dir, "heavy_tx.embed", &heavy.0.0);
+            write_cs_merkle(&out_dir, &sidecars, "heavy_tx.csmerkle", &heavy.0.1);
+            write_blob(&out_dir, "heavy_chain.embed", &heavy.1.0);
+            write_cs_merkle(&out_dir, &sidecars, "heavy_chain.csmerkle", &heavy.1.1);
+            write_blob(&out_dir, "light_tx.embed", &light.0.0);
+            write_cs_merkle(&out_dir, &sidecars, "light_tx.csmerkle", &light.0.1);
+            write_blob(&out_dir, "light_chain.embed", &light.1.0);
+            write_cs_merkle(&out_dir, &sidecars, "light_chain.csmerkle", &light.1.1);
         })
         .expect("circuit build thread must start")
         .join()

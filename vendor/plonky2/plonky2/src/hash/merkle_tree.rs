@@ -257,6 +257,16 @@ pub struct MerkleTree<F: RichField, H: Hasher<F>> {
     pub cap: MerkleCap<F, H>,
 }
 
+/// Precomputed Merkle nodes for a column-backed tree. Isolate marker:
+/// cs-digest-blob-1786682000.
+#[derive(Debug)]
+pub struct AdoptedCsMerkle<F: RichField, H: Hasher<F>> {
+    pub num_leaves: usize,
+    pub cap: Vec<H::Hash>,
+    pub level_digests: Option<LevelOrderDigests<H::Hash>>,
+    pub interleaved: Option<Vec<H::Hash>>,
+}
+
 impl<F: RichField, H: Hasher<F>> Default for MerkleTree<F, H> {
     fn default() -> Self {
         Self {
@@ -864,6 +874,46 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             level_digests: None,
             cap: MerkleCap(cap),
         }
+    }
+
+    /// Wraps filled LDE columns with adopted digests. Returns `None` when the
+    /// blob's leaf count or cap height does not match the columns.
+    pub fn from_adopted_columns(
+        columns: ColumnStore<F>,
+        adopted: AdoptedCsMerkle<F, H>,
+    ) -> Option<Self> {
+        let num_leaves = columns.num_rows();
+        if adopted.num_leaves != num_leaves {
+            return None;
+        }
+        if !adopted.cap.len().is_power_of_two() || adopted.cap.is_empty() {
+            return None;
+        }
+        let log_rows = log2_strict(num_leaves);
+        if let Some(level_digests) = adopted.level_digests {
+            if level_digests.nodes.len() != 2 * num_leaves - adopted.cap.len() {
+                return None;
+            }
+            return Some(Self::from_prebuilt_columns(
+                columns,
+                level_digests,
+                adopted.cap,
+            ));
+        }
+        if let Some(digests) = adopted.interleaved {
+            let cap_count = adopted.cap.len();
+            if digests.len() != 2 * (num_leaves - cap_count) {
+                return None;
+            }
+            return Some(Self {
+                leaves: MerkleLeaves::Columns { columns, log_rows },
+                num_leaves,
+                digests,
+                level_digests: None,
+                cap: MerkleCap(adopted.cap),
+            });
+        }
+        None
     }
 
     /// Wraps an already-hashed column store (e.g. from the fused GPU NTT +

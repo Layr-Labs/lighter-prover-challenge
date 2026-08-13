@@ -115,13 +115,42 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
         );
 
-        Self::from_coeffs(
+        Self::from_coeffs_opt(
             coeffs,
             rate_bits,
             blinding,
             cap_height,
             timing,
             fft_root_table,
+            None,
+        )
+    }
+
+    /// Like [`Self::from_values`], but will adopt `adopted` Merkle nodes
+    /// after the LDE fill when the blob matches the column store. On any
+    /// mismatch it hashes as usual.
+    pub fn from_values_adopt(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        adopted: crate::hash::merkle_tree::AdoptedCsMerkle<F, C::Hasher>,
+    ) -> Self {
+        let coeffs = timed!(
+            timing,
+            "IFFT",
+            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
+        );
+        Self::from_coeffs_opt(
+            coeffs,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+            Some(adopted),
         )
     }
 
@@ -134,9 +163,29 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
+        Self::from_coeffs_opt(
+            polynomials,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+            None,
+        )
+    }
+
+    fn from_coeffs_opt(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        adopted: Option<crate::hash::merkle_tree::AdoptedCsMerkle<F, C::Hasher>>,
+    ) -> Self {
         let degree = polynomials[0].len();
 
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if GPU_NTT_COMMITMENTS && !blinding && adopted.is_none() {
             let coeff_columns: Vec<&[F]> = polynomials
                 .iter()
                 .map(|p| p.coeffs.as_slice())
@@ -166,6 +215,85 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // buffer instead of copying every column through the pooled input.
         let lde_len = degree << rate_bits;
         if !blinding {
+            if let Some(adopted) = adopted {
+                // Adopt first: never enter the streamed GPU hash while a
+                // sidecar is in hand. Metal column allocate is independent of
+                // MAX_BUFFER_SETS (retained LDE storage); if it fails, the
+                // CPU-owned LDE path still adopts. Layout mismatch hashes.
+                let mut adopted = Some(adopted);
+                if let Some(mut columns) = C::Hasher::try_allocate_merkle_tree_columns(
+                    polynomials.len(),
+                    lde_len,
+                    cap_height,
+                ) {
+                    let initialized = timed!(
+                        timing,
+                        "FFT + blinding",
+                        Self::fill_lde_column_store(
+                            &mut columns,
+                            &polynomials,
+                            rate_bits,
+                            fft_root_table,
+                        )
+                    );
+                    if initialized {
+                        let adopted = adopted.take().expect("adopted sidecar");
+                        if let Some(merkle_tree) =
+                            MerkleTree::from_adopted_columns(columns.clone(), adopted)
+                        {
+                            return Self {
+                                polynomials,
+                                merkle_tree,
+                                degree_log: log2_strict(degree),
+                                rate_bits,
+                                blinding,
+                            };
+                        }
+                        let merkle_tree = timed!(
+                            timing,
+                            "build Merkle tree",
+                            MerkleTree::new_column_store(columns, cap_height)
+                        );
+                        return Self {
+                            polynomials,
+                            merkle_tree,
+                            degree_log: log2_strict(degree),
+                            rate_bits,
+                            blinding,
+                        };
+                    }
+                }
+                let adopted = adopted.expect("adopted sidecar");
+                let lde_values = timed!(
+                    timing,
+                    "FFT + blinding",
+                    Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table)
+                );
+                if let Some(merkle_tree) = MerkleTree::from_adopted_columns(
+                    ColumnStore::Owned(lde_values.clone()),
+                    adopted,
+                ) {
+                    return Self {
+                        polynomials,
+                        merkle_tree,
+                        degree_log: log2_strict(degree),
+                        rate_bits,
+                        blinding,
+                    };
+                }
+                let merkle_tree = timed!(
+                    timing,
+                    "build Merkle tree",
+                    MerkleTree::new_columns(lde_values, cap_height)
+                );
+                return Self {
+                    polynomials,
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding,
+                };
+            }
             if let Some(mut columns) =
                 C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height)
             {
