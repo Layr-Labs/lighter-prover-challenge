@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
-    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_normalized_scale,
+    ifft_with_options_and_postscale,
 };
 use crate::types::Field;
 
@@ -78,6 +79,11 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Coset IFFT against a table that already contains `n^{-1} * shift^{-i}`.
+    pub fn coset_ifft_with_normalized_powers(self, scales: &[F]) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_normalized_scale(self, None, None, scales)
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
