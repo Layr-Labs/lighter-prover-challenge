@@ -8,6 +8,7 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
@@ -488,10 +489,61 @@ fn reduce_gate_constraints_base_batch<F: Field>(
                 None => res_out.fill(F::ZERO),
             }
         }
-        for constraint_row in rows {
-            for (&term, result) in constraint_row.iter().zip(res_out.chunks_exact_mut(2)) {
-                result[0] = term.multiply_accumulate(result[0], alpha_0);
-                result[1] = term.multiply_accumulate(result[1], alpha_1);
+        // Pack WIDTH consecutive points. Each point still has its own two
+        // challenge accumulators and the same Horner order
+        // `term + acc * alpha`, so every limb stays bit-identical to the
+        // scalar loop. `res_out` is point-major pairs, so the two challenge
+        // accumulators are gathered/scattered around stride 2; the term row
+        // is already point-contiguous. Remainder points (batch_size % WIDTH)
+        // keep the original scalar path.
+        //
+        // `PackedField` is imported only in this block: a module-level import
+        // makes `F::multiply_accumulate` ambiguous with the blanket
+        // `PackedField` impl for every `Field`.
+        {
+            use crate::field::packed::PackedField;
+            let width = <F as Packable>::Packing::WIDTH;
+            let alpha0_p = <F as Packable>::Packing::from(alpha_0);
+            let alpha1_p = <F as Packable>::Packing::from(alpha_1);
+            for constraint_row in rows {
+                let n_points = constraint_row.len();
+                let mut point = 0;
+                while point + width <= n_points {
+                    let mut terms = <F as Packable>::Packing::ZEROS;
+                    terms
+                        .as_slice_mut()
+                        .copy_from_slice(&constraint_row[point..point + width]);
+                    let mut acc0 = <F as Packable>::Packing::ZEROS;
+                    let mut acc1 = <F as Packable>::Packing::ZEROS;
+                    {
+                        let a0 = acc0.as_slice_mut();
+                        let a1 = acc1.as_slice_mut();
+                        for k in 0..width {
+                            let slot = (point + k) * 2;
+                            a0[k] = res_out[slot];
+                            a1[k] = res_out[slot + 1];
+                        }
+                    }
+                    acc0 = PackedField::multiply_accumulate(&terms, acc0, alpha0_p);
+                    acc1 = PackedField::multiply_accumulate(&terms, acc1, alpha1_p);
+                    {
+                        let a0 = acc0.as_slice();
+                        let a1 = acc1.as_slice();
+                        for k in 0..width {
+                            let slot = (point + k) * 2;
+                            res_out[slot] = a0[k];
+                            res_out[slot + 1] = a1[k];
+                        }
+                    }
+                    point += width;
+                }
+                while point < n_points {
+                    let term = constraint_row[point];
+                    let result = &mut res_out[point * 2..point * 2 + 2];
+                    result[0] = Field::multiply_accumulate(&term, result[0], alpha_0);
+                    result[1] = Field::multiply_accumulate(&term, result[1], alpha_1);
+                    point += 1;
+                }
             }
         }
         return;
@@ -1755,7 +1807,7 @@ mod tests {
         assert_eq!(actual[0], F::from_canonical_u64(91));
         assert_eq!(actual[2], F::from_canonical_u64(116));
 
-        for batch_size in [1, 11, 31, 32] {
+        for batch_size in [1, 3, 4, 5, 11, 31, 32] {
             let num_constraints = 7;
             let terms = (0..batch_size * num_constraints)
                 .map(|i| F::from_canonical_usize(i * 17 + 3))
@@ -1776,7 +1828,12 @@ mod tests {
 
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
-            assert_eq!(actual, expected, "batch size {batch_size}");
+            for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    a.0, e.0,
+                    "raw limb mismatch at {i}, batch size {batch_size}"
+                );
+            }
         }
     }
 
