@@ -2191,12 +2191,19 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         command_buffer.to_owned()
     });
 
+    // The Metal queue executes command buffers in submission order, and the
+    // parents command was committed after every absorb, so a single wait on
+    // the last command implies every absorb completed. This collapses the
+    // per-command semaphore/wakeup round-trips (up to 17 absorbs + parents on
+    // the 2^21 final-block wires tree) into one blocking wait while keeping
+    // the per-command status checks. The per-group commit-before-next-fill
+    // ordering above is unchanged, so the CPU-fill/GPU-absorb overlap is
+    // preserved exactly; only the completion signaling is consolidated.
     parents_command.wait_until_completed();
     let all_ok = absorb_commands
         .iter()
         .chain(core::iter::once(&parents_command))
         .all(|command_buffer| {
-            command_buffer.wait_until_completed();
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
     drop(job);
