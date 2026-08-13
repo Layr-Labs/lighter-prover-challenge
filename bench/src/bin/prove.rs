@@ -42,7 +42,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
 // Keep the promoted writer path while exercising a second submission from that baseline.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 42 * 1024 * 1024;
 
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
@@ -252,6 +252,6 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// arithmetic-on-promoted-frontier-1786506400
+// arithmetic-on-promoted-frontier-1786579200
 
-// p90-fire-top1-50-1786515495
+// p-stack-v93-n65-1
