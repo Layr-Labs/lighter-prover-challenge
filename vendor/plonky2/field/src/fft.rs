@@ -1336,6 +1336,156 @@ fn fft_classic_simd_layers_parallel<P, M>(
 {
     let lg_packed_width = log2_strict(P::WIDTH);
     let scalar_len = packed_values.len() * P::WIDTH;
+
+    // Large Goldilocks transforms already take this parallel entry. The
+    // serial path fuses stage pairs with the 4-wide NEON kernel; this
+    // path was still one whole-buffer layer at a time. Same kernels,
+    // same 4q block size, parallelized over those blocks.
+    #[cfg(target_arch = "aarch64")]
+    if start + 2 <= end
+        && scalar_len >= PARALLEL_FFT_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<WideGoldilocksField>()
+    {
+        let mut lg_half_m = start;
+        {
+            // SAFETY: TypeId proves P is WideGoldilocksField, so the packed
+            // slice is 4 * len contiguous Goldilocks scalars. Same cast as
+            // the serial fused-pair path.
+            let scalars = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            while lg_half_m + 2 <= end {
+                let w1_row = unsafe {
+                    let row = &root_table[lg_half_m];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    let row = &root_table[lg_half_m + 1];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                let q = 1usize << lg_half_m;
+                let block_scalars = 4 * q;
+                let block_count = scalars.len() / block_scalars;
+                if block_count >= 2 {
+                    MaybeParChunksMut::par_chunks_mut(scalars, block_scalars).for_each(
+                        |block| {
+                            fft_classic_simd_two_layers_neon_w4(
+                                block, lg_half_m, w1_row, w2_row,
+                            );
+                        },
+                    );
+                } else {
+                    fft_classic_simd_two_layers_neon_w4(
+                        scalars, lg_half_m, w1_row, w2_row,
+                    );
+                }
+                lg_half_m += 2;
+            }
+        }
+        if lg_half_m < end {
+            let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
+            let block_count = packed_values.len() / packed_m;
+            if block_count >= 2 {
+                MaybeParChunksMut::par_chunks_mut(packed_values, packed_m).for_each(
+                    |block| {
+                        fft_classic_simd_single_layer_with::<P, M>(
+                            block,
+                            lg_half_m,
+                            lg_packed_width,
+                            root_table,
+                        );
+                    },
+                );
+            } else {
+                fft_classic_simd_single_layer_with::<P, M>(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+            }
+        }
+        return;
+    }
+
+    // FRI / quadratic-extension large FFTs take this parallel entry too,
+    // but they cannot use the Goldilocks 4-wide NEON pair kernel. Use the
+    // existing generic fused-pair body on disjoint 4q packed blocks.
+    #[cfg(target_arch = "aarch64")]
+    if start + 2 <= end
+        && scalar_len >= PARALLEL_FFT_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::extension::quadratic::QuadraticExtension<
+                    crate::goldilocks_field::GoldilocksField,
+                >,
+            >()
+    {
+        let mut lg_half_m = start;
+        while lg_half_m + 2 <= end {
+            let q = (1usize << lg_half_m) >> lg_packed_width;
+            debug_assert!(q != 0);
+            let block_packed = 4 * q;
+            let block_count = packed_values.len() / block_packed;
+            if block_count >= 2 {
+                MaybeParChunksMut::par_chunks_mut(packed_values, block_packed).for_each(
+                    |block| {
+                        fft_classic_simd_fused_two_layers_with::<P, M>(
+                            block,
+                            lg_half_m,
+                            lg_packed_width,
+                            root_table,
+                        );
+                    },
+                );
+            } else {
+                fft_classic_simd_fused_two_layers_with::<P, M>(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+            }
+            lg_half_m += 2;
+        }
+        if lg_half_m < end {
+            let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
+            let block_count = packed_values.len() / packed_m;
+            if block_count >= 2 {
+                MaybeParChunksMut::par_chunks_mut(packed_values, packed_m).for_each(
+                    |block| {
+                        fft_classic_simd_single_layer_with::<P, M>(
+                            block,
+                            lg_half_m,
+                            lg_packed_width,
+                            root_table,
+                        );
+                    },
+                );
+            } else {
+                fft_classic_simd_single_layer_with::<P, M>(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
+            }
+        }
+        return;
+    }
+
     for lg_half_m in start..end {
         let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
         let block_count = packed_values.len() / packed_m;
