@@ -11,6 +11,8 @@ use plonky2_maybe_rayon::*;
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -698,7 +700,104 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let (denominators_0, denominators_1, denominator_inverses) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
-                    for (t, &x) in xs.iter().enumerate() {
+                    // Pack WIDTH consecutive points. Each lane keeps its own four
+                    // accumulators and the same `for j in start..end` multiply
+                    // order as the scalar loop, so every limb is bit-identical.
+                    // A fixed routed wire currently `continue`s (omits the factor);
+                    // multiplying that lane by ONE is raw-limb equivalent because
+                    // `reduce128` is the identity on inputs `< 2^64`.
+                    let width = <F as Packable>::Packing::WIDTH;
+                    let n_points = xs.len();
+                    let mut t = 0;
+                    while t + width <= n_points {
+                        let i0 = base + t;
+                        let x_pack = *<F as Packable>::Packing::from_slice(&xs[t..t + width]);
+                        for chunk in 0..num_chunks {
+                            let start = chunk * degree;
+                            let end = min(start + degree, num_routed_wires);
+                            let mut numerator_0 = <F as Packable>::Packing::ONES;
+                            let mut numerator_1 = <F as Packable>::Packing::ONES;
+                            let mut denominator_0 = <F as Packable>::Packing::ONES;
+                            let mut denominator_1 = <F as Packable>::Packing::ONES;
+                            for j in start..end {
+                                let mut any_fixed = false;
+                                for k in 0..width {
+                                    if fixed_routed_wire(
+                                        &prover_data.fixed_routed_wires,
+                                        (i0 + k) * num_routed_wires + j,
+                                    ) {
+                                        any_fixed = true;
+                                        break;
+                                    }
+                                }
+                                if !any_fixed {
+                                    let wire = *<F as Packable>::Packing::from_slice(
+                                        &witness.wire_values[j][i0..i0 + width],
+                                    );
+                                    let mut sigma = <F as Packable>::Packing::ZEROS;
+                                    {
+                                        let sigma_lanes = sigma.as_slice_mut();
+                                        for k in 0..width {
+                                            sigma_lanes[k] = prover_data.sigmas[i0 + k][j];
+                                        }
+                                    }
+                                    numerator_0 *=
+                                        wire + x_pack * beta_k_is_0[j] + gamma_0;
+                                    numerator_1 *=
+                                        wire + x_pack * beta_k_is_1[j] + gamma_1;
+                                    denominator_0 *= wire + sigma * beta_0 + gamma_0;
+                                    denominator_1 *= wire + sigma * beta_1 + gamma_1;
+                                } else {
+                                    for k in 0..width {
+                                        if fixed_routed_wire(
+                                            &prover_data.fixed_routed_wires,
+                                            (i0 + k) * num_routed_wires + j,
+                                        ) {
+                                            continue;
+                                        }
+                                        let wire_value = witness.get_wire(i0 + k, j);
+                                        let sigma = prover_data.sigmas[i0 + k][j];
+                                        let x = xs[t + k];
+                                        numerator_0.as_slice_mut()[k] *=
+                                            wire_value + beta_k_is_0[j] * x + gamma_0;
+                                        numerator_1.as_slice_mut()[k] *=
+                                            wire_value + beta_k_is_1[j] * x + gamma_1;
+                                        denominator_0.as_slice_mut()[k] *=
+                                            wire_value + beta_0 * sigma + gamma_0;
+                                        denominator_1.as_slice_mut()[k] *=
+                                            wire_value + beta_1 * sigma + gamma_1;
+                                    }
+                                }
+                            }
+                            let num0_lanes = numerator_0.as_slice();
+                            let num1_lanes = numerator_1.as_slice();
+                            let den0_lanes = denominator_0.as_slice();
+                            let den1_lanes = denominator_1.as_slice();
+                            for k in 0..width {
+                                let output = (t + k) * num_chunks + chunk;
+                                products_0[output].write(num0_lanes[k]);
+                                products_1[output].write(num1_lanes[k]);
+                            }
+                            // Denominator push order is point-major (all chunks of
+                            // t, then t+1, …). Defer until the 4-point group finishes.
+                            if chunk == 0 {
+                                for _ in 0..width {
+                                    denominators_0
+                                        .extend(core::iter::repeat(F::ZERO).take(num_chunks));
+                                    denominators_1
+                                        .extend(core::iter::repeat(F::ZERO).take(num_chunks));
+                                }
+                            }
+                            let den_base = denominators_0.len() - width * num_chunks;
+                            for k in 0..width {
+                                denominators_0[den_base + k * num_chunks + chunk] = den0_lanes[k];
+                                denominators_1[den_base + k * num_chunks + chunk] = den1_lanes[k];
+                            }
+                        }
+                        t += width;
+                    }
+                    while t < n_points {
+                        let x = xs[t];
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
                         let routed_base = i * num_routed_wires;
@@ -734,6 +833,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             denominators_0.push(denominator_0);
                             denominators_1.push(denominator_1);
                         }
+                        t += 1;
                     }
                     // SAFETY: the loop above wrote every slot of both
                     // sub-slices — `t` covers `0..xs.len()` and `chunk` covers
@@ -2347,11 +2447,19 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    // The three offloaded GPU contributions each used to merge with their own
+    // full parallel pass over `quotient_values`, re-reading the buffer and
+    // re-fetching `z_h_on_coset.eval_inverse(i)` every time. Goldilocks
+    // addition is exact and canonicalizing, so accumulating the three addends
+    // in any association yields the identical field element. Finish all three
+    // jobs first (each keeping its own fallback-to-CPU error path), then merge
+    // them in a single traversal.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_poseidon_values: Option<&[F]> = match gpu_poseidon.as_ref() {
+        Some((_, job)) => match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                Some(values)
             }
             Err(error) => {
                 GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2378,26 +2486,16 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        },
+        None => None,
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values: Option<&[F]> = match gpu_range.as_ref() {
+        Some((_, job)) => match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                Some(values)
             }
             Err(error) => {
                 GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2427,24 +2525,14 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        },
+        None => None,
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
+    let gpu_permutation_values: Option<&[F]> = match gpu_permutation.as_ref() {
+        Some(job) => match job.finish() {
+            Ok(values) => Some(values),
             Err(error) => {
                 log::warn!(
                     "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
@@ -2464,18 +2552,34 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        },
+        None => None,
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        let contributions: [Option<&[F]>; 3] = [
+            gpu_poseidon_values,
+            gpu_range_values,
+            gpu_permutation_values,
+        ];
+        for gpu_values in contributions.iter().flatten() {
+            debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        }
+        if contributions.iter().any(Option::is_some) {
+            quotient_values
+                .par_chunks_exact_mut(num_challenges)
+                .enumerate()
+                .for_each(|(i, cpu_values)| {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    for gpu_values in contributions.iter().flatten() {
+                        let gpu = &gpu_values[i * num_challenges..(i + 1) * num_challenges];
+                        for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu) {
+                            *cpu += gpu * denominator_inv;
+                        }
+                    }
+                });
+        }
     }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
