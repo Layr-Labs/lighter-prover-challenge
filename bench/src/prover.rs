@@ -778,6 +778,9 @@ pub(crate) fn prove_block_after_pre(
     }
     block.tx_chunks = tx_chunks;
     block.tx_chunks.push(Vec::new());
+    let block_number = block.block_number;
+    let created_at = block.created_at;
+    let old_account_delta_tree_root = block.old_account_delta_tree_root;
 
     // Both transaction paths prove concurrently and each ends in a strictly
     // sequential chain tail, but the exclusive-GPU switch that tail wants is
@@ -817,16 +820,15 @@ pub(crate) fn prove_block_after_pre(
                         TxPath::Heavy,
                         heavy_chunks,
                         circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
+                        block_number,
+                        created_at,
+                        old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
                         active_paths,
                     )
                 })
                 .expect("heavy transaction chain thread must start");
-            let block_ref = &block;
             let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
@@ -835,7 +837,7 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
                         "final_block_build",
-                        block_ref.block_number,
+                        block_number,
                         &[],
                     );
                     #[cfg(feature = "diagnostic_profile")]
@@ -851,7 +853,7 @@ pub(crate) fn prove_block_after_pre(
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
                         &block_target,
-                        block_ref,
+                        &block,
                         pre_proof_ref,
                     )
                     .expect("final block early witness inputs failed");
@@ -861,6 +863,9 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
+                    // The pending partition owns every value derived from the block;
+                    // keep only those witness values while the proof paths drain.
+                    drop(block);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
@@ -900,9 +905,9 @@ pub(crate) fn prove_block_after_pre(
                         TxPath::Light,
                         light_chunks,
                         circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
+                        block_number,
+                        created_at,
+                        old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
                         active_paths,
@@ -951,7 +956,7 @@ pub(crate) fn prove_block_after_pre(
 
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
-        plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
+        plonky2::util::profile::enter_context("final_block", block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "final_block_tail");
     let (light_chain_input, heavy_chain_input) =
