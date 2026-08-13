@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{
     boxed::Box,
+    format,
     string::{String, ToString},
     vec,
     vec::Vec,
@@ -331,6 +332,115 @@ pub struct PartitionSeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
     unresolved_watches: &'b mut [usize],
     generator_indices_by_watches: &'b GeneratorWatchIndex,
+    layout: SeedLayoutMode<'b>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SeedLayoutEntry {
+    target: Target,
+    representative: u32,
+}
+
+/// A recorded seed layout cannot be applied to this immutable circuit/input shape.
+///
+/// Callers may safely retry only this error on the generic target-lookup path. Errors emitted by
+/// witness writes or generator execution deliberately retain their original type and must
+/// propagate rather than rerun a stateful input writer.
+#[derive(Debug)]
+pub struct SeedLayoutMismatch(String);
+
+impl core::fmt::Display for SeedLayoutMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl core::error::Error for SeedLayoutMismatch {}
+
+fn seed_layout_mismatch(message: impl Into<String>) -> anyhow::Error {
+    SeedLayoutMismatch(message.into()).into()
+}
+
+/// Whether an error denotes only seed-layout applicability, for a guarded generic fallback.
+pub fn is_seed_layout_mismatch(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SeedLayoutMismatch>().is_some()
+}
+
+/// Exact target order and aggregate watcher effects of a fixed witness-input writer.
+///
+/// Values are intentionally absent: replay still receives and writes every value supplied by the
+/// caller. The layout only removes repeated target-to-representative lookup and repeated traversal
+/// of the immutable watcher CSR for the same circuit/input shape.
+pub struct PartitionSeedLayout<
+    'a,
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    entries: Vec<SeedLayoutEntry>,
+    seeded_watch_decrements: Vec<(u32, u32)>,
+    /// Lifetime brand for the exact immutable prover topology used while recording. Holding the
+    /// whole owner borrowed prevents drop, mutation, and allocator-address reuse (ABA), while
+    /// pointer equality binds the representative map, generator list, watch counts, and watcher
+    /// CSR in O(1) at replay.
+    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+    common_data: &'a CommonCircuitData<F, D>,
+}
+
+/// Seed-only state exposed solely to the focused cross-crate correctness oracle.
+///
+/// The `seed_layout_oracle` feature is enabled only by `bench`'s dev dependency. Ranked release
+/// builds do not compile this surface. No generator worklist is run before this snapshot.
+#[cfg(feature = "seed_layout_oracle")]
+#[derive(Debug)]
+pub struct SeedStageSnapshot<'a, F: Field> {
+    pub witness: PartitionWitness<'a, F>,
+    pub unresolved_watches: Vec<usize>,
+}
+
+impl<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> Debug for PartitionSeedLayout<'_, F, C, D>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PartitionSeedLayout")
+            .field("target_write_count", &self.entries.len())
+            .field(
+                "changed_generator_count",
+                &self.seeded_watch_decrements.len(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> PartitionSeedLayout<'_, F, C, D>
+{
+    /// Number of `set_target` calls captured by the fixed writer. This is exposed for focused
+    /// census/oracle output only; replay never trusts a caller-supplied count.
+    pub fn target_write_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Number of generators whose seeded watch count changes. Replay traverses exactly this
+    /// sparse list instead of every watcher list reached by every input target.
+    pub fn changed_generator_count(&self) -> usize {
+        self.seeded_watch_decrements.len()
+    }
+}
+
+enum SeedLayoutMode<'a> {
+    Plain,
+    Record(&'a mut Vec<SeedLayoutEntry>),
+    Replay {
+        entries: &'a [SeedLayoutEntry],
+        cursor: usize,
+    },
 }
 
 impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
@@ -341,7 +451,46 @@ impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
 
 impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
-        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
+        let newly_set = match &mut self.layout {
+            SeedLayoutMode::Plain => self.witness.set_target_returning_rep(target, value)?,
+            SeedLayoutMode::Record(entries) => {
+                let representative =
+                    self.witness.representative_map[self.witness.target_index(target)];
+                entries.push(SeedLayoutEntry {
+                    target,
+                    representative,
+                });
+                self.witness
+                    .set_rep_index_returning_new(representative as usize, target, value)?
+            }
+            SeedLayoutMode::Replay { entries, cursor } => {
+                let entry = entries.get(*cursor).ok_or_else(|| {
+                    seed_layout_mismatch(format!(
+                        "seed layout ended before target {target:?} at position {cursor}"
+                    ))
+                })?;
+                if entry.target != target {
+                    return Err(seed_layout_mismatch(format!(
+                        "seed layout target mismatch at position {}: {:?} != {:?}",
+                        *cursor,
+                        entry.target,
+                        target,
+                    )));
+                }
+                *cursor += 1;
+                // Watcher decrements are applied once, in aggregate, after the checked replay.
+                self.witness.set_rep_index_returning_new(
+                    entry.representative as usize,
+                    target,
+                    value,
+                )?
+            }
+        };
+
+        if matches!(&self.layout, SeedLayoutMode::Replay { .. }) {
+            return Ok(());
+        }
+        if let Some(watch) = newly_set {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
                     debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
@@ -435,6 +584,145 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
 impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PendingPartitionWitness<'a, F, C, D>
 {
+    /// Seed the production direct writer and snapshot the exact state before any generator runs.
+    #[cfg(feature = "seed_layout_oracle")]
+    pub fn seed_stage_plain_for_oracle(
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<SeedStageSnapshot<'a, F>> {
+        let mut witness = PartitionWitness::new(
+            common_data.config.num_wires,
+            common_data.degree(),
+            &prover_data.representative_map,
+        );
+        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        seed(&mut PartitionSeeder {
+            witness: &mut witness,
+            unresolved_watches: &mut unresolved_watches,
+            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+            layout: SeedLayoutMode::Plain,
+        })?;
+        Ok(SeedStageSnapshot {
+            witness,
+            unresolved_watches,
+        })
+    }
+
+    /// Record the production direct writer and snapshot before any generator runs.
+    #[cfg(feature = "seed_layout_oracle")]
+    pub fn seed_stage_recording_for_oracle(
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &'a CommonCircuitData<F, D>,
+        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<(
+        SeedStageSnapshot<'a, F>,
+        PartitionSeedLayout<'a, F, C, D>,
+    )> {
+        let mut witness = PartitionWitness::new(
+            common_data.config.num_wires,
+            common_data.degree(),
+            &prover_data.representative_map,
+        );
+        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let mut entries = Vec::new();
+        seed(&mut PartitionSeeder {
+            witness: &mut witness,
+            unresolved_watches: &mut unresolved_watches,
+            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+            layout: SeedLayoutMode::Record(&mut entries),
+        })?;
+        let seeded_watch_decrements = prover_data
+            .generator_watch_counts
+            .iter()
+            .zip(&unresolved_watches)
+            .enumerate()
+            .filter_map(|(generator, (&total, &unresolved))| {
+                let decrement = total - unresolved;
+                (decrement != 0).then(|| {
+                    Ok((
+                        u32::try_from(generator)
+                            .map_err(|_| anyhow!("generator index exceeds u32"))?,
+                        u32::try_from(decrement)
+                            .map_err(|_| anyhow!("seed watcher decrement exceeds u32"))?,
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok((
+            SeedStageSnapshot {
+                witness,
+                unresolved_watches,
+            },
+            PartitionSeedLayout {
+                entries,
+                seeded_watch_decrements,
+                prover_data,
+                common_data,
+            },
+        ))
+    }
+
+    /// Replay a checked recorded layout and snapshot before any generator runs.
+    #[cfg(feature = "seed_layout_oracle")]
+    pub fn seed_stage_replay_for_oracle(
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &'a CommonCircuitData<F, D>,
+        layout: &PartitionSeedLayout<'a, F, C, D>,
+        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<SeedStageSnapshot<'a, F>> {
+        if !core::ptr::eq(layout.prover_data, prover_data)
+            || !core::ptr::eq(layout.common_data, common_data)
+        {
+            return Err(seed_layout_mismatch(
+                "seed layout belongs to a different immutable circuit topology instance",
+            ));
+        }
+        let mut witness = PartitionWitness::new(
+            common_data.config.num_wires,
+            common_data.degree(),
+            &prover_data.representative_map,
+        );
+        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let cursor = {
+            let mut seeder = PartitionSeeder {
+                witness: &mut witness,
+                unresolved_watches: &mut unresolved_watches,
+                generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+                layout: SeedLayoutMode::Replay {
+                    entries: &layout.entries,
+                    cursor: 0,
+                },
+            };
+            seed(&mut seeder)?;
+            match seeder.layout {
+                SeedLayoutMode::Replay { cursor, .. } => cursor,
+                _ => unreachable!(),
+            }
+        };
+        if cursor != layout.entries.len() {
+            return Err(seed_layout_mismatch(format!(
+                "seed layout has {} trailing targets after replayed {}",
+                layout.entries.len() - cursor,
+                cursor,
+            )));
+        }
+        for &(generator, decrement) in &layout.seeded_watch_decrements {
+            let count = &mut unresolved_watches[generator as usize];
+            let decrement = decrement as usize;
+            if *count < decrement {
+                return Err(seed_layout_mismatch(
+                    "seed layout watcher decrement underflow",
+                ));
+            }
+            *count -= decrement;
+        }
+        Ok(SeedStageSnapshot {
+            witness,
+            unresolved_watches,
+        })
+    }
+
     /// Seeds `inputs` and runs generators to quiescence. Unlike [`generate_partial_witness`],
     /// generators whose watched values are still missing are left pending rather than being an
     /// error.
@@ -519,6 +807,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             witness: &mut witness,
             unresolved_watches: &mut unresolved_watches,
             generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+            layout: SeedLayoutMode::Plain,
         })?;
 
         let mut generator_is_expired = vec![false; generators.len()];
@@ -535,6 +824,153 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
+        Ok(Self {
+            witness,
+            unresolved_watches,
+            generator_is_expired,
+            remaining_generators,
+            prover_data,
+            parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
+        })
+    }
+
+    /// Records the checked target/representative layout while performing an ordinary direct seed.
+    /// The returned layout is circuit-specific and may be passed to
+    /// [`Self::start_seeded_with_layout`] for later inputs written in the same target order.
+    pub fn start_seeded_recording(
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &'a CommonCircuitData<F, D>,
+        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<(Self, PartitionSeedLayout<'a, F, C, D>)> {
+        let generators = &prover_data.generators;
+        let mut witness = PartitionWitness::new(
+            common_data.config.num_wires,
+            common_data.degree(),
+            &prover_data.representative_map,
+        );
+        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let mut entries = Vec::new();
+        seed(&mut PartitionSeeder {
+            witness: &mut witness,
+            unresolved_watches: &mut unresolved_watches,
+            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+            layout: SeedLayoutMode::Record(&mut entries),
+        })?;
+        let seeded_watch_decrements = prover_data
+            .generator_watch_counts
+            .iter()
+            .zip(&unresolved_watches)
+            .enumerate()
+            .filter_map(|(generator, (&total, &unresolved))| {
+                let decrement = total - unresolved;
+                (decrement != 0).then(|| {
+                    Ok((
+                        u32::try_from(generator)
+                            .map_err(|_| anyhow!("generator index exceeds u32"))?,
+                        u32::try_from(decrement)
+                            .map_err(|_| anyhow!("seed watcher decrement exceeds u32"))?,
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut generator_is_expired = vec![false; generators.len()];
+        let mut remaining_generators = generators.len();
+        run_generator_worklist(
+            &mut witness,
+            prover_data,
+            &mut unresolved_watches,
+            &mut generator_is_expired,
+            &mut remaining_generators,
+            (0..generators.len()).collect(),
+            PARALLEL_WORKLIST_THRESHOLD,
+        )?;
+        Ok((
+            Self {
+                witness,
+                unresolved_watches,
+                generator_is_expired,
+                remaining_generators,
+                prover_data,
+                parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
+            },
+            PartitionSeedLayout {
+                entries,
+                seeded_watch_decrements,
+                prover_data,
+                common_data,
+            },
+        ))
+    }
+
+    /// Replays a previously recorded fixed target layout while preserving all runtime values.
+    /// Any target-order/length mismatch fails closed. The generic [`Self::start_seeded`] path is
+    /// unchanged and remains the fallback for writers without a reusable layout.
+    pub fn start_seeded_with_layout(
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &'a CommonCircuitData<F, D>,
+        layout: &PartitionSeedLayout<'a, F, C, D>,
+        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<Self> {
+        let generators = &prover_data.generators;
+        if !core::ptr::eq(layout.prover_data, prover_data)
+            || !core::ptr::eq(layout.common_data, common_data)
+        {
+            return Err(seed_layout_mismatch(
+                "seed layout belongs to a different immutable circuit topology instance"
+            ));
+        }
+        let mut witness = PartitionWitness::new(
+            common_data.config.num_wires,
+            common_data.degree(),
+            &prover_data.representative_map,
+        );
+        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let cursor = {
+            let mut seeder = PartitionSeeder {
+                witness: &mut witness,
+                unresolved_watches: &mut unresolved_watches,
+                generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+                layout: SeedLayoutMode::Replay {
+                    entries: &layout.entries,
+                    cursor: 0,
+                },
+            };
+            seed(&mut seeder)?;
+            match seeder.layout {
+                SeedLayoutMode::Replay { cursor, .. } => cursor,
+                _ => unreachable!(),
+            }
+        };
+        if cursor != layout.entries.len() {
+            return Err(seed_layout_mismatch(format!(
+                "seed layout has {} trailing targets after replayed {}",
+                layout.entries.len() - cursor,
+                cursor,
+            )));
+        }
+        for &(generator, decrement) in &layout.seeded_watch_decrements {
+            let count = &mut unresolved_watches[generator as usize];
+            let decrement = decrement as usize;
+            if *count < decrement {
+                return Err(seed_layout_mismatch(
+                    "seed layout watcher decrement underflow",
+                ));
+            }
+            *count -= decrement;
+        }
+
+        let mut generator_is_expired = vec![false; generators.len()];
+        let mut remaining_generators = generators.len();
+        run_generator_worklist(
+            &mut witness,
+            prover_data,
+            &mut unresolved_watches,
+            &mut generator_is_expired,
+            &mut remaining_generators,
+            (0..generators.len()).collect(),
+            PARALLEL_WORKLIST_THRESHOLD,
+        )?;
         Ok(Self {
             witness,
             unresolved_watches,
@@ -1197,10 +1633,7 @@ mod tests {
     /// The initialization that `seed_inputs_and_unresolved_watches` replaced: seed every input,
     /// then walk the entire representative-keyed watcher map counting, per generator, the
     /// still-unpopulated representatives it watches. Kept as an in-test oracle.
-    fn legacy_seed_inputs_and_unresolved_watches<
-        C: GenericConfig<D, F = F>,
-        const D: usize,
-    >(
+    fn legacy_seed_inputs_and_unresolved_watches<C: GenericConfig<D, F = F>, const D: usize>(
         witness: &mut PartitionWitness<F>,
         inputs: PartialWitness<F>,
         prover_data: &ProverOnlyCircuitData<F, C, D>,
@@ -1346,6 +1779,115 @@ mod tests {
         assert_eq!(run_calls.load(Ordering::Relaxed), 1);
     }
 
+    /// A recorded fixed target layout must preserve arbitrary runtime values and exact generator
+    /// readiness while rejecting reordered, shortened, or foreign-circuit layouts. This oracle is
+    /// deliberately value-agnostic: transaction type and inactive payload contents can change
+    /// without entering the layout.
+    #[test]
+    fn recorded_seed_layout_matches_plain_seed_and_fails_closed() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let left = builder.add_virtual_target();
+        let right = builder.add_virtual_target();
+        let sum = builder.add(left, right);
+        builder.register_public_input(sum);
+        let circuit = builder.build::<C>();
+
+        let (recorded, layout) = PendingPartitionWitness::start_seeded_recording(
+            &circuit.prover_only,
+            &circuit.common,
+            |seed| {
+                seed.set_target(left, F::from_canonical_u64(3))?;
+                seed.set_target(right, F::from_canonical_u64(5))
+            },
+        )?;
+        let recorded = recorded.finish()?;
+        assert_eq!(recorded.get_target(sum), F::from_canonical_u64(8));
+        assert_eq!(layout.target_write_count(), 2);
+
+        let replayed = PendingPartitionWitness::start_seeded_with_layout(
+            &circuit.prover_only,
+            &circuit.common,
+            &layout,
+            |seed| {
+                seed.set_target(left, F::from_canonical_u64(11))?;
+                seed.set_target(right, F::from_canonical_u64(13))
+            },
+        )?
+        .finish()?;
+        let plain =
+            PendingPartitionWitness::start_seeded(&circuit.prover_only, &circuit.common, |seed| {
+                seed.set_target(left, F::from_canonical_u64(11))?;
+                seed.set_target(right, F::from_canonical_u64(13))
+            })?
+            .finish()?;
+        assert_eq!(replayed.set_bitmap, plain.set_bitmap);
+        for rep in 0..replayed.values.len() {
+            if replayed.is_set_by_rep_index(rep) {
+                assert_eq!(replayed.values[rep], plain.values[rep]);
+            }
+        }
+        assert_eq!(replayed.get_target(sum), F::from_canonical_u64(24));
+
+        let reordered = PendingPartitionWitness::start_seeded_with_layout(
+            &circuit.prover_only,
+            &circuit.common,
+            &layout,
+            |seed| {
+                seed.set_target(right, F::ONE)?;
+                seed.set_target(left, F::ONE)
+            },
+        );
+        let reordered_error = reordered.expect_err("reordered layout replay must fail closed");
+        assert!(is_seed_layout_mismatch(&reordered_error));
+        let shortened = PendingPartitionWitness::start_seeded_with_layout(
+            &circuit.prover_only,
+            &circuit.common,
+            &layout,
+            |seed| seed.set_target(left, F::ONE),
+        );
+        let shortened_error = shortened.expect_err("short layout replay must fail closed");
+        assert!(is_seed_layout_mismatch(&shortened_error));
+
+        let mut other_builder =
+            CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let other = other_builder.add_virtual_target();
+        other_builder.register_public_input(other);
+        let other_circuit = other_builder.build::<C>();
+        let foreign = PendingPartitionWitness::start_seeded_with_layout(
+            &other_circuit.prover_only,
+            &other_circuit.common,
+            &layout,
+            |seed| seed.set_target(other, F::ONE),
+        );
+        let foreign_error = foreign.expect_err("foreign representative map must fail closed");
+        assert!(is_seed_layout_mismatch(&foreign_error));
+
+        // A genuine writer/value error is deliberately not classified as layout applicability.
+        // This proves callers cannot mask it by retrying the stateful writer on the generic path.
+        let (_duplicate_pending, duplicate_layout) =
+            PendingPartitionWitness::start_seeded_recording(
+                &circuit.prover_only,
+                &circuit.common,
+                |seed| {
+                    seed.set_target(left, F::ONE)?;
+                    seed.set_target(left, F::ONE)
+                },
+            )?;
+        let contradiction = PendingPartitionWitness::start_seeded_with_layout(
+            &circuit.prover_only,
+            &circuit.common,
+            &duplicate_layout,
+            |seed| {
+                seed.set_target(left, F::ONE)?;
+                seed.set_target(left, F::from_canonical_u64(2))
+            },
+        )
+        .expect_err("conflicting witness values must propagate");
+        assert!(!is_seed_layout_mismatch(&contradiction));
+
+        Ok(())
+    }
+
     /// M1 differential: the fused `full_witness` drain over the narrowed `u32` map must produce
     /// the same matrix, cell for cell as raw canonical `u64`s, as resolving every wire through
     /// the per-target read path.
@@ -1422,12 +1964,7 @@ mod tests {
         // set, so compare only slots every witness actually set; unset slots
         // are F::ZERO at every real observation point (full_witness,
         // try_get_target) and carry no information here.
-        for (rep, (single, split)) in single_shot
-            .values
-            .iter()
-            .zip(&two_phase.values)
-            .enumerate()
-        {
+        for (rep, (single, split)) in single_shot.values.iter().zip(&two_phase.values).enumerate() {
             if !(single_shot.is_set_by_rep_index(rep)
                 && single_shot_repeat.is_set_by_rep_index(rep)
                 && two_phase.is_set_by_rep_index(rep))
@@ -1466,29 +2003,32 @@ mod tests {
     fn direct_seeded_pending_witness_matches_map_seeded_recursive_circuit() -> Result<()> {
         let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
 
-        let mut map_seeded =
-            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
+        let mut map_seeded = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
         map_seeded.feed(late_inputs.clone())?;
         let map_seeded = map_seeded.finish()?;
 
         // RandomValueGenerator outputs are expected to differ between the two
         // executions, but all remaining witness slots must match.
-        let mut map_seeded_repeat =
-            PendingPartitionWitness::start(early_inputs.clone(), &outer.prover_only, &outer.common)?;
+        let mut map_seeded_repeat = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &outer.prover_only,
+            &outer.common,
+        )?;
         map_seeded_repeat.feed(late_inputs.clone())?;
         let map_seeded_repeat = map_seeded_repeat.finish()?;
         let num_random_generators = count_random_generators(&outer.prover_only);
 
-        let mut direct_seeded = PendingPartitionWitness::start_seeded(
-            &outer.prover_only,
-            &outer.common,
-            |seeder| {
+        let mut direct_seeded =
+            PendingPartitionWitness::start_seeded(&outer.prover_only, &outer.common, |seeder| {
                 for (&target, &value) in &early_inputs.target_values {
                     seeder.set_target(target, value)?;
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         direct_seeded.feed_seeded(|feeder| {
             for (&target, &value) in &late_inputs.target_values {
                 feeder.set_target(target, value)?;
