@@ -2049,19 +2049,17 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
-    // only when the GPU stream is unoccupied at entry, the same occupancy
-    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
-    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
-    // while an already-busy stream would just queue the absorb groups behind
-    // another tree and stretch both.
-    let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
-    } else {
-        leaf_count >= 1 << 19
-            && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
-    };
+    // Exclusive phases still stream the 2^20+ trees (final-block wires).
+    // The pipelined 2^19 arm is deleted. Post-fatlib the absorb kernels
+    // launch from a lookup (~1.5 ms) instead of AIR→ISA, so the CPU-fill
+    // / GPU-absorb overlap window that justified N command-buffer commits
+    // (one per 8-column group, ~17 for a width-135 wires tree) shrank;
+    // those commits sit on the single FIFO queue in front of the light
+    // path's other trees. The caller already has the classic fill-then-
+    // hash fallback (one hash after a full CPU fill) and uses it whenever
+    // this function returns None. Isolate marker: nostream19-1786672000.
+    let stream_admitted = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+        && leaf_count >= 1 << 20;
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width < 16
