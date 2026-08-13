@@ -623,6 +623,64 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+/// Lockstep form of [`z_polynomials_from_quotient_chunk_products`] for the
+/// production two-challenge path. Each lane retains the scalar helper's exact
+/// multiply and push order; interleaving the independent chains exposes their
+/// field multiplications to instruction-level parallelism without adding a
+/// Rayon fork/join to the steady transaction and chain-proof pipeline.
+fn paired_z_polynomials_from_quotient_chunk_products<F: Field>(
+    quotient_products_0: Vec<F>,
+    quotient_products_1: Vec<F>,
+    num_prods: usize,
+) -> (Vec<PolynomialValues<F>>, Vec<PolynomialValues<F>>) {
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(quotient_products_0.len(), quotient_products_1.len());
+    debug_assert_eq!(quotient_products_0.len() % num_chunks, 0);
+    let n_points = quotient_products_0.len() / num_chunks;
+    let mut columns_0: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut columns_1: Vec<Vec<F>> = (0..num_chunks)
+        .map(|_| Vec::with_capacity(n_points))
+        .collect();
+    let mut z_x_0 = F::ONE;
+    let mut z_x_1 = F::ONE;
+
+    for (row_0, row_1) in quotient_products_0
+        .chunks_exact(num_chunks)
+        .zip(quotient_products_1.chunks_exact(num_chunks))
+    {
+        let mut acc_0 = z_x_0;
+        let mut acc_1 = z_x_1;
+        for (k, (&quotient_product_0, &quotient_product_1)) in
+            row_0.iter().zip(row_1).enumerate()
+        {
+            acc_0 *= quotient_product_0;
+            acc_1 *= quotient_product_1;
+            if k == num_prods {
+                columns_0[k].push(z_x_0);
+                columns_1[k].push(z_x_1);
+                z_x_0 = acc_0;
+                z_x_1 = acc_1;
+            } else {
+                columns_0[k].push(acc_0);
+                columns_1[k].push(acc_1);
+            }
+        }
+    }
+
+    (
+        columns_0
+            .into_iter()
+            .map(PolynomialValues::new)
+            .collect(),
+        columns_1
+            .into_iter()
+            .map(PolynomialValues::new)
+            .collect(),
+    )
+}
+
 /// Compute both production permutation challenges in one pass over the witness
 /// and sigma rows.
 ///
@@ -663,7 +721,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
 
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     let product_count = subgroup.len() * num_chunks;
     // Same uninitialised-capacity handling as the per-challenge path: every
     // slot is written below before anything reads it, so zero-filling first is
@@ -688,16 +746,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (denominators, denominator_inverses) = scratch;
+                    denominators.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -731,8 +787,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            denominators.push(denominator_0);
+                            denominators.push(denominator_1);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,8 +803,20 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    // Montgomery's trick pays for one ordinary inverse per
+                    // call. Interleave both challenges so this chunk pays it
+                    // once, while retaining each challenge's denominator and
+                    // quotient-product order.
+                    F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
+                    debug_assert_eq!(denominator_inverses.len(), 2 * products_0.len());
+                    for ((product_0, product_1), inverses) in products_0
+                        .iter_mut()
+                        .zip(products_1.iter_mut())
+                        .zip(denominator_inverses.chunks_exact(2))
+                    {
+                        *product_0 *= inverses[0];
+                        *product_1 *= inverses[1];
+                    }
                 },
             );
     }
@@ -761,10 +829,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    vec![
-        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-    ]
+    let (columns_0, columns_1) = paired_z_polynomials_from_quotient_chunk_products(
+        quotient_products_0,
+        quotient_products_1,
+        num_prods,
+    );
+    vec![columns_0, columns_1]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -793,7 +863,7 @@ fn wires_permutation_partial_products_and_zs<
     // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     // Every slot of this buffer is assigned below before anything reads it —
     // the inner loop writes `quotient_products[t * num_chunks + chunk]` for
     // every `t` in the batch and every `chunk`, which covers each sub-slice
@@ -1801,6 +1871,98 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Sum the raw CPU and GPU quotient numerators, apply their common denominator
+/// once, and scatter the point-major values into one column per challenge.
+fn sum_scale_and_scatter_quotient_numerators<F: RichField>(
+    cpu_quotient_numerators: &[F],
+    gpu_quotient_numerators: &[&[F]],
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Vec<Vec<F>> {
+    match gpu_quotient_numerators {
+        [] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        &[first] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [first],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        &[first, second] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [first, second],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        &[first, second, third] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [first, second, third],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        _ => unreachable!("at most three Metal quotient families exist"),
+    }
+}
+
+fn sum_scale_and_scatter_quotient_numerators_inner<F: RichField, const N: usize>(
+    cpu_quotient_numerators: &[F],
+    gpu_quotient_numerators: [&[F]; N],
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Vec<Vec<F>> {
+    debug_assert!(num_challenges > 0);
+    debug_assert_eq!(cpu_quotient_numerators.len() % num_challenges, 0);
+    debug_assert!(gpu_quotient_numerators
+        .iter()
+        .all(|values| values.len() == cpu_quotient_numerators.len()));
+    let num_points = cpu_quotient_numerators.len() / num_challenges;
+
+    struct ColPtr<T>(*mut T);
+    unsafe impl<T> Send for ColPtr<T> {}
+    unsafe impl<T> Sync for ColPtr<T> {}
+
+    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+        .map(|_| {
+            let mut column = Vec::with_capacity(num_points);
+            // SAFETY: the disjoint parallel scatter below writes every element
+            // exactly once before any read; `F` is plain data.
+            unsafe { column.set_len(num_points) };
+            column
+        })
+        .collect();
+    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
+        .iter_mut()
+        .map(|column| ColPtr(column.as_mut_ptr()))
+        .collect();
+    let column_ptrs = &column_ptrs;
+    cpu_quotient_numerators
+        .par_chunks(BATCH_SIZE * num_challenges)
+        .enumerate()
+        .for_each(|(chunk_i, chunk)| {
+            let base = BATCH_SIZE * chunk_i;
+            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                let point = base + k;
+                let element_base = point * num_challenges;
+                let denominator_inv = z_h_on_coset.eval_inverse(base + k);
+                for (challenge, (column, &cpu_numerator)) in
+                    column_ptrs.iter().zip(point_values).enumerate()
+                {
+                    let mut numerator = cpu_numerator;
+                    for gpu_numerators in gpu_quotient_numerators {
+                        numerator += gpu_numerators[element_base + challenge];
+                    }
+                    // SAFETY: `base + k` lies in this chunk's disjoint range.
+                    unsafe { *column.0.add(point) = numerator * denominator_inv };
+                }
+            }
+        });
+    challenge_columns
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2333,22 +2495,12 @@ fn compute_quotient_polys<
                     &mut scratch.vanishing,
                     quotient_values_batch,
                 );
-
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
             },
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        let values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2379,22 +2531,15 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        let values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2428,22 +2573,15 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
+        let values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2465,57 +2603,51 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let (gpu_quotient_numerators, num_gpu_quotient_numerators) = {
+        let mut numerators: [&[F]; 3] = [&[]; 3];
+        let mut len = 0;
+        for values in [
+            gpu_poseidon_values,
+            gpu_range_values,
+            gpu_permutation_values,
+        ]
+        .iter()
+        .flatten()
+        {
+            numerators[len] = values;
+            len += 1;
+        }
+        (numerators, len)
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let (gpu_quotient_numerators, num_gpu_quotient_numerators): ([&[F]; 0], usize) = ([], 0);
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
+    // Parallel sum, scale, and scatter of the interleaved point-major CPU/GPU
+    // numerators into the per-challenge columns. Keeping completed Metal output
+    // buffers borrowed through this pass avoids separately reading and writing
+    // the full CPU accumulator once per active GPU family. The common `Z_H`
+    // inverse is applied once after the per-element sum. The former single
+    // streaming scatter was serial:
     // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
     // walked by one thread between the parallel quotient evaluation and the
     // parallel IFFT while every other core sat idle. Each parallel chunk
     // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
-    struct ColPtr<T>(*mut T);
-    unsafe impl<T> Send for ColPtr<T> {}
-    unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
-        .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
-                }
-            }
-        });
+    // exactly once with the value the old separately-scaled contributions
+    // produced (covered by `shared_quotient_denominator_matches_...`).
+    let challenge_columns = sum_scale_and_scatter_quotient_numerators(
+        &quotient_values,
+        &gpu_quotient_numerators[..num_gpu_quotient_numerators],
+        num_challenges,
+        &z_h_on_coset,
+    );
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -2650,6 +2782,85 @@ pub(crate) mod precomputed {
         coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
         two_adic_subgroup,
     };
+}
+
+#[cfg(test)]
+mod quotient_denominator_tests {
+    use super::{sum_scale_and_scatter_quotient_numerators, BATCH_SIZE};
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, PrimeField64};
+    use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+
+    type F = GoldilocksField;
+
+    fn values(len: usize, seed: u64) -> Vec<F> {
+        (0..len)
+            .map(|i| {
+                F::from_noncanonical_u64(
+                    u64::MAX.wrapping_sub(seed.wrapping_mul(97).wrapping_add(131 * i as u64)),
+                )
+            })
+            .collect()
+    }
+
+    /// The production path can collect a CPU numerator plus Poseidon, Range/U32
+    /// and permutation GPU numerators. Delaying their shared `Z_H` inverse until
+    /// the point-major-to-column scatter must match the old per-contribution
+    /// scaling exactly. Zero GPU contributions also models every recursive CPU
+    /// fallback; several challenge counts exercise the interleaved layout.
+    #[test]
+    fn shared_quotient_denominator_matches_per_contribution_scaling() {
+        let num_points = BATCH_SIZE + 3;
+        let z_h_on_coset = ZeroPolyOnCoset::<F>::new(4, 3);
+
+        for num_challenges in 1..=3 {
+            let len = num_points * num_challenges;
+            let cpu_numerators = values(len, 1);
+            let gpu_numerators = [values(len, 2), values(len, 3), values(len, 4)];
+
+            for contribution_count in 0..=gpu_numerators.len() {
+                let mut expected = vec![vec![F::ZERO; num_points]; num_challenges];
+                for point in 0..num_points {
+                    let denominator_inv = z_h_on_coset.eval_inverse(point);
+                    for challenge in 0..num_challenges {
+                        let i = point * num_challenges + challenge;
+                        let mut value = cpu_numerators[i] * denominator_inv;
+                        for contribution in gpu_numerators.iter().take(contribution_count) {
+                            value += contribution[i] * denominator_inv;
+                        }
+                        expected[challenge][point] = value;
+                    }
+                }
+
+                let gpu_contributions = gpu_numerators[..contribution_count]
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<_>>();
+                let actual = sum_scale_and_scatter_quotient_numerators(
+                    &cpu_numerators,
+                    &gpu_contributions,
+                    num_challenges,
+                    &z_h_on_coset,
+                );
+
+                for (challenge, (actual, expected)) in
+                    actual.iter().zip(&expected).enumerate()
+                {
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>(),
+                        "challenge={challenge}, contributions={contribution_count}"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3309,8 +3520,10 @@ mod permutation_pairing_tests {
 
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
+        paired_z_polynomials_from_quotient_chunk_products,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
+        z_polynomials_from_quotient_chunk_products,
     };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
@@ -3399,6 +3612,50 @@ mod permutation_pairing_tests {
             .collect()
     }
 
+    #[test]
+    fn paired_z_chains_are_limb_identical_to_independent_chains() {
+        for &num_prods in &[0usize, 1, 3, 9] {
+            let num_chunks = num_prods + 1;
+            for &n_points in &[1usize, 2, 32, 128] {
+                let mut rng = Rng::new(
+                    0x7a31_c6d4_95e2_b80f
+                        ^ ((num_prods as u64) << 32)
+                        ^ n_points as u64,
+                );
+                let products_0 = (0..n_points * num_chunks)
+                    .map(|_| rng.next_field())
+                    .collect::<Vec<_>>();
+                let products_1 = (0..n_points * num_chunks)
+                    .map(|_| rng.next_field())
+                    .collect::<Vec<_>>();
+
+                let expected = vec![
+                    z_polynomials_from_quotient_chunk_products(
+                        products_0.clone(),
+                        num_prods,
+                    ),
+                    z_polynomials_from_quotient_chunk_products(
+                        products_1.clone(),
+                        num_prods,
+                    ),
+                ];
+                let (actual_0, actual_1) =
+                    paired_z_polynomials_from_quotient_chunk_products(
+                        products_0,
+                        products_1,
+                        num_prods,
+                    );
+                let actual = vec![actual_0, actual_1];
+
+                assert_eq!(
+                    raw_limbs(&actual),
+                    raw_limbs(&expected),
+                    "paired Z chains diverged at {n_points} points and {num_chunks} chunks"
+                );
+            }
+        }
+    }
+
     /// Independent, deliberately naive reference: per-point chunk ratios with a
     /// *per-element* inverse (not Montgomery batch inversion) and the Z chain
     /// written out longhand. Compared by field value rather than by limb —
@@ -3470,10 +3727,10 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // Point counts spanning: a single point, a short first batch, the
-        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
-        // several batches with a short tail.
-        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
+        // PolynomialValues requires power-of-two domains. Span a single
+        // point, short batches, the inversion boundary (INV_BATCH = 128),
+        // and several complete batches.
+        for &n_points in &[1usize, 2, 64, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();
