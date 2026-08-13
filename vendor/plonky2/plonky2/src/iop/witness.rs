@@ -2,9 +2,9 @@
 use alloc::{vec, vec::Vec};
 use core::iter::zip;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use hashbrown::HashMap;
-use itertools::{zip_eq, Itertools};
+use itertools::{Itertools, zip_eq};
 
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::Field;
@@ -386,6 +386,22 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// target was already set, returns `None`.
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)] as usize;
+        self.set_rep_index_returning_new(rep_index, target, value)
+    }
+
+    /// Set a representative selected by a previously checked target layout.
+    ///
+    /// This is crate-private because the caller must have derived `rep_index` from this exact
+    /// witness's `representative_map`. Keeping `target` preserves the ordinary contradiction
+    /// diagnostic while allowing repeated fixed-layout seeding to delete the target-index and
+    /// representative-map lookup.
+    #[inline]
+    pub(crate) fn set_rep_index_returning_new(
+        &mut self,
+        rep_index: usize,
+        target: Target,
+        value: F,
+    ) -> Result<Option<usize>> {
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {
@@ -420,9 +436,8 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         // and initializes every cell exactly once before the final `set_len`.
         let num_wires = self.num_wires;
         let degree = self.degree;
-        let mut wire_values: Vec<Vec<F>> = (0..num_wires)
-            .map(|_| Vec::with_capacity(degree))
-            .collect();
+        let mut wire_values: Vec<Vec<F>> =
+            (0..num_wires).map(|_| Vec::with_capacity(degree)).collect();
         let num_chunks = 16.min(degree.max(1));
         let chunk_rows = degree.div_ceil(num_chunks);
         {
@@ -430,8 +445,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
                 .map(|_| Vec::with_capacity(num_wires))
                 .collect();
             for column in wire_values.iter_mut() {
-                let mut rest =
-                    crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
+                let mut rest = crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
                 for segment_columns in segments.iter_mut() {
                     let take = chunk_rows.min(rest.len());
                     let (head, tail) = rest.split_at_mut(take);

@@ -21,7 +21,9 @@ use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
+use plonky2::iop::generator::{
+    ParallelWitnessGuard, PartitionSeedLayout, PendingPartitionWitness, is_seed_layout_mismatch,
+};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
 use plonky2::iop::witness::{PartitionWitness, Witness};
@@ -208,16 +210,111 @@ impl ChainState<'_> {
     }
 }
 
+#[derive(Debug, Default)]
+struct ChainSeedLayoutStats {
+    recordings: AtomicUsize,
+    replays: AtomicUsize,
+    typed_fallbacks: AtomicUsize,
+}
+
+impl ChainSeedLayoutStats {
+    fn snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.recordings.load(Ordering::Relaxed),
+            self.replays.load(Ordering::Relaxed),
+            self.typed_fallbacks.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn chain_step_proof(
+fn start_chain_step_early<'a>(
+    chain_target: &BlockTxChainTarget,
+    chain_data: &'a CircuitData<F, C, D>,
+    chain_step: u64,
+    dummy_proof: &Proof,
+    tx_proof: &Proof,
+    seed_layout: &std::sync::OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+    stats: &ChainSeedLayoutStats,
+) -> anyhow::Result<PendingPartitionWitness<'a, F, C, D>> {
+    if let Some(layout) = seed_layout.get() {
+        let replay = PendingPartitionWitness::start_seeded_with_layout(
+            &chain_data.prover_only,
+            &chain_data.common,
+            layout,
+            |seeder| {
+                BlockTxChainCircuit::witness_inputs_early_into(
+                    chain_target,
+                    chain_data,
+                    chain_step,
+                    dummy_proof,
+                    tx_proof,
+                    seeder,
+                )
+            },
+        );
+        return match replay {
+            Ok(pending) => {
+                stats.replays.fetch_add(1, Ordering::Relaxed);
+                Ok(pending)
+            }
+            Err(error) if is_seed_layout_mismatch(&error) => {
+                // Only immutable-layout applicability may retry. The failed replay owns and drops
+                // its partial witness; writer contradictions and generator errors propagate.
+                stats.typed_fallbacks.fetch_add(1, Ordering::Relaxed);
+                PendingPartitionWitness::start_seeded(
+                    &chain_data.prover_only,
+                    &chain_data.common,
+                    |seeder| {
+                        BlockTxChainCircuit::witness_inputs_early_into(
+                            chain_target,
+                            chain_data,
+                            chain_step,
+                            dummy_proof,
+                            tx_proof,
+                            seeder,
+                        )
+                    },
+                )
+            }
+            Err(error) => Err(error),
+        };
+    }
+
+    // Do not serialize racing chain threads behind `get_or_init`: every empty-cell observer may
+    // record independently. A losing publisher keeps its already-valid pending witness and drops
+    // only the redundant immutable layout.
+    let (pending, layout) = PendingPartitionWitness::start_seeded_recording(
+        &chain_data.prover_only,
+        &chain_data.common,
+        |seeder| {
+            BlockTxChainCircuit::witness_inputs_early_into(
+                chain_target,
+                chain_data,
+                chain_step,
+                dummy_proof,
+                tx_proof,
+                seeder,
+            )
+        },
+    )?;
+    stats.recordings.fetch_add(1, Ordering::Relaxed);
+    let _losing_layout = seed_layout.set(layout).err();
+    Ok(pending)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_step_proof<'a>(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
-    chain_data: &CircuitData<F, C, D>,
+    chain_data: &'a CircuitData<F, C, D>,
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    seed_layout: &std::sync::OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+    seed_layout_stats: &ChainSeedLayoutStats,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -233,19 +330,14 @@ fn chain_step_proof(
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
         // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
+        let mut pending = start_chain_step_early(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            seed_layout,
+            seed_layout_stats,
         )?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
@@ -434,6 +526,12 @@ fn prove_path(
         }
     };
 
+    // Declared after the path's circuit guards, so the lifetime-branded layout and every scoped
+    // borrower drop before either immutable owner. Each `prove_path` invocation gets its own cell:
+    // heavy and light layouts can never cross circuit owners.
+    let chain_seed_layout = std::sync::OnceLock::new();
+    let chain_seed_layout_stats = ChainSeedLayoutStats::default();
+
     let base_proof = cyclic_base_witness(
         dummy_proof,
         block_number,
@@ -443,6 +541,7 @@ fn prove_path(
         old_account_delta_tree_root,
     );
     let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
+    let expected_chain_steps = chunks.len();
     let mut chunks = chunks.into_iter();
     let (mut current_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
@@ -460,6 +559,8 @@ fn prove_path(
 
 
     let chain_proof = std::thread::scope(|scope| {
+        let chain_seed_layout = &chain_seed_layout;
+        let chain_seed_layout_stats = &chain_seed_layout_stats;
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
@@ -489,6 +590,8 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            chain_seed_layout,
+                            chain_seed_layout_stats,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -582,6 +685,8 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        chain_seed_layout,
+                        chain_seed_layout_stats,
                     )
                 })
                 .expect("chain step pipeline thread must start");
@@ -641,6 +746,8 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        chain_seed_layout,
+                        chain_seed_layout_stats,
                     )
                 })
                 .expect("chain drain thread must start");
@@ -654,6 +761,35 @@ fn prove_path(
         }
         chain_proof
     });
+    let (recordings, replays, typed_fallbacks) = chain_seed_layout_stats.snapshot();
+    debug_assert!(chain_seed_layout.get().is_some());
+    debug_assert_eq!(
+        recordings + replays + typed_fallbacks,
+        expected_chain_steps,
+        "every chain step must record, replay, or take the typed fallback exactly once"
+    );
+    #[cfg(feature = "diagnostic_profile")]
+    {
+        plonky2::util::profile::counter("scheduler", "chain_seed_recordings", recordings as u64);
+        plonky2::util::profile::counter("scheduler", "chain_seed_replays", replays as u64);
+        plonky2::util::profile::counter(
+            "scheduler",
+            "chain_seed_typed_fallbacks",
+            typed_fallbacks as u64,
+        );
+        if let Some(layout) = chain_seed_layout.get() {
+            plonky2::util::profile::counter(
+                "scheduler",
+                "chain_seed_target_writes",
+                layout.target_write_count() as u64,
+            );
+            plonky2::util::profile::counter(
+                "scheduler",
+                "chain_seed_changed_generators",
+                layout.changed_generator_count() as u64,
+            );
+        }
+    }
     // This path has produced its last proof. Retiring it here — after the scope,
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
@@ -991,8 +1127,216 @@ mod tests {
 
     use super::*;
     use crate::api::{
-        HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
+        HEAVY_TX_MODE, HEAVY_TX_PER_PROOF, LIGHT_TX_MODE, LIGHT_TX_PER_PROOF,
+        PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT, PathCircuits,
     };
+
+    fn assert_chain_seed_stage_matches_plain(
+        candidate: &plonky2::iop::generator::SeedStageSnapshot<'_, F>,
+        plain: &plonky2::iop::generator::SeedStageSnapshot<'_, F>,
+    ) {
+        use plonky2::field::types::PrimeField64;
+
+        assert_eq!(candidate.witness.set_bitmap, plain.witness.set_bitmap);
+        assert_eq!(candidate.unresolved_watches, plain.unresolved_watches);
+        for representative in 0..plain.witness.values.len() {
+            if !plain.witness.is_set_by_rep_index(representative) {
+                continue;
+            }
+            assert_eq!(
+                candidate.witness.values[representative].to_noncanonical_u64(),
+                plain.witness.values[representative].to_noncanonical_u64(),
+                "raw chain seed representative {representative} differs"
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_chain_seed_stage_for_oracle<'a>(
+        chain_target: &BlockTxChainTarget,
+        chain_data: &'a CircuitData<F, C, D>,
+        chain_step: u64,
+        dummy_proof: &Proof,
+        tx_proof: &Proof,
+        seed_layout: &std::sync::OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+        stats: &ChainSeedLayoutStats,
+    ) -> anyhow::Result<plonky2::iop::generator::SeedStageSnapshot<'a, F>> {
+        if let Some(layout) = seed_layout.get() {
+            let replay = PendingPartitionWitness::seed_stage_replay_for_oracle(
+                &chain_data.prover_only,
+                &chain_data.common,
+                layout,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        tx_proof,
+                        seeder,
+                    )
+                },
+            );
+            return match replay {
+                Ok(snapshot) => {
+                    stats.replays.fetch_add(1, Ordering::Relaxed);
+                    Ok(snapshot)
+                }
+                Err(error) if is_seed_layout_mismatch(&error) => {
+                    stats.typed_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    PendingPartitionWitness::seed_stage_plain_for_oracle(
+                        &chain_data.prover_only,
+                        &chain_data.common,
+                        |seeder| {
+                            BlockTxChainCircuit::witness_inputs_early_into(
+                                chain_target,
+                                chain_data,
+                                chain_step,
+                                dummy_proof,
+                                tx_proof,
+                                seeder,
+                            )
+                        },
+                    )
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        let (snapshot, layout) = PendingPartitionWitness::seed_stage_recording_for_oracle(
+            &chain_data.prover_only,
+            &chain_data.common,
+            |seeder| {
+                BlockTxChainCircuit::witness_inputs_early_into(
+                    chain_target,
+                    chain_data,
+                    chain_step,
+                    dummy_proof,
+                    tx_proof,
+                    seeder,
+                )
+            },
+        )?;
+        stats.recordings.fetch_add(1, Ordering::Relaxed);
+        let _losing_layout = seed_layout.set(layout).err();
+        Ok(snapshot)
+    }
+
+    #[test]
+    fn production_chain_seed_layout_heavy_light_census_and_differential() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(production_chain_seed_layout_heavy_light_census_and_differential_impl)
+            .expect("chain seed-layout component thread must start")
+            .join()
+            .expect("chain seed-layout component thread must finish");
+    }
+
+    fn production_chain_seed_layout_heavy_light_census_and_differential_impl() {
+        let block = Block::<F>::from_json_with_empty_txs(
+            include_bytes!("../bench_test.json"),
+            HEAVY_TX_PER_PROOF,
+            LIGHT_TX_PER_PROOF,
+            PUBLIC_HEAVY_TX_COUNT,
+            PUBLIC_LIGHT_TX_COUNT,
+        )
+        .expect("public fixture must parse");
+        let mut state_metadata = block.state_metadata.clone();
+        if block.calculate_funding {
+            state_metadata.last_funding_round_timestamp = block.created_at;
+        }
+        if block.calculate_oracle_prices {
+            state_metadata.last_oracle_price_timestamp = block.created_at;
+        }
+        if block.calculate_premium {
+            state_metadata.last_premium_timestamp = block.created_at;
+        }
+        let state_metadata_hash = state_metadata.hash();
+        let mut total_recordings = 0usize;
+        let mut total_replays = 0usize;
+
+        for (path, tx_per_proof, tx_mode, exact_steps) in [
+            (TxPath::Heavy, HEAVY_TX_PER_PROOF, HEAVY_TX_MODE, 3usize),
+            (TxPath::Light, LIGHT_TX_PER_PROOF, LIGHT_TX_MODE, 49usize),
+        ] {
+            let chunks = block
+                .tx_chunks
+                .iter()
+                .filter(|txs| chunk_is_light(txs) == (path == TxPath::Light))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(chunks.len(), exact_steps);
+            let circuits = PathCircuits::new(tx_per_proof, tx_mode);
+            let initial_jump = JumpState::initial(
+                chunks[0][0].old_state_root,
+                chunks[0][0].old_account_delta_tree_root,
+            );
+            let (tx_witness, _) = generate_tx_witness(
+                path,
+                0,
+                chunks[0].clone(),
+                &circuits.tx_data,
+                &circuits.tx_target,
+                block.created_at,
+                state_metadata_hash,
+                initial_jump,
+            );
+            let tx_proof = prove_with_partition_witness::<F, C, D>(
+                &circuits.tx_data.prover_only,
+                &circuits.tx_data.common,
+                tx_witness,
+                &mut TimingTree::default(),
+            )
+            .expect("component tx proof must succeed");
+            let cell = std::sync::OnceLock::new();
+            let stats = ChainSeedLayoutStats::default();
+
+            for step in 0..exact_steps {
+                let plain = PendingPartitionWitness::seed_stage_plain_for_oracle(
+                    &circuits.chain_data.prover_only,
+                    &circuits.chain_data.common,
+                    |seeder| {
+                        BlockTxChainCircuit::witness_inputs_early_into(
+                            &circuits.chain_target,
+                            &circuits.chain_data,
+                            step as u64,
+                            &circuits.dummy_proof,
+                            &tx_proof,
+                            seeder,
+                        )
+                    },
+                )
+                .expect("plain seed stage must succeed");
+                let candidate = start_chain_seed_stage_for_oracle(
+                    &circuits.chain_target,
+                    &circuits.chain_data,
+                    step as u64,
+                    &circuits.dummy_proof,
+                    &tx_proof,
+                    &cell,
+                    &stats,
+                )
+                .expect("record/replay seed stage must succeed");
+                assert_chain_seed_stage_matches_plain(&candidate, &plain);
+            }
+            let (recordings, replays, typed_fallbacks) = stats.snapshot();
+            assert_eq!(recordings + replays + typed_fallbacks, exact_steps);
+            assert_eq!(recordings, 1);
+            assert!(replays >= 1);
+            assert_eq!(typed_fallbacks, 0);
+            let layout = cell.get().expect("path cell must be populated");
+            total_recordings += recordings;
+            total_replays += replays;
+            println!(
+                "CHAIN_SEED_LAYOUT path={path:?} steps={exact_steps} recordings={recordings} replays={replays} typed_fallbacks={typed_fallbacks} target_writes={} changed_generators={}",
+                layout.target_write_count(),
+                layout.changed_generator_count(),
+            );
+        }
+        assert_eq!(total_recordings + total_replays, 52);
+        assert_eq!(total_recordings, 2);
+        assert_eq!(total_replays, 50);
+    }
 
     #[cfg(feature = "diagnostic_profile")]
     #[test]
@@ -1212,6 +1556,8 @@ mod tests {
         );
 
         let mut previous: Option<Proof> = None;
+        let direct_seed_layout = std::sync::OnceLock::new();
+        let direct_seed_layout_stats = ChainSeedLayoutStats::default();
         for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
 
@@ -1291,6 +1637,8 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                &direct_seed_layout,
+                &direct_seed_layout_stats,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);
@@ -1302,6 +1650,19 @@ mod tests {
             );
             previous = Some(direct_proof);
         }
+
+        let (recordings, replays, typed_fallbacks) = direct_seed_layout_stats.snapshot();
+        assert_eq!(recordings, 1);
+        assert_eq!(replays, CHAIN_STEPS as usize - 1);
+        assert_eq!(typed_fallbacks, 0);
+        let layout = direct_seed_layout
+            .get()
+            .expect("chain timing harness must publish its seed layout");
+        println!(
+            "CHAIN_SEED_LAYOUT_CENSUS path=Light steps={CHAIN_STEPS} recordings={recordings} replays={replays} typed_fallbacks={typed_fallbacks} target_writes={} changed_generators={}",
+            layout.target_write_count(),
+            layout.changed_generator_count(),
+        );
 
         circuits
             .chain_data

@@ -51,6 +51,7 @@ circuit = { path = "../circuit", default-features = true }
 
 [dev-dependencies]
 flate2 = "1.0"
+plonky2 = { workspace = true, features = ["seed_layout_oracle"] }
 criterion = { version = "0.5.1", default-features = false }
 num_cpus = { version = "1.14.0", default-features = false }
 rand = { workspace = true, features = [
