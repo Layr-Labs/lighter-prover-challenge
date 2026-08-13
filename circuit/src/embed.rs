@@ -17,8 +17,10 @@
 //!   stored — sigma *values* are re-derived from the representative map with
 //!   the same [`Forest::wire_partition`] + [`WirePartition::get_sigma_polys`]
 //!   code the builder itself uses, and the constants/sigmas commitment is
-//!   recomputed through [`PolynomialBatch::from_values`], the builder's own
-//!   commitment path, guaranteeing a bit-identical Merkle cap;
+//!   recomputed through [`PolynomialBatch::from_values`] (or
+//!   [`PolynomialBatch::from_values_adopt`] when a build-time Merkle sidecar
+//!   is supplied), the builder's own commitment path, guaranteeing a
+//!   bit-identical Merkle cap;
 //! * the representative map is stored as zigzag-varint deltas against the
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
 //! * the generator watch index is stored in its CSR form (varint-delta
@@ -41,6 +43,7 @@ use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
+use plonky2::plonk::config::GenericConfig;
 use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
@@ -303,7 +306,10 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 /// constants/sigmas commitment) is derived by the same code paths the builder
 /// itself runs, from the same inputs. The recomputed commitment cap is checked
 /// against the embedded verifier data before returning.
-pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+pub fn deserialize_embedded<T: DeserializeOwned>(
+    bytes: &[u8],
+    cs_merkle_blob: Option<&[u8]>,
+) -> Result<(T, CircuitData<F, C, D>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -510,16 +516,24 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 
     // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+    // Sidecar is required. Decode / adopt decline is a load error, not a
+    // silent GPU-hash fallback: 806087d verified at 25.71 (slow host class)
+    // and we cannot tell from that score whether adopt fired.
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+    let blob = cs_merkle_blob.context("missing constants/sigmas Merkle sidecar")?;
+    let adopted = crate::cs_merkle::decode::<F, <C as GenericConfig<D>>::Hasher>(blob)
+        .context("constants/sigmas Merkle sidecar decode")?;
+    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values_adopt(
         constants_sigmas_vecs,
         rate_bits,
         false,
         cap_height,
         &mut TimingTree::default(),
         Some(&root_table),
-    );
+        adopted,
+    )
+    .context("constants/sigmas Merkle adopt declined")?;
     if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
         bail!(
             "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
