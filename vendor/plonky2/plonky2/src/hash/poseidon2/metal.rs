@@ -247,6 +247,53 @@ pub(crate) struct PermutationQuotientJob<F> {
     _phantom: PhantomData<F>,
 }
 
+/// One uncommitted Metal command buffer shared by the quotient kernels of a
+/// proof. Their outputs are disjoint and the queue preserves encoder order,
+/// so batching deletes submit boundaries without changing field operations or
+/// the CPU contribution merge order.
+pub(crate) struct QuotientCommandBatch {
+    command_buffer: Option<CommandBuffer>,
+    #[cfg(feature = "diagnostic_profile")]
+    work_items: u64,
+}
+
+impl Default for QuotientCommandBatch {
+    fn default() -> Self {
+        Self {
+            command_buffer: None,
+            #[cfg(feature = "diagnostic_profile")]
+            work_items: 0,
+        }
+    }
+}
+
+impl QuotientCommandBatch {
+    fn command_buffer_for(
+        &mut self,
+        context: &MetalShared,
+    ) -> CommandBuffer {
+        self.command_buffer
+            .get_or_insert_with(|| context.queue.new_command_buffer().to_owned())
+            .clone()
+    }
+
+    #[cfg(feature = "diagnostic_profile")]
+    fn record_work(&mut self, work_items: u64) {
+        self.work_items = self.work_items.saturating_add(work_items);
+    }
+
+    /// Each returned quotient job retains a command-buffer clone, so taking
+    /// the batch's own reference after commit cannot invalidate its output.
+    pub(crate) fn commit(&mut self) {
+        let Some(command_buffer) = self.command_buffer.take() else {
+            return;
+        };
+        #[cfg(feature = "diagnostic_profile")]
+        profile_command_buffer(&command_buffer, "quotient_batch", self.work_items);
+        command_buffer.commit();
+    }
+}
+
 #[cfg(test)]
 std::thread_local! {
     static FORCE_RANGE_QUOTIENT_FINISH_FAILURE:
@@ -1507,6 +1554,7 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     include_unused_selector: bool,
     alphas: &[F],
     alpha_offset: usize,
+    batch: Option<&mut QuotientCommandBatch>,
 ) -> Option<PoseidonGateQuotientJob<F>> {
     const POSEIDON_GATE_WIRES: usize = 135;
     const POSEIDON_GATE_CONSTRAINTS: usize = 123;
@@ -1553,6 +1601,7 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
         group,
         include_unused_selector,
         &alpha_powers,
+        batch,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -1582,6 +1631,7 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
     gammas: &[F],
     beta_k_is: &[F],
     alphas: &[F],
+    batch: Option<&mut QuotientCommandBatch>,
 ) -> Option<PermutationQuotientJob<F>> {
     const NUM_CHALLENGES: usize = 2;
     const MAX_INLINE_BYTES: usize = 4096;
@@ -1654,6 +1704,7 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
         &alpha_powers,
         alpha_stride,
         &challenges,
+        batch,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -1676,6 +1727,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     u32_specs: &[U32QuotientSpec],
     alphas: &[F],
     alpha_offset: usize,
+    batch: Option<&mut QuotientCommandBatch>,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
     const SPEC_WORDS: usize = 10;
     const MAX_INLINE_BYTES: usize = 4096;
@@ -1978,6 +2030,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         u32_specs.len(),
         &alpha_powers,
         alpha_stride,
+        batch,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -2593,6 +2646,7 @@ impl MetalShared {
         group: core::ops::Range<usize>,
         include_unused_selector: bool,
         alpha_powers: &[u64],
+        batch: Option<&mut QuotientCommandBatch>,
     ) -> Result<PoseidonGateQuotientJob<F>, String> {
         let pipeline = poseidon_gate_quotient_pipeline()
             .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
@@ -2604,8 +2658,16 @@ impl MetalShared {
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
         let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+        let shared_command = batch.is_some();
+        let command_buffer = match batch {
+            Some(batch) => {
+                #[cfg(feature = "diagnostic_profile")]
+                batch.record_work(quotient_rows.saturating_mul(group.end - group.start) as u64);
+                batch.command_buffer_for(self)
+            }
+            None => self.queue.new_command_buffer().to_owned(),
+        };
+        autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -2627,14 +2689,15 @@ impl MetalShared {
             set_u32(encoder, 12, include_unused_selector as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "poseidon_quotient",
-                (quotient_rows * (group.end - group.start)) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            if !shared_command {
+                #[cfg(feature = "diagnostic_profile")]
+                profile_command_buffer(
+                    &command_buffer,
+                    "poseidon_quotient",
+                    (quotient_rows * (group.end - group.start)) as u64,
+                );
+                command_buffer.commit();
+            }
         });
         Ok(PoseidonGateQuotientJob {
             command_buffer,
@@ -2658,6 +2721,7 @@ impl MetalShared {
         u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
+        batch: Option<&mut QuotientCommandBatch>,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
@@ -2674,8 +2738,18 @@ impl MetalShared {
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
         let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+        let shared_command = batch.is_some();
+        let command_buffer = match batch {
+            Some(batch) => {
+                #[cfg(feature = "diagnostic_profile")]
+                batch.record_work(
+                    quotient_rows.saturating_mul(range_count.saturating_add(u32_count)) as u64,
+                );
+                batch.command_buffer_for(self)
+            }
+            None => self.queue.new_command_buffer().to_owned(),
+        };
+        autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -2699,14 +2773,15 @@ impl MetalShared {
             set_u32(encoder, 10, u32_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "range_u32_quotient",
-                (quotient_rows * (range_count + u32_count)) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            if !shared_command {
+                #[cfg(feature = "diagnostic_profile")]
+                profile_command_buffer(
+                    &command_buffer,
+                    "range_u32_quotient",
+                    (quotient_rows * (range_count + u32_count)) as u64,
+                );
+                command_buffer.commit();
+            }
         });
         #[cfg(test)]
         let failure_observer = FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
@@ -2747,6 +2822,7 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
         challenges: &[u64],
+        batch: Option<&mut QuotientCommandBatch>,
     ) -> Result<PermutationQuotientJob<F>, String> {
         let pipeline = permutation_quotient_pipeline()
             .ok_or("permutation quotient pipeline unavailable")?;
@@ -2766,8 +2842,18 @@ impl MetalShared {
             .ok_or("permutation quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
         let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+        let shared_command = batch.is_some();
+        let command_buffer = match batch {
+            Some(batch) => {
+                #[cfg(feature = "diagnostic_profile")]
+                batch.record_work(
+                    quotient_rows.saturating_mul(num_routed_wires).saturating_mul(2) as u64,
+                );
+                batch.command_buffer_for(self)
+            }
+            None => self.queue.new_command_buffer().to_owned(),
+        };
+        autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -2796,14 +2882,15 @@ impl MetalShared {
             set_u32(encoder, 15, alpha_stride as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "permutation_quotient",
-                (quotient_rows * num_routed_wires * 2) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
+            if !shared_command {
+                #[cfg(feature = "diagnostic_profile")]
+                profile_command_buffer(
+                    &command_buffer,
+                    "permutation_quotient",
+                    (quotient_rows * num_routed_wires * 2) as u64,
+                );
+                command_buffer.commit();
+            }
         });
         Ok(PermutationQuotientJob {
             command_buffer,
@@ -4321,6 +4408,7 @@ mod tests {
                 true,
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal quotient job must start");
             let actual = job.finish().expect("Metal quotient job must finish");
@@ -4427,7 +4515,8 @@ mod tests {
                 }
             }
 
-            let job = start_permutation_quotient(
+            let mut batch = QuotientCommandBatch::default();
+            let first = start_permutation_quotient(
                 &wires,
                 &constants,
                 &zs,
@@ -4443,15 +4532,40 @@ mod tests {
                 &gammas,
                 &beta_k_is,
                 &alphas,
+                Some(&mut batch),
             )
             .expect("Metal permutation job must start");
-            let actual = job.finish().expect("Metal permutation job must finish");
-            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    actual.to_canonical_u64(),
-                    expected.to_canonical_u64(),
-                    "permutation quotient mismatch at word {i}, step {step}"
-                );
+            let second = start_permutation_quotient(
+                &wires,
+                &constants,
+                &zs,
+                &shifted_points,
+                QUOTIENT_ROWS,
+                step,
+                NEXT_STEP,
+                SIGMA_START,
+                ROUTED,
+                NUM_PARTIALS,
+                CHUNK_SIZE,
+                &betas,
+                &gammas,
+                &beta_k_is,
+                &alphas,
+                Some(&mut batch),
+            )
+            .expect("second Metal permutation job must start");
+            batch.commit();
+            for actual in [
+                first.finish().expect("first Metal permutation job must finish"),
+                second.finish().expect("second Metal permutation job must finish"),
+            ] {
+                for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        actual.to_canonical_u64(),
+                        expected.to_canonical_u64(),
+                        "permutation quotient mismatch at word {i}, step {step}"
+                    );
+                }
             }
         }
     }
@@ -4590,6 +4704,7 @@ mod tests {
                 &[],
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal RangeCheck quotient job must start");
             let actual = job.finish().expect("Metal RangeCheck quotient job must finish");
@@ -4952,6 +5067,7 @@ mod tests {
                 &specs,
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal U32 quotient job must start");
             let actual = job.finish().expect("Metal U32 quotient job must finish");
@@ -5568,6 +5684,7 @@ mod tests {
                 &u32_specs,
                 &alphas,
                 ALPHA_OFFSET,
+                None,
             )
             .expect("Metal byte/quintic quotient job must start");
             let actual = job

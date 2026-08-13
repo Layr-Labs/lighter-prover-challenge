@@ -1200,6 +1200,7 @@ fn start_gpu_poseidon_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
+    batch: Option<&mut crate::hash::poseidon2::metal::QuotientCommandBatch>,
 ) -> Option<(
     usize,
     crate::hash::poseidon2::metal::PoseidonGateQuotientJob<F>,
@@ -1243,6 +1244,7 @@ fn start_gpu_poseidon_gate_quotient<
         common_data.selectors_info.num_selectors() > 1,
         alphas,
         alpha_offset,
+        batch,
     )?;
     let started = GPU_POSEIDON_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
@@ -1286,6 +1288,7 @@ fn start_gpu_range_check_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
+    batch: Option<&mut crate::hash::poseidon2::metal::QuotientCommandBatch>,
 ) -> Option<(
     Vec<usize>,
     crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
@@ -1715,6 +1718,7 @@ fn start_gpu_range_check_gate_quotient<
         &u32_specs,
         alphas,
         alpha_offset,
+        batch,
     ) else {
         if gpu_poseidon_quotient_diagnostics_enabled() {
             eprintln!(
@@ -1761,6 +1765,7 @@ fn start_gpu_permutation_quotient<
     gammas: &[F],
     beta_k_is: &[F],
     alphas: &[F],
+    batch: Option<&mut crate::hash::poseidon2::metal::QuotientCommandBatch>,
 ) -> Option<crate::hash::poseidon2::metal::PermutationQuotientJob<F>> {
     if common_data.num_lookup_polys != 0 || common_data.config.num_challenges != 2 {
         return None;
@@ -1789,6 +1794,7 @@ fn start_gpu_permutation_quotient<
         gammas,
         beta_k_is,
         alphas,
+        batch,
     )?;
     if gpu_poseidon_quotient_diagnostics_enabled() {
         eprintln!(
@@ -1873,6 +1879,8 @@ fn compute_quotient_polys<
     let lde_mask = lde_size - 1;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let mut gpu_quotient_batch = crate::hash::poseidon2::metal::QuotientCommandBatch::default();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon = allow_gpu_poseidon
         .then(|| {
             start_gpu_poseidon_gate_quotient(
@@ -1882,6 +1890,7 @@ fn compute_quotient_polys<
                 lde_size,
                 step,
                 alphas,
+                Some(&mut gpu_quotient_batch),
             )
         })
         .flatten();
@@ -1895,6 +1904,7 @@ fn compute_quotient_polys<
                 lde_size,
                 step,
                 alphas,
+                Some(&mut gpu_quotient_batch),
             )
         })
         .flatten();
@@ -1914,9 +1924,12 @@ fn compute_quotient_polys<
                 gammas,
                 beta_k_is,
                 alphas,
+                Some(&mut gpu_quotient_batch),
             )
         })
         .flatten();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    gpu_quotient_batch.commit();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let permutation_products_offloaded = gpu_permutation.is_some();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
