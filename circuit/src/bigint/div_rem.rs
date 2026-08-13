@@ -27,6 +27,7 @@ use super::comparison::CircuitBuilderBiguintSubtractiveComparison;
 use crate::bigint::bigint::{BigIntTarget, CircuitBuilderBigInt, SignTarget};
 use crate::builder::Builder;
 use crate::uint::u32::gadgets::arithmetic_u32::U32Target;
+use crate::uint::u32::witness::{GeneratedValuesU32, WitnessU32};
 
 pub trait CircuitBuilderBiguintDivRem<F: RichField + Extendable<D>, const D: usize> {
     /// Returns the quotient and remainder of a divided by b. If b is zero, returns (0, 0).
@@ -177,6 +178,32 @@ pub struct BigUintDivRemGenerator<F: RichField + Extendable<D>, const D: usize> 
     _phantom: PhantomData<F>,
 }
 
+// Archive retry fingerprint: paired traversals plus one-limb division, retry 1.
+
+/// Divide a little-endian base-2^32 limb slice by one nonzero limb.
+///
+/// Quotient limbs are reported high-to-low because each quotient digit depends
+/// on the remainder from the next higher input limb. The generator reverses
+/// only the just-appended output segment afterwards, restoring the historical
+/// low-to-high target order without allocating an intermediate digit vector.
+#[inline]
+fn divide_by_u32_limb(
+    num_limbs: usize,
+    divisor: u32,
+    mut read_limb: impl FnMut(usize) -> u32,
+    mut emit_quotient_limb: impl FnMut(usize, u32) -> Result<()>,
+) -> Result<u32> {
+    debug_assert_ne!(divisor, 0);
+    let divisor = u64::from(divisor);
+    let mut remainder = 0u64;
+    for i in (0..num_limbs).rev() {
+        let dividend = (remainder << 32) | u64::from(read_limb(i));
+        emit_quotient_limb(i, (dividend / divisor) as u32)?;
+        remainder = dividend % divisor;
+    }
+    Ok(remainder as u32)
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
     for BigUintDivRemGenerator<F, D>
 {
@@ -194,6 +221,42 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
+        // Most ranked fixed-integer divisions use a one-limb denominator. Do
+        // their base-2^32 long division directly from witness limbs, avoiding
+        // both heap-backed BigUint operands, the BigUint quotient/remainder,
+        // and their digit extraction buffers. Arbitrary-width divisors retain
+        // the exact generic path below.
+        if self.b.num_limbs() == 1 {
+            let divisor = witness.get_u32_target(self.b.limbs[0]);
+            if divisor == 0 {
+                for &target in &self.div.limbs {
+                    out_buffer.set_u32_target(target, 0)?;
+                }
+                out_buffer.set_u32_target(self.rem.limbs[0], 0)?;
+                return Ok(());
+            }
+
+            let output_start = out_buffer.target_values.len();
+            let remainder = divide_by_u32_limb(
+                self.a.num_limbs(),
+                divisor,
+                |i| witness.get_u32_target(self.a.limbs[i]),
+                |i, quotient_limb| {
+                    if i < self.div.num_limbs() {
+                        out_buffer.set_u32_target(self.div.limbs[i], quotient_limb)
+                    } else {
+                        // The generic path's set_biguint_target asserts the
+                        // same fit condition for a trimmed quotient target.
+                        assert_eq!(quotient_limb, 0, "BigUint quotient does not fit");
+                        Ok(())
+                    }
+                },
+            )?;
+            out_buffer.target_values[output_start..].reverse();
+            out_buffer.set_u32_target(self.rem.limbs[0], remainder)?;
+            return Ok(());
+        }
+
         let a = witness.get_biguint_target(self.a.clone());
         let b = witness.get_biguint_target(self.b.clone());
 
@@ -245,5 +308,51 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             ),
             _phantom: PhantomData,
         })
+    }
+}
+
+#[cfg(test)]
+mod one_limb_division_tests {
+    use num::{BigUint, Integer};
+
+    use super::divide_by_u32_limb;
+
+    #[test]
+    fn one_limb_long_division_matches_biguint_raw_digits() {
+        let cases: &[&[u32]] = &[
+            &[0],
+            &[1],
+            &[u32::MAX],
+            &[0, 1],
+            &[u32::MAX, u32::MAX],
+            &[0x0123_4567, 0x89ab_cdef, 0xfedc_ba98, 0x7654_3210],
+        ];
+        for &limbs in cases {
+            for divisor in [1, 2, 3, 17, 65_537, 0x8000_0001, u32::MAX] {
+                let mut quotient = vec![0u32; limbs.len()];
+                let remainder = divide_by_u32_limb(
+                    limbs.len(),
+                    divisor,
+                    |i| limbs[i],
+                    |i, value| {
+                        quotient[i] = value;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+
+                let a = BigUint::new(limbs.to_vec());
+                let (expected_quotient, expected_remainder) =
+                    a.div_rem(&BigUint::from(divisor));
+                let mut expected_digits = expected_quotient.to_u32_digits();
+                expected_digits.resize(limbs.len(), 0);
+                assert_eq!(quotient, expected_digits, "divisor={divisor}");
+                assert_eq!(
+                    remainder,
+                    expected_remainder.to_u32_digits().first().copied().unwrap_or(0),
+                    "divisor={divisor}"
+                );
+            }
+        }
     }
 }
