@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// Candidate marker 803-gpt56-sol-pipelined-quotient-merge-20260813
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
