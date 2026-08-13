@@ -688,16 +688,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (interleaved_denominators, denominator_inverses) = scratch;
+                    interleaved_denominators.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -731,8 +729,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            interleaved_denominators.push(denominator_0);
+                            interleaved_denominators.push(denominator_1);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,8 +745,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    divide_paired_chunk_products(
+                        products_0,
+                        products_1,
+                        interleaved_denominators,
+                        denominator_inverses,
+                    );
                 },
             );
     }
@@ -1799,6 +1801,34 @@ fn start_gpu_permutation_quotient<
         );
     }
     Some(job)
+}
+
+/// Divide the two ranked permutation challenges with one Montgomery batch.
+///
+/// The paired producer already computes both challenges in the same Rayon
+/// task. Interleaving their denominators lets Montgomery's trick share its
+/// single field inversion across both streams. Each returned element is still
+/// the inverse of exactly the same denominator; only the prefix-product batch
+/// containing the independent elements is wider.
+#[inline]
+fn divide_paired_chunk_products<F: Field>(
+    numerator_products_0: &mut [F],
+    numerator_products_1: &mut [F],
+    interleaved_denominators: &[F],
+    inverse_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(numerator_products_0.len(), numerator_products_1.len());
+    debug_assert_eq!(interleaved_denominators.len(), 2 * numerator_products_0.len());
+    F::batch_multiplicative_inverse_into(interleaved_denominators, inverse_scratch);
+    for (((product_0, product_1), inverse_0), inverse_1) in numerator_products_0
+        .iter_mut()
+        .zip(numerator_products_1.iter_mut())
+        .zip(inverse_scratch.iter().step_by(2))
+        .zip(inverse_scratch.iter().skip(1).step_by(2))
+    {
+        *product_0 *= *inverse_0;
+        *product_1 *= *inverse_1;
+    }
 }
 
 fn compute_quotient_polys<
@@ -3081,7 +3111,7 @@ mod flat_chunk_products_tests {
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{divide_chunk_products, divide_paired_chunk_products};
 
     type F = GoldilocksField;
 
@@ -3118,6 +3148,57 @@ mod flat_chunk_products_tests {
             divide_chunk_products(&mut actual, &denominator_products, &mut scratch);
             assert_eq!(actual, expected, "width={width}, chunk_size={chunk_size}");
             assert_eq!(scratch.len(), actual.len());
+        }
+    }
+
+    #[test]
+    fn paired_montgomery_batch_matches_two_independent_batches_raw() {
+        for len in [1usize, 2, 3, 4, 5, 17, 127, 128, 1279, 1280] {
+            let numerators_0 = noncanonical_vec(len, 0x1020_3040);
+            let numerators_1 = noncanonical_vec(len, 0x5060_7080);
+            // Adding ONE rules out zero without canonicalizing the input
+            // distribution used by this representation-sensitive oracle.
+            let denominators_0 = noncanonical_vec(len, 0x90a0_b0c0)
+                .into_iter()
+                .map(|x| x + F::ONE)
+                .collect::<Vec<_>>();
+            let denominators_1 = noncanonical_vec(len, 0xd0e0_f001)
+                .into_iter()
+                .map(|x| x + F::ONE)
+                .collect::<Vec<_>>();
+
+            let mut expected_0 = numerators_0.clone();
+            let mut expected_1 = numerators_1.clone();
+            let mut separate_scratch = Vec::new();
+            divide_chunk_products(
+                &mut expected_0,
+                &denominators_0,
+                &mut separate_scratch,
+            );
+            divide_chunk_products(
+                &mut expected_1,
+                &denominators_1,
+                &mut separate_scratch,
+            );
+
+            let interleaved_denominators = denominators_0
+                .iter()
+                .zip(&denominators_1)
+                .flat_map(|(&a, &b)| [a, b])
+                .collect::<Vec<_>>();
+            let mut actual_0 = numerators_0;
+            let mut actual_1 = numerators_1;
+            let mut paired_scratch = Vec::new();
+            divide_paired_chunk_products(
+                &mut actual_0,
+                &mut actual_1,
+                &interleaved_denominators,
+                &mut paired_scratch,
+            );
+
+            assert_eq!(raw(&actual_0), raw(&expected_0), "stream 0, len={len}");
+            assert_eq!(raw(&actual_1), raw(&expected_1), "stream 1, len={len}");
+            assert_eq!(paired_scratch.len(), 2 * len);
         }
     }
 
