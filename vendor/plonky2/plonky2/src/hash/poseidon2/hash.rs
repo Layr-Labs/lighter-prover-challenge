@@ -680,11 +680,21 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+
+    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        inputs.map(Self::permute)
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
+        let [a, b, c, d] = inputs;
+        let (a, b, c, d) = F::poseidon2_x4(a, b, c, d);
+        [a, b, c, d]
     }
 }
 
@@ -726,6 +736,14 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    fn permute_quad(states: &mut [Self; 4]) {
+        let inputs = states.map(|state| state.state);
+        let outputs = T::permute_quad(inputs);
+        for (state, output) in states.iter_mut().zip(outputs) {
+            state.state = output;
+        }
     }
 
     fn squeeze(&self) -> &[T] {
@@ -1113,6 +1131,24 @@ mod test {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[test]
+    fn poseidon2_quad_permutation_matches_scalar_lanes() {
+        let inputs: [[F; WIDTH]; 4] = core::array::from_fn(|lane| {
+            core::array::from_fn(|i| F::from_canonical_usize(1000 * lane + 17 * i + 3))
+        });
+        let mut scalar = inputs.map(Poseidon2Permutation::new);
+        for state in &mut scalar {
+            state.permute();
+        }
+
+        let mut quad = inputs.map(Poseidon2Permutation::new);
+        Poseidon2Permutation::permute_quad(&mut quad);
+
+        for lane in 0..4 {
+            assert_eq!(quad[lane].as_ref(), scalar[lane].as_ref(), "lane {lane}");
+        }
+    }
 
     #[test]
     fn test_poseidon2_with_plonky3() {

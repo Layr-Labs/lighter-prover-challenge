@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -287,16 +287,27 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let pow_witness = (0..=max_candidate / 4)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .filter_map(|group| {
+            let (candidates, live_lanes) = pow_quad_candidates(group, max_candidate);
+            let mut duplex_states = [duplex_intermediate_state; 4];
+            for lane in 0..live_lanes {
+                duplex_states[lane].set_elt(
+                    F::from_canonical_u64(candidates[lane]),
+                    witness_input_pos,
+                );
+            }
+            <C::Hasher as Hasher<F>>::Permutation::permute_quad(&mut duplex_states);
+
+            (0..live_lanes).find_map(|lane| {
+                let pow_response = duplex_states[lane].squeeze().iter().last().unwrap();
+                let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                (leading_zeros >= min_leading_zeros).then_some(candidates[lane])
+            })
         })
+        .find_any(|_| true)
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 
@@ -306,6 +317,23 @@ pub(crate) fn fri_proof_of_work<
     let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
     assert!(leading_zeros >= min_leading_zeros);
     pow_witness
+}
+
+/// Returns the four candidates represented by `group`, plus the number of
+/// lanes that are inside the inclusive range `0..=max_candidate`. Dead lanes
+/// repeat the group base and must not be inspected. Expressing the search in
+/// quotient space keeps both `group * 4` and the inclusive tail valid even
+/// when `max_candidate == u64::MAX`.
+#[inline]
+fn pow_quad_candidates(group: u64, max_candidate: u64) -> ([u64; 4], usize) {
+    debug_assert!(group <= max_candidate / 4);
+    let base = group * 4;
+    let live_lanes = (max_candidate - base).min(3) as usize + 1;
+    let mut candidates = [base; 4];
+    for (lane, candidate) in candidates.iter_mut().enumerate().take(live_lanes) {
+        *candidate = base + lane as u64;
+    }
+    (candidates, live_lanes)
 }
 
 fn fri_prover_query_rounds<
@@ -366,10 +394,95 @@ fn fri_prover_query_round<
 
 #[cfg(test)]
 mod tests {
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{PrimeField64, Sample};
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::hash::poseidon2::hash::{Poseidon2Hash, Poseidon2Permutation};
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn pow_quad_candidates_cover_every_inclusive_tail_without_overflow() {
+        for max_candidate in 0..12u64 {
+            let last_group = max_candidate / 4;
+            let (candidates, live_lanes) = pow_quad_candidates(last_group, max_candidate);
+            assert_eq!(live_lanes, (max_candidate % 4 + 1) as usize);
+            assert_eq!(candidates[0], last_group * 4);
+            assert_eq!(candidates[live_lanes - 1], max_candidate);
+            assert!(candidates[..live_lanes].windows(2).all(|w| w[1] == w[0] + 1));
+        }
+
+        for max_candidate in [u64::MAX - 3, u64::MAX - 2, u64::MAX - 1, u64::MAX] {
+            let last_group = max_candidate / 4;
+            let (candidates, live_lanes) = pow_quad_candidates(last_group, max_candidate);
+            assert_eq!(candidates[live_lanes - 1], max_candidate);
+            assert!(candidates[..live_lanes].iter().all(|&x| x <= max_candidate));
+        }
+    }
+
+    #[test]
+    fn pow_quad_responses_and_transcript_successors_match_scalar_lanes() {
+        type F = GoldilocksField;
+        type P = Poseidon2Permutation<F>;
+
+        let mut challenger = Challenger::<F, Poseidon2Hash>::new();
+        challenger.observe_elements(&[
+            F::from_canonical_u64(7),
+            F::from_canonical_u64(11),
+            F::from_canonical_u64(19),
+        ]);
+        let witness_input_pos = challenger.input_buffer.len();
+        let mut intermediate = challenger.sponge_state;
+        intermediate.set_from_iter(challenger.input_buffer.clone(), 0);
+
+        let candidates = [40u64, 41, 42, 43];
+        let mut quad_states = [intermediate; 4];
+        for lane in 0..4 {
+            quad_states[lane].set_elt(F::from_canonical_u64(candidates[lane]), witness_input_pos);
+        }
+        P::permute_quad(&mut quad_states);
+
+        for lane in 0..4 {
+            let mut scalar = challenger.clone();
+            scalar.observe_element(F::from_canonical_u64(candidates[lane]));
+            let response = scalar.get_challenge();
+            let successor = scalar.get_challenge();
+            let squeezed = quad_states[lane].squeeze();
+            assert_eq!(response, squeezed[P::RATE - 1], "response lane {lane}");
+            assert_eq!(successor, squeezed[P::RATE - 2], "successor lane {lane}");
+            assert_eq!(quad_states[lane].as_ref(), scalar.sponge_state.as_ref());
+        }
+    }
+
+    #[test]
+    fn fri_pow_witness_replays_through_challenger() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let mut challenger = Challenger::<F, Poseidon2Hash>::new();
+        challenger.observe_elements(&[
+            F::from_canonical_u64(23),
+            F::from_canonical_u64(29),
+            F::from_canonical_u64(31),
+        ]);
+        let mut replay = challenger.clone();
+        let config = FriConfig {
+            rate_bits: 1,
+            cap_height: 0,
+            proof_of_work_bits: 4,
+            reduction_strategy:
+                crate::fri::reduction_strategies::FriReductionStrategy::ConstantArityBits(1, 1),
+            num_query_rounds: 1,
+        };
+
+        let witness = fri_proof_of_work::<F, C, D>(&mut challenger, &config);
+        replay.observe_element(witness);
+        let replay_response = replay.get_challenge();
+        assert!(replay_response.to_canonical_u64().leading_zeros() >= 4);
+        assert_eq!(challenger.get_challenge(), replay.get_challenge());
+        assert_eq!(challenger.sponge_state.as_ref(), replay.sponge_state.as_ref());
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
