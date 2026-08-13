@@ -111,68 +111,49 @@ fn main() {
             }
         },
     );
-    // The pre-execution witness is pure block-derived data (no circuit
-    // dependency), and the remaining four circuit blobs take ~5x longer to
-    // load than it takes to compute. Load the blobs on a scoped thread while
-    // the main thread derives the pre-execution witness, then start the pre
-    // proof the moment its witness exists — the pre proof runs underneath the
-    // tail of the blob loads instead of waiting for them to finish first.
-    // Value-exact: no quantity is computed differently, only in parallel.
-    let (pre_handle, remaining) = std::thread::scope(|scope| {
-        let remaining_handle = scope.spawn(|| {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
-            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-                .then(Circuits::load_remaining_embedded)
-        });
-        let pre_exec = {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
-            circuit::block_pre_execution::BlockPreExec::from_block(&block)
-        };
-        let pre_handle = std::thread::Builder::new()
-            .name("pre-exec-startup".into())
+    // Load the light and heavy path pairs independently. The public fixture's
+    // light path owns 49 of 52 chunks, so it can begin as soon as its pair and
+    // the pre proof are ready instead of waiting for the unrelated heavy pair.
+    // A loader error is still fail-closed: speculative light work is joined and
+    // discarded before the established all-circuit build fallback starts.
+    let force_build = std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1");
+    let heavy_handle = (!force_build).then(|| {
+        std::thread::Builder::new()
+            .name("heavy-circuit-load".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn(move || {
-                let (pre_target, mut pre_data) = pre_circuits;
-                let pre_proof =
-                    prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
-                // The pre-execution circuit is proven exactly once, here, and this
-                // is that proof's last instruction. Its rate-2^3 constants/sigmas
-                // low-degree extension — 2^17 rows x 86 columns = 86 MiB, held in a
-                // CPU-visible Metal shared buffer whose release returns the pages to
-                // the OS immediately — is read only by proofs *of this circuit*
-                // (`fill_lde_batch` for the quotient and the FRI query openings), so
-                // it is unreachable from here on. The only later uses of `pre_data`
-                // are as an input to the final block circuit's construction, which
-                // reads `common` and `verifier_only` only (`BlockCircuit::define` ->
-                // `handle_proofs`: `constant_verifier_data(&..verifier_only)` and
-                // `verify_proof(.., &..common)`), and
-                // `release_finished_circuit_extensions`, which assigns the same
-                // empty value again.
-                //
-                // Without this the buffer stays resident from the first second of
-                // the process until the pipeline joins, i.e. across the entire
-                // transaction/chain phase, which is where five concurrent workers
-                // contend for the machine's memory. Value-exact and free: no
-                // quantity is computed differently and no work is added — storage
-                // that no subsequent read can reach is returned earlier.
-                pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-                (pre_target, pre_data, pre_proof)
+            .spawn(|| {
+                #[cfg(feature = "diagnostic_profile")]
+                let _span = plonky2::util::profile::span("startup", "heavy_circuit_loads");
+                Circuits::load_heavy_embedded()
             })
-            .expect("pre-execution startup thread must start");
-        #[cfg(feature = "diagnostic_profile")]
-        let _remaining_wait =
-            plonky2::util::profile::span("wait", "remaining_circuit_loads_join");
-        let remaining = remaining_handle
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (pre_handle, remaining)
+            .expect("heavy embedded circuit loader must start")
     });
-    // The pre circuit is owned by the startup proof until it completes; only
-    // the other four blobs are loaded above (loading all five here would
-    // deserialize the same pre circuit twice on the scored critical path).
-    // Keep the forced-build mode's established behavior unchanged.
+    let light_handle = (!force_build).then(|| {
+        std::thread::Builder::new()
+            .name("light-circuit-load".into())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                #[cfg(feature = "diagnostic_profile")]
+                let _span = plonky2::util::profile::span("startup", "light_circuit_loads");
+                Circuits::load_light_embedded()
+            })
+            .expect("light embedded circuit loader must start")
+    });
+    let pre_exec = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
+        circuit::block_pre_execution::BlockPreExec::from_block(&block)
+    };
+    let pre_handle = std::thread::Builder::new()
+        .name("pre-exec-startup".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
+            let (pre_target, mut pre_data) = pre_circuits;
+            let pre_proof = prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
+            pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            (pre_target, pre_data, pre_proof)
+        })
+        .expect("pre-execution startup thread must start");
     #[cfg(feature = "diagnostic_profile")]
     let _pre_wait = plonky2::util::profile::span("wait", "pre_execution_join");
     let (pre_target, pre_data, pre_proof) = pre_handle
@@ -180,20 +161,39 @@ fn main() {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     #[cfg(feature = "diagnostic_profile")]
     drop(_pre_wait);
-    let circuits = match remaining {
-        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
-        Some(Err(error)) => {
-            log::warn!(
-                "embedded remaining circuits unavailable ({error:#}); building from scratch"
-            );
-            Circuits::load()
+
+    let proof = match (light_handle, heavy_handle) {
+        (Some(light_handle), Some(heavy_handle)) => {
+            #[cfg(feature = "diagnostic_profile")]
+            let _light_wait = plonky2::util::profile::span("wait", "light_circuit_load_join");
+            match light_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            {
+                Ok(light) => match prover::prove_block_after_pre_streaming(
+                    block,
+                    (pre_target, pre_data),
+                    light,
+                    heavy_handle,
+                    pre_proof,
+                ) {
+                    Ok(proof) => proof,
+                    Err((block, pre_proof, error)) => {
+                        log::warn!("embedded heavy circuits unavailable ({error:#}); building from scratch");
+                        prover::prove_block_after_pre(block, Circuits::load(), pre_proof)
+                    }
+                },
+                Err(error) => {
+                    let _ = heavy_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    log::warn!("embedded light circuits unavailable ({error:#}); building from scratch");
+                    prover::prove_block_after_pre(block, Circuits::load(), pre_proof)
+                }
+            }
         }
-        None => Circuits::load(),
-    };
-    let proof = {
-        #[cfg(feature = "diagnostic_profile")]
-        let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
-        prover::prove_block_after_pre(block, circuits, pre_proof)
+        (None, None) => prover::prove_block_after_pre(block, Circuits::load(), pre_proof),
+        _ => unreachable!("embedded path loaders are enabled as a pair"),
     };
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
@@ -255,3 +255,173 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+
+#[cfg(test)]
+mod startup_streaming_tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    use super::api::Circuits;
+
+    enum TestRoute<T> {
+        Streamed { light: T, heavy: T },
+        CompleteFallback { light: T, heavy: T },
+    }
+
+    /// A test-only transcription of the worker's fail-closed startup decision.
+    /// The work handle represents the speculative light path: it starts before
+    /// the heavy join, but is always joined and discarded before a complete-set
+    /// fallback is constructed. Production code remains byte-for-byte V1.
+    fn route_pair_for_test<T, E>(
+        light: Result<T, E>,
+        heavy: JoinHandle<Result<T, E>>,
+        start_light_work: impl FnOnce(T) -> JoinHandle<()>,
+        complete_fallback: impl FnOnce() -> (T, T),
+    ) -> TestRoute<T>
+    where
+        T: Clone,
+    {
+        match light {
+            Ok(light) => {
+                let light_work = start_light_work(light.clone());
+                match heavy.join().expect("heavy loader must not panic") {
+                    Ok(heavy) => {
+                        light_work.join().expect("light work must not panic");
+                        TestRoute::Streamed { light, heavy }
+                    }
+                    Err(_) => {
+                        light_work.join().expect("discarded light work must finish");
+                        let (light, heavy) = complete_fallback();
+                        TestRoute::CompleteFallback { light, heavy }
+                    }
+                }
+            }
+            Err(_) => {
+                let _ = heavy.join().expect("heavy loader must not panic");
+                let (light, heavy) = complete_fallback();
+                TestRoute::CompleteFallback { light, heavy }
+            }
+        }
+    }
+
+    #[test]
+    fn startup_streaming_normal_route_engages() {
+        let heavy = std::thread::spawn(Circuits::load_heavy_embedded);
+        let light = Circuits::load_light_embedded();
+        let light_started = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&light_started);
+        let route = route_pair_for_test(
+            light,
+            heavy,
+            move |_| {
+                std::thread::spawn(move || {
+                    started.store(true, Ordering::Release);
+                })
+            },
+            || panic!("valid embedded path pairs must not fall back"),
+        );
+        assert!(light_started.load(Ordering::Acquire));
+        assert!(matches!(route, TestRoute::Streamed { .. }));
+    }
+
+    #[test]
+    fn startup_streaming_delayed_heavy_starts_light_before_barrier() {
+        let light = Arc::new(1usize);
+        let heavy = Arc::new(2usize);
+        let (release_heavy, wait_for_light) = mpsc::sync_channel::<()>(0);
+        let heavy_for_thread = Arc::clone(&heavy);
+        let heavy_handle = std::thread::spawn(move || {
+            wait_for_light
+                .recv()
+                .expect("light work must release delayed heavy loader");
+            Ok::<_, &'static str>(heavy_for_thread)
+        });
+        let light_started = Arc::new(AtomicBool::new(false));
+        let started = Arc::clone(&light_started);
+        let route = route_pair_for_test(
+            Ok::<_, &'static str>(Arc::clone(&light)),
+            heavy_handle,
+            move |_| {
+                std::thread::spawn(move || {
+                    started.store(true, Ordering::Release);
+                    release_heavy
+                        .send(())
+                        .expect("delayed heavy loader must still be waiting");
+                })
+            },
+            || panic!("delayed success must not fall back"),
+        );
+        assert!(light_started.load(Ordering::Acquire));
+        match route {
+            TestRoute::Streamed {
+                light: routed_light,
+                heavy: routed_heavy,
+            } => {
+                assert!(Arc::ptr_eq(&routed_light, &light));
+                assert!(Arc::ptr_eq(&routed_heavy, &heavy));
+            }
+            TestRoute::CompleteFallback { .. } => panic!("delayed success fell back"),
+        }
+    }
+
+    #[test]
+    fn startup_streaming_errors_join_and_use_complete_fallback() {
+        for heavy_fails in [false, true] {
+            let embedded_light = Arc::new(10usize);
+            let embedded_heavy = Arc::new(11usize);
+            let fallback_light = Arc::new(20usize);
+            let fallback_heavy = Arc::new(21usize);
+            let work_finished = Arc::new(AtomicBool::new(false));
+            let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+            let heavy_value = Arc::clone(&embedded_heavy);
+            let heavy = std::thread::spawn(move || {
+                if heavy_fails {
+                    Err("injected heavy load failure")
+                } else {
+                    Ok(heavy_value)
+                }
+            });
+            let light = if heavy_fails {
+                Ok(Arc::clone(&embedded_light))
+            } else {
+                Err("injected light load failure")
+            };
+            let finished = Arc::clone(&work_finished);
+            let calls = Arc::clone(&fallback_calls);
+            let new_light = Arc::clone(&fallback_light);
+            let new_heavy = Arc::clone(&fallback_heavy);
+            let route = route_pair_for_test(
+                light,
+                heavy,
+                move |_| {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(5));
+                        finished.store(true, Ordering::Release);
+                    })
+                },
+                move || {
+                    // On a late heavy failure the speculative light result must
+                    // be joined before the complete-set fallback is observable.
+                    if heavy_fails {
+                        assert!(work_finished.load(Ordering::Acquire));
+                    }
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    (new_light, new_heavy)
+                },
+            );
+            assert_eq!(fallback_calls.load(Ordering::Relaxed), 1);
+            match route {
+                TestRoute::CompleteFallback { light, heavy } => {
+                    assert!(Arc::ptr_eq(&light, &fallback_light));
+                    assert!(Arc::ptr_eq(&heavy, &fallback_heavy));
+                    assert!(!Arc::ptr_eq(&light, &embedded_light));
+                    assert!(!Arc::ptr_eq(&heavy, &embedded_heavy));
+                }
+                TestRoute::Streamed { .. } => panic!("injected failure used streamed route"),
+            }
+        }
+    }
+}

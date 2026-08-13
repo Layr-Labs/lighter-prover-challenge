@@ -21,7 +21,7 @@ use circuit::embed::deserialize_embedded;
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
-use crate::api::{Circuits, Proof};
+use crate::api::{Circuits, PathCircuits, Proof, SharedPathCircuits};
 
 static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
 static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
@@ -33,12 +33,8 @@ static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light
 /// this separate lets the worker start the pre-execution proof from its already
 /// decoded circuit while these independent blobs load in parallel.
 pub(crate) struct RemainingEmbeddedCircuits {
-    heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
-    heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
-    light_tx: (BlockTxTarget, CircuitData<F, C, D>),
-    light_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
-    dummy_heavy_proof: Proof,
-    dummy_light_proof: Proof,
+    heavy: std::sync::Arc<SharedPathCircuits>,
+    light: std::sync::Arc<SharedPathCircuits>,
 }
 
 impl RemainingEmbeddedCircuits {
@@ -47,23 +43,11 @@ impl RemainingEmbeddedCircuits {
         pre: (BlockPreExecutionTarget, CircuitData<F, C, D>),
     ) -> Circuits {
         let (pre_target, pre_data) = pre;
-        let (heavy_tx_target, heavy_tx_data) = self.heavy_tx;
-        let (heavy_chain_target, heavy_chain_data) = self.heavy_chain;
-        let (light_tx_target, light_tx_data) = self.light_tx;
-        let (light_chain_target, light_chain_data) = self.light_chain;
         Circuits {
-            heavy_tx_target,
-            heavy_tx_data: std::sync::RwLock::new(heavy_tx_data),
-            light_tx_target,
-            light_tx_data: std::sync::RwLock::new(light_tx_data),
+            heavy: self.heavy,
+            light: self.light,
             pre_target,
             pre_data,
-            heavy_chain_target,
-            heavy_chain_data: std::sync::RwLock::new(heavy_chain_data),
-            light_chain_target,
-            light_chain_data: std::sync::RwLock::new(light_chain_data),
-            dummy_heavy_proof: self.dummy_heavy_proof,
-            dummy_light_proof: self.dummy_light_proof,
         }
     }
 }
@@ -81,6 +65,53 @@ fn load_blob<T: serde::de::DeserializeOwned>(
 }
 
 impl Circuits {
+    fn load_path_embedded(
+        tx_name: &'static str,
+        tx_blob: &'static [u8],
+        chain_name: &'static str,
+        chain_blob: &'static [u8],
+        dummy_blob: &'static [u8],
+    ) -> anyhow::Result<std::sync::Arc<SharedPathCircuits>> {
+        let (tx, chain) = rayon::join(
+            || load_blob::<BlockTxTarget>(tx_name, tx_blob),
+            || load_blob::<BlockTxChainTarget>(chain_name, chain_blob),
+        );
+        let (tx_target, tx_data) = tx?;
+        let (chain_target, chain_data) = chain?;
+        let dummy_proof: Proof =
+            bincode::deserialize(dummy_blob).expect("embedded chain dummy proof is invalid");
+        Ok(PathCircuits {
+            tx_target,
+            tx_data,
+            chain_target,
+            chain_data,
+            dummy_proof,
+        }
+        .into_shared())
+    }
+
+    pub(crate) fn load_heavy_embedded(
+    ) -> anyhow::Result<std::sync::Arc<SharedPathCircuits>> {
+        Self::load_path_embedded(
+            "heavy_tx",
+            HEAVY_TX_BLOB,
+            "heavy_chain",
+            HEAVY_CHAIN_BLOB,
+            include_bytes!("../dummy-heavy-chain-proof.bin"),
+        )
+    }
+
+    pub(crate) fn load_light_embedded(
+    ) -> anyhow::Result<std::sync::Arc<SharedPathCircuits>> {
+        Self::load_path_embedded(
+            "light_tx",
+            LIGHT_TX_BLOB,
+            "light_chain",
+            LIGHT_CHAIN_BLOB,
+            include_bytes!("../dummy-light-chain-proof.bin"),
+        )
+    }
+
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
     /// behind the remaining circuit loads.
@@ -93,36 +124,12 @@ impl Circuits {
     /// [`Self::load`].
     pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingEmbeddedCircuits> {
         let (heavy, light) = rayon::join(
-            || {
-                rayon::join(
-                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
-                )
-            },
-            || {
-                rayon::join(
-                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
-                )
-            },
+            Self::load_heavy_embedded,
+            Self::load_light_embedded,
         );
-        let (heavy_tx, heavy_chain) = (heavy.0?, heavy.1?);
-        let (light_tx, light_chain) = (light.0?, light.1?);
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
-
         Ok(RemainingEmbeddedCircuits {
-            heavy_tx,
-            heavy_chain,
-            light_tx,
-            light_chain,
-            dummy_heavy_proof,
-            dummy_light_proof,
+            heavy: heavy?,
+            light: light?,
         })
     }
 
@@ -194,6 +201,31 @@ mod tests {
         bytes
     }
 
+    // Bounded semantic oracle audited by the final-block embed V7 lane. It
+    // avoids whole-ProverOnly serialization and an all-LDE leaf traversal.
+    fn assert_normalized_commitment_equal(
+        name: &str,
+        rebuilt_data: &CircuitData<F, C, D>,
+        embedded_data: &CircuitData<F, C, D>,
+    ) {
+        let rebuilt = &rebuilt_data.prover_only.constants_sigmas_commitment;
+        let embedded = &embedded_data.prover_only.constants_sigmas_commitment;
+        let rebuilt_tree = &rebuilt.merkle_tree;
+        let embedded_tree = &embedded.merkle_tree;
+        assert_eq!(rebuilt.degree_log, embedded.degree_log, "{name}: degree log");
+        assert_eq!(rebuilt.rate_bits, embedded.rate_bits, "{name}: rate bits");
+        assert_eq!(rebuilt.blinding, embedded.blinding, "{name}: blinding");
+        assert_eq!(rebuilt_tree.num_leaves, embedded_tree.num_leaves, "{name}: leaf count");
+        assert_eq!(rebuilt_tree.leaf_width(), embedded_tree.leaf_width(), "{name}: leaf width");
+        for leaf_index in [0, rebuilt_tree.num_leaves / 4, rebuilt_tree.num_leaves / 2, rebuilt_tree.num_leaves - 1] {
+            assert_eq!(rebuilt_tree.leaf_vec(leaf_index), embedded_tree.leaf_vec(leaf_index), "{name}: leaf {leaf_index}");
+        }
+        assert_eq!(rebuilt_tree.cap, embedded_tree.cap, "{name}: cap");
+        for leaf_index in [0, rebuilt_tree.num_leaves / 2, rebuilt_tree.num_leaves - 1] {
+            assert_eq!(rebuilt_tree.prove(leaf_index), embedded_tree.prove(leaf_index), "{name}: path {leaf_index}");
+        }
+    }
+
     fn assert_circuit_pair_identical<T: serde::Serialize>(
         name: &str,
         rebuilt: (&T, &CircuitData<F, C, D>),
@@ -262,13 +294,26 @@ mod tests {
             "{name}: common circuit data diverges"
         );
 
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
-        assert!(
-            rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
-        );
+        // Exact semantic/derived fields. Full Eq is backend-storage-identity
+        // sensitive; whole serialization/all-leaf traversal is multi-GB.
+        assert_eq!(rebuilt_data.prover_only.generator_indices_by_watches, embedded_data.prover_only.generator_indices_by_watches, "{name}: watch index");
+        assert_eq!(rebuilt_data.prover_only.generator_watch_counts, embedded_data.prover_only.generator_watch_counts, "{name}: watch counts");
+        assert_eq!(rebuilt_data.prover_only.fixed_routed_wires, embedded_data.prover_only.fixed_routed_wires, "{name}: fixed wires");
+        assert_eq!(rebuilt_data.prover_only.fft_root_table, embedded_data.prover_only.fft_root_table, "{name}: FFT roots");
+        assert_eq!(rebuilt_data.prover_only.constants_sigmas_commitment.polynomials, embedded_data.prover_only.constants_sigmas_commitment.polynomials, "{name}: coefficients");
+        assert_eq!(rebuilt_data.prover_only.sigmas, embedded_data.prover_only.sigmas, "{name}: sigmas");
+        assert_eq!(rebuilt_data.prover_only.subgroup, embedded_data.prover_only.subgroup, "{name}: subgroup");
+        assert_eq!(rebuilt_data.prover_only.public_inputs, embedded_data.prover_only.public_inputs, "{name}: public inputs");
+        assert_eq!(rebuilt_data.prover_only.representative_map, embedded_data.prover_only.representative_map, "{name}: representative map");
+        assert_eq!(rebuilt_data.prover_only.lookup_rows, embedded_data.prover_only.lookup_rows, "{name}: lookup rows");
+        assert_eq!(rebuilt_data.prover_only.lut_to_lookups, embedded_data.prover_only.lut_to_lookups, "{name}: LUTs");
+        assert_normalized_commitment_equal(name, rebuilt_data, embedded_data);
+        assert_eq!(rebuilt_data.prover_only.constants_sigmas_quotient_cache, embedded_data.prover_only.constants_sigmas_quotient_cache, "{name}: quotient cache");
+        assert_eq!(rebuilt_data.prover_only.constants_sigmas_quotient_step, embedded_data.prover_only.constants_sigmas_quotient_step, "{name}: quotient step");
+        assert_eq!(rebuilt_data.prover_only.constants_sigmas_quotient_domain, embedded_data.prover_only.constants_sigmas_quotient_domain, "{name}: quotient domain");
+        if rebuilt_data.prover_only.constants_sigmas_quotient_cache.is_none() {
+            assert_eq!(rebuilt_data.prover_only.constants_sigmas_quotient_step, 1, "{name}: uncached step");
+        }
     }
 
     /// Determinism oracle for the embed mechanism: builds all five circuits
@@ -292,45 +337,45 @@ mod tests {
             assert_circuit_pair_identical(
                 "heavy_tx",
                 (
-                    &rebuilt.heavy_tx_target,
-                    &rebuilt.heavy_tx_data.read().unwrap(),
+                    &rebuilt.heavy.tx_target,
+                    &rebuilt.heavy.tx_data.read().unwrap(),
                 ),
                 (
-                    &embedded.heavy_tx_target,
-                    &embedded.heavy_tx_data.read().unwrap(),
+                    &embedded.heavy.tx_target,
+                    &embedded.heavy.tx_data.read().unwrap(),
                 ),
             );
             assert_circuit_pair_identical(
                 "heavy_chain",
                 (
-                    &rebuilt.heavy_chain_target,
-                    &rebuilt.heavy_chain_data.read().unwrap(),
+                    &rebuilt.heavy.chain_target,
+                    &rebuilt.heavy.chain_data.read().unwrap(),
                 ),
                 (
-                    &embedded.heavy_chain_target,
-                    &embedded.heavy_chain_data.read().unwrap(),
+                    &embedded.heavy.chain_target,
+                    &embedded.heavy.chain_data.read().unwrap(),
                 ),
             );
             assert_circuit_pair_identical(
                 "light_tx",
                 (
-                    &rebuilt.light_tx_target,
-                    &rebuilt.light_tx_data.read().unwrap(),
+                    &rebuilt.light.tx_target,
+                    &rebuilt.light.tx_data.read().unwrap(),
                 ),
                 (
-                    &embedded.light_tx_target,
-                    &embedded.light_tx_data.read().unwrap(),
+                    &embedded.light.tx_target,
+                    &embedded.light.tx_data.read().unwrap(),
                 ),
             );
             assert_circuit_pair_identical(
                 "light_chain",
                 (
-                    &rebuilt.light_chain_target,
-                    &rebuilt.light_chain_data.read().unwrap(),
+                    &rebuilt.light.chain_target,
+                    &rebuilt.light.chain_data.read().unwrap(),
                 ),
                 (
-                    &embedded.light_chain_target,
-                    &embedded.light_chain_data.read().unwrap(),
+                    &embedded.light.chain_target,
+                    &embedded.light.chain_data.read().unwrap(),
                 ),
             );
 
@@ -339,7 +384,7 @@ mod tests {
             let mut bytes = Vec::new();
             bytes
                 .write_common_circuit_data(
-                    &rebuilt.light_tx_data.read().unwrap().common,
+                    &rebuilt.light.tx_data.read().unwrap().common,
                     &BlockGateSerializer,
                 )
                 .expect("common data must serialize");

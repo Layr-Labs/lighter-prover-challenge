@@ -26,8 +26,8 @@ pub const PUBLIC_HEAVY_TX_COUNT: usize = 10;
 pub const PUBLIC_LIGHT_TX_COUNT: usize = 490;
 pub const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-pub struct Circuits {
-    pub heavy_tx_target: BlockTxTarget,
+pub(crate) struct SharedPathCircuits {
+    pub(crate) tx_target: BlockTxTarget,
     /// The heavy transaction and chain circuits are the only two whose proving
     /// is over long before the pipeline joins — the heavy path has three chunks
     /// against the light path's forty-nine — so their preprocessed extensions
@@ -39,8 +39,7 @@ pub struct Circuits {
     /// once both are gone. Shared guards never block one another, so no reader
     /// is serialized against another and no work is added; the lock is a proof
     /// obligation discharged by the type system, not a scheduling change.
-    pub heavy_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
-    pub light_tx_target: BlockTxTarget,
+    pub(crate) tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
     /// The light pair's extensions are dead the moment the light path's thread
     /// exits (the last light transaction proof and the last light chain step
     /// both read them), while the final block proof and the block-circuit lane
@@ -49,17 +48,18 @@ pub struct Circuits {
     /// [`Circuits::release_light_circuit_extensions`] retire them right after
     /// the light thread joins — during the remaining block-lane join and final
     /// witness setup — instead of at [`Self::release_finished_circuit_extensions`].
-    pub light_tx_data: std::sync::RwLock<CircuitData<F, C, D>>,
+    pub(crate) chain_target: BlockTxChainTarget,
+    /// See [`Circuits::heavy_tx_data`].
+    pub(crate) chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
+    /// See [`Circuits::light_tx_data`].
+    pub(crate) dummy_proof: Proof,
+}
+
+pub struct Circuits {
+    pub(crate) heavy: std::sync::Arc<SharedPathCircuits>,
+    pub(crate) light: std::sync::Arc<SharedPathCircuits>,
     pub pre_target: BlockPreExecutionTarget,
     pub pre_data: CircuitData<F, C, D>,
-    pub heavy_chain_target: BlockTxChainTarget,
-    /// See [`Circuits::heavy_tx_data`].
-    pub heavy_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
-    pub light_chain_target: BlockTxChainTarget,
-    /// See [`Circuits::light_tx_data`].
-    pub light_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
-    pub dummy_heavy_proof: Proof,
-    pub dummy_light_proof: Proof,
 }
 
 // Revalidate the fixed permutation-mask and release-log stack on the ranked host.
@@ -101,6 +101,16 @@ impl PathCircuits {
             dummy_proof,
         }
     }
+
+    pub(crate) fn into_shared(self) -> std::sync::Arc<SharedPathCircuits> {
+        std::sync::Arc::new(SharedPathCircuits {
+            tx_target: self.tx_target,
+            tx_data: std::sync::RwLock::new(self.tx_data),
+            chain_target: self.chain_target,
+            chain_data: std::sync::RwLock::new(self.chain_data),
+            dummy_proof: self.dummy_proof,
+        })
+    }
 }
 
 impl Circuits {
@@ -118,18 +128,10 @@ impl Circuits {
             },
         );
         Self {
-            heavy_tx_target: heavy.tx_target,
-            heavy_tx_data: std::sync::RwLock::new(heavy.tx_data),
-            light_tx_target: light.tx_target,
-            light_tx_data: std::sync::RwLock::new(light.tx_data),
+            heavy: heavy.into_shared(),
+            light: light.into_shared(),
             pre_target,
             pre_data,
-            heavy_chain_target: heavy.chain_target,
-            heavy_chain_data: std::sync::RwLock::new(heavy.chain_data),
-            light_chain_target: light.chain_target,
-            light_chain_data: std::sync::RwLock::new(light.chain_data),
-            dummy_heavy_proof: heavy.dummy_proof,
-            dummy_light_proof: light.dummy_proof,
         }
     }
 
@@ -170,21 +172,8 @@ impl Circuits {
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
-        for lock in [
-            &mut self.light_tx_data,
-            &mut self.light_chain_data,
-            &mut self.heavy_tx_data,
-            &mut self.heavy_chain_data,
-        ] {
-            let data = lock
-                .get_mut()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // The quotient-domain cache is reachable only from the same proofs
-            // as the commitment above, so wherever that is dead this is too.
-            // Clearing it is idempotent for a path that already released its own.
-            data.prover_only.constants_sigmas_quotient_cache = None;
-        }
+        self.light.release_extensions();
+        self.heavy.release_extensions();
     }
 
     /// Releases the heavy transaction and chain circuits' preprocessed
@@ -211,16 +200,7 @@ impl Circuits {
     /// Value-exact and free: no quantity is computed differently and no work is
     /// added — storage that no subsequent read can reach is returned earlier.
     pub fn release_heavy_circuit_extensions(&self) {
-        for lock in [&self.heavy_tx_data, &self.heavy_chain_data] {
-            let mut data = lock
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // Same guard, same argument: the exclusive acquisition proves no
-            // reader remains, and the quotient-domain cache is read only by the
-            // proofs that read the commitment.
-            data.prover_only.constants_sigmas_quotient_cache = None;
-        }
+        self.heavy.release_extensions();
     }
 
     /// Releases the light transaction and chain circuits' preprocessed
@@ -235,16 +215,7 @@ impl Circuits {
     /// CPU-visible Metal shared buffers released seconds before
     /// [`Self::release_finished_circuit_extensions`] would.
     pub fn release_light_circuit_extensions(&self) {
-        for lock in [&self.light_tx_data, &self.light_chain_data] {
-            let mut data = lock
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
-            // Same guard, same argument: the exclusive acquisition proves no
-            // reader remains, and the quotient-domain cache is read only by the
-            // proofs that read the commitment.
-            data.prover_only.constants_sigmas_quotient_cache = None;
-        }
+        self.light.release_extensions();
     }
 
     /// Builds the final block circuit, which depends on the pre-execution and
@@ -256,11 +227,13 @@ impl Circuits {
         // so the shared guard is needed only for the construction itself and is
         // dropped before the (much longer) `build` below.
         let heavy_chain_data = self
-            .heavy_chain_data
+            .heavy
+            .chain_data
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let light_chain_data = self
-            .light_chain_data
+            .light
+            .chain_data
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let block = BlockCircuit::define(
@@ -273,6 +246,18 @@ impl Circuits {
         drop(light_chain_data);
         drop(heavy_chain_data);
         (block.target, block.builder.build::<C>())
+    }
+}
+
+impl SharedPathCircuits {
+    fn release_extensions(&self) {
+        for lock in [&self.tx_data, &self.chain_data] {
+            let mut data = lock
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_quotient_cache = None;
+        }
     }
 }
 

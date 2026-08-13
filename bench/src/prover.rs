@@ -29,7 +29,7 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof, SharedPathCircuits};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -87,6 +87,42 @@ fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
         .expect("block transaction chunk must not be empty")
         .tx_circuit_type
         == TX_LIGHT
+}
+
+struct PrestartedLightPath {
+    handle: std::thread::JoinHandle<Proof>,
+    active_paths: Arc<AtomicUsize>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_light_path(
+    chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
+    circuits: Arc<SharedPathCircuits>,
+    block_number: u64,
+    created_at: i64,
+    old_account_delta_tree_root: HashOut<F>,
+    pre_output: Arc<BlockPreExecWitness<F>>,
+    state_metadata_hash: HashOut<F>,
+    active_paths: Arc<AtomicUsize>,
+) -> std::thread::JoinHandle<Proof> {
+    std::thread::Builder::new()
+        .name("light-tx-chain".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
+            mark_spine_thread_latency_critical();
+            prove_path(
+                TxPath::Light,
+                chunks,
+                &circuits,
+                block_number,
+                created_at,
+                old_account_delta_tree_root,
+                &pre_output,
+                state_metadata_hash,
+                &active_paths,
+            )
+        })
+        .expect("light transaction chain thread must start")
 }
 
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
@@ -363,7 +399,7 @@ fn prove_tx_witness(
 fn prove_path(
     path: TxPath,
     chunks: Vec<(usize, Vec<Arc<Tx<F>>>)>,
-    circuits: &Circuits,
+    circuits: &SharedPathCircuits,
     block_number: u64,
     created_at: i64,
     old_account_delta_tree_root: HashOut<F>,
@@ -393,46 +429,19 @@ fn prove_path(
     // path is finished with them. Shared guards never block one another, so
     // this neither serializes the two paths nor delays the concurrent block
     // circuit construction, which takes its own shared guard.
-    let heavy_tx_guard;
-    let heavy_chain_guard;
-    let light_tx_guard;
-    let light_chain_guard;
-    let (tx_data, tx_target, chain_data, chain_target, dummy_proof) = match path {
-        TxPath::Light => {
-            light_tx_guard = circuits
-                .light_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            light_chain_guard = circuits
-                .light_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*light_tx_guard,
-                &circuits.light_tx_target,
-                &*light_chain_guard,
-                &circuits.light_chain_target,
-                &circuits.dummy_light_proof,
-            )
-        }
-        TxPath::Heavy => {
-            heavy_tx_guard = circuits
-                .heavy_tx_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            heavy_chain_guard = circuits
-                .heavy_chain_data
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            (
-                &*heavy_tx_guard,
-                &circuits.heavy_tx_target,
-                &*heavy_chain_guard,
-                &circuits.heavy_chain_target,
-                &circuits.dummy_heavy_proof,
-            )
-        }
-    };
+    let tx_guard = circuits
+        .tx_data
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let chain_guard = circuits
+        .chain_data
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let tx_data = &*tx_guard;
+    let tx_target = &circuits.tx_target;
+    let chain_data = &*chain_guard;
+    let chain_target = &circuits.chain_target;
+    let dummy_proof = &circuits.dummy_proof;
 
     let base_proof = cyclic_base_witness(
         dummy_proof,
@@ -753,16 +762,97 @@ pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
 /// this once both the pre-execution proof and the remaining circuit loads have
 /// completed.
 pub(crate) fn prove_block_after_pre(
+    block: Block<F>,
+    circuits: Circuits,
+    pre_proof: Proof,
+) -> Proof {
+    prove_block_after_pre_inner(block, circuits, pre_proof, None)
+}
+
+/// Starts the fixture's long light path as soon as its two embedded circuits
+/// and the pre proof are ready, while the independent heavy pair finishes
+/// loading. A heavy-load error joins and discards the speculative light proof
+/// and returns the untouched block so the caller can execute the established
+/// all-circuit build fallback; embedded and rebuilt path data are never mixed.
+pub(crate) fn prove_block_after_pre_streaming(
+    block: Block<F>,
+    pre: (BlockPreExecutionTarget, CircuitData<F, C, D>),
+    light: Arc<SharedPathCircuits>,
+    heavy_handle: std::thread::JoinHandle<anyhow::Result<Arc<SharedPathCircuits>>>,
+    pre_proof: Proof,
+) -> Result<Proof, (Block<F>, Proof, anyhow::Error)> {
+    let pre_output = Arc::new(BlockPreExecWitness::from_public_inputs(
+        &pre_proof.public_inputs,
+    ));
+    let state_metadata_hash = pre_output.new_state_metadata.hash();
+    // Clone only the Arc handles in the public fixture's 49 light chunks. The
+    // original block stays untouched until every embedded path has validated,
+    // which makes the late-error fallback exact rather than reconstructive.
+    let light_chunks = block
+        .tx_chunks
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(_, txs)| chunk_is_light(txs))
+        .collect();
+    let active_paths = Arc::new(AtomicUsize::new(2));
+    let light_handle = spawn_light_path(
+        light_chunks,
+        Arc::clone(&light),
+        block.block_number,
+        block.created_at,
+        block.old_account_delta_tree_root,
+        pre_output,
+        state_metadata_hash,
+        Arc::clone(&active_paths),
+    );
+
+    let heavy = match heavy_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    {
+        Ok(heavy) => heavy,
+        Err(error) => {
+            // The speculative result is deliberately unobservable. Join it so
+            // no GPU or proof work survives into the unchanged build fallback.
+            let _ = light_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            return Err((block, pre_proof, error));
+        }
+    };
+    let (pre_target, pre_data) = pre;
+    let circuits = Circuits {
+        heavy,
+        light,
+        pre_target,
+        pre_data,
+    };
+    Ok(prove_block_after_pre_inner(
+        block,
+        circuits,
+        pre_proof,
+        Some(PrestartedLightPath {
+            handle: light_handle,
+            active_paths,
+        }),
+    ))
+}
+
+fn prove_block_after_pre_inner(
     mut block: Block<F>,
     mut circuits: Circuits,
     pre_proof: Proof,
+    prestarted_light: Option<PrestartedLightPath>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
         plonky2::util::profile::enter_context("block_pipeline", block.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_block_after_pre");
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+    let pre_output = Arc::new(BlockPreExecWitness::from_public_inputs(
+        &pre_proof.public_inputs,
+    ));
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
@@ -784,7 +874,22 @@ pub(crate) fn prove_block_after_pre(
     // process-global. This counter lets a path tell "my own pipeline is done"
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
-    let active_paths = AtomicUsize::new(2);
+    let (active_paths, prestarted_light_handle) = match prestarted_light {
+        Some(prestarted) => (prestarted.active_paths, Some(prestarted.handle)),
+        None => (Arc::new(AtomicUsize::new(2)), None),
+    };
+    let light_handle = prestarted_light_handle.unwrap_or_else(|| {
+        spawn_light_path(
+            std::mem::take(&mut light_chunks),
+            Arc::clone(&circuits.light),
+            block.block_number,
+            block.created_at,
+            block.old_account_delta_tree_root,
+            Arc::clone(&pre_output),
+            state_metadata_hash,
+            Arc::clone(&active_paths),
+        )
+    });
     let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
@@ -816,7 +921,7 @@ pub(crate) fn prove_block_after_pre(
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
-                        circuits,
+                        &circuits.heavy,
                         block.block_number,
                         block.created_at,
                         block.old_account_delta_tree_root,
@@ -890,25 +995,6 @@ pub(crate) fn prove_block_after_pre(
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
                 .expect("block circuit build thread must start");
-            let light_chunks = std::mem::take(&mut light_chunks);
-            let light_handle = std::thread::Builder::new()
-                .name("light-tx-chain".into())
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
-                    mark_spine_thread_latency_critical();
-                    prove_path(
-                        TxPath::Light,
-                        light_chunks,
-                        circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
-                        state_metadata_hash,
-                        active_paths,
-                    )
-                })
-                .expect("light transaction chain thread must start");
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
