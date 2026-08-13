@@ -564,8 +564,10 @@ impl ColumnStorePool {
 /// wires store (larger than the pool's per-buffer cap, so never recycled)
 /// otherwise zero-faults its ~2 GiB inside the run's most serial window; the
 /// orchestrator fills this slot from a background thread while the pipeline
-/// still runs, so the block's fill starts on already-resident pages. A size
-/// mismatch simply misses and falls through to a fresh allocation.
+/// still runs, so the block's fill starts on already-resident pages. Match
+/// the requested size exactly: `>=` would let a smaller oversized alloc
+/// (block constants/sigmas LDE) consume the wires stash. A size mismatch
+/// simply misses and falls through to a fresh allocation.
 static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
 
 /// Allocates a `bytes`-sized shared buffer, touches one word per page so the
@@ -614,7 +616,7 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
             }
         }
     } else if let Ok(mut slot) = PREWARMED_LARGE_STORE.try_lock() {
-        if slot.as_ref().is_some_and(|b| b.length() >= bytes) {
+        if slot.as_ref().is_some_and(|b| b.length() == bytes) {
             return slot.take().expect("checked above");
         }
     }
