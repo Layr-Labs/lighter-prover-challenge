@@ -7,7 +7,7 @@ use super::neon_goldilocks_field::NeonGoldilocksField;
 use crate::goldilocks_field::GoldilocksField;
 use crate::ops::Square;
 use crate::packed::PackedField;
-use crate::types::Field;
+use crate::types::{Field, Field64};
 
 /// Four packed Goldilocks elements implemented as two independent AArch64 lane pairs.
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -215,18 +215,105 @@ unsafe impl PackedField for WideGoldilocksField {
         }
     }
 
-    /// Delegates to the two `NeonGoldilocksField` halves, each of which fuses
-    /// its lane pair into one interleaved multiply-accumulate-reduce block.
-    /// Routing lane by lane through the scalar path instead would emit four
-    /// separate assembly blocks; the compiler schedules a block as a unit, so
-    /// their serial dependency chains could not overlap.
+    /// Four independent fused multiply-accumulate reductions. This keeps the
+    /// entire packed word in one assembly block, so all four product and
+    /// reduction dependency chains are visible to the AArch64 scheduler at
+    /// once rather than being split across two opaque pair kernels.
     #[inline]
     fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
-        Self([
-            self.0[0].multiply_accumulate(x.0[0], y.0[0]),
-            self.0[1].multiply_accumulate(x.0[1], y.0[1]),
-        ])
+        let [acc0, acc1, acc2, acc3] = self.lanes().map(|value| value.0);
+        let [lhs0, lhs1, lhs2, lhs3] = x.lanes().map(|value| value.0);
+        let [rhs0, rhs1, rhs2, rhs3] = y.lanes().map(|value| value.0);
+        Self::from_lanes(
+            mul_acc_reduce_quad(
+                [acc0, acc1, acc2, acc3],
+                [lhs0, lhs1, lhs2, lhs3],
+                [rhs0, rhs1, rhs2, rhs3],
+            )
+            .map(GoldilocksField),
+        )
     }
+}
+
+/// Four independent copies of the raw-representation-preserving two-lane
+/// `reduce128(acc + a * b)` schedule. The arithmetic instructions for the
+/// four lanes are interleaved only between condition-flag producers; each
+/// `adds`/`adc` and `subs`/`csetm` pair remains adjacent so a lane's carry is
+/// never observed by another lane.
+#[inline(always)]
+fn mul_acc_reduce_quad(acc: [u64; 4], lhs: [u64; 4], rhs: [u64; 4]) -> [u64; 4] {
+    let [mut result0, mut result1, mut result2, mut result3] = lhs;
+    let [scratch0, scratch1, scratch2, scratch3] = rhs;
+    let [acc0, acc1, acc2, acc3] = acc;
+
+    unsafe {
+        core::arch::asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "umulh {hi2}, {result2}, {scratch2}",
+            "umulh {hi3}, {result3}, {scratch3}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "mul   {result2}, {result2}, {scratch2}",
+            "mul   {result3}, {result3}, {scratch3}",
+            "adds  {result0}, {result0}, {acc0}",
+            "adc   {hi0}, {hi0}, xzr",
+            "adds  {result1}, {result1}, {acc1}",
+            "adc   {hi1}, {hi1}, xzr",
+            "adds  {result2}, {result2}, {acc2}",
+            "adc   {hi2}, {hi2}, xzr",
+            "adds  {result3}, {result3}, {acc3}",
+            "adc   {hi3}, {hi3}, xzr",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "umull {scratch2}, {hi2:w}, {epsilon:w}",
+            "umull {scratch3}, {hi3:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "subs  {result2}, {result2}, {hi2}, lsr #32",
+            "csetm {hi2:w}, cc",
+            "subs  {result3}, {result3}, {hi3}, lsr #32",
+            "csetm {hi3:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "sub   {result2}, {result2}, {hi2}",
+            "sub   {result3}, {result3}, {hi3}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "adds  {result2}, {result2}, {scratch2}",
+            "csetm {scratch2:w}, cs",
+            "adds  {result3}, {result3}, {scratch3}",
+            "csetm {scratch3:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            "add   {result2}, {result2}, {scratch2}",
+            "add   {result3}, {result3}, {scratch3}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            result2 = inout(reg) result2,
+            result3 = inout(reg) result3,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            scratch2 = inout(reg) scratch2 => _,
+            scratch3 = inout(reg) scratch3 => _,
+            acc0 = in(reg) acc0,
+            acc1 = in(reg) acc1,
+            acc2 = in(reg) acc2,
+            acc3 = in(reg) acc3,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            hi2 = out(reg) _,
+            hi3 = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    [result0, result1, result2, result3]
 }
 
 impl Square for WideGoldilocksField {
