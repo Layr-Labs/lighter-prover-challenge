@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -15,8 +15,6 @@ use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
-#[cfg(test)]
-use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
@@ -791,9 +789,10 @@ pub(crate) fn prove_block_after_pre(
         let circuits = &circuits;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+            // The final block circuit depends only on static circuit data and
+            // is not needed until the final proof. The release path loads its
+            // compile-time embedding here (with runtime construction retained
+            // as a fallback), concurrently with the transaction/chain pipeline.
             // Two-phase final-block witness (H13): this lane also runs the
             // EARLY witness phase (block data + pre-proof generators) after the
             // build, then joins the heavy path — which finishes ~30 s before
