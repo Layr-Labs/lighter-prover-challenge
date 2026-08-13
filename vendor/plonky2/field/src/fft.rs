@@ -282,7 +282,17 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     let lg_n = log2_strict(n);
     let n_inv = F::inverse_2exp(lg_n);
     let PolynomialValues { values: mut buffer } = poly;
-    fft_dispatch(&mut buffer, zero_factor, root_table);
+    // Quotient IFFT is a few large base-field columns. Column-level
+    // par_iter over columns leaves the pool idle through each serial butterfly
+    // stack. FRI already parallelizes outer stages at PARALLEL_FFT_MIN_SCALARS
+    // (2^18); use that same dispatch here. Smaller wire/Zs IFFTs (2^16) stay
+    // serial — they already fill the pool via column par_iter.
+    // Not IFFT+ext2 / yp-01 (those are burned; this is base-field dispatch).
+    if n >= PARALLEL_FFT_MIN_SCALARS {
+        fft_dispatch_parallel(&mut buffer, zero_factor, root_table);
+    } else {
+        fft_dispatch(&mut buffer, zero_factor, root_table);
+    }
 
     match postscale {
         None => {
