@@ -2333,16 +2333,10 @@ fn compute_quotient_polys<
                     &mut scratch.vanishing,
                     quotient_values_batch,
                 );
-
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
+                // Leave quotient_values unscaled here. The single z_h
+                // denominator_inv multiply is fused into the final scatter
+                // store below (final-scatter one-scale). Avoids the burned
+                // scale_in_* last-merge form in vanishing_poly.
             },
         );
 
@@ -2384,10 +2378,11 @@ fn compute_quotient_polys<
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(_i, (cpu_values, gpu_values))| {
+                // Additive merge of unscaled GPU terms; final-scatter one-scale
+                // applies denominator_inv once when scattering.
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2433,10 +2428,11 @@ fn compute_quotient_polys<
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(_i, (cpu_values, gpu_values))| {
+                // Additive merge of unscaled GPU terms; final-scatter one-scale
+                // applies denominator_inv once when scattering.
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2470,10 +2466,11 @@ fn compute_quotient_polys<
             .par_chunks_exact_mut(num_challenges)
             .zip(gpu_values.par_chunks_exact(num_challenges))
             .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
+            .for_each(|(_i, (cpu_values, gpu_values))| {
+                // Additive merge of unscaled GPU terms; final-scatter one-scale
+                // applies denominator_inv once when scattering.
                 for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
+                    *cpu += gpu;
                 }
             });
     }
@@ -2486,6 +2483,11 @@ fn compute_quotient_polys<
     // parallel IFFT while every other core sat idle. Each parallel chunk
     // below owns a disjoint point range, and column position `i` is written
     // exactly once with the identical value the serial pass stored there.
+    //
+    // Final-scatter one-scale: fuse the single z_h denominator_inv multiply
+    // into this store (`value * denom_inv`). Quotient eval + GPU merges leave
+    // unscaled additive terms; scaling here is bit-identical to the old
+    // pre-scatter passes and avoids the burned scale_in_* last-merge form.
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
@@ -2510,9 +2512,10 @@ fn compute_quotient_polys<
         .for_each(|(chunk_i, chunk)| {
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                let denominator_inv = z_h_on_coset.eval_inverse(base + k);
                 for (column, &value) in column_ptrs.iter().zip(point_values) {
                     // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    unsafe { *column.0.add(base + k) = value * denominator_inv };
                 }
             }
         });
