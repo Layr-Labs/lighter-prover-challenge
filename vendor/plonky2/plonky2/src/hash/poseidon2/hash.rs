@@ -638,16 +638,15 @@ impl Poseidon2 for F {
     /// side of it. Twelve independent three-instruction wraparound adds have
     /// no dependency chain to hide behind vectorisation in the first place.
     #[inline]
+    #[unroll::unroll_for_loops]
     fn add_rc(state: &mut [Self; WIDTH], external_round: usize) {
         use plonky2_field::types::Field64;
         debug_assert!(external_round < EXTERNAL_CONSTANTS.len());
-        state
-            .iter_mut()
-            .zip(EXTERNAL_CONSTANTS[external_round].iter())
-            .for_each(|(x, &m)| {
-                // SAFETY: `m < Self::ORDER` for every external constant.
-                *x = unsafe { x.add_canonical_u64(m) };
-            });
+        let rc = &EXTERNAL_CONSTANTS[external_round];
+        for i in 0..WIDTH {
+            // SAFETY: `rc[i] < Self::ORDER` for every external constant.
+            state[i] = unsafe { state[i].add_canonical_u64(rc[i]) };
+        }
     }
 
     #[inline]
