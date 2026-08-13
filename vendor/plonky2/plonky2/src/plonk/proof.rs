@@ -411,6 +411,27 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             ),
         }
     }
+    /// Absorb these openings in the same order as [`Self::to_fri_openings`]
+    /// without allocating its two concatenated batch vectors.
+    pub(crate) fn observe_into<H: Hasher<F>>(
+        &self,
+        challenger: &mut crate::iop::challenger::Challenger<F, H>,
+    ) {
+        for values in [
+            self.constants.as_slice(),
+            self.plonk_sigmas.as_slice(),
+            self.wires.as_slice(),
+            self.plonk_zs.as_slice(),
+            self.partial_products.as_slice(),
+            self.quotient_polys.as_slice(),
+            self.lookup_zs.as_slice(),
+            self.plonk_zs_next.as_slice(),
+            self.lookup_zs_next.as_slice(),
+        ] {
+            challenger.observe_extension_elements(values);
+        }
+    }
+
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
         let has_lookup = !self.lookup_zs.is_empty();
         let zeta_batch = if has_lookup {
@@ -532,6 +553,44 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn opening_set_direct_observation_matches_fri_batches() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type E = <F as Extendable<D>>::Extension;
+
+        let mut next = 1u64;
+        let mut values = |len: usize| -> Vec<E> {
+            (0..len)
+                .map(|_| {
+                    let value = E::from_canonical_u64(next);
+                    next += 1;
+                    value
+                })
+                .collect()
+        };
+        let openings: OpeningSet<F, D> = OpeningSet {
+            constants: values(3),
+            plonk_sigmas: values(2),
+            wires: values(5),
+            plonk_zs: values(2),
+            plonk_zs_next: values(2),
+            lookup_zs: values(1),
+            lookup_zs_next: values(1),
+            partial_products: values(4),
+            quotient_polys: values(6),
+        };
+        type H = <C as GenericConfig<D>>::Hasher;
+        let mut materialized = crate::iop::challenger::Challenger::<F, H>::new();
+        let mut direct = crate::iop::challenger::Challenger::<F, H>::new();
+        materialized.observe_openings(&openings.to_fri_openings());
+        openings.observe_into(&mut direct);
+        for _ in 0..32 {
+            assert_eq!(materialized.get_challenge(), direct.get_challenge());
+        }
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {
