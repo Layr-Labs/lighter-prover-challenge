@@ -368,12 +368,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 #[derive(Eq, PartialEq, Debug)]
 pub struct GeneratorWatchIndex {
     offsets: Vec<u32>,
-    watchers: Vec<usize>,
+    watchers: Vec<u32>,
     entries: usize,
 }
 
 impl GeneratorWatchIndex {
-    pub fn from_map(map: BTreeMap<usize, Vec<usize>>) -> Self {
+    pub fn from_map(map: BTreeMap<usize, Vec<u32>>) -> Self {
         let entries = map.values().filter(|watchers| !watchers.is_empty()).count();
         let Some((&max_representative, _)) = map.last_key_value() else {
             return Self {
@@ -475,14 +475,18 @@ impl GeneratorWatchIndex {
         // preserves the old ascending generator order without a second cursor array. Afterwards,
         // each end cursor has become the next representative's start, so one overlapping shift
         // restores the original CSR offsets.
-        let mut watchers = vec![0usize; representatives.len()];
+        assert!(
+            u32::try_from(generator_watch_counts.len()).is_ok(),
+            "generator count exceeds u32 watcher indices"
+        );
+        let mut watchers = vec![0u32; representatives.len()];
         let mut group_end = representatives.len();
         for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
             let group_start = group_end - count;
             for &representative in &representatives[group_start..group_end] {
                 let cursor = &mut offsets[representative as usize + 1];
                 *cursor -= 1;
-                watchers[*cursor as usize] = generator;
+                watchers[*cursor as usize] = generator as u32;
             }
             group_end = group_start;
         }
@@ -504,7 +508,7 @@ impl GeneratorWatchIndex {
     }
 
     /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
-    pub fn watchers(&self) -> &[usize] {
+    pub fn watchers(&self) -> &[u32] {
         &self.watchers
     }
 
@@ -513,7 +517,7 @@ impl GeneratorWatchIndex {
     /// function of the offsets and is re-derived. The offsets must be
     /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
     /// exactly as [`Self::from_map`] produces them.
-    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
+    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<u32>) -> Self {
         assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
         assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
         assert_eq!(
@@ -536,7 +540,7 @@ impl GeneratorWatchIndex {
     }
 
     #[inline]
-    pub fn get(&self, representative: &usize) -> Option<&[usize]> {
+    pub fn get(&self, representative: &usize) -> Option<&[u32]> {
         let end_index = representative.checked_add(1)?;
         let (&start, &end) = (
             self.offsets.get(*representative)?,
@@ -549,7 +553,7 @@ impl GeneratorWatchIndex {
         self.entries
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &[usize])> {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &[u32])> {
         self.offsets
             .windows(2)
             .enumerate()
@@ -948,15 +952,15 @@ mod generator_watch_index_tests {
 
     #[test]
     fn sparse_watch_index_preserves_lists_and_empty_representatives() {
-        let map = BTreeMap::from([(1usize, vec![2usize, 5]), (4, vec![3])]);
+        let map = BTreeMap::from([(1usize, vec![2u32, 5]), (4, vec![3])]);
         let index = GeneratorWatchIndex::from_map(map);
 
         assert_eq!(index.len(), 2);
         assert_eq!(index.get(&0), None);
-        assert_eq!(index.get(&1), Some([2usize, 5].as_slice()));
+        assert_eq!(index.get(&1), Some([2u32, 5].as_slice()));
         assert_eq!(index.get(&2), None);
         assert_eq!(index.get(&3), None);
-        assert_eq!(index.get(&4), Some([3usize].as_slice()));
+        assert_eq!(index.get(&4), Some([3u32].as_slice()));
         assert_eq!(index.get(&5), None);
 
         let entries = index
