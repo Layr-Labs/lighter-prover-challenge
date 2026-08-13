@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::polynomial::PolynomialCoeffs;
 use crate::field::types::Field;
+use crate::fri::FriParams;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
     CompressedFriProof, FriChallenges, FriChallengesTarget, FriProof, FriProofTarget,
@@ -21,9 +22,9 @@ use crate::fri::proof::{
 use crate::fri::structure::{
     FriOpeningBatch, FriOpeningBatchTarget, FriOpenings, FriOpeningsTarget,
 };
-use crate::fri::FriParams;
 use crate::hash::hash_types::{MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
+use crate::iop::challenger::Challenger;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
 use crate::plonk::circuit_data::{CommonCircuitData, VerifierOnlyCircuitData};
@@ -350,28 +351,6 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // and compares every entry by raw noncanonical limbs.
         let g_subgroup =
             crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
-        let g_zeta_pows: Vec<F::Extension> = zeta_pows
-            .iter()
-            .zip(g_subgroup.iter())
-            .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
-            .collect();
-        if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
-            let reference = table(g * zeta);
-            assert_eq!(reference.len(), g_zeta_pows.len());
-            for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
-                let a_raw: Vec<u64> = a
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                let b_raw: Vec<u64> = b
-                    .to_basefield_array()
-                    .iter()
-                    .map(|c| c.to_noncanonical_u64())
-                    .collect();
-                assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
-            }
-        }
         let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
             polynomials
                 .par_iter()
@@ -389,6 +368,59 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
         let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
+        let zs_range = common_data.zs_range();
+        let lookup_range = common_data.lookup_range();
+        // Production has exactly two permutation-Z polynomials and no lookup argument. Fuse their
+        // shifted evaluations with the subgroup twist: this deletes the degree-sized `g*zeta`
+        // powers allocation and its complete construction pass. The general lookup/shape path is
+        // unchanged. Associativity in the exact field gives
+        // `(zeta^i * g^i) * c_i == zeta^i * (g^i * c_i)` term by term.
+        let (plonk_zs_next, lookup_zs_next) = if lookup_range.start
+            == shifted_polynomials.len()
+            && zs_range.len() == 2
+        {
+            let (z_0, z_1) = F::twisted_extension_base_dot_product_pair(
+                &zeta_pows,
+                &g_subgroup,
+                &shifted_polynomials[zs_range.start].coeffs,
+                &shifted_polynomials[zs_range.start + 1].coeffs,
+            );
+            if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
+                let reference_pows = table(g * zeta);
+                let reference =
+                    eval_polynomials(&reference_pows, &shifted_polynomials[zs_range.clone()]);
+                assert_eq!(reference, vec![z_0, z_1]);
+            }
+            (vec![z_0, z_1], vec![])
+        } else {
+            let g_zeta_pows: Vec<F::Extension> = zeta_pows
+                .iter()
+                .zip(g_subgroup.iter())
+                .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
+                .collect();
+            if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
+                let reference = table(g * zeta);
+                assert_eq!(reference.len(), g_zeta_pows.len());
+                for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
+                    let a_raw: Vec<u64> = a
+                        .to_basefield_array()
+                        .iter()
+                        .map(|c| c.to_noncanonical_u64())
+                        .collect();
+                    let b_raw: Vec<u64> = b
+                        .to_basefield_array()
+                        .iter()
+                        .map(|c| c.to_noncanonical_u64())
+                        .collect();
+                    assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
+                }
+            }
+            (
+                eval_polynomials(&g_zeta_pows, &shifted_polynomials[zs_range.clone()]),
+                eval_polynomials(&g_zeta_pows, &shifted_polynomials[lookup_range.clone()]),
+            )
+        };
+
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
@@ -397,18 +429,12 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             // Partial-product polynomials are opened only at `zeta`, never at
             // `g * zeta`; evaluate only the shifted Z polynomials consumed by
             // the FRI next batch.
-            plonk_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.zs_range()],
-            ),
+            plonk_zs_next,
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
             quotient_polys,
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.lookup_range()],
-            ),
+            lookup_zs_next,
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
@@ -450,6 +476,26 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         };
         FriOpenings {
             batches: vec![zeta_batch, zeta_next_batch],
+        }
+    }
+
+    /// Absorb the two FRI opening batches in protocol order without first
+    /// cloning and concatenating all nine opening vectors. Every proof already
+    /// owns these vectors, while the challenger consumes them sequentially
+    /// and never retains the temporary [`FriOpenings`].
+    pub(crate) fn observe_into<H: Hasher<F>>(&self, challenger: &mut Challenger<F, H>) {
+        challenger.observe_extension_elements(&self.constants);
+        challenger.observe_extension_elements(&self.plonk_sigmas);
+        challenger.observe_extension_elements(&self.wires);
+        challenger.observe_extension_elements(&self.plonk_zs);
+        challenger.observe_extension_elements(&self.partial_products);
+        challenger.observe_extension_elements(&self.quotient_polys);
+        if !self.lookup_zs.is_empty() {
+            challenger.observe_extension_elements(&self.lookup_zs);
+        }
+        challenger.observe_extension_elements(&self.plonk_zs_next);
+        if !self.lookup_zs.is_empty() {
+            challenger.observe_extension_elements(&self.lookup_zs_next);
         }
     }
 }
@@ -521,7 +567,7 @@ mod tests {
 
     use anyhow::Result;
     use itertools::Itertools;
-    use plonky2_field::types::Sample;
+    use plonky2_field::types::{PrimeField64, Sample};
 
     use super::*;
     use crate::fri::reduction_strategies::FriReductionStrategy;
@@ -532,6 +578,42 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn direct_opening_observation_matches_materialized_batches() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type FE = <F as Extendable<D>>::Extension;
+
+        let random = |n: usize| (0..n).map(|_| FE::rand()).collect::<Vec<_>>();
+        for has_lookup in [false, true] {
+            let openings = OpeningSet::<F, D> {
+                constants: random(5),
+                plonk_sigmas: random(7),
+                wires: random(11),
+                plonk_zs: random(3),
+                plonk_zs_next: random(3),
+                partial_products: random(9),
+                quotient_polys: random(13),
+                lookup_zs: if has_lookup { random(4) } else { Vec::new() },
+                lookup_zs_next: if has_lookup { random(4) } else { Vec::new() },
+            };
+
+            let mut reference = Challenger::<F, <C as GenericConfig<D>>::Hasher>::new();
+            reference.observe_openings(&openings.to_fri_openings());
+            let mut direct = Challenger::<F, <C as GenericConfig<D>>::Hasher>::new();
+            openings.observe_into(&mut direct);
+
+            for draw in 0..32 {
+                assert_eq!(
+                    direct.get_challenge().to_noncanonical_u64(),
+                    reference.get_challenge().to_noncanonical_u64(),
+                    "transcript mismatch: lookup={has_lookup}, draw={draw}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {

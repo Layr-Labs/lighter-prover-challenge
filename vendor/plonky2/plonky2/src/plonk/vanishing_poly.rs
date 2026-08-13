@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
+use core::mem::MaybeUninit;
 
 use plonky2_field::polynomial::PolynomialCoeffs;
 
@@ -337,10 +338,20 @@ fn eval_interleave_pair_dense_fused<F: Field>(
 
     const STACK_COLS: usize = 10;
     let required = STACK_COLS * batch_size;
-    let mut stack = [F::ZERO; STACK_COLS * INTERLEAVE_PAIR_STACK_BATCH];
+    // Every scratch region below is initialized before its first read:
+    // `parity_accumulators` is filled once, each operation fills its `x` and
+    // `base4_accumulator`, and `range` is overwritten before every MAC. The
+    // production final proof invokes this exact pair for every 32-point
+    // quotient batch, so zero-initializing all ten columns here was a dead
+    // 320-field store loop per call.
+    let mut stack = [MaybeUninit::<F>::uninit(); STACK_COLS * INTERLEAVE_PAIR_STACK_BATCH];
     let mut heap;
     let scratch: &mut [F] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
-        &mut stack[..required]
+        // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`.
+        // The slices produced from this storage are initialized by the fills
+        // and point loops described above before `batch_multiply_add_inplace`
+        // or any arithmetic reads them.
+        unsafe { core::slice::from_raw_parts_mut(stack.as_mut_ptr().cast::<F>(), required) }
     } else {
         heap = vec![F::ZERO; required];
         &mut heap
@@ -1795,7 +1806,9 @@ mod tests {
             GoldilocksField(state)
         };
 
-        for batch_size in [1usize, 7, 32] {
+        // Exercise the production stack boundary and the first heap-fallback
+        // size as well as small/odd batches.
+        for batch_size in [1usize, 7, 32, 33] {
             let wires = (0..INTERLEAVE_PAIR_WIRES * batch_size)
                 .map(|_| next())
                 .collect::<Vec<_>>();

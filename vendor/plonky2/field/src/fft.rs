@@ -321,6 +321,69 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
+/// IFFT and post-scale directly into independently owned coefficient chunks.
+///
+/// This preserves the transform and coefficient write order of
+/// [`ifft_with_options_and_postscale`], but avoids materializing one large
+/// coefficient vector and then copying it through `PolynomialCoeffs::chunks`.
+/// Coefficients after `live_len` retain the old `trim_to_len` contract: they
+/// must be zero and are not returned.
+pub(crate) fn ifft_with_options_and_postscale_into_chunks<F: Field>(
+    poly: PolynomialValues<F>,
+    postscale: &[F],
+    live_len: usize,
+    chunk_size: usize,
+) -> anyhow::Result<Vec<PolynomialCoeffs<F>>> {
+    anyhow::ensure!(chunk_size != 0);
+    anyhow::ensure!(chunk_size.is_power_of_two());
+    anyhow::ensure!(live_len != 0);
+    anyhow::ensure!(live_len % chunk_size == 0);
+    anyhow::ensure!(live_len <= poly.len());
+    anyhow::ensure!(postscale.len() == poly.len());
+
+    let n = poly.len();
+    anyhow::ensure!(n >= 2);
+    let lg_n = log2_strict(n);
+    let n_inv = F::inverse_2exp(lg_n);
+    let PolynomialValues { values: mut buffer } = poly;
+    fft_dispatch(&mut buffer, None, None);
+
+    let mut chunks = (0..live_len / chunk_size)
+        .map(|_| {
+            let mut coeffs = Vec::with_capacity(chunk_size);
+            // SAFETY: every index below `live_len` is written exactly once by
+            // the complete IFFT reversal before any chunk can be observed.
+            unsafe { coeffs.set_len(chunk_size) };
+            PolynomialCoeffs { coeffs }
+        })
+        .collect::<Vec<_>>();
+
+    let chunk_bits = log2_strict(chunk_size);
+    let chunk_mask = chunk_size - 1;
+    let mut write = |index: usize, value: F| -> anyhow::Result<()> {
+        if index < live_len {
+            chunks[index >> chunk_bits].coeffs[index & chunk_mask] = value;
+        } else {
+            anyhow::ensure!(value.is_zero());
+        }
+        Ok(())
+    };
+    let scaled = |mut value: F, index: usize| {
+        value *= n_inv;
+        value *= postscale[index];
+        value
+    };
+
+    write(0, scaled(buffer[0], 0))?;
+    write(n / 2, scaled(buffer[n / 2], n / 2))?;
+    for i in 1..(n / 2) {
+        let j = n - i;
+        write(i, scaled(buffer[j], i))?;
+        write(j, scaled(buffer[i], j))?;
+    }
+    Ok(chunks)
+}
+
 /// `ifft` of a borrowed column without the caller-side copy: the initial
 /// bit-reversal permutation is applied as an out-of-place gather from
 /// `values` into the fresh buffer (the same permutation `fft_classic`'s

@@ -322,8 +322,32 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+
+        // The ranked recursion circuits have the fixed `(subgroup_bits=4,
+        // degree=6, D=2, batch=32)` shape: 16 extension values and 12 * 32
+        // base-field constraint words. Keep those bounded buffers in the
+        // Rayon worker's stack frame instead of performing two heap
+        // allocations for every quotient batch. The generic heap fallback
+        // preserves support for larger custom gates and batch sizes.
+        const STACK_VALUES: usize = 16;
+        const STACK_CONSTRAINT_WORDS: usize = 12 * 32;
+        let mut stack_values = [F::Extension::ZERO; STACK_VALUES];
+        let mut heap_values = Vec::new();
+        let values: &mut [F::Extension] = if self.num_points() <= STACK_VALUES {
+            &mut stack_values[..self.num_points()]
+        } else {
+            heap_values.resize(self.num_points(), F::Extension::ZERO);
+            &mut heap_values
+        };
+        let scratch_len = num_constraints * n;
+        let mut stack_scratch = [F::ZERO; STACK_CONSTRAINT_WORDS];
+        let mut heap_scratch = Vec::new();
+        let scratch: &mut [F] = if scratch_len <= STACK_CONSTRAINT_WORDS {
+            &mut stack_scratch[..scratch_len]
+        } else {
+            heap_scratch.resize(scratch_len, F::ZERO);
+            &mut heap_scratch
+        };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];
@@ -746,7 +770,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -785,7 +809,13 @@ mod tests {
 
             let mut actual = initial;
             gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
-            assert_eq!(actual, expected, "max_degree {max_degree}");
+            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_noncanonical_u64(),
+                    expected.to_noncanonical_u64(),
+                    "max_degree={max_degree}, output={i}"
+                );
+            }
         }
     }
 
