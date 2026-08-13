@@ -963,6 +963,7 @@ fn fft_classic_simd_single_layer_neon_ext(
     omega_row: &[crate::extension::quadratic::QuadraticExtension<
         crate::goldilocks_field::GoldilocksField,
     >],
+    known_base_subfield: bool,
 ) {
     use core::arch::aarch64::*;
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
@@ -974,9 +975,12 @@ fn fft_classic_simd_single_layer_neon_ext(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    // Production FRI uses BaseSubfieldTwiddle: every twiddle is [w, 0], so
+    // the paired-mul arm is valid without scanning the row. The scan stays
+    // for GeneralTwiddle (full two-adicity), where later layers have
+    // extension roots but earlier ones may still be base-subfield.
+    let base_subfield = known_base_subfield
+        || omega_row[..half].iter().all(|w| w.0[1].0 == 0);
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
@@ -1113,7 +1117,14 @@ fn fft_classic_simd_single_layer_with<P, M>(
                 row.len(),
             )
         };
-        fft_classic_simd_single_layer_neon_ext(ext_values, lg_half_m, omega_row);
+        let known_base_subfield = core::any::TypeId::of::<M>()
+            == core::any::TypeId::of::<BaseSubfieldTwiddle>();
+        fft_classic_simd_single_layer_neon_ext(
+            ext_values,
+            lg_half_m,
+            omega_row,
+            known_base_subfield,
+        );
         return;
     }
 
