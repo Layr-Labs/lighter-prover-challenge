@@ -4,6 +4,7 @@ use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -1083,6 +1084,46 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    #[cfg(test)]
+    fn is_published(&self) -> bool {
+        matches!(self.built.get(), Some(Some(_)))
+    }
+
+    #[cfg(test)]
+    fn builder_thread_outstanding(&self) -> bool {
+        self.builder
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(true)
+    }
+}
+
+/// Creating a compute pipeline from the committed metallib is a lookup only
+/// when the `applegpu` slice matches this device (the ranked M4 Pro). On any
+/// other GPU the air64 slice still loads and every function name resolves, but
+/// `newComputePipelineStateWithFunction` lowers AIR→ISA and takes hundreds of
+/// milliseconds. Serializing that miss would re-expose the old compile cost.
+const PIPELINE_LOOKUP_BOUND: Duration = Duration::from_millis(20); // redraw sample 3
+
+fn pipeline_create_looks_like_lookup(elapsed: Duration) -> bool {
+    elapsed < PIPELINE_LOOKUP_BOUND
+}
+
+fn build_pipeline(
+    device: &Device,
+    library: &metal::Library,
+    name: &'static str,
+    kind: &'static str,
+) -> Result<ComputePipelineState, String> {
+    autoreleasepool(|| {
+        let function = library
+            .get_function(name, None)
+            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+        device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+    })
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
@@ -2409,108 +2450,126 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
-            // Build the compute pipelines concurrently, one thread each.
-            //
-            // Every `newComputePipelineStateWithFunction:` lowers that kernel's
-            // AIR to a GPU binary through MTLCompilerService, and the three
-            // Poseidon2 permutation kernels plus the two gate-quotient kernels
-            // are large enough that each takes hundreds of milliseconds when the
-            // result is not already in the OS shader cache. The benchmark
-            // sandbox denies writes to that cache, which disables it outright —
-            // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
+            // Pipeline create is a lookup only when the committed applegpu
+            // slice matches this GPU (ranked M4 Pro / AGXG16S). Loading the
+            // metallib and resolving function names is not enough: the air64
+            // slice loads on every Apple GPU, and AIR→ISA lowering still costs
+            // hundreds of milliseconds there (565 ms for all ten on an Air).
+            // Time the first required pipeline and serialize the rest only
+            // when that create looks like a lookup. Otherwise keep the old
+            // 5-way parallel remainder plus detached optional builders, which
+            // were measured to collapse a 2.36 s serial compile to ~0.67 s.
             //
             // This is a scheduling change only: the pipelines, and therefore
-            // every value the GPU later computes, are identical. `Device`,
-            // `Library` and `ComputePipelineState` are all `Send + Sync`, and
-            // each worker thread gets its own autorelease pool so the temporary
-            // `NSError`s the Metal API autoreleases are drained on the thread
-            // that created them rather than leaking.
-            let device_ref = &device;
-            let library_ref = &library;
-            let required = |name: &'static str, kind: &'static str| {
-                move || -> Result<ComputePipelineState, String> {
-                    autoreleasepool(|| {
-                        let function = library_ref
-                            .get_function(name, None)
-                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
-                        device_ref
-                            .new_compute_pipeline_state_with_function(&function)
-                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
-                    })
-                }
-            };
-            // The two gate-quotient kernels are the two most expensive to lower
-            // and the only two the context can do without: every caller already
-            // treats an absent pipeline as "run this on the CPU". Lowering them
-            // on the blocking path makes the whole context wait for the slowest
-            // kernel in the shader; measured cold under the benchmark's sandbox
-            // profile, where the OS shader cache is disabled:
-            //
-            //     range_check_gate_quotient   679 ms
-            //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
-            //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
-            // maximum and add contention on MTLCompilerService. Building them
-            // off the blocking path instead leaves the context ready in 838 ms
-            // rather than 1270 ms, and they land shortly after, long before the
-            // first quotient evaluation of a proof asks for them.
-            //
-            // Started below, once the required six have finished, so they do not
-            // simply move their MTLCompilerService contention onto the path they
-            // are being taken off.
+            // every value the GPU later computes, are identical.
+            let first_pipeline_started = Instant::now();
+            let leaf_pipeline =
+                build_pipeline(&device, &library, "poseidon2_hash_leaves", "leaf")?;
+            let first_pipeline_elapsed = first_pipeline_started.elapsed();
+            let applegpu_lookup = pipeline_create_looks_like_lookup(first_pipeline_elapsed);
+
             let (
-                leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                // A panic inside a pipeline build is a bug, not a runtime
-                // condition; propagate it rather than papering over it.
+            ) = if applegpu_lookup {
                 (
-                    leaf.join().expect("leaf pipeline thread panicked"),
-                    leaf_colmajor
-                        .join()
-                        .expect("col-major leaf pipeline thread panicked"),
-                    parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
+                    build_pipeline(
+                        &device,
+                        &library,
+                        "poseidon2_hash_leaves_colmajor",
+                        "col-major leaf",
+                    )?,
+                    build_pipeline(&device, &library, "poseidon2_hash_parents", "parent")?,
+                    build_pipeline(&device, &library, "ntt_prepare", "ntt prepare")?,
+                    build_pipeline(&device, &library, "ntt_stage", "ntt stage")?,
+                    build_pipeline(&device, &library, "ifft_finalize", "ifft finalize")?,
                 )
-            });
-            // Surfaced in kernel order, so a single missing or unbuildable
-            // kernel yields the same error string the sequential construction
-            // produced. Only the tie-break between two simultaneous failures
-            // can differ, and every one of these kernels is present in
-            // `SHADER_SOURCE`; a failure here means the whole library is bad,
-            // which `new_library_with_source` above has already rejected.
-            let leaf_pipeline = leaf_pipeline?;
-            let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
-            let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+            } else {
+                let device_ref = &device;
+                let library_ref = &library;
+                let required = |name: &'static str, kind: &'static str| {
+                    move || -> Result<ComputePipelineState, String> {
+                        build_pipeline(device_ref, library_ref, name, kind)
+                    }
+                };
+                // Miss-path numbers (cold, shader cache denied):
+                // range_check_gate_quotient 679 ms, poseidon2_gate_quotient
+                // 601 ms, remaining required kernels 491 ms and below.
+                // Parallel remainder + detached optionals keeps CONTEXT ready
+                // without waiting for the two slowest kernels.
+                let (
+                    leaf_colmajor_pipeline,
+                    parent_pipeline,
+                    ntt_prepare_pipeline,
+                    ntt_stage_pipeline,
+                    ifft_finalize_pipeline,
+                ) = std::thread::scope(|scope| {
+                    let leaf_colmajor = scope
+                        .spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
+                    let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
+                    let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
+                    let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
+                    let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+                    (
+                        leaf_colmajor
+                            .join()
+                            .expect("col-major leaf pipeline thread panicked"),
+                        parent.join().expect("parent pipeline thread panicked"),
+                        ntt_prepare
+                            .join()
+                            .expect("ntt prepare pipeline thread panicked"),
+                        ntt_stage
+                            .join()
+                            .expect("ntt stage pipeline thread panicked"),
+                        ifft_finalize
+                            .join()
+                            .expect("ifft finalize pipeline thread panicked"),
+                    )
+                });
+                (
+                    leaf_colmajor_pipeline?,
+                    parent_pipeline?,
+                    ntt_prepare_pipeline?,
+                    ntt_stage_pipeline?,
+                    ifft_finalize_pipeline?,
+                )
+            };
 
-            spawn_optional_pipelines(&device, &library);
+            if applegpu_lookup {
+                let _ = POSEIDON_GATE_QUOTIENT_PIPELINE.built.set(Some(
+                    build_pipeline(
+                        &device,
+                        &library,
+                        "poseidon2_gate_quotient",
+                        "poseidon gate quotient",
+                    )?,
+                ));
+                let _ = RANGE_CHECK_GATE_QUOTIENT_PIPELINE.built.set(Some(
+                    build_pipeline(
+                        &device,
+                        &library,
+                        "range_check_gate_quotient",
+                        "range-check gate quotient",
+                    )?,
+                ));
+                let _ = PERMUTATION_QUOTIENT_PIPELINE.built.set(Some(build_pipeline(
+                    &device,
+                    &library,
+                    "permutation_quotient",
+                    "permutation quotient",
+                )?));
+                let _ = ABSORB_PASS_PIPELINE.built.set(Some(build_pipeline(
+                    &device,
+                    &library,
+                    "poseidon2_absorb_pass",
+                    "absorb pass",
+                )?));
+            } else {
+                spawn_optional_pipelines(&device, &library);
+            }
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3991,6 +4050,73 @@ mod tests {
             assert!(
                 library.get_function(name, None).is_ok(),
                 "prebuilt metallib is missing kernel {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn pipeline_create_looks_like_lookup_uses_20ms_bound() {
+        assert!(pipeline_create_looks_like_lookup(Duration::from_millis(1)));
+        assert!(pipeline_create_looks_like_lookup(Duration::from_nanos(1)));
+        assert!(!pipeline_create_looks_like_lookup(Duration::from_millis(
+            20
+        )));
+        assert!(!pipeline_create_looks_like_lookup(Duration::from_millis(
+            565
+        )));
+    }
+
+    /// Reports whether this device treats the committed metallib as a lookup.
+    /// An M4 Pro applegpu hit is ~1.5 ms; an Air air64 miss is hundreds of ms.
+    /// Production branches on that measurement. This test does not fail the
+    /// miss — it only prints the number.
+    #[test]
+    fn metallib_serial_pipeline_create_reports_elapsed() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("prebuilt metallib must load");
+        let start = Instant::now();
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library
+                .get_function(name, None)
+                .unwrap_or_else(|error| panic!("{name} missing: {error}"));
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .unwrap_or_else(|error| panic!("{name} pipeline: {error}"));
+        }
+        let elapsed = start.elapsed();
+        eprintln!(
+            "serial create of 10 pipelines from SHADER_METALLIB: {elapsed:?} (lookup={})",
+            pipeline_create_looks_like_lookup(elapsed)
+        );
+    }
+
+    #[test]
+    fn force_context_optional_pipelines_are_usable() {
+        let Some(_) = Device::system_default() else {
+            return;
+        };
+        super::force_context_for_tests();
+        for (name, slot) in [
+            ("poseidon2_gate_quotient", &super::POSEIDON_GATE_QUOTIENT_PIPELINE),
+            (
+                "range_check_gate_quotient",
+                &super::RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
+            ),
+            ("permutation_quotient", &super::PERMUTATION_QUOTIENT_PIPELINE),
+            ("poseidon2_absorb_pass", &super::ABSORB_PASS_PIPELINE),
+        ] {
+            assert!(
+                slot.get().is_some(),
+                "{name} must be usable after force_context"
+            );
+            eprintln!(
+                "{name}: published={} builder_outstanding={}",
+                slot.is_published(),
+                slot.builder_thread_outstanding()
             );
         }
     }
