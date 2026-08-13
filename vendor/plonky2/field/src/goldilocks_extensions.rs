@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_product_pair(
+        extension_values: &[QuadraticExtension<Self>],
+        base_scalars_0: &[Self],
+        base_scalars_1: &[Self],
+    ) -> [QuadraticExtension<Self>; 2] {
+        ext2_base_scalar_dot_product_pair(extension_values, base_scalars_0, base_scalars_1)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -277,6 +286,62 @@ fn ext2_base_scalar_dot_product(
         start = end;
     }
     result
+}
+
+/// Evaluate two equally shaped GF(p^2)-by-GF(p) dot products while reading
+/// the common extension table once. The two accumulator pairs are completely
+/// independent, so their reduction order and raw representatives match two
+/// calls to `ext2_base_scalar_dot_product` exactly. Unequal or extraordinarily
+/// large inputs retain the general two-call fallback.
+#[inline]
+fn ext2_base_scalar_dot_product_pair(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_scalars_0: &[GoldilocksField],
+    base_scalars_1: &[GoldilocksField],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len_0 = extension_values.len().min(base_scalars_0.len());
+    let len_1 = extension_values.len().min(base_scalars_1.len());
+    if len_0 != len_1 || len_0 > MAX_TERMS_PER_REDUCTION {
+        return [
+            ext2_base_scalar_dot_product(extension_values, base_scalars_0),
+            ext2_base_scalar_dot_product(extension_values, base_scalars_1),
+        ];
+    }
+    if len_0 == 0 {
+        return [QuadraticExtension::ZERO; 2];
+    }
+
+    let (mut lo_00, mut hi_00) = (0u128, 0u32);
+    let (mut lo_01, mut hi_01) = (0u128, 0u32);
+    let (mut lo_10, mut hi_10) = (0u128, 0u32);
+    let (mut lo_11, mut hi_11) = (0u128, 0u32);
+    for ((&QuadraticExtension([a0, a1]), &scalar_0), &scalar_1) in extension_values
+        [..len_0]
+        .iter()
+        .zip(&base_scalars_0[..len_0])
+        .zip(&base_scalars_1[..len_0])
+    {
+        u160_add_product(&mut lo_00, &mut hi_00, a0.0, scalar_0.0);
+        u160_add_product(&mut lo_01, &mut hi_01, a1.0, scalar_0.0);
+        u160_add_product(&mut lo_10, &mut hi_10, a0.0, scalar_1.0);
+        u160_add_product(&mut lo_11, &mut hi_11, a1.0, scalar_1.0);
+    }
+
+    // SAFETY: each accumulator has exactly the same per-output bound as the
+    // single-dot helper above; interleaving their updates does not combine
+    // their values.
+    [
+        QuadraticExtension([
+            unsafe { reduce160(lo_00, hi_00) },
+            unsafe { reduce160(lo_01, hi_01) },
+        ]),
+        QuadraticExtension([
+            unsafe { reduce160(lo_10, hi_10) },
+            unsafe { reduce160(lo_11, hi_11) },
+        ]),
+    ]
 }
 
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
@@ -805,6 +870,101 @@ mod tests {
         assert_eq!(
             <GF as Extendable<4>>::extension_base_dot_product(&[], &scalars),
             Q4::ZERO
+        );
+        let scalars_1 = scalars.iter().rev().copied().collect::<Vec<_>>();
+        assert_eq!(
+            <GF as Extendable<4>>::extension_base_dot_product_pair(
+                &values,
+                &scalars,
+                &scalars_1,
+            ),
+            [
+                <GF as Extendable<4>>::extension_base_dot_product(&values, &scalars),
+                <GF as Extendable<4>>::extension_base_dot_product(&values, &scalars_1),
+            ]
+        );
+    }
+
+    #[test]
+    fn ext2_paired_base_dot_product_matches_two_single_raw_outputs() {
+        let raw_specials = [0, 1, GF::ORDER - 1, GF::ORDER, GF::ORDER + 1, u64::MAX];
+        let lengths = [0usize, 1, 2, 3, 15, 16, 17, 63, 64, 65, 255, 256, 257, 4096];
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for len in lengths {
+            let values = (0..len)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[i]
+                        } else {
+                            next()
+                        }),
+                        GoldilocksField(if i < raw_specials.len() {
+                            raw_specials[raw_specials.len() - 1 - i]
+                        } else {
+                            next()
+                        }),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let scalars_0 = (0..len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 3) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let scalars_1 = (0..len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5 + 1) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            let expected = [
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars_0),
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars_1),
+            ];
+            let actual = <GF as Extendable<2>>::extension_base_dot_product_pair(
+                &values,
+                &scalars_0,
+                &scalars_1,
+            );
+            assert_eq!(actual, expected, "paired output diverged at len={len}");
+            for output in 0..2 {
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual[output].0[limb].to_noncanonical_u64(),
+                        expected[output].0[limb].to_noncanonical_u64(),
+                        "raw output {output} limb {limb} diverged at len={len}"
+                    );
+                }
+            }
+        }
+
+        // Unequal input lengths are a deliberate fallback and retain each
+        // single helper's independent zip-to-shorter semantics.
+        let values = vec![Q2::ONE; 17];
+        let short = vec![GF::ONE; 3];
+        let long = vec![GF::ONE; 19];
+        assert_eq!(
+            <GF as Extendable<2>>::extension_base_dot_product_pair(&values, &short, &long),
+            [
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &short),
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &long),
+            ]
         );
     }
 
