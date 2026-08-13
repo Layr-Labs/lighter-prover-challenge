@@ -1,6 +1,7 @@
 use alloc::vec::Vec;
 use core::cmp::{max, min};
 
+use anyhow::{ensure, Result};
 use plonky2_maybe_rayon::MaybeParChunksMut;
 #[cfg(feature = "parallel")]
 use plonky2_maybe_rayon::ParallelIterator;
@@ -319,6 +320,61 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
         }
     }
     PolynomialCoeffs { coeffs: buffer }
+}
+
+/// Computes an IFFT and writes the retained, post-scaled coefficients directly into
+/// `chunk_size`-sized polynomials.
+///
+/// This is value-identical to `ifft_with_options_and_postscale`, followed by
+/// `trim_to_len(retained_len)` and `chunks(chunk_size)`, but folds the IFFT's final
+/// reversal, normalization, and post-scaling into the chunk writes. In particular, it
+/// avoids first materializing the finalized full-length coefficient vector and then
+/// copying its retained prefix into separately allocated chunk vectors.
+pub(crate) fn ifft_with_options_and_postscale_into_chunks<F: Field>(
+    poly: PolynomialValues<F>,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    postscale: &[F],
+    retained_len: usize,
+    chunk_size: usize,
+) -> Result<Vec<PolynomialCoeffs<F>>> {
+    let n = poly.len();
+    ensure!(retained_len <= n);
+    ensure!(chunk_size > 0);
+    ensure!(postscale.len() == n);
+
+    let lg_n = log2_strict(n);
+    let n_inv = F::inverse_2exp(lg_n);
+    let PolynomialValues { values: mut buffer } = poly;
+    fft_dispatch(&mut buffer, zero_factor, root_table);
+
+    // The ordinary IFFT reverses all coefficients except the first after the
+    // forward-shaped butterflies. Read the same source cell and preserve the
+    // exact multiplication order (`source * n_inv`, then `* postscale[i]`).
+    let coefficient = |i: usize| {
+        let source = if i == 0 || i == n / 2 { i } else { n - i };
+        let mut value = buffer[source] * n_inv;
+        // `ifft_with_options_and_postscale` applies the normalization twice to
+        // the sole cell of a length-one transform. `n_inv` is one there, but
+        // retaining the operation also pins raw-representation equivalence.
+        if n == 1 {
+            value *= n_inv;
+        }
+        value *= postscale[i];
+        value
+    };
+
+    // Preserve `trim_to_len`'s divisibility gate before discarding the tail.
+    ensure!((retained_len..n).all(|i| coefficient(i).is_zero()));
+
+    let mut chunks = Vec::with_capacity(retained_len.div_ceil(chunk_size));
+    for start in (0..retained_len).step_by(chunk_size) {
+        let end = min(start + chunk_size, retained_len);
+        let mut coeffs = Vec::with_capacity(end - start);
+        coeffs.extend((start..end).map(&coefficient));
+        chunks.push(PolynomialCoeffs::new(coeffs));
+    }
+    Ok(chunks)
 }
 
 /// `ifft` of a borrowed column without the caller-side copy: the initial

@@ -336,7 +336,7 @@ where
 
     let alphas = challenger.get_n_challenges(num_challenges);
 
-    let quotient_polys = timed!(
+    let all_quotient_poly_chunks = timed!(
         timing,
         "compute quotient polys",
         compute_quotient_polys::<F, C, D>(
@@ -354,6 +354,8 @@ where
             // circuit has no lookups; the per-point path otherwise.
             !has_lookup,
             true,
+            quotient_degree,
+            degree,
         )
     );
 
@@ -375,9 +377,15 @@ where
             &alphas,
             true,
             false,
+            quotient_degree,
+            degree,
         );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (actual, expected)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+        assert_eq!(all_quotient_poly_chunks.len(), reference.len());
+        for (p, (actual, expected)) in all_quotient_poly_chunks
+            .iter()
+            .zip(reference.iter())
+            .enumerate()
+        {
             assert_eq!(actual.coeffs.len(), expected.coeffs.len());
             for (i, (actual, expected)) in
                 actual.coeffs.iter().zip(expected.coeffs.iter()).enumerate()
@@ -396,52 +404,49 @@ where
         }
     }
 
-    // Differential gate for the layout seam: recompute the quotient through
-    // the per-point reference path on the same witness, commitments and
-    // challenges, and require value-identical polynomials.
+    // Differential gate for both layout seams: recompute the quotient through
+    // the per-point evaluator and the generic point-major output/scatter path
+    // on the same witness, commitments and challenges, then require raw-limb
+    // identical final chunks.
     #[cfg(test)]
-    if !has_lookup && COMPARE_QUOTIENT_LAYOUTS.load(core::sync::atomic::Ordering::Relaxed) {
-        let reference = compute_quotient_polys::<F, C, D>(
-            common_data,
-            prover_data,
-            &public_inputs_hash,
-            &wires_commitment,
-            &partial_products_zs_and_lookup_commitment,
-            &betas,
-            &gammas,
-            &beta_k_is,
-            &deltas,
-            &alphas,
-            false,
-            false,
-        );
-        assert_eq!(quotient_polys.len(), reference.len());
-        for (p, (a, b)) in quotient_polys.iter().zip(reference.iter()).enumerate() {
+    if !has_lookup && COMPARE_QUOTIENT_LAYOUTS.with(|enabled| enabled.get()) {
+        let reference = FORCE_GENERAL_QUOTIENT_OUTPUT.with(|force_general| {
+            let previous = force_general.replace(true);
+            let reference = compute_quotient_polys::<F, C, D>(
+                common_data,
+                prover_data,
+                &public_inputs_hash,
+                &wires_commitment,
+                &partial_products_zs_and_lookup_commitment,
+                &betas,
+                &gammas,
+                &beta_k_is,
+                &deltas,
+                &alphas,
+                false,
+                false,
+                quotient_degree,
+                degree,
+            );
+            force_general.set(previous);
+            reference
+        });
+        assert_eq!(all_quotient_poly_chunks.len(), reference.len());
+        for (p, (a, b)) in all_quotient_poly_chunks
+            .iter()
+            .zip(reference.iter())
+            .enumerate()
+        {
             assert_eq!(a.coeffs.len(), b.coeffs.len());
             for (i, (x, y)) in a.coeffs.iter().zip(b.coeffs.iter()).enumerate() {
                 assert_eq!(
-                    x.to_canonical_u64(),
-                    y.to_canonical_u64(),
+                    x.to_noncanonical_u64(),
+                    y.to_noncanonical_u64(),
                     "quotient layout divergence: poly {p}, coeff {i}"
                 );
             }
         }
     }
-
-    let all_quotient_poly_chunks: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "split up quotient polys",
-        quotient_polys
-            .into_par_iter()
-            .flat_map(|mut quotient_poly| {
-                quotient_poly.trim_to_len(quotient_degree).expect(
-                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
-                );
-                // Split quotient into degree-n chunks.
-                quotient_poly.chunks(degree)
-            })
-            .collect()
-    );
 
     let quotient_polys_commitment = timed!(
         timing,
@@ -1020,6 +1025,70 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// Raw output view used by disjoint quotient batches. The ranked two-challenge
+/// shape writes challenge-owned columns directly; other shapes write the
+/// traditional point-major buffer for the generic scatter below.
+struct QuotientOutput<T> {
+    point_major: *mut T,
+    column_0: *mut T,
+    column_1: *mut T,
+    direct_columns: bool,
+}
+
+unsafe impl<T> Send for QuotientOutput<T> {}
+unsafe impl<T> Sync for QuotientOutput<T> {}
+
+impl<T: Copy> QuotientOutput<T> {
+    #[inline]
+    fn write_batch(&self, start: usize, num_challenges: usize, values: &[T]) {
+        if self.direct_columns {
+            debug_assert_eq!(num_challenges, 2);
+            debug_assert!(values.chunks_exact(2).remainder().is_empty());
+            for (k, pair) in values.chunks_exact(2).enumerate() {
+                // SAFETY: parallel batches have disjoint `[start, end)`
+                // ranges, and both columns were allocated for the domain.
+                unsafe {
+                    *self.column_0.add(start + k) = pair[0];
+                    *self.column_1.add(start + k) = pair[1];
+                }
+            }
+        } else {
+            // SAFETY: parallel batches have disjoint point-major ranges and
+            // `values` has exactly that batch's initialized output.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    self.point_major.add(start * num_challenges),
+                    values.len(),
+                );
+            }
+        }
+    }
+
+    #[inline]
+    fn add_scaled(&self, point: usize, challenge: usize, num_challenges: usize, value: T)
+    where
+        T: core::ops::AddAssign,
+    {
+        debug_assert!(challenge < num_challenges);
+        debug_assert!(!self.direct_columns || num_challenges == 2);
+        // SAFETY: every parallel caller owns one distinct point, and the
+        // challenge index selects a distinct element at that point.
+        unsafe {
+            if self.direct_columns {
+                let dst = if challenge == 0 {
+                    self.column_0.add(point)
+                } else {
+                    self.column_1.add(point)
+                };
+                *dst += value;
+            } else {
+                *self.point_major.add(point * num_challenges + challenge) += value;
+            }
+        }
+    }
+}
+
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
 /// lookups, two challenges, the 135-wire/123-constraint Poseidon2 gate, and
@@ -1129,16 +1198,23 @@ fn gpu_poseidon_quotient_differential_enabled() -> bool {
 pub(crate) static COMPARE_GPU_QUOTIENT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
-/// values twice — once through the default column-major (`PolyMajor`)
-/// permutation path and once through the per-point (`PointMajor`) reference
-/// path — over the same witness, commitments and challenges, and asserts the
-/// two are value-identical. (Cross-run proof-byte comparison is not a usable
-/// oracle in this fork: unused wire slots carry nondeterministic padding, so
-/// two proofs of the same witness legitimately differ byte-wise.)
+// Test-only switch: when set, `compute_quotient_polys` evaluates the quotient
+// values twice — once through the default column-major (`PolyMajor`)
+// permutation path and once through the per-point (`PointMajor`) reference
+// path — over the same witness, commitments and challenges, and asserts the
+// two are value-identical. (Cross-run proof-byte comparison is not a usable
+// oracle in this fork: unused wire slots carry nondeterministic padding, so
+// two proofs of the same witness legitimately differ byte-wise.)
 #[cfg(test)]
-pub(crate) static COMPARE_QUOTIENT_LAYOUTS: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+std::thread_local! {
+    pub(crate) static COMPARE_QUOTIENT_LAYOUTS: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+
+    /// Test-only seam used by the in-process quotient differential to exercise the
+    /// old point-major ownership and scatter with the production two-challenge shape.
+    static FORCE_GENERAL_QUOTIENT_OUTPUT: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
 
 /// Diagnostics-only gate census: prints, once per distinct circuit shape, the
 /// full gate list with the wire span / constraint count / degree that decide
@@ -1819,6 +1895,8 @@ fn compute_quotient_polys<
     alphas: &[F],
     col_major_perm: bool,
     allow_gpu_poseidon: bool,
+    retained_quotient_len: usize,
+    quotient_chunk_size: usize,
 ) -> Vec<PolynomialCoeffs<F>> {
     let num_challenges = common_data.config.num_challenges;
 
@@ -2013,6 +2091,7 @@ fn compute_quotient_polys<
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
         vanishing: VanishingScratch<F>,
+        quotient_values: Vec<F>,
     }
 
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
@@ -2079,14 +2158,51 @@ fn compute_quotient_polys<
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
     let quotient_len = points.len() * num_challenges;
-    let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
-    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
-    // writes every element before any is read (see above). Same idiom as the
-    // promoted zero-tail fast path in `fri/oracle.rs`.
-    unsafe { quotient_values.set_len(quotient_len) };
-    quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
-        .zip(points_batches)
+    // The ranked configuration has exactly two challenges. Give each batch a
+    // disjoint range of each challenge-owned column so its point-major evaluator
+    // output is transposed while still hot in the thread-local 32-point scratch,
+    // rather than materializing and later rereading a full-domain point-major
+    // buffer. Other challenge counts retain the general point-major path.
+    #[cfg(test)]
+    let force_general_output = FORCE_GENERAL_QUOTIENT_OUTPUT.with(|force| force.get());
+    #[cfg(not(test))]
+    let force_general_output = false;
+    let direct_column_output = num_challenges == 2 && !force_general_output;
+    let mut quotient_values: Vec<F> = if direct_column_output {
+        Vec::new()
+    } else {
+        let mut values = Vec::with_capacity(quotient_len);
+        // SAFETY: the disjoint parallel batch writes below initialize every
+        // element before the generic scatter or any GPU merge reads it.
+        unsafe { values.set_len(quotient_len) };
+        values
+    };
+    let mut challenge_columns: Vec<Vec<F>> = if direct_column_output {
+        (0..2)
+            .map(|_| {
+                let mut column = Vec::with_capacity(points.len());
+                // SAFETY: each batch initializes its disjoint point range before
+                // any consumer reads the columns.
+                unsafe { column.set_len(points.len()) };
+                column
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let quotient_output = QuotientOutput {
+        point_major: quotient_values.as_mut_ptr(),
+        column_0: challenge_columns
+            .first_mut()
+            .map_or(core::ptr::null_mut(), Vec::as_mut_ptr),
+        column_1: challenge_columns
+            .get_mut(1)
+            .map_or(core::ptr::null_mut(), Vec::as_mut_ptr),
+        direct_columns: direct_column_output,
+    };
+
+    points_batches
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
@@ -2098,8 +2214,9 @@ fn compute_quotient_polys<
                 zs_local_flat: Vec::new(),
                 zs_next_flat: Vec::new(),
                 vanishing: VanishingScratch::default(),
+                quotient_values: Vec::with_capacity(BATCH_SIZE * num_challenges),
             },
-            |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+            |scratch, (batch_i, xs_batch)| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
                     xs_batch.len() == BATCH_SIZE
@@ -2309,7 +2426,10 @@ fn compute_quotient_polys<
                     public_inputs_hash,
                 );
 
-                let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
+                scratch
+                    .quotient_values
+                    .resize(n * num_challenges, F::ZERO);
+                let quotient_values_batch = &mut scratch.quotient_values;
                 eval_vanishing_poly_base_batch::<F, D>(
                     common_data,
                     indices_batch,
@@ -2343,8 +2463,32 @@ fn compute_quotient_polys<
                         .iter_mut()
                         .for_each(|v| *v *= denominator_inv);
                 }
+                quotient_output.write_batch(
+                    BATCH_SIZE * batch_i,
+                    num_challenges,
+                    quotient_values_batch,
+                );
             },
         );
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let merge_gpu_values = |gpu_values: &[F]| {
+        debug_assert_eq!(gpu_values.len(), quotient_len);
+        gpu_values
+            .par_chunks_exact(num_challenges)
+            .enumerate()
+            .for_each(|(i, gpu_values)| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (challenge, &gpu) in gpu_values.iter().enumerate() {
+                    quotient_output.add_scaled(
+                        i,
+                        challenge,
+                        num_challenges,
+                        gpu * denominator_inv,
+                    );
+                }
+            });
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some((_, job)) = &gpu_poseidon {
@@ -2376,20 +2520,12 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    retained_quotient_len,
+                    quotient_chunk_size,
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_values(&gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2422,23 +2558,15 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    retained_quotient_len,
+                    quotient_chunk_size,
                 );
                 #[cfg(test)]
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_values(&gpu_values);
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2462,25 +2590,19 @@ fn compute_quotient_polys<
                     alphas,
                     col_major_perm,
                     false,
+                    retained_quotient_len,
+                    quotient_chunk_size,
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
+        merge_gpu_values(&gpu_values);
     }
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
+    debug_assert!(
+        direct_column_output || quotient_values.len() == points.len() * num_challenges
+    );
+    // General-shape fallback: parallel scatter the interleaved point-major
+    // buffer into per-challenge columns. The former single streaming pass was serial:
     // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
     // walked by one thread between the parallel quotient evaluation and the
     // parallel IFFT while every other core sat idle. Each parallel chunk
@@ -2489,44 +2611,56 @@ fn compute_quotient_polys<
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
-        .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+    if !direct_column_output {
+        challenge_columns = (0..num_challenges)
+            .map(|_| {
+                let mut column = Vec::with_capacity(points.len());
+                // SAFETY: the disjoint parallel scatter below writes every element
+                // exactly once before any read; `F` is plain data. Same idiom as
+                // the zero-tail fast path in `fri/oracle.rs`.
+                unsafe { column.set_len(points.len()) };
+                column
+            })
+            .collect();
+        let column_ptrs: Vec<ColPtr<F>> = challenge_columns
+            .iter_mut()
+            .map(|column| ColPtr(column.as_mut_ptr()))
+            .collect();
+        let column_ptrs = &column_ptrs;
+        quotient_values
+            .par_chunks(BATCH_SIZE * num_challenges)
+            .enumerate()
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    for (column, &value) in column_ptrs.iter().zip(point_values) {
+                        // SAFETY: `base + k` lies in this chunk's disjoint range.
+                        unsafe { *column.0.add(base + k) = value };
+                    }
                 }
-            }
-        });
+            });
+    }
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
-    challenge_columns
+    let chunk_columns: Vec<Vec<PolynomialCoeffs<F>>> = challenge_columns
         .into_par_iter()
         .map(|column| {
             // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
+            // whole coefficient vector again afterwards, and finalize directly
+            // into degree chunks instead of allocating a full finalized vector
+            // and copying its retained prefix during the subsequent split.
             PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+                .coset_ifft_with_powers_into_chunks(
+                    inverse_coset_shift_powers.as_slice(),
+                    retained_quotient_len,
+                    quotient_chunk_size,
+                )
+                .expect(
+                    "Quotient has failed, the vanishing polynomial is not divisible by Z_H",
+                )
         })
-        .collect()
+        .collect();
+    // Preserve the protocol's challenge-major, then degree-chunk-major order.
+    chunk_columns.into_iter().flatten().collect()
 }
 
 /// Process-global caches for deterministic per-degree precomputations that
@@ -2658,7 +2792,9 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        precomputed, BatchLayout, QuotientOutput, BATCH_SIZE, COMPARE_QUOTIENT_LAYOUTS,
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
@@ -2680,8 +2816,9 @@ mod quotient_layout_tests {
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
 
-    fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
-        let config = CircuitConfig::standard_recursion_config();
+    fn circuit_with_config(
+        config: CircuitConfig,
+    ) -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let mut builder = CircuitBuilder::<F, D>::new(config);
         let x = builder.add_virtual_target();
         let mut cur = x;
@@ -2695,6 +2832,10 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
+        circuit_with_config(CircuitConfig::standard_recursion_config())
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2722,11 +2863,87 @@ mod quotient_layout_tests {
         let (data, pw) = small_circuit();
         assert!(data.common.luts.is_empty());
 
-        COMPARE_QUOTIENT_LAYOUTS.store(true, Ordering::SeqCst);
+        COMPARE_QUOTIENT_LAYOUTS.with(|enabled| enabled.set(true));
         let proof = data.prove(pw);
-        COMPARE_QUOTIENT_LAYOUTS.store(false, Ordering::SeqCst);
+        COMPARE_QUOTIENT_LAYOUTS.with(|enabled| enabled.set(false));
 
         data.verify(proof?)?;
+        Ok(())
+    }
+
+    /// The ranked two-challenge writer must transpose each evaluator batch
+    /// directly into challenge-owned columns, including a short final batch.
+    /// The general writer remains point-major for every other challenge count.
+    #[test]
+    fn quotient_output_owns_columns_and_preserves_general_fallback() {
+        let points = BATCH_SIZE + 3;
+        let two_challenge_values = (0..points * 2)
+            .map(|i| F::from_noncanonical_u64(u64::MAX - (i as u64 + 17) * 13))
+            .collect::<Vec<_>>();
+        let poison = F::from_canonical_u64(0x1234_5678);
+        let mut column_0 = vec![poison; points];
+        let mut column_1 = vec![poison; points];
+        let direct = QuotientOutput {
+            point_major: core::ptr::null_mut(),
+            column_0: column_0.as_mut_ptr(),
+            column_1: column_1.as_mut_ptr(),
+            direct_columns: true,
+        };
+        direct.write_batch(0, 2, &two_challenge_values[..BATCH_SIZE * 2]);
+        direct.write_batch(
+            BATCH_SIZE,
+            2,
+            &two_challenge_values[BATCH_SIZE * 2..],
+        );
+        for i in 0..points {
+            assert_eq!(column_0[i].0, two_challenge_values[2 * i].0);
+            assert_eq!(column_1[i].0, two_challenge_values[2 * i + 1].0);
+        }
+
+        let contribution = F::from_noncanonical_u64(u64::MAX - 777);
+        let mut expected = column_1[points - 1];
+        expected += contribution;
+        direct.add_scaled(points - 1, 1, 2, contribution);
+        assert_eq!(column_1[points - 1].0, expected.0);
+
+        let num_challenges = 3usize;
+        let general_values = (0..points * num_challenges)
+            .map(|i| F::from_noncanonical_u64(u64::MAX - (i as u64 + 29) * 7))
+            .collect::<Vec<_>>();
+        let mut point_major = vec![poison; general_values.len()];
+        let general = QuotientOutput {
+            point_major: point_major.as_mut_ptr(),
+            column_0: core::ptr::null_mut(),
+            column_1: core::ptr::null_mut(),
+            direct_columns: false,
+        };
+        general.write_batch(
+            0,
+            num_challenges,
+            &general_values[..BATCH_SIZE * num_challenges],
+        );
+        general.write_batch(
+            BATCH_SIZE,
+            num_challenges,
+            &general_values[BATCH_SIZE * num_challenges..],
+        );
+        assert_eq!(
+            point_major.iter().map(|value| value.0).collect::<Vec<_>>(),
+            general_values
+                .iter()
+                .map(|value| value.0)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn quotient_general_challenge_count_proves_and_verifies() -> Result<()> {
+        let mut config = CircuitConfig::standard_recursion_config();
+        config.num_challenges = 3;
+        let (data, pw) = circuit_with_config(config);
+        assert_eq!(data.common.config.num_challenges, 3);
+        let proof = data.prove(pw)?;
+        data.verify(proof)?;
         Ok(())
     }
 

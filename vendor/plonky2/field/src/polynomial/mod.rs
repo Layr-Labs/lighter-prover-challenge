@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
     FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    ifft_with_options_and_postscale_into_chunks,
 };
 use crate::types::Field;
 
@@ -78,6 +79,24 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// Returns the retained coefficients in `chunk_size`-sized polynomials while
+    /// finalizing the coset IFFT directly into those chunks.
+    pub fn coset_ifft_with_powers_into_chunks(
+        self,
+        inverse_shift_powers: &[F],
+        retained_len: usize,
+        chunk_size: usize,
+    ) -> Result<Vec<PolynomialCoeffs<F>>> {
+        ifft_with_options_and_postscale_into_chunks(
+            self,
+            None,
+            None,
+            inverse_shift_powers,
+            retained_len,
+            chunk_size,
+        )
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -553,6 +572,75 @@ mod tests {
                     .collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn test_coset_ifft_into_chunks_matches_trim_and_split() {
+        type F = GoldilocksField;
+
+        let n = 16usize;
+        let retained_len = 11usize;
+        let chunk_size = 4usize;
+        let shift = F::coset_shift();
+        let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
+        let mut source_coeffs = vec![F::ZERO; n];
+        for (i, coefficient) in source_coeffs[..retained_len].iter_mut().enumerate() {
+            *coefficient = F::from_noncanonical_u64(
+                u64::MAX.wrapping_sub((i as u64 + 3) * 0x1234_5678),
+            );
+        }
+        let evals = PolynomialCoeffs::new(source_coeffs).coset_fft(shift);
+
+        let mut expected = evals
+            .clone()
+            .coset_ifft_with_powers(inverse_powers.as_slice());
+        expected.trim_to_len(retained_len).unwrap();
+        let expected = expected.chunks(chunk_size);
+        let actual = evals
+            .coset_ifft_with_powers_into_chunks(
+                inverse_powers.as_slice(),
+                retained_len,
+                chunk_size,
+            )
+            .unwrap();
+
+        assert_eq!(actual.len(), 3);
+        assert_eq!(actual.last().unwrap().len(), 3);
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(
+                actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected
+                    .coeffs
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // The direct finalizer must preserve the old divisibility gate instead
+        // of silently discarding a nonzero coefficient outside the retained prefix.
+        let mut nondivisible = vec![F::ZERO; n];
+        nondivisible[n - 1] = F::ONE;
+        let evals = PolynomialCoeffs::new(nondivisible).coset_fft(shift);
+        assert!(
+            evals
+                .coset_ifft_with_powers_into_chunks(
+                    inverse_powers.as_slice(),
+                    n - 1,
+                    chunk_size,
+                )
+                .is_err()
+        );
+
+        // Pin the length-one reversal/normalization corner case as well.
+        let singleton = PolynomialValues::new(vec![F::from_noncanonical_u64(u64::MAX - 9)]);
+        let expected = singleton
+            .clone()
+            .coset_ifft_with_powers(&[F::ONE]);
+        let actual = singleton
+            .coset_ifft_with_powers_into_chunks(&[F::ONE], 1, 1)
+            .unwrap();
+        assert_eq!(actual[0].coeffs[0].0, expected.coeffs[0].0);
     }
 
     #[test]
