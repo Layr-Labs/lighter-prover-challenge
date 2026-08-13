@@ -425,9 +425,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     }
     // Watch counts are a pure function of the (deduplicated) watcher lists;
     // this mirrors `read_prover_only_circuit_data`'s reconstruction.
-    let mut generator_watch_counts = vec![0usize; generator_count];
+    let mut generator_watch_counts = vec![0u32; generator_count];
     for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
+        generator_watch_counts[watcher] = generator_watch_counts[watcher]
+            .checked_add(1)
+            .context("generator distinct watch count exceeds u32")?;
     }
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 

@@ -580,8 +580,10 @@ pub struct ProverOnlyCircuitData<
     /// witness generation can seed its `unresolved_watches` counters by cloning this vector and
     /// decrementing on first population, instead of traversing the entire watcher map at the
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
-    /// and is reconstructed on deserialization, so the serialized format is unchanged.
-    pub generator_watch_counts: Vec<usize>,
+    /// and is reconstructed on deserialization, so the serialized format is unchanged. Counts
+    /// use `u32`, matching the watch index's `u32` edge/offset domain; all construction seams
+    /// reject overflow instead of truncating.
+    pub generator_watch_counts: Vec<u32>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
