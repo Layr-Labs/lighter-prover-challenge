@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -287,16 +287,45 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    // Search four witnesses per work item. Poseidon2 overrides
+    // `permute_batch_4` with its four-state interleaved permutation; other
+    // hash configurations retain the exact scalar behavior through the trait
+    // default. This preserves the set of accepted witnesses while quartering
+    // Rayon item/scheduling overhead and exposing four independent sponge
+    // states to the permutation backend.
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let pow_witness = (0..=max_candidate / 4)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .flat_map_iter(|group| {
+            let base = group * 4;
+            let candidates: [Option<u64>; 4] = core::array::from_fn(|lane| {
+                base.checked_add(lane as u64)
+                    .filter(|&candidate| candidate <= max_candidate)
+            });
+            let mut duplex_states = [duplex_intermediate_state; 4];
+            for (state, candidate) in duplex_states.iter_mut().zip(candidates) {
+                if let Some(candidate) = candidate {
+                    state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                }
+            }
+            <C::Hasher as Hasher<F>>::Permutation::permute_batch_4(&mut duplex_states);
+            candidates
+                .into_iter()
+                .enumerate()
+                .filter_map(move |(lane, candidate)| {
+                    candidate.filter(|_| {
+                        duplex_states[lane]
+                            .squeeze()
+                            .iter()
+                            .last()
+                            .unwrap()
+                            .to_canonical_u64()
+                            .leading_zeros()
+                            >= min_leading_zeros
+                    })
+                })
         })
+        .find_any(|_| true)
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");
 

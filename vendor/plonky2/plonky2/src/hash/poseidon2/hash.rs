@@ -680,11 +680,33 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
-}
 
+    fn permute_x4(
+        a: [Self; WIDTH],
+        b: [Self; WIDTH],
+        c: [Self; WIDTH],
+        d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        (
+            Self::permute(a),
+            Self::permute(b),
+            Self::permute(c),
+            Self::permute(d),
+        )
+    }
+}
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    fn permute_x4(
+        a: [Self; WIDTH],
+        b: [Self; WIDTH],
+        c: [Self; WIDTH],
+        d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        <F as Poseidon2>::poseidon2_x4(a, b, c, d)
     }
 }
 
@@ -726,6 +748,19 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    fn permute_batch_4(states: &mut [Self; 4]) {
+        let (a, b, c, d) = T::permute_x4(
+            states[0].state,
+            states[1].state,
+            states[2].state,
+            states[3].state,
+        );
+        states[0].state = a;
+        states[1].state = b;
+        states[2].state = c;
+        states[3].state = d;
     }
 
     fn squeeze(&self) -> &[T] {
@@ -1228,6 +1263,19 @@ mod pair_hash_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn permutation_batch_4_matches_four_individual_permutations() {
+        let mut batched: [Poseidon2Permutation<F>; 4] = core::array::from_fn(|lane| {
+            Poseidon2Permutation::new(
+                (0..WIDTH).map(|i| F::from_canonical_usize(lane * WIDTH + i)),
+            )
+        });
+        let mut individual = batched;
+        individual.iter_mut().for_each(PlonkyPermutation::permute);
+        Poseidon2Permutation::permute_batch_4(&mut batched);
+        assert_eq!(batched, individual);
     }
 
     #[test]
