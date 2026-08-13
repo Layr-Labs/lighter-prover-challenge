@@ -99,6 +99,32 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute two dot products whose shared extension values are first multiplied by the same
+    /// base-field twist. The default is deliberately general; concrete fields may fuse the
+    /// twist and both accumulations to avoid materializing the twisted extension vector.
+    #[doc(hidden)]
+    #[inline]
+    fn twisted_extension_base_dot_product_pair(
+        extension_values: &[Self::Extension],
+        twists: &[Self],
+        base_scalars_0: &[Self],
+        base_scalars_1: &[Self],
+    ) -> (Self::Extension, Self::Extension) {
+        let len = extension_values
+            .len()
+            .min(twists.len())
+            .min(base_scalars_0.len())
+            .min(base_scalars_1.len());
+        let mut sum_0 = Self::Extension::ZERO;
+        let mut sum_1 = Self::Extension::ZERO;
+        for i in 0..len {
+            let twisted = extension_values[i].scalar_mul(twists[i]);
+            sum_0 += twisted.scalar_mul(base_scalars_0[i]);
+            sum_1 += twisted.scalar_mul(base_scalars_1[i]);
+        }
+        (sum_0, sum_1)
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

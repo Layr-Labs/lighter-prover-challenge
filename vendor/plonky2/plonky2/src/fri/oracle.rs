@@ -751,7 +751,10 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
     } else {
         scaled.resize(len, F::ZERO);
     }
-    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+    // The parallel FFT already uses this crossover internally. Route large
+    // final-polynomial transforms there even outside the exclusive drain;
+    // keep the common d14 transform on the exact existing serial path.
+    if len >= (1 << 18) || crate::hash::poseidon2::is_exclusive_gpu_phase() {
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
     } else {
         fft_in_place_with_options(&mut scaled, zero_factor, root_table);
