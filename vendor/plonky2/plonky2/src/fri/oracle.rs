@@ -646,7 +646,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
             let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            accumulate_linear_quotient::<F, D>(&mut final_poly, &composition_poly, *point, shift);
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -773,11 +773,11 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// only dropped work is the recurrence's final step (the remainder `p(z)`,
 /// which the division discards) and the reference's `+ ZERO` on the pad
 /// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
-fn accumulate_linear_quotient<F: Field>(
-    final_poly: &mut PolynomialCoeffs<F>,
-    composition_poly: &PolynomialCoeffs<F>,
-    z: F,
-    shift: F,
+fn accumulate_linear_quotient<BF: Extendable<D>, const D: usize>(
+    final_poly: &mut PolynomialCoeffs<BF::Extension>,
+    composition_poly: &PolynomialCoeffs<BF::Extension>,
+    z: BF::Extension,
+    shift: BF::Extension,
 ) {
     let d = composition_poly.len();
     let coeffs = &composition_poly.coeffs;
@@ -787,7 +787,7 @@ fn accumulate_linear_quotient<F: Field>(
         *l *= shift;
     }
     if buf.len() < d {
-        buf.resize(d, F::ZERO);
+        buf.resize(d, BF::Extension::ZERO);
     }
     if d == 0 {
         return;
@@ -796,10 +796,10 @@ fn accumulate_linear_quotient<F: Field>(
     buf[d - 1] *= shift;
     // Synthetic division, highest coefficient first: the quotient's
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
-    let mut acc = F::ZERO;
+    let mut acc = BF::Extension::ZERO;
     for i in (0..d - 1).rev() {
-        acc = acc * z + coeffs[i + 1];
-        buf[i] = buf[i] * shift + acc;
+        acc = BF::extension_multiply_accumulate(coeffs[i + 1], acc, z);
+        buf[i] = BF::extension_multiply_accumulate(acc, buf[i], shift);
     }
 }
 
@@ -1079,10 +1079,28 @@ mod tests {
             expected_in_place += quotient_in_place;
 
             let mut actual = initial;
-            accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
+            accumulate_linear_quotient::<GoldilocksField, 2>(
+                &mut actual,
+                &composition_poly,
+                z,
+                shift,
+            );
 
-            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
-            assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+            // The two historical references stay raw-identical to each other.
+            // The fused Goldilocks path is field-equal, not raw-limb-identical:
+            // one reduce160 per limb vs mul-then-add (two reductions + an add).
+            assert_eq!(raw(&expected.coeffs), raw(&expected_in_place.coeffs));
+            assert_eq!(actual.coeffs.len(), expected.coeffs.len());
+            for (a, e) in actual.coeffs.iter().zip(&expected.coeffs) {
+                let a_c = FieldExtension::<2>::to_basefield_array(a);
+                let e_c = FieldExtension::<2>::to_basefield_array(e);
+                for limb in 0..2 {
+                    assert_eq!(
+                        a_c[limb].to_canonical_u64(),
+                        e_c[limb].to_canonical_u64(),
+                    );
+                }
+            }
         }
     }
 

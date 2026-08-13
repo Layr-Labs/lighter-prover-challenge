@@ -35,6 +35,15 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_multiply_accumulate(
+        acc: QuadraticExtension<Self>,
+        x: QuadraticExtension<Self>,
+        y: QuadraticExtension<Self>,
+    ) -> QuadraticExtension<Self> {
+        ext2_multiply_accumulate(acc, x, y)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -389,6 +398,33 @@ pub fn ext2_base_scalar_dot_slots(
             unsafe { reduce160(lo1, hi1) },
         ]);
     }
+}
+
+/// `acc + x * y` in GF(p^2) with one reduction per limb.
+/// c0 = acc0 + a0*b0 + 7*a1*b1; c1 = acc1 + a0*b1 + a1*b0.
+#[inline]
+fn ext2_multiply_accumulate(
+    acc: QuadraticExtension<GoldilocksField>,
+    x: QuadraticExtension<GoldilocksField>,
+    y: QuadraticExtension<GoldilocksField>,
+) -> QuadraticExtension<GoldilocksField> {
+    let QuadraticExtension([acc0, acc1]) = acc;
+    let QuadraticExtension([a0, a1]) = x;
+    let QuadraticExtension([b0, b1]) = y;
+    let (mut c0l, mut c0h) = (acc0.0 as u128, 0u32);
+    let (mut c0w_l, mut c0w_h) = (0u128, 0u32);
+    let (mut c1l, mut c1h) = (acc1.0 as u128, 0u32);
+    u160_add_product(&mut c0l, &mut c0h, a0.0, b0.0);
+    u160_add_product(&mut c0w_l, &mut c0w_h, a1.0, b1.0);
+    let (c0w_l, c0w_h) = u160_times_7(c0w_l, c0w_h);
+    let (c0l, carry) = c0l.overflowing_add(c0w_l);
+    let c0h = c0h + c0w_h + carry as u32;
+    u160_add_product(&mut c1l, &mut c1h, a0.0, b1.0);
+    u160_add_product(&mut c1l, &mut c1h, a1.0, b0.0);
+    QuadraticExtension([
+        unsafe { reduce160(c0l, c0h) },
+        unsafe { reduce160(c1l, c1h) },
+    ])
 }
 
 /*
@@ -897,6 +933,34 @@ mod tests {
         let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
+    }
+
+    #[test]
+    fn ext2_multiply_accumulate_matches_mul_then_add() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut elem = || QuadraticExtension([GF::from_noncanonical_u64(next()), GF::from_noncanonical_u64(next())]);
+        for _ in 0..4000 {
+            let acc = elem();
+            let x = elem();
+            let y = elem();
+            let expected: Q2 = acc + x * y;
+            let actual = <GF as Extendable<2>>::extension_multiply_accumulate(acc, x, y);
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].to_canonical_u64(),
+                    expected.0[limb].to_canonical_u64(),
+                );
+            }
+        }
+        let z = <GF as Extendable<2>>::extension_multiply_accumulate(Q2::ZERO, Q2::ZERO, Q2::ZERO);
+        assert_eq!(z.0[0].to_canonical_u64(), 0);
+        assert_eq!(z.0[1].to_canonical_u64(), 0);
     }
 
     #[test]
