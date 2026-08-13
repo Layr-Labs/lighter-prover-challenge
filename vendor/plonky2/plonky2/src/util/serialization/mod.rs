@@ -39,6 +39,10 @@ use crate::hash::merkle_tree::{MerkleCap, MerkleLeaves, MerkleTree};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::generator::WitnessGeneratorRef;
 use crate::iop::target::{BoolTarget, Target};
+use crate::iop::witness::{
+    build_wire_ifft_representative_plan, direct_wire_ifft_plan_is_requested,
+    direct_wire_ifft_shape_is_eligible,
+};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_builder::LookupWire;
 use crate::plonk::circuit_data::{
@@ -907,6 +911,22 @@ pub trait Read {
         let public_inputs = self.read_target_vec()?;
 
         let representative_map = self.read_usize_encoded_u32_vec()?;
+        let wire_ifft_representative_plan = (direct_wire_ifft_plan_is_requested()
+            && direct_wire_ifft_shape_is_eligible(
+                common_data.config.num_wires,
+                common_data.config.num_routed_wires,
+                common_data.config.num_challenges,
+                common_data.degree(),
+                !common_data.luts.is_empty(),
+            ))
+        .then(|| {
+            build_wire_ifft_representative_plan(
+                &representative_map,
+                common_data.config.num_wires,
+                common_data.degree(),
+            )
+        })
+        .flatten();
         let fixed_routed_wires = crate::plonk::permutation_argument::fixed_routed_wire_mask(
             &representative_map,
             common_data.config.num_wires,
@@ -956,6 +976,7 @@ pub trait Read {
             subgroup,
             public_inputs,
             representative_map,
+            wire_ifft_representative_plan,
             fixed_routed_wires,
             fft_root_table,
             circuit_digest,
@@ -1939,6 +1960,9 @@ pub trait Write {
             subgroup,
             public_inputs,
             representative_map,
+            // Runtime-only: reconstructed from `representative_map` on read,
+            // so it contributes no bytes and preserves the serialized format.
+            wire_ifft_representative_plan: _,
             // Runtime-only: reconstructed from `representative_map` on read, so it contributes
             // no bytes and the serialized format is unchanged.
             fixed_routed_wires: _,

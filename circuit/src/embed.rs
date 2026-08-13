@@ -38,6 +38,10 @@ use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
+use plonky2::iop::witness::{
+    build_wire_ifft_representative_plan, direct_wire_ifft_plan_is_requested,
+    direct_wire_ifft_shape_is_eligible,
+};
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
@@ -576,6 +580,23 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         }
     };
 
+    let wire_ifft_representative_plan = (direct_wire_ifft_plan_is_requested()
+        && direct_wire_ifft_shape_is_eligible(
+            common.config.num_wires,
+            common.config.num_routed_wires,
+            common.config.num_challenges,
+            common.degree(),
+            !common.luts.is_empty(),
+        ))
+    .then(|| {
+        build_wire_ifft_representative_plan(
+            &representative_map,
+            common.config.num_wires,
+            common.degree(),
+        )
+    })
+    .flatten();
+
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
         constants_sigmas_quotient_cache,
         constants_sigmas_quotient_step,
@@ -588,6 +609,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         subgroup,
         public_inputs,
         representative_map,
+        wire_ifft_representative_plan,
         fixed_routed_wires,
         fft_root_table: Some(root_table),
         circuit_digest,

@@ -10,7 +10,7 @@ use plonky2_maybe_rayon::*;
 
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
-use crate::field::fft::ifft_borrowed;
+use crate::field::fft::{ifft_borrowed, ifft_from_bit_reversed};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -23,7 +23,10 @@ use crate::hash::hash_types::RichField;
 use crate::iop::challenger::Challenger;
 use crate::iop::generator::generate_partial_witness;
 use crate::iop::target::Target;
-use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness, WitnessWrite};
+use crate::iop::witness::{
+    MatrixWitness, PartialWitness, PartitionWitness, Witness, WitnessWrite,
+    direct_wire_ifft_shape_is_eligible,
+};
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::config::{GenericConfig, Hasher};
@@ -38,6 +41,99 @@ use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_ceil};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WireDrainArm {
+    Control,
+    FullH41,
+    Hybrid,
+}
+
+#[cfg(feature = "std")]
+fn requested_wire_drain_arm() -> WireDrainArm {
+    match std::env::var("LIGHTER_H41_ARM").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("hybrid") => WireDrainArm::Hybrid,
+        Ok("control") => WireDrainArm::Control,
+        Ok("full-h41") => WireDrainArm::FullH41,
+        Ok(other) => panic!(
+            "invalid LIGHTER_H41_ARM={other:?}; expected control, full-h41, or hybrid"
+        ),
+        Err(error) => panic!("invalid LIGHTER_H41_ARM: {error}"),
+    }
+}
+
+#[cfg(not(feature = "std"))]
+fn requested_wire_drain_arm() -> WireDrainArm {
+    WireDrainArm::Control
+}
+
+fn wire_drain_arm_is_eligible<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    has_lookup: bool,
+) -> bool {
+    let config = &common_data.config;
+    direct_wire_ifft_shape_is_eligible(
+        config.num_wires,
+        config.num_routed_wires,
+        config.num_challenges,
+        common_data.degree(),
+        has_lookup,
+    )
+}
+
+/// Lifetime carrier for the production-faithful three-arm experiment.
+/// Full H41 intentionally retains Partition through the wire commitment and
+/// permutation; control and hybrid retain a Matrix instead.
+enum ProvingWitness<'a, F: Field> {
+    Matrix(MatrixWitness<F>),
+    Partition {
+        witness: PartitionWitness<'a, F>,
+        direct_plan: Option<&'a [u32]>,
+    },
+}
+
+trait WireValueSource<F: Field> {
+    fn get_wire_value(&self, row: usize, column: usize) -> F;
+}
+
+impl<F: Field> WireValueSource<F> for MatrixWitness<F> {
+    #[inline]
+    fn get_wire_value(&self, row: usize, column: usize) -> F {
+        self.get_wire(row, column)
+    }
+}
+
+impl<F: Field> WireValueSource<F> for PartitionWitness<'_, F> {
+    #[inline]
+    fn get_wire_value(&self, row: usize, column: usize) -> F {
+        let rep = self.representative_map[row * self.num_wires + column] as usize;
+        if self.is_set_by_rep_index(rep) {
+            self.values[rep]
+        } else {
+            F::ZERO
+        }
+    }
+}
+
+static H41_CONTROL_PROOFS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static H41_FULL_PROOFS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static H41_HYBRID_PROOFS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static H41_FALLBACK_PROOFS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// `(control, full_h41, hybrid, ineligible_fallback)` proof counts.
+pub fn h41_wire_drain_counts() -> (usize, usize, usize, usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (
+        H41_CONTROL_PROOFS.load(Relaxed),
+        H41_FULL_PROOFS.load(Relaxed),
+        H41_HYBRID_PROOFS.load(Relaxed),
+        H41_FALLBACK_PROOFS.load(Relaxed),
+    )
+}
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -197,11 +293,69 @@ where
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
     let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
 
-    let mut witness = timed!(
-        timing,
-        "compute full witness",
-        partition_witness.full_witness()
+    let requested_arm = requested_wire_drain_arm();
+    let eligible = wire_drain_arm_is_eligible(common_data, has_lookup);
+    let arm = if eligible {
+        requested_arm
+    } else {
+        WireDrainArm::Control
+    };
+    let direct_plan = prover_data.wire_ifft_representative_plan.as_deref();
+    let expected_plan = requested_arm == WireDrainArm::FullH41 && eligible;
+    assert_eq!(
+        direct_plan.is_some(),
+        expected_plan,
+        "H41 plan presence must exactly match the eligible full-h41 arm"
     );
+    if let Some(plan) = direct_plan {
+        assert_eq!(
+            plan.len(),
+            common_data.config.num_wires * common_data.degree(),
+            "full-H41 circuit plan length mismatch"
+        );
+    }
+    use core::sync::atomic::Ordering::Relaxed;
+    if !eligible {
+        H41_FALLBACK_PROOFS.fetch_add(1, Relaxed);
+    } else {
+        match arm {
+            WireDrainArm::Control => {
+                H41_CONTROL_PROOFS.fetch_add(1, Relaxed);
+            }
+            WireDrainArm::FullH41 => {
+                H41_FULL_PROOFS.fetch_add(1, Relaxed);
+            }
+            WireDrainArm::Hybrid => {
+                H41_HYBRID_PROOFS.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let mut hybrid_direct_inputs = None;
+    let mut witness = match arm {
+        WireDrainArm::Control => ProvingWitness::Matrix(timed!(
+            timing,
+            "compute full witness",
+            partition_witness.full_witness()
+        )),
+        WireDrainArm::FullH41 => {
+            ProvingWitness::Partition {
+                witness: partition_witness,
+                direct_plan,
+            }
+        }
+        WireDrainArm::Hybrid => {
+            let (routed_witness, direct_inputs) = timed!(
+                timing,
+                "compute routed witness and direct IFFT inputs",
+                partition_witness
+                    .routed_witness_and_direct_ifft_inputs(num_routed_wires)
+            );
+            hybrid_direct_inputs = Some(direct_inputs);
+            ProvingWitness::Matrix(routed_witness)
+        }
+    };
 
     // Only the routed columns are read again after this point (the
     // permutation argument covers wires `j < num_routed_wires`; nothing else
@@ -209,22 +363,63 @@ where
     // place; routed columns are IFFT'd from the borrowed witness column
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
-    let num_routed_wires = common_data.config.num_routed_wires;
     let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
         timing,
         "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
+        match &mut witness {
+            ProvingWitness::Matrix(witness) => match hybrid_direct_inputs.take() {
+                None => witness
+                    .wire_values
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(j, column)| {
+                        if j < num_routed_wires {
+                            ifft_borrowed(column)
+                        } else {
+                            PolynomialValues::new(core::mem::take(column)).ifft()
+                        }
+                    })
+                    .collect(),
+                Some(direct_inputs) => {
+                    debug_assert_eq!(witness.wire_values.len(), num_routed_wires);
+                    let mut coeffs: Vec<_> = witness
+                        .wire_values
+                        .par_iter()
+                        .map(|column| ifft_borrowed(column))
+                        .collect();
+                    let direct_coeffs: Vec<_> = direct_inputs
+                        .into_par_iter()
+                        .map(ifft_from_bit_reversed)
+                        .collect();
+                    coeffs.extend(direct_coeffs);
+                    coeffs
                 }
-            })
-            .collect()
+            },
+            ProvingWitness::Partition {
+                witness,
+                direct_plan,
+            } => {
+                let degree = witness.degree;
+                direct_plan
+                    .expect("full-H41 is only selectable in std production builds")
+                    .par_chunks_exact(degree)
+                    .map(|column_plan| {
+                        let buffer = column_plan
+                            .iter()
+                            .map(|&rep| {
+                                let rep = rep as usize;
+                                if witness.is_set_by_rep_index(rep) {
+                                    witness.values[rep]
+                                } else {
+                                    F::ZERO
+                                }
+                            })
+                            .collect();
+                        ifft_from_bit_reversed(buffer)
+                    })
+                    .collect()
+            }
+        }
     );
 
     let wires_commitment = timed!(
@@ -285,14 +480,24 @@ where
     let mut partial_products_and_zs = timed!(
         timing,
         "compute partial products",
-        all_wires_permutation_partial_products(
-            &witness,
-            &betas,
-            &beta_k_is,
-            &gammas,
-            prover_data,
-            common_data,
-        )
+        match &witness {
+            ProvingWitness::Matrix(witness) => all_wires_permutation_partial_products(
+                witness,
+                &betas,
+                &beta_k_is,
+                &gammas,
+                prover_data,
+                common_data,
+            ),
+            ProvingWitness::Partition { witness, .. } => all_wires_permutation_partial_products(
+                witness,
+                &betas,
+                &beta_k_is,
+                &gammas,
+                prover_data,
+                common_data,
+            ),
+        }
     );
 
     // Z is expected at the front of our batch; see `zs_range` and `partial_products_range`.
@@ -306,8 +511,15 @@ where
     zs_partial_products.extend(partial_products_and_zs.into_iter().flatten());
 
     // All lookup polys: RE and partial SLDCs.
-    let lookup_polys =
-        compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
+    let lookup_polys = match &witness {
+        ProvingWitness::Matrix(witness) => {
+            compute_all_lookup_polys(witness, &deltas, prover_data, common_data, has_lookup)
+        }
+        ProvingWitness::Partition { .. } => {
+            debug_assert!(!has_lookup);
+            Vec::new()
+        }
+    };
 
     // The permutation argument and lookup polys were the last readers of the
     // witness matrix (non-routed columns were already moved out into
@@ -521,8 +733,9 @@ fn all_wires_permutation_partial_products<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
+    W: WireValueSource<F> + Sync + ?Sized,
 >(
-    witness: &MatrixWitness<F>,
+    witness: &W,
     betas: &[F],
     beta_k_is: &[F],
     gammas: &[F],
@@ -642,8 +855,9 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
+    W: WireValueSource<F> + Sync + ?Sized,
 >(
-    witness: &MatrixWitness<F>,
+    witness: &W,
     betas: &[F],
     beta_k_is: &[F],
     gammas: &[F],
@@ -721,7 +935,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 ) {
                                     continue;
                                 }
-                                let wire_value = witness.get_wire(i, j);
+                                let wire_value = witness.get_wire_value(i, j);
                                 let sigma = s_sigmas[j];
                                 numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
                                 numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
@@ -774,8 +988,9 @@ fn wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
+    W: WireValueSource<F> + Sync + ?Sized,
 >(
-    witness: &MatrixWitness<F>,
+    witness: &W,
     beta: F,
     beta_k_is: &[F],
     gamma: F,
@@ -830,7 +1045,7 @@ fn wires_permutation_partial_products_and_zs<
                         let mut numerator_product = F::ONE;
                         let mut denominator_product = F::ONE;
                         for j in start..end {
-                            let wire_value = witness.get_wire(i, j);
+                            let wire_value = witness.get_wire_value(i, j);
                             numerator_product *= wire_value + beta_k_is[j] * x + gamma;
                             denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
                         }

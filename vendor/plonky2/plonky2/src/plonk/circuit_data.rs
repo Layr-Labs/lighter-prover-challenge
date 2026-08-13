@@ -597,6 +597,12 @@ pub struct ProverOnlyCircuitData<
     /// zero-extended at every indexing site. The serialized encoding keeps the legacy 8-byte
     /// per-entry format.
     pub representative_map: Vec<u32>,
+    /// Column-major, bit-reversed representative slots for the full-H41
+    /// direct wire IFFT. Runtime-only and reconstructed from
+    /// [`Self::representative_map`] during circuit build/deserialization.
+    /// Present only in the `full-h41` process arm for exact eligible circuits;
+    /// control, hybrid, lookup, and degree-2^18 circuits retain no plan.
+    pub wire_ifft_representative_plan: Option<Vec<u32>>,
     /// One bit per routed `(row, column)` position, in row-major order. A set bit means that the
     /// position is the sole routed member of its copy-constraint component, hence its sigma
     /// permutation target is itself and its permutation factor cancels for every proof.
