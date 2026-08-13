@@ -77,7 +77,13 @@ impl<F: Field> PolynomialValues<F> {
     /// Returns the polynomial evaluated by `self` on a coset when the caller
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
-        ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+        ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers), false)
+    }
+
+    /// Like `coset_ifft_with_powers`, but `scaled_powers[i]` must already equal
+    /// `n^-1 * coset_shift^-i` so the IFFT post-pass needs one multiply per slot.
+    pub fn coset_ifft_with_scaled_powers(self, scaled_powers: &[F]) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_postscale(self, None, None, Some(scaled_powers), true)
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
