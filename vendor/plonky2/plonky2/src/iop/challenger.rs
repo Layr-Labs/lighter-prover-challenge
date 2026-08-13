@@ -55,8 +55,24 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     }
 
     pub fn observe_elements(&mut self, elements: &[F]) {
-        for &element in elements {
-            self.observe_element(element);
+        // Same duplex points as N times `observe_element`: fill to RATE,
+        // permute, repeat. One `extend_from_slice` per fill instead of a
+        // push+length check per field element. Empty input still a no-op
+        // (does not clear `output_buffer`).
+        if elements.is_empty() {
+            return;
+        }
+        self.output_buffer.clear();
+        let mut rest = elements;
+        let rate = H::Permutation::RATE;
+        while !rest.is_empty() {
+            let space = rate - self.input_buffer.len();
+            let take = rest.len().min(space);
+            self.input_buffer.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.input_buffer.len() == rate {
+                self.duplexing();
+            }
         }
     }
 
