@@ -60,6 +60,9 @@ pub struct Circuits {
     pub light_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
+    /// Fixture-independent final circuit, built and embedded at compile time.
+    pub block_target: BlockTarget,
+    pub block_data: CircuitData<F, C, D>,
 }
 
 // Revalidate the fixed permutation-mask and release-log stack on the ranked host.
@@ -117,6 +120,15 @@ impl Circuits {
                 )
             },
         );
+        let block = BlockCircuit::define(
+            CIRCUIT_CONFIG,
+            &pre_data,
+            &light.chain_data,
+            &heavy.chain_data,
+            ON_CHAIN_OPERATIONS_LIMIT,
+        );
+        let block_target = block.target;
+        let block_data = block.builder.build::<C>();
         Self {
             heavy_tx_target: heavy.tx_target,
             heavy_tx_data: std::sync::RwLock::new(heavy.tx_data),
@@ -130,6 +142,8 @@ impl Circuits {
             light_chain_data: std::sync::RwLock::new(light.chain_data),
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
+            block_target,
+            block_data,
         }
     }
 
@@ -247,9 +261,8 @@ impl Circuits {
         }
     }
 
-    /// Builds the final block circuit, which depends on the pre-execution and
-    /// both chain circuits but is only needed for the final proof. Callers run
-    /// this concurrently with transaction/chain proving.
+    /// Rebuilds the final block circuit for explicit build-vs-embedded gates.
+    /// Production borrows the compile-time embedded `block_target`/`block_data`.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),

@@ -785,15 +785,15 @@ pub(crate) fn prove_block_after_pre(
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
+    let (light_chain_proof, heavy_chain_proof, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+            // The fixture-independent final circuit is embedded at compile
+            // time. Its immutable target/data are already loaded, so this lane
+            // starts the early witness instead of rebuilding the circuit.
             // Two-phase final-block witness (H13): this lane also runs the
             // EARLY witness phase (block data + pre-proof generators) after the
             // build, then joins the heavy path — which finishes ~30 s before
@@ -806,9 +806,8 @@ pub(crate) fn prove_block_after_pre(
             // WORK MOVED OFF THE TAIL onto an otherwise-idle lane, not new
             // parallelism: the lane sleeps in `join` until the heavy proof
             // arrives, then does 0.6 s of serial work while ~the light spine
-            // alone is running. The circuit data is leaked to hand the pending
-            // witness a 'static borrow across the thread boundary — free, the
-            // worker exits via `process::exit`.
+            // alone is running. The pending witness borrows the embedded
+            // circuit data, whose owner outlives this scope and final proof.
             let heavy_handle_outer = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -841,24 +840,16 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
-                    let (block_target, block_data) = {
-                        #[cfg(feature = "diagnostic_profile")]
-                        let _span =
-                            plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
-                    };
-                    let block_data: &'static CircuitData<F, C, D> =
-                        Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
+                        &circuits.block_target,
                         block_ref,
                         pre_proof_ref,
                     )
                     .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
                         early,
-                        &block_data.prover_only,
-                        &block_data.common,
+                        &circuits.block_data.prover_only,
+                        &circuits.block_data.common,
                     )
                     .expect("final block early witness phase failed");
                     #[cfg(feature = "diagnostic_profile")]
@@ -881,13 +872,13 @@ pub(crate) fn prove_block_after_pre(
                     pending
                         .feed(
                             BlockCircuit::witness_inputs_heavy_chain(
-                                &block_target,
+                                &circuits.block_target,
                                 &heavy_chain_proof,
                             )
                             .expect("final block heavy-chain witness inputs failed"),
                         )
                         .expect("final block heavy-chain witness feed failed");
-                    (block_target, block_data, pending, heavy_chain_proof)
+                    (pending, heavy_chain_proof)
                 })
                 .expect("block circuit build thread must start");
             let light_chunks = std::mem::take(&mut light_chunks);
@@ -912,7 +903,7 @@ pub(crate) fn prove_block_after_pre(
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
+            let (block_pending, heavy_chain_proof) =
                 block_circuit_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -936,18 +927,14 @@ pub(crate) fn prove_block_after_pre(
             (
                 light_chain_proof,
                 heavy_chain_proof,
-                block_target,
-                block_data,
                 block_pending,
             )
         })
     };
 
-    // Every circuit but the block circuit has now produced its last proof, so
-    // their preprocessed low-degree extensions are unreachable. Release them
-    // before the final block proof — the process's peak-RSS moment — stacks its
-    // own extensions on top of them.
-    circuits.release_finished_circuit_extensions();
+    // The pre extension was released after startup and the heavy/light pairs
+    // were released above, so no mutable whole-`circuits` borrow is needed
+    // while the pending witness borrows its embedded final circuit.
 
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
@@ -970,7 +957,10 @@ pub(crate) fn prove_block_after_pre(
         let _span = plonky2::util::profile::span("witness", "final_light_feed");
         block_pending
             .feed(
-                BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
+                BlockCircuit::witness_inputs_light_chain(
+                    &circuits.block_target,
+                    light_chain_input,
+                )
                     .expect("final block light-chain witness inputs failed"),
             )
             .expect("final block light-chain witness feed failed");
@@ -979,7 +969,7 @@ pub(crate) fn prove_block_after_pre(
     let final_proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "final_block_proof");
-        BlockCircuit::prove_prepared(block_pending, block_data)
+        BlockCircuit::prove_prepared(block_pending, &circuits.block_data)
             .expect("final block proof failed")
     };
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
