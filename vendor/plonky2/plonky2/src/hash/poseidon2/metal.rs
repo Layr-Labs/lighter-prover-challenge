@@ -602,11 +602,100 @@ pub fn prewarm_large_column_store(bytes: u64) {
     }
 }
 
+/// Exact-size walked buffers, published only after the page walk finishes.
+/// Distinct from [`COLUMN_STORE_POOL`]: a consumer takes a buffer iff
+/// `length() == bytes`, so a 544 MiB wires stash cannot be handed to an
+/// 86-col chain tree. Isolate marker: pool-prefill-v2-1786678000.
+static PREFILLED_EXACT: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+static PREFILL_STARTED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+const PREFILL_COLUMN_STORE_SHAPES: &[u64] = &[
+    88 * (1 << 19) * 8,
+    88 * (1 << 19) * 8,
+    136 * (1 << 19) * 8,
+    136 * (1 << 19) * 8,
+    86 * (1 << 17) * 8,
+    86 * (1 << 17) * 8,
+];
+
+fn take_exact_prefill(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREFILLED_EXACT.try_lock().ok()?;
+    let index = stash.iter().position(|buffer| buffer.length() == bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+fn page_fault_shared_buffer(buffer: &Buffer) {
+    let bytes = buffer.length();
+    let base = buffer.contents().cast::<u8>();
+    if base.is_null() {
+        return;
+    }
+    const PAGE: isize = 16 * 1024;
+    let mut offset: isize = 0;
+    while (offset as u64) < bytes {
+        // SAFETY: offset stays within the allocation. A read faults the
+        // page (kernel zeros it) without storing a new value.
+        let _ = unsafe { base.offset(offset).read_volatile() };
+        offset += PAGE;
+    }
+}
+
+fn prefill_exact_column_stores(device: &Device) {
+    for &bytes in PREFILL_COLUMN_STORE_SHAPES {
+        if bytes == 0 || bytes > MAX_CACHED_COLUMN_STORE_BYTES {
+            continue;
+        }
+        let buffer = autoreleasepool(|| {
+            device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+        });
+        page_fault_shared_buffer(&buffer);
+        if let Ok(mut stash) = PREFILLED_EXACT.lock() {
+            stash.push(buffer);
+        }
+    }
+}
+
+/// After the Metal context is fully built — never during `MetalShared::new`.
+/// v1 spawned inside `new()` and published into the best-fit pool; ranked
+/// fixture 03 then failed verification. This path starts only once
+/// `CONTEXT_READY` is published, uses a private exact-size stash, and
+/// faults pages with reads.
+fn spawn_column_store_prefill() {
+    if PREFILL_STARTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("column-store-prefill".to_owned())
+        .spawn(|| {
+            #[allow(non_camel_case_types)]
+            {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+            }
+            let Some(device) = Device::system_default() else {
+                return;
+            };
+            prefill_exact_column_stores(&device);
+        });
+}
+
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
 /// device allocation. Misses (including lock contention) fall through to the
 /// allocator; the pool is a best-effort page-warm cache, never a correctness
 /// dependency.
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
+    if let Some(buffer) = take_exact_prefill(bytes) {
+        return buffer;
+    }
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
         if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
             if let Some(buffer) = pool.take_best_fit(bytes) {
@@ -1212,6 +1301,13 @@ static CONTEXT_READY: core::sync::atomic::AtomicBool =
 fn force_context() -> &'static Result<MetalShared, String> {
     let context = &*CONTEXT;
     CONTEXT_READY.store(true, core::sync::atomic::Ordering::Release);
+    // Context is fully built. Fault the recurring column stores on E-cores
+    // so later exact-size takes do not zero-fill on the load / first-prove
+    // thread. Must not run inside `MetalShared::new` (v1 did; fixture 03
+    // failed verification).
+    if context.is_ok() {
+        spawn_column_store_prefill();
+    }
     context
 }
 
