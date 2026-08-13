@@ -592,6 +592,16 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
             .collect()
     }
 
+    fn try_extend_dependencies(&self, dst: &mut Vec<Target>) -> bool {
+        dst.extend(
+            (0..WIDTH)
+                .map(|i| Poseidon2Gate::<F, D>::wire_input(i))
+                .chain(Some(Poseidon2Gate::<F, D>::WIRE_SWAP))
+                .map(|column| Target::wire(self.row, column)),
+        );
+        true
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

@@ -281,6 +281,18 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             .collect()
     }
 
+    fn try_extend_dependencies(&self, dst: &mut Vec<Target>) -> bool {
+        dst.extend(
+            ArithmeticExtensionGate::<D>::wires_ith_multiplicand_0(self.i)
+                .chain(ArithmeticExtensionGate::<D>::wires_ith_multiplicand_1(
+                    self.i,
+                ))
+                .chain(ArithmeticExtensionGate::<D>::wires_ith_addend(self.i))
+                .map(|column| Target::wire(self.row, column)),
+        );
+        true
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

@@ -584,6 +584,11 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         vec![Target::wire(self.row, self.gate.wire_ith_input(self.i))]
     }
 
+    fn try_extend_dependencies(&self, dst: &mut Vec<Target>) -> bool {
+        dst.push(Target::wire(self.row, self.gate.wire_ith_input(self.i)));
+        true
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,

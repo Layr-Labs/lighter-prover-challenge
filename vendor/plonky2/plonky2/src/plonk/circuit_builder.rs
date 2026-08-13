@@ -1331,13 +1331,26 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let mut generator_watch_counts = vec![0usize; self.generators.len()];
         let mut generator_watch_representatives = Vec::new();
         let mut generator_representatives = Vec::new();
+        let mut generator_watches = Vec::new();
         for (i, generator) in self.generators.iter().enumerate() {
-            let watches = generator.0.watch_list();
+            generator_watches.clear();
             generator_representatives.clear();
-            generator_representatives.extend(watches.into_iter().map(|watch| {
-                let watch_index = forest.target_index(watch);
-                forest.parents[watch_index]
-            }));
+            if generator.0.try_extend_watch_list(&mut generator_watches) {
+                generator_representatives.extend(generator_watches.iter().copied().map(|watch| {
+                    let watch_index = forest.target_index(watch);
+                    forest.parents[watch_index]
+                }));
+            } else {
+                debug_assert!(generator_watches.is_empty());
+                // The one legacy Vec is consumed and dropped at the same loop boundary as before.
+                // This adds neither a copy nor a second dependency traversal for custom generators.
+                generator_representatives.extend(generator.0.watch_list().into_iter().map(
+                    |watch| {
+                        let watch_index = forest.target_index(watch);
+                        forest.parents[watch_index]
+                    },
+                ));
+            }
             generator_representatives.sort_unstable();
             generator_representatives.dedup();
             generator_watch_counts[i] = generator_representatives.len();
@@ -1350,6 +1363,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             );
         drop(generator_watch_representatives);
         drop(generator_representatives);
+        drop(generator_watches);
 
         let num_gate_constraints = gates
             .iter()

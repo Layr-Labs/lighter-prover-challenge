@@ -629,6 +629,14 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// the generator will be queued to run.
     fn watch_list(&self) -> Vec<Target>;
 
+    /// Appends the watch list directly when this generator has an allocation-free implementation.
+    /// Returning `false` must leave `dst` unchanged; callers then use [`Self::watch_list`] exactly
+    /// once as the compatibility path.
+    #[doc(hidden)]
+    fn try_extend_watch_list(&self, _dst: &mut Vec<Target>) -> bool {
+        false
+    }
+
     /// Run this generator, returning a flag indicating whether the generator is finished. If the
     /// flag is true, the generator will never be run again, otherwise it will be queued for another
     /// run next time a target in its watch list is populated.
@@ -741,6 +749,13 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
 
     fn dependencies(&self) -> Vec<Target>;
 
+    /// Appends dependencies directly when implemented. The default preserves the allocating
+    /// compatibility path without adding a second dependency traversal or scratch copy.
+    #[doc(hidden)]
+    fn try_extend_dependencies(&self, _dst: &mut Vec<Target>) -> bool {
+        false
+    }
+
     fn run_once(
         &self,
         witness: &PartitionWitness<F>,
@@ -783,6 +798,10 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
 
     fn watch_list(&self) -> Vec<Target> {
         self.inner.dependencies()
+    }
+
+    fn try_extend_watch_list(&self, dst: &mut Vec<Target>) -> bool {
+        self.inner.try_extend_dependencies(dst)
     }
 
     fn run(&self, witness: &PartitionWitness<F>, out_buffer: &mut GeneratedValues<F>) -> bool {

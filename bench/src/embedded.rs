@@ -431,4 +431,105 @@ mod tests {
             );
         }
     }
+
+    /// Exact differential for CQ's allocation-free watch-list seam. It covers every installed
+    /// final-block generator, including the allocating compatibility fallback, and reconstructs
+    /// the downstream representative counts and CSR watcher index from the retained old streams.
+    #[test]
+    #[ignore = "focused CQ watch-list and CSR differential; run explicitly and serially"]
+    fn cq_final_block_direct_watch_lists_match_retained() {
+        use std::collections::BTreeMap;
+
+        const SELECTED_IDS: [&str; 12] = [
+            "U32AddManyGenerator",
+            "U32ArithmeticGenerator",
+            "RandomAccessGenerator",
+            "Poseidon2Generator",
+            "AdditionBaseGenerator",
+            "U32InterleaveGenerator",
+            "ArithmeticExtensionGenerator",
+            "U32SubtractionGenerator",
+            "UninterleaveToU32Generator",
+            "ArithmeticBaseGenerator",
+            "RangeCheckGenerator",
+            "ReducingGenerator",
+        ];
+
+        on_big_stack(|| {
+            let circuits = Circuits::from_embedded().expect("production embedded circuits load");
+            let (_, block_data) = circuits.build_block_circuit();
+            let num_wires = block_data.common.config.num_wires;
+            let degree = block_data.common.degree();
+            let mut expected_index = BTreeMap::<usize, Vec<usize>>::new();
+            let sentinel = plonky2::iop::target::Target::VirtualTarget { index: usize::MAX };
+            let mut handled_count = 0usize;
+            let mut fallback_count = 0usize;
+
+            for (generator_index, generator) in
+                block_data.prover_only.generators.iter().enumerate()
+            {
+                let id = generator.0.id();
+                let retained = generator.0.watch_list();
+                let mut direct = vec![sentinel];
+                let handled = generator.0.try_extend_watch_list(&mut direct);
+                assert_eq!(direct[0], sentinel, "{id}: caller prefix changed");
+                assert_eq!(
+                    handled,
+                    SELECTED_IDS.contains(&id.as_str()),
+                    "{id}: selected/fallback dispatch mismatch"
+                );
+                if handled {
+                    handled_count += 1;
+                    assert_eq!(
+                        &direct[1..],
+                        retained.as_slice(),
+                        "{id}: direct Target stream differs"
+                    );
+                } else {
+                    fallback_count += 1;
+                    assert_eq!(direct, [sentinel], "{id}: false path touched scratch");
+                }
+
+                let mut representatives = retained
+                    .iter()
+                    .map(|target| {
+                        let target_index = target.index(num_wires, degree);
+                        usize::try_from(block_data.prover_only.representative_map[target_index])
+                            .expect("representative index fits usize")
+                    })
+                    .collect::<Vec<_>>();
+                representatives.sort_unstable();
+                representatives.dedup();
+                assert_eq!(
+                    representatives.len(),
+                    block_data.prover_only.generator_watch_counts[generator_index],
+                    "{id}: distinct representative count differs"
+                );
+                for representative in representatives {
+                    expected_index
+                        .entry(representative)
+                        .or_default()
+                        .push(generator_index);
+                }
+            }
+
+            let expected_index = expected_index.into_iter().collect::<Vec<_>>();
+            let actual_index = block_data
+                .prover_only
+                .generator_indices_by_watches
+                .iter()
+                .map(|(representative, generators)| (representative, generators.to_vec()))
+                .collect::<Vec<_>>();
+            assert_eq!(actual_index, expected_index, "final CSR watcher index differs");
+            assert_eq!(handled_count, 546_861, "selected instance census changed");
+            assert_eq!(fallback_count, 25_924, "fallback instance census changed");
+            println!(
+                "cq_direct_watch_oracle_pass\tgenerators={}\thandled={}\tfallback={}\tcsr_entries={}",
+                block_data.prover_only.generators.len(),
+                handled_count,
+                fallback_count,
+                actual_index.len(),
+            );
+        });
+    }
 }
