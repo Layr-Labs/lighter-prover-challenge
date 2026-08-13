@@ -233,6 +233,11 @@ fn chain_step_proof(
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
         // per-path template clone, no replay pass.
+        // Exp-34: parallel chain witness generation (phase 1 early + phase 2 cyclic).
+        // See generate_tx_witness: workers run sequentially so the pool-contention
+        // rationale for sequential witness is stale; the chain's parallel worklist
+        // rounds use otherwise-idle pool cores. Deterministic, value-identical.
+        let _parallel_chain_witness = ParallelWitnessGuard::new();
         let mut pending = PendingPartitionWitness::start_seeded(
             &chain_data.prover_only,
             &chain_data.common,
@@ -306,6 +311,15 @@ fn generate_tx_witness<'a>(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "generate_tx_witness");
+    // Exp-34: parallel witness generation. Transaction witness runs on the main
+    // path thread while the previous chunk's proof and the chain steps prove on
+    // separate threads; with ACTIVE txs (ranked fixture) witness generation is a
+    // serial main-thread cost. The harness runs ranked workers SEQUENTIALLY (one
+    // worker owns all cores), so the old "contend with the pipeline's pool" reason
+    // for forcing sequential witness is largely stale here. Opt into parallel
+    // generator rounds; the merge is deterministic so witness values (and proof
+    // bytes) are identical regardless of thread count.
+    let _parallel_tx_witness = ParallelWitnessGuard::new();
     let block_tx = BlockTx {
         created_at,
         state_metadata_hash,
