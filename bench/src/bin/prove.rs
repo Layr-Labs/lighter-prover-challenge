@@ -27,6 +27,19 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Marker: narenas4-1786713000. On the perm-inv-merge 30.560 keeper.
+// jemalloc's default `narenas` is `4 * ncpus` (~40–48 on the ranked
+// M4 Pro). Each new OS thread is assigned an arena round-robin, so
+// consecutive same-shape allocations (the pipeline's 50+ witness /
+// coefficient cycles) usually miss the previous thread's freed
+// extents. Capping to 4 matches the lanes that are ever live at
+// once (light, heavy, block, early-LDE). Allocator arena choice
+// changes no computed value. Decay periods stay at the promoted
+// default (see below) — this is not `dirty_decay_ms:0`.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 10] = b"narenas:4\0";
+
 // jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
 // mapped long enough for the next identically-shaped allocation to reuse them.
 //
