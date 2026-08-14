@@ -1994,20 +1994,48 @@ pub(crate) fn allocate_columns<F: RichField>(
     rows: usize,
     cap_height: usize,
 ) -> Option<MetalColumns<F>> {
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || cols == 0
-        || rows == 0
-        || !rows.is_power_of_two()
-        || rows > u32::MAX as usize
-        || cols > u32::MAX as usize
-        || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
-    {
+    if !columns_shape_supported::<F>(cols, rows, cap_height) {
         return None;
     }
 
     let context = ready_context_for_allocation(cols, rows)?;
+    allocate_columns_with_context(context, rows, cols)
+}
+
+/// Allocates shared columns after waiting for Metal initialization. This is
+/// reserved for restoring precomputed commitments whose downstream quotient
+/// kernels require GPU-visible constants; ordinary commitments keep using the
+/// nonblocking routing above.
+pub(crate) fn allocate_columns_blocking<F: RichField>(
+    cols: usize,
+    rows: usize,
+    cap_height: usize,
+) -> Option<MetalColumns<F>> {
+    if !columns_shape_supported::<F>(cols, rows, cap_height) {
+        return None;
+    }
+
+    let context = shared_context()?;
+    allocate_columns_with_context(context, rows, cols)
+}
+
+fn columns_shape_supported<F: RichField>(cols: usize, rows: usize, cap_height: usize) -> bool {
+    F::ORDER == 0xffff_ffff_0000_0001
+        && size_of::<F>() == size_of::<u64>()
+        && cols != 0
+        && rows != 0
+        && rows.is_power_of_two()
+        && rows <= u32::MAX as usize
+        && cols <= u32::MAX as usize
+        && cap_height <= rows.ilog2() as usize
+        && gpu_worthwhile(cols, rows, cap_height)
+}
+
+fn allocate_columns_with_context<F: RichField>(
+    context: &MetalShared,
+    rows: usize,
+    cols: usize,
+) -> Option<MetalColumns<F>> {
     match context.allocate_columns(rows, cols) {
         Ok(columns) => Some(columns),
         Err(error) => {

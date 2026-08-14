@@ -167,6 +167,18 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         None
     }
 
+    /// Allocates retained column-major leaf storage for a caller that has
+    /// already decided the columns must remain visible to the specialized
+    /// backend. Unlike the normal routing hook, implementations may wait for
+    /// backend initialization instead of deliberately selecting CPU storage.
+    fn try_allocate_merkle_tree_columns_blocking(
+        num_columns: usize,
+        num_rows: usize,
+        cap_height: usize,
+    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
+        Self::try_allocate_merkle_tree_columns(num_columns, num_rows, cap_height)
+    }
+
     /// Like [`Hasher::try_build_merkle_tree_columns`], but accepts retained
     /// column storage allocated by
     /// [`Hasher::try_allocate_merkle_tree_columns`].
