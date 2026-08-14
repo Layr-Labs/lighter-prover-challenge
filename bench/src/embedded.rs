@@ -68,7 +68,7 @@ impl RemainingEmbeddedCircuits {
     }
 }
 
-fn load_blob<T: serde::de::DeserializeOwned>(
+fn load_blob<T: serde::de::DeserializeOwned + Send>(
     name: &'static str,
     blob: &[u8],
 ) -> anyhow::Result<(T, CircuitData<F, C, D>)> {
@@ -92,35 +92,55 @@ impl Circuits {
     /// the worker startup path only; normal callers should keep using
     /// [`Self::load`].
     pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingEmbeddedCircuits> {
+        // Six independent decodes in one fan-out. The two dummy chain proofs
+        // are plain `bincode` decodes of embedded bytes with no dependency on
+        // any circuit, but they used to run serially *after* the join, i.e. at
+        // the tail of the startup critical path; they belong in the same
+        // parallel region. Each lane is headed by its transaction blob, the
+        // largest item on that side. Value-exact: identical bytes decoded by
+        // identical code, only concurrently.
         let (heavy, light) = rayon::join(
             || {
                 rayon::join(
                     || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                    || {
+                        rayon::join(
+                            || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                            || -> Proof {
+                                bincode::deserialize(include_bytes!(
+                                    "../dummy-heavy-chain-proof.bin"
+                                ))
+                                .expect("embedded heavy chain dummy proof is invalid")
+                            },
+                        )
+                    },
                 )
             },
             || {
                 rayon::join(
                     || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                    || {
+                        rayon::join(
+                            || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                            || -> Proof {
+                                bincode::deserialize(include_bytes!(
+                                    "../dummy-light-chain-proof.bin"
+                                ))
+                                .expect("embedded light chain dummy proof is invalid")
+                            },
+                        )
+                    },
                 )
             },
         );
-        let (heavy_tx, heavy_chain) = (heavy.0?, heavy.1?);
-        let (light_tx, light_chain) = (light.0?, light.1?);
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
-        let dummy_light_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
-                .expect("embedded light chain dummy proof is invalid");
+        let (heavy_tx, (heavy_chain, dummy_heavy_proof)) = heavy;
+        let (light_tx, (light_chain, dummy_light_proof)) = light;
 
         Ok(RemainingEmbeddedCircuits {
-            heavy_tx,
-            heavy_chain,
-            light_tx,
-            light_chain,
+            heavy_tx: heavy_tx?,
+            heavy_chain: heavy_chain?,
+            light_tx: light_tx?,
+            light_chain: light_chain?,
             dummy_heavy_proof,
             dummy_light_proof,
         })
