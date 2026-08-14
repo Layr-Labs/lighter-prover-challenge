@@ -130,7 +130,7 @@ where
         generate_partial_witness(inputs, prover_data, common_data)?
     );
 
-    prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
+    prove_with_partition_witness(prover_data, common_data, partition_witness, timing, None)
 }
 
 pub fn prove_with_partition_witness<
@@ -142,6 +142,7 @@ pub fn prove_with_partition_witness<
     common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
     timing: &mut TimingTree,
+    mut early_wire_lde: Option<crate::plonk::early_wire_lde::EarlyWireLde<F>>,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -210,34 +211,68 @@ where
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
     let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
+    let num_wires = witness.wire_values.len();
+    let (wires_coeffs, ready_ldes) = timed!(
         timing,
         "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
+        {
+            // Always IFFT from the finished witness (the production
+            // polynomials). Reuse an early LDE only when that IFFT matches
+            // the snapshot's coefficients bit-for-bit. 8020574 compared
+            // preimages and reused both coeffs and LDE; a mismatched LDE
+            // function then shipped a valid-looking proof that failed
+            // fixture 03.
+            let coeffs: Vec<PolynomialCoeffs<F>> = witness
+                .wire_values
+                .par_iter_mut()
+                .enumerate()
+                .map(|(j, column)| {
+                    if j < num_routed_wires {
+                        ifft_borrowed(column)
+                    } else {
+                        PolynomialValues::new(core::mem::take(column)).ifft()
+                    }
+                })
+                .collect();
+            let mut ready_ldes: Vec<Option<Vec<F>>> = vec![None; num_wires];
+            if let Some(early) = early_wire_lde.as_mut() {
+                for j in 0..num_wires {
+                    let same = matches!(
+                        (early.coeffs[j].as_ref(), coeffs.get(j)),
+                        (Some(saved), Some(now)) if saved.coeffs == now.coeffs
+                    );
+                    if same {
+                        ready_ldes[j] = early.ldes[j].take();
+                    }
                 }
-            })
-            .collect()
+            }
+            (coeffs, ready_ldes)
+        }
     );
 
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            wires_coeffs,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::WIRES.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        )
+        if ready_ldes.iter().any(Option::is_some) {
+            PolynomialBatch::<F, C, D>::from_coeffs_with_ready_ldes(
+                wires_coeffs,
+                ready_ldes,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        } else {
+            PolynomialBatch::<F, C, D>::from_coeffs(
+                wires_coeffs,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        }
     );
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
@@ -589,6 +624,34 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+/// Marker: perm-inv-merge-1786708000. The fused two-challenge path used to
+/// invert each challenge's denominators separately. One invert of the
+/// concatenation is the same inverses (Montgomery batch is elementwise) and
+/// one setup. Wrong inverse is a wrong Z — fail-closed.
+#[inline]
+fn divide_chunk_products_pair<F: Field>(
+    numerator_0: &mut [F],
+    denominator_0: &[F],
+    numerator_1: &mut [F],
+    denominator_1: &[F],
+    joined: &mut Vec<F>,
+    inverse_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(numerator_0.len(), denominator_0.len());
+    debug_assert_eq!(numerator_1.len(), denominator_1.len());
+    joined.clear();
+    joined.extend_from_slice(denominator_0);
+    joined.extend_from_slice(denominator_1);
+    F::batch_multiplicative_inverse_into(joined, inverse_scratch);
+    let n0 = denominator_0.len();
+    for (product, &inverse) in numerator_0.iter_mut().zip(&inverse_scratch[..n0]) {
+        *product *= inverse;
+    }
+    for (product, &inverse) in numerator_1.iter_mut().zip(&inverse_scratch[n0..]) {
+        *product *= inverse;
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -690,12 +753,13 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     (
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    let (denominators_0, denominators_1, joined, denominator_inverses) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
                     for (t, &x) in xs.iter().enumerate() {
@@ -747,8 +811,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    divide_chunk_products_pair(
+                        products_0,
+                        denominators_0,
+                        products_1,
+                        denominators_1,
+                        joined,
+                        denominator_inverses,
+                    );
                 },
             );
     }
@@ -898,88 +968,95 @@ fn compute_lookup_polys<
         first_lut_gate: first_lut_row,
     } in prover_data.lookup_rows.clone()
     {
-        // Set values for partial Sums and RE.
-        for row in (last_lut_row..(first_lut_row + 1)).rev() {
-            // Get combos for Sum.
-            let looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeA as usize] * looked_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looked_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looked_combos[s])
-                .collect();
-            // Get 1/(alpha - combo).
-            let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked_combos);
-
-            // Get lookup combos, used to check the well formation of the LUT.
-            let lookup_combos: Vec<F> = (0..num_lut_slots)
-                .map(|s| {
-                    let looked_inp = witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
-                    let looked_out = witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
-
-                    looked_inp + deltas[LookupChallenges::ChallengeB as usize] * looked_out
-                })
-                .collect();
-
-            // Compute next row's first value of RE.
-            // If `row == first_lut_row`, then `final_poly_vecs[0].values[row + 1] == 0`.
-            let mut new_re = final_poly_vecs[0].values[row + 1];
-            for elt in &lookup_combos {
-                new_re = new_re * deltas[LookupChallenges::ChallengeDelta as usize] + *elt
+        // Marker: lookup-inv-hoist-1786709000. On the perm-inv-merge 30.560
+        // keeper. Per-row invert of (α-combo) does not depend on the
+        // RE/Sum/LDC recurrence; one invert per table is value-identical.
+        // Prior solo draw `cbddb31` was 25.873 slow-class verify only.
+        let lut_lo = last_lut_row;
+        let lut_hi = first_lut_row + 1;
+        if lut_lo < lut_hi {
+            let n_rows = lut_hi - lut_lo;
+            let mut minus_looked = Vec::with_capacity(n_rows * num_lut_slots);
+            for row in (lut_lo..lut_hi).rev() {
+                for s in 0..num_lut_slots {
+                    let looked_inp =
+                        witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
+                    let looked_out =
+                        witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+                    let combo = looked_inp
+                        + deltas[LookupChallenges::ChallengeA as usize] * looked_out;
+                    minus_looked
+                        .push(deltas[LookupChallenges::ChallengeAlpha as usize] - combo);
+                }
             }
-            final_poly_vecs[0].values[row] = new_re;
-
-            for slot in 0..num_partial_lookups {
-                let prev = if slot != 0 {
-                    final_poly_vecs[slot].values[row]
-                } else {
-                    // If `row == first_lut_row`, then `final_poly_vecs[num_partial_lookups].values[row + 1] == 0`.
-                    final_poly_vecs[num_partial_lookups].values[row + 1]
-                };
-                let sum = (slot * max_lookup_table_degree
-                    ..min((slot + 1) * max_lookup_table_degree, num_lut_slots))
-                    .fold(prev, |acc, s| {
-                        acc + witness.get_wire(row, LookupTableGate::wire_ith_multiplicity(s))
-                            * looked_combo_inverses[s]
-                    });
-                final_poly_vecs[slot + 1].values[row] = sum;
+            let looked_combo_inverses = F::batch_multiplicative_inverse(&minus_looked);
+            for (idx, row) in (lut_lo..lut_hi).rev().enumerate() {
+                let invs = &looked_combo_inverses
+                    [idx * num_lut_slots..(idx + 1) * num_lut_slots];
+                let lookup_combos: Vec<F> = (0..num_lut_slots)
+                    .map(|s| {
+                        let looked_inp =
+                            witness.get_wire(row, LookupTableGate::wire_ith_looked_inp(s));
+                        let looked_out =
+                            witness.get_wire(row, LookupTableGate::wire_ith_looked_out(s));
+                        looked_inp
+                            + deltas[LookupChallenges::ChallengeB as usize] * looked_out
+                    })
+                    .collect();
+                let mut new_re = final_poly_vecs[0].values[row + 1];
+                for elt in &lookup_combos {
+                    new_re = new_re * deltas[LookupChallenges::ChallengeDelta as usize] + *elt
+                }
+                final_poly_vecs[0].values[row] = new_re;
+                for slot in 0..num_partial_lookups {
+                    let prev = if slot != 0 {
+                        final_poly_vecs[slot].values[row]
+                    } else {
+                        final_poly_vecs[num_partial_lookups].values[row + 1]
+                    };
+                    let sum = (slot * max_lookup_table_degree
+                        ..min((slot + 1) * max_lookup_table_degree, num_lut_slots))
+                        .fold(prev, |acc, s| {
+                            acc + witness.get_wire(
+                                row,
+                                LookupTableGate::wire_ith_multiplicity(s),
+                            ) * invs[s]
+                        });
+                    final_poly_vecs[slot + 1].values[row] = sum;
+                }
             }
         }
 
-        // Set values for partial LDCs.
-        for row in (last_lu_row..last_lut_row).rev() {
-            // Get looking combos.
-            let looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| {
+        let lu_lo = last_lu_row;
+        let lu_hi = last_lut_row;
+        if lu_lo < lu_hi {
+            let n_rows = lu_hi - lu_lo;
+            let mut minus_looking = Vec::with_capacity(n_rows * num_lu_slots);
+            for row in (lu_lo..lu_hi).rev() {
+                for s in 0..num_lu_slots {
                     let looking_in = witness.get_wire(row, LookupGate::wire_ith_looking_inp(s));
-                    let looking_out = witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
-
-                    looking_in + deltas[LookupChallenges::ChallengeA as usize] * looking_out
-                })
-                .collect();
-            // Get (alpha - combo).
-            let minus_looking_combos: Vec<F> = (0..num_lu_slots)
-                .map(|s| deltas[LookupChallenges::ChallengeAlpha as usize] - looking_combos[s])
-                .collect();
-            // Get 1 / (alpha - combo).
-            let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking_combos);
-
-            for slot in 0..num_partial_lookups {
-                let prev = if slot == 0 {
-                    // Valid at _any_ row, even `first_lu_row`.
-                    final_poly_vecs[num_partial_lookups].values[row + 1]
-                } else {
-                    final_poly_vecs[slot].values[row]
-                };
-                let sum = (slot * max_lookup_degree
-                    ..min((slot + 1) * max_lookup_degree, num_lu_slots))
-                    .fold(F::ZERO, |acc, s| acc + looking_combo_inverses[s]);
-                final_poly_vecs[slot + 1].values[row] = prev - sum;
+                    let looking_out =
+                        witness.get_wire(row, LookupGate::wire_ith_looking_out(s));
+                    let combo = looking_in
+                        + deltas[LookupChallenges::ChallengeA as usize] * looking_out;
+                    minus_looking
+                        .push(deltas[LookupChallenges::ChallengeAlpha as usize] - combo);
+                }
+            }
+            let looking_combo_inverses = F::batch_multiplicative_inverse(&minus_looking);
+            for (idx, row) in (lu_lo..lu_hi).rev().enumerate() {
+                let invs = &looking_combo_inverses[idx * num_lu_slots..(idx + 1) * num_lu_slots];
+                for slot in 0..num_partial_lookups {
+                    let prev = if slot == 0 {
+                        final_poly_vecs[num_partial_lookups].values[row + 1]
+                    } else {
+                        final_poly_vecs[slot].values[row]
+                    };
+                    let sum = (slot * max_lookup_degree
+                        ..min((slot + 1) * max_lookup_degree, num_lu_slots))
+                        .fold(F::ZERO, |acc, s| acc + invs[s]);
+                    final_poly_vecs[slot + 1].values[row] = prev - sum;
+                }
             }
         }
     }
