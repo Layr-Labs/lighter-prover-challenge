@@ -1922,6 +1922,30 @@ fn compute_quotient_polys<
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let permutation_products_offloaded = false;
 
+    // A successful permutation job already proves that this commitment owns
+    // immutable shared Metal columns. At production's step one, each quotient
+    // batch is a contiguous slice of the two Z columns, so retain those views
+    // instead of copying two 32-element tiles into Rayon scratch. The
+    // step-generic gathered representation remains the fallback below.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let direct_offloaded_zs: Option<(&[F], &[F])> =
+        if permutation_products_offloaded && step == 1 {
+            let columns = zs_partial_products_and_lookup_commitment
+                .merkle_tree
+                .shared_columns()
+                .expect("a started permutation job must retain shared Z columns");
+            let zs_range = common_data.zs_range();
+            assert_eq!(zs_range.len(), 2);
+            let z0 = columns.col(zs_range.start);
+            let z1 = columns.col(zs_range.start + 1);
+            assert!(z0.len() >= lde_size && z1.len() >= lde_size);
+            Some((&z0[..lde_size], &z1[..lde_size]))
+        } else {
+            None
+        };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let direct_offloaded_zs: Option<(&[F], &[F])> = None;
+
     let permutation_gate_scales = if permutation_products_offloaded {
         let prefix_len = num_challenges * (common_data.num_partial_products + 2);
         alphas
@@ -2197,7 +2221,12 @@ fn compute_quotient_polys<
                 // keeps the full-width PointMajor gathers and row views.
                 let (batch_layout, zs_local_range, zs_next_range) = if col_major_perm {
                     if permutation_products_offloaded {
-                        (BatchLayout::PolyMajor, common_data.zs_range(), 0..0)
+                        let local_range = if direct_offloaded_zs.is_some() {
+                            0..0
+                        } else {
+                            common_data.zs_range()
+                        };
+                        (BatchLayout::PolyMajor, local_range, 0..0)
                     } else {
                         (
                             BatchLayout::PolyMajor,
@@ -2287,7 +2316,16 @@ fn compute_quotient_polys<
                     (Vec::new(), Vec::new())
                 };
 
-                let perm = if col_major_perm {
+                let perm = if let Some((z0, z1)) = direct_offloaded_zs {
+                    let batch_end = cache_start
+                        .checked_add(n)
+                        .expect("quotient batch range overflow");
+                    assert!(batch_end <= z0.len() && batch_end <= z1.len());
+                    PermutationBatch::OffloadedZs {
+                        z0: &z0[cache_start..batch_end],
+                        z1: &z1[cache_start..batch_end],
+                    }
+                } else if col_major_perm {
                     PermutationBatch::Cols {
                         zs_partial_products_cols: &scratch.zs_local_flat,
                         zs_next_cols: &scratch.zs_next_flat,

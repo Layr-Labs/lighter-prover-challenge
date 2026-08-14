@@ -187,7 +187,7 @@ pub(crate) struct VanishingScratch<F> {
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
-/// of two layouts.
+/// of three representations.
 ///
 /// `Rows` carries per-point slices (entry `k` is the row for point `k`) cut out
 /// of point-major gather buffers; it is required whenever the circuit has
@@ -215,6 +215,65 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
         s_sigmas_cols: &'a [F],
     },
+    /// The only two CPU-owned rows left after the Metal permutation-product
+    /// job starts. These are direct views into the immutable retained Z
+    /// columns; unlike `Cols`, no per-batch gather backs them.
+    OffloadedZs {
+        z0: &'a [F],
+        z1: &'a [F],
+    },
+}
+
+#[inline]
+fn offloaded_z_columns<'a, F>(perm: PermutationBatch<'a, F>, n: usize) -> (&'a [F], &'a [F]) {
+    match perm {
+        PermutationBatch::OffloadedZs { z0, z1 } => {
+            assert_eq!(z0.len(), n);
+            assert_eq!(z1.len(), n);
+            (z0, z1)
+        }
+        PermutationBatch::Cols {
+            zs_partial_products_cols,
+            ..
+        } => {
+            assert!(zs_partial_products_cols.len() >= 2 * n);
+            (
+                &zs_partial_products_cols[..n],
+                &zs_partial_products_cols[n..2 * n],
+            )
+        }
+        PermutationBatch::Rows { .. } => {
+            unreachable!("Metal permutation offload requires column-major inputs")
+        }
+    }
+}
+
+#[inline(always)]
+fn eval_offloaded_permutation_tail<F: RichField, L: FnMut(usize) -> F>(
+    n: usize,
+    num_challenges: usize,
+    perm: PermutationBatch<'_, F>,
+    alphas: &[F],
+    permutation_gate_scales: &[F],
+    res_out: &mut [F],
+    mut l_0_at: L,
+) {
+    let (z0, z1) = offloaded_z_columns(perm, n);
+    assert_eq!(permutation_gate_scales.len(), num_challenges);
+    for k in 0..n {
+        let l_0_x = l_0_at(k);
+        let z1_0 = l_0_x * z0[k].sub_one();
+        let z1_1 = l_0_x * z1[k].sub_one();
+        let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+        for ((&alpha, &gate_scale), value) in alphas
+            .iter()
+            .zip(permutation_gate_scales)
+            .zip(point.iter_mut())
+        {
+            let gate_terms = *value * gate_scale;
+            *value = z1_0 + z1_1 * alpha + gate_terms;
+        }
+    }
 }
 
 const INTERLEAVE_PAIR_WIRES: usize = 136;
@@ -597,14 +656,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
-        let PermutationBatch::Cols {
-            zs_partial_products_cols,
-            ..
-        } = perm
-        else {
-            unreachable!("Metal permutation offload requires column-major inputs")
-        };
-        assert!(zs_partial_products_cols.len() >= num_challenges * n);
+        assert_eq!(num_challenges, 2);
         // Global constraint order is
         //   [z1_0, z1_1, partial(0,0..chunks), partial(1,0..chunks), gates...].
         // The Metal job emits only the partial rows at their powers 2..P-1.
@@ -612,21 +664,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // inexpensive L_0 rows here. This deletes every routed-wire/sigma/
         // partial-product traversal from the CPU without moving a transcript
         // barrier or changing an alpha exponent.
-        assert_eq!(permutation_gate_scales.len(), num_challenges);
-        for k in 0..n {
-            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-            let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-            let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
-            let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-            for ((&alpha, &gate_scale), value) in alphas
-                .iter()
-                .zip(permutation_gate_scales)
-                .zip(point.iter_mut())
-            {
-                let gate_terms = *value * gate_scale;
-                *value = z1_0 + z1_1 * alpha + gate_terms;
-            }
-        }
+        eval_offloaded_permutation_tail(
+            n,
+            num_challenges,
+            perm,
+            alphas,
+            permutation_gate_scales,
+            res_out,
+            |k| z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]),
+        );
         return;
     }
 
@@ -1727,9 +1773,114 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
+    use plonky2_field::types::{Field64, PrimeField64};
 
     use super::*;
+
+    fn raw_test_limb(i: usize, salt: u64) -> GoldilocksField {
+        let raw = match i % 8 {
+            0 => GoldilocksField::ORDER,
+            1 => GoldilocksField::ORDER + 1,
+            2 => u64::MAX,
+            _ => (i as u64)
+                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                .rotate_left((i % 63) as u32)
+                .wrapping_add(salt),
+        };
+        GoldilocksField::from_noncanonical_u64(raw)
+    }
+
+    #[test]
+    fn direct_offloaded_z_views_match_gathered_evaluator_output_raw() {
+        type F = GoldilocksField;
+
+        for n in [1usize, 31, 32] {
+            let z0 = (0..n).map(|i| raw_test_limb(i, 0x10)).collect::<Vec<_>>();
+            let z1 = (0..n)
+                .map(|i| raw_test_limb(i + 3, 0x20))
+                .collect::<Vec<_>>();
+            let l_0s = (0..n)
+                .map(|i| raw_test_limb(i + 5, 0x30))
+                .collect::<Vec<_>>();
+            let alphas = [raw_test_limb(6, 0x40), raw_test_limb(7, 0x50)];
+            let gate_scales = [raw_test_limb(3, 0x60), raw_test_limb(4, 0x70)];
+            let gate_prefix = (0..2 * n)
+                .map(|i| raw_test_limb(i + 1, 0x80))
+                .collect::<Vec<_>>();
+            let mut gathered = z0.clone();
+            gathered.extend_from_slice(&z1);
+
+            let raw_inputs = z0
+                .iter()
+                .chain(&z1)
+                .chain(&l_0s)
+                .chain(&alphas)
+                .chain(&gate_scales)
+                .chain(&gate_prefix)
+                .map(|v| v.to_noncanonical_u64())
+                .collect::<Vec<_>>();
+            assert!(raw_inputs.contains(&F::ORDER));
+            assert!(raw_inputs.contains(&(F::ORDER + 1)));
+            assert!(raw_inputs.contains(&u64::MAX));
+            assert!(raw_inputs.iter().any(|&v| {
+                v != F::ORDER && v != F::ORDER + 1 && v != u64::MAX
+            }));
+
+            let mut direct = gate_prefix.clone();
+            eval_offloaded_permutation_tail(
+                n,
+                2,
+                PermutationBatch::OffloadedZs { z0: &z0, z1: &z1 },
+                &alphas,
+                &gate_scales,
+                &mut direct,
+                |k| l_0s[k],
+            );
+            let mut gathered_output = gate_prefix.clone();
+            eval_offloaded_permutation_tail(
+                n,
+                2,
+                PermutationBatch::Cols {
+                    zs_partial_products_cols: &gathered,
+                    zs_next_cols: &[],
+                    s_sigmas_cols: &[],
+                },
+                &alphas,
+                &gate_scales,
+                &mut gathered_output,
+                |k| l_0s[k],
+            );
+
+            // Independent generic gathered-column successor oracle.
+            let mut expected = gate_prefix.clone();
+            for k in 0..n {
+                let z1_0 = l_0s[k] * gathered[k].sub_one();
+                let z1_1 = l_0s[k] * gathered[n + k].sub_one();
+                for challenge in 0..2 {
+                    expected[2 * k + challenge] = z1_0
+                        + z1_1 * alphas[challenge]
+                        + gate_prefix[2 * k + challenge] * gate_scales[challenge];
+                }
+            }
+
+            let raw = |values: &[F]| {
+                values
+                    .iter()
+                    .map(|v| v.to_noncanonical_u64())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(raw(&direct), raw(&gathered_output));
+            assert_eq!(raw(&direct), raw(&expected));
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn direct_offloaded_z_views_reject_wrong_batch_length() {
+        let z0 = [GoldilocksField::ONE; 2];
+        let z1 = [GoldilocksField::ONE; 1];
+        let _ = offloaded_z_columns(PermutationBatch::OffloadedZs { z0: &z0, z1: &z1 }, 2);
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
