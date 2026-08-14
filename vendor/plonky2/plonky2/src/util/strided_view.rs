@@ -83,6 +83,42 @@ impl<'a, P: PackedField> PackedStridedView<'a, P> {
         }
     }
 
+    /// Constructs a view whose invariants were established by an owning
+    /// checked batch. This is deliberately crate-private: arbitrary callers
+    /// must use [`Self::new`].
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee all of the following:
+    /// - `stride >= P::WIDTH`;
+    /// - `data.len() % stride == 0`;
+    /// - `offset + P::WIDTH <= stride`; and
+    /// - `length == data.len() / stride`.
+    ///
+    /// The borrowed `data` argument lifetime-brands the returned raw pointer.
+    #[inline(always)]
+    pub(crate) unsafe fn new_derived(
+        data: &'a [P::Scalar],
+        stride: usize,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        debug_assert!(stride >= P::WIDTH);
+        debug_assert_eq!(data.len() % stride, 0);
+        debug_assert!(offset + P::WIDTH <= stride);
+        debug_assert_eq!(length, data.len() / stride);
+
+        Self {
+            // Keep the checked constructor's empty-slice behavior: `offset`
+            // may be nonzero even when `data` is empty, and the pointer is
+            // never dereferenced because `length == 0`.
+            start_ptr: data.as_ptr().wrapping_add(offset),
+            length,
+            stride,
+            _phantom: PhantomData,
+        }
+    }
+
     #[inline]
     pub const fn get(&self, index: usize) -> Option<&'a P> {
         if index < self.length {
