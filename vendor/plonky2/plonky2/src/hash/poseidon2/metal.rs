@@ -1267,6 +1267,48 @@ pub fn prewarm() {
                 }
             }
             let _ = force_context();
+            // The first transaction wires commitment needs a recurring
+            // 136-column x 2^19-row shared store (544 MiB). It is below the
+            // column-pool cap, so page-fault it during startup and publish it
+            // to the existing best-fit pool before proving reaches the first
+            // allocation. The LDE fill overwrites every live word before read.
+            #[allow(non_camel_case_types)]
+            {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                unsafe {
+                    // QOS_CLASS_UTILITY: prefer E-cores for the page walk after
+                    // the user-initiated Metal compiler work has completed.
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+            }
+            const TX_WIRES_STORE_BYTES: u64 = 136 * (1 << 19) * 8;
+            if let Some(context) = shared_context() {
+                let buffer = autoreleasepool(|| {
+                    context.device.new_buffer(
+                        TX_WIRES_STORE_BYTES,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                });
+                let base = buffer.contents().cast::<u8>();
+                if !base.is_null() {
+                    const PAGE: isize = 16 * 1024;
+                    let mut offset: isize = 0;
+                    while (offset as u64) < TX_WIRES_STORE_BYTES {
+                        // SAFETY: offset stays within the allocated length.
+                        unsafe { base.offset(offset).write_volatile(0) };
+                        offset += PAGE;
+                    }
+                    if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
+                        pool.recycle(buffer);
+                    }
+                }
+            }
         })
         .ok();
 }
