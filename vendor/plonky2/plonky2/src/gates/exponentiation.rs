@@ -243,11 +243,55 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
 
         // Rewrite `bit * base + (1 - bit)` as `1 + bit * (base - 1)`.
         // Besides deleting one packed subtraction per bit, this exposes the
-        // existing AArch64 multiply-accumulate specialization. Evaluate two
+        // existing AArch64 multiply-accumulate specialization. Evaluate eight
         // independent transitions at a time to increase instruction-level
-        // parallelism without changing constraint emission order.
+        // parallelism without changing arithmetic or constraint emission
+        // order. The production gate has 67 transitions, so the scalar tail
+        // below retains the last three after eight eight-wide groups.
         let base_minus_one = base - P::ONES;
         let mut i = 0;
+        while i + 7 < self.num_power_bits {
+            let prev_0 = if i == 0 {
+                P::ONES
+            } else {
+                intermediate_values[i - 1].square()
+            };
+            let prev_1 = intermediate_values[i].square();
+            let prev_2 = intermediate_values[i + 1].square();
+            let prev_3 = intermediate_values[i + 2].square();
+            let prev_4 = intermediate_values[i + 3].square();
+            let prev_5 = intermediate_values[i + 4].square();
+            let prev_6 = intermediate_values[i + 5].square();
+            let prev_7 = intermediate_values[i + 6].square();
+
+            // power_bits is in LE order, but we accumulate in BE order.
+            let bit_0 = power_bits[self.num_power_bits - i - 1];
+            let bit_1 = power_bits[self.num_power_bits - i - 2];
+            let bit_2 = power_bits[self.num_power_bits - i - 3];
+            let bit_3 = power_bits[self.num_power_bits - i - 4];
+            let bit_4 = power_bits[self.num_power_bits - i - 5];
+            let bit_5 = power_bits[self.num_power_bits - i - 6];
+            let bit_6 = power_bits[self.num_power_bits - i - 7];
+            let bit_7 = power_bits[self.num_power_bits - i - 8];
+            let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
+            let mul_by_1 = P::ONES.multiply_accumulate(bit_1, base_minus_one);
+            let mul_by_2 = P::ONES.multiply_accumulate(bit_2, base_minus_one);
+            let mul_by_3 = P::ONES.multiply_accumulate(bit_3, base_minus_one);
+            let mul_by_4 = P::ONES.multiply_accumulate(bit_4, base_minus_one);
+            let mul_by_5 = P::ONES.multiply_accumulate(bit_5, base_minus_one);
+            let mul_by_6 = P::ONES.multiply_accumulate(bit_6, base_minus_one);
+            let mul_by_7 = P::ONES.multiply_accumulate(bit_7, base_minus_one);
+
+            yield_constr.one(prev_0 * mul_by_0 - intermediate_values[i]);
+            yield_constr.one(prev_1 * mul_by_1 - intermediate_values[i + 1]);
+            yield_constr.one(prev_2 * mul_by_2 - intermediate_values[i + 2]);
+            yield_constr.one(prev_3 * mul_by_3 - intermediate_values[i + 3]);
+            yield_constr.one(prev_4 * mul_by_4 - intermediate_values[i + 4]);
+            yield_constr.one(prev_5 * mul_by_5 - intermediate_values[i + 5]);
+            yield_constr.one(prev_6 * mul_by_6 - intermediate_values[i + 6]);
+            yield_constr.one(prev_7 * mul_by_7 - intermediate_values[i + 7]);
+            i += 8;
+        }
         while i + 1 < self.num_power_bits {
             let prev_0 = if i == 0 {
                 P::ONES
