@@ -41,8 +41,33 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
+//
+// Arena count: the worker spawns one short-lived scoped thread per chunk
+// proof and per chain step (100+ per block, 500+ per worker), each recycling
+// the same witness/coefficient allocation shapes. With jemalloc's default
+// arena count near four times the CPU count, successive threads land in
+// different arenas and miss the extents the previous thread just freed.
+// `narenas:4` keeps the rotating thread->arena assignment dense so a freed
+// extent is reused by one of the next few threads instead of being split and
+// decayed. This changes allocator placement only; sizes, lifetimes, byte
+// contents, and computed values are untouched.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static std::os::raw::c_char> = Some(unsafe {
+    #[allow(dead_code)]
+    union U {
+        x: &'static [u8],
+        y: &'static std::os::raw::c_char,
+    }
+    U {
+        x: b"narenas:4\0",
+    }
+    .y
+});
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 58 * 1024 * 1024;
 
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
@@ -252,6 +277,6 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// arithmetic-on-promoted-frontier-1786506400
+// arithmetic-on-promoted-frontier-1786579200
 
-// p90-fire-top1-50-1786515495
+// p-stack-v93-n81-1
