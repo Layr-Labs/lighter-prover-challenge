@@ -3815,3 +3815,73 @@ mod tests {
     }
 
 }
+
+#[cfg(test)]
+mod roofline_bench {
+    //! How close is the NEON butterfly kernel to the hardware floor?
+    //!
+    //! The CPU decomposition attributes `41.5%` of prover compute to FFT, and
+    //! `75%` of that to two NEON kernels. Before attempting to make them
+    //! faster, this measures achieved cycles per butterfly against what the
+    //! instruction mix can possibly reach, so the remaining headroom is a
+    //! number rather than a guess.
+    //!
+    //! `cargo test --release --lib fft::roofline_bench -- --ignored --nocapture`
+    use std::time::Instant;
+
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::polynomial::PolynomialCoeffs;
+    use crate::types::{Field, Sample};
+
+    #[test]
+    #[ignore = "manual focused FFT roofline measurement"]
+    fn benchmark_fft_butterfly_roofline() {
+        // Production wire commitment: degree 2^16 coset-LDE'd to 2^19.
+        for (log_degree, rate_bits) in [(16usize, 3usize), (14, 3)] {
+            let degree = 1usize << log_degree;
+            let log_lde = log_degree + rate_bits;
+            let coeffs: Vec<GoldilocksField> =
+                (0..degree).map(|_| GoldilocksField::rand()).collect();
+
+            let once = || {
+                let p = PolynomialCoeffs::new(coeffs.clone());
+                let start = Instant::now();
+                let out = p.lde(rate_bits).coset_fft_with_options(
+                    GoldilocksField::coset_shift(),
+                    Some(rate_bits),
+                    None,
+                );
+                let e = start.elapsed();
+                core::hint::black_box(&out);
+                e
+            };
+            once();
+            let mut s: Vec<_> = (0..7).map(|_| once()).collect();
+            s.sort_unstable();
+            let med = s[s.len() / 2];
+
+            // A radix-2 FFT of size N has (N/2) * log2(N) butterflies. The
+            // zero-padded prefix lets the first `rate_bits` layers be skipped
+            // or cheapened, so this count is an upper bound and the derived
+            // cycles/butterfly is therefore a lower bound.
+            let n = 1u64 << log_lde;
+            let butterflies = (n / 2) * log_lde as u64;
+            let ns = med.as_secs_f64() * 1e9;
+            let ns_per = ns / butterflies as f64;
+            // M1 Pro P-core sustained clock.
+            let cycles_per = ns_per * 3.2;
+            eprintln!(
+                "degree 2^{log_degree} -> LDE 2^{log_lde}, single thread:\n  \
+                 {:.3} ms   {:>12} butterflies   {ns_per:.3} ns/butterfly   \
+                 {cycles_per:.2} cycles/butterfly",
+                ns / 1e6,
+                butterflies,
+            );
+        }
+        eprintln!(
+            "\n  Floor: a Goldilocks butterfly is ~1 mul (mul+umulh) + 128->64 reduction\n  \
+             + one add and one sub each with epsilon correction, plus 2 loads and 2 stores\n  \
+             ~= 16 uops. At 4-wide issue that is ~4 cycles/butterfly."
+        );
+    }
+}

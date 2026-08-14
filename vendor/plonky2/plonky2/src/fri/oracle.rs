@@ -29,11 +29,28 @@ use crate::util::{log2_strict, reverse_bits};
 pub const SALT_SIZE: usize = 4;
 
 /// Route the whole commitment (NTT + hashing) through the GPU backend.
-/// Official ranked A/B: submission 644c4257 (this on, over the 8.0011
-/// frontier) scored 6.2323 despite a +4.6% controlled local win — the NTT
-/// stages extend each tree's exclusive occupancy of the serialized GPU
-/// stream, which is the ranked critical path. Keep off; hashing-only GPU
-/// trees (`new_columns`) remain on.
+///
+/// Keep off. The *reason* recorded here was re-derived on 2026-08-13 because
+/// the original citation did not survive scrutiny.
+///
+/// The prior justification was official submission 644c4257, which scored
+/// 6.2323 against an 8.0011 frontier. That evidence is statistically void: its
+/// 55-minute window held 28 submissions from many solvers spanning
+/// 5.487-7.972 (45.3% spread, sigma 0.856); 6.2323 sits -0.75 sigma from the
+/// window median with 29% of contemporaries scoring lower, and the same
+/// solver's next submission 23 minutes later scored 7.7236 (+23.9%). One draw
+/// in that band cannot separate a mechanism from noise.
+///
+/// A same-binary local A/B on the #145 pipeline settles it properly. Protected
+/// B-C-C-B, trusted verifier passing on every run, control drift 0.190 s:
+/// control 39.404/39.214 s (mean 39.309), candidate 44.614/41.775 s (mean
+/// 43.194) -- candidate +9.88% runtime, both pairings lost (+13.22%, +6.53%).
+///
+/// The originally stated *mechanism* is therefore correct even though its
+/// evidence was not: the NTT stages extend each tree's exclusive occupancy of
+/// the serialized GPU stream. Today's streamed path already overlaps CPU FFT
+/// with GPU hashing into max(FFT, hash), so moving the NTT onto that stream
+/// lengthens the critical path instead of shortening it.
 const GPU_NTT_COMMITMENTS: bool = false;
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].

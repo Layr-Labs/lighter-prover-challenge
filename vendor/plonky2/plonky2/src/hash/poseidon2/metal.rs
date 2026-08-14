@@ -5824,6 +5824,225 @@ kernel void goldilocks_mul_bench_native(
             gpu_duration(&command_buffer, start.elapsed())
         }
 
+        /// Identical tree to `run_merkle`, but every parent level is encoded
+        /// into a *single* compute command encoder instead of one encoder per
+        /// level. A compute encoder defaults to `MTLDispatchTypeSerial`, so
+        /// consecutive dispatches in it are ordered and memory-coherent with
+        /// no explicit barrier — the same guarantee the per-level encoders
+        /// provide. If the measured per-level floor is an encoder cost rather
+        /// than a dispatch cost, this removes it from every level at once.
+        fn run_merkle_single_encoder(
+            &self,
+            leaf_pipeline: &ComputePipelineState,
+            parent_pipeline: &ComputePipelineState,
+            input: &Buffer,
+            output: &Buffer,
+            leaf_width: usize,
+            leaf_count: usize,
+            cap_height: usize,
+        ) -> Duration {
+            let start = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let leaf_encoder = command_buffer.new_compute_command_encoder();
+                leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
+                leaf_encoder.set_buffer(0, Some(input), 0);
+                leaf_encoder.set_buffer(1, Some(output), 0);
+                leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(leaf_encoder, 3, leaf_width as u32);
+                set_u32(leaf_encoder, 4, leaf_count as u32);
+                dispatch(leaf_encoder, leaf_pipeline, leaf_count);
+                leaf_encoder.end_encoding();
+
+                let cap_count = 1usize << cap_height;
+                let parent_encoder = command_buffer.new_compute_command_encoder();
+                parent_encoder.set_compute_pipeline_state(parent_pipeline);
+                parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                let mut level_offset = 0usize;
+                let mut child_count = leaf_count;
+                while child_count > cap_count {
+                    let parent_count = child_count / 2;
+                    let child_offset = level_offset;
+                    level_offset += child_count * 4;
+                    parent_encoder.set_buffer(
+                        0,
+                        Some(output),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(
+                        1,
+                        Some(output),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(parent_encoder, 3, parent_count as u32);
+                    dispatch(parent_encoder, parent_pipeline, parent_count);
+                    child_count = parent_count;
+                }
+                parent_encoder.end_encoding();
+
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed,
+                "single-encoder Merkle build failed with status {:?}",
+                command_buffer.status()
+            );
+            gpu_duration(&command_buffer, start.elapsed())
+        }
+
+        /// `run_merkle` truncated after `max_parent_levels` parent levels, in a
+        /// single command buffer exactly like production. Timing a sweep of
+        /// prefixes and differencing gives each level's true marginal cost --
+        /// kernel plus its encoder barrier -- without the per-command-buffer
+        /// floor that separate submission would add to every level.
+        fn run_merkle_prefix(
+            &self,
+            leaf_pipeline: &ComputePipelineState,
+            parent_pipeline: &ComputePipelineState,
+            input: &Buffer,
+            output: &Buffer,
+            leaf_width: usize,
+            leaf_count: usize,
+            cap_height: usize,
+            max_parent_levels: usize,
+        ) -> Duration {
+            let start = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let leaf_encoder = command_buffer.new_compute_command_encoder();
+                leaf_encoder.set_compute_pipeline_state(leaf_pipeline);
+                leaf_encoder.set_buffer(0, Some(input), 0);
+                leaf_encoder.set_buffer(1, Some(output), 0);
+                leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(leaf_encoder, 3, leaf_width as u32);
+                set_u32(leaf_encoder, 4, leaf_count as u32);
+                dispatch(leaf_encoder, leaf_pipeline, leaf_count);
+                leaf_encoder.end_encoding();
+
+                let cap_count = 1usize << cap_height;
+                let mut level_offset = 0usize;
+                let mut child_count = leaf_count;
+                let mut emitted = 0usize;
+                while child_count > cap_count && emitted < max_parent_levels {
+                    let parent_count = child_count / 2;
+                    let child_offset = level_offset;
+                    level_offset += child_count * 4;
+                    let parent_encoder = command_buffer.new_compute_command_encoder();
+                    parent_encoder.set_compute_pipeline_state(parent_pipeline);
+                    parent_encoder.set_buffer(
+                        0,
+                        Some(output),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(
+                        1,
+                        Some(output),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent_encoder.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(parent_encoder, 3, parent_count as u32);
+                    dispatch(parent_encoder, parent_pipeline, parent_count);
+                    parent_encoder.end_encoding();
+                    child_count = parent_count;
+                    emitted += 1;
+                }
+
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed,
+                "prefix Merkle build failed with status {:?}",
+                command_buffer.status()
+            );
+            gpu_duration(&command_buffer, start.elapsed())
+        }
+
+        /// Same tree as `run_merkle`, but each stage is submitted in its own
+        /// command buffer so its GPU time can be read individually. Returns
+        /// `(leaf, [parent levels, widest first])`.
+        ///
+        /// Separate submission adds per-command-buffer overhead that the fused
+        /// path does not pay, so the caller must compare the split total
+        /// against `run_merkle` before trusting the absolute numbers. The
+        /// *shares* are what this is for.
+        fn run_merkle_split(
+            &self,
+            leaf_pipeline: &ComputePipelineState,
+            parent_pipeline: &ComputePipelineState,
+            input: &Buffer,
+            output: &Buffer,
+            leaf_width: usize,
+            leaf_count: usize,
+            cap_height: usize,
+        ) -> (Duration, Vec<(usize, Duration)>) {
+            let submit = |encode: &mut dyn FnMut(&metal::CommandBufferRef)| -> Duration {
+                let start = Instant::now();
+                let command_buffer = autoreleasepool(|| {
+                    let command_buffer = self.queue.new_command_buffer();
+                    encode(command_buffer);
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                });
+                command_buffer.wait_until_completed();
+                assert_eq!(
+                    command_buffer.status(),
+                    MTLCommandBufferStatus::Completed,
+                    "split Merkle stage failed with status {:?}",
+                    command_buffer.status()
+                );
+                gpu_duration(&command_buffer, start.elapsed())
+            };
+
+            let leaf = submit(&mut |command_buffer| {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(leaf_pipeline);
+                encoder.set_buffer(0, Some(input), 0);
+                encoder.set_buffer(1, Some(output), 0);
+                encoder.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(encoder, 3, leaf_width as u32);
+                set_u32(encoder, 4, leaf_count as u32);
+                dispatch(encoder, leaf_pipeline, leaf_count);
+                encoder.end_encoding();
+            });
+
+            let cap_count = 1usize << cap_height;
+            let mut levels = Vec::new();
+            let mut level_offset = 0usize;
+            let mut child_count = leaf_count;
+            while child_count > cap_count {
+                let parent_count = child_count / 2;
+                let child_offset = level_offset;
+                level_offset += child_count * 4;
+                let elapsed = submit(&mut |command_buffer| {
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    encoder.set_compute_pipeline_state(parent_pipeline);
+                    encoder.set_buffer(
+                        0,
+                        Some(output),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    encoder.set_buffer(
+                        1,
+                        Some(output),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    encoder.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(encoder, 3, parent_count as u32);
+                    dispatch(encoder, parent_pipeline, parent_count);
+                    encoder.end_encoding();
+                });
+                levels.push((parent_count, elapsed));
+                child_count = parent_count;
+            }
+            (leaf, levels)
+        }
+
         fn run_merkle(
             &self,
             leaf_pipeline: &ComputePipelineState,
@@ -6104,6 +6323,348 @@ kernel void goldilocks_mul_bench_native(
              speedup={:.3}x",
             native_median.as_secs_f64() / limb_median.as_secs_f64()
         );
+    }
+
+    /// Decomposes the Merkle tree build by dispatch so the ceiling on
+    /// leaf/first-parent fusion can be read before any kernel is written.
+    ///
+    /// The public constraint map attributes `9.73 s` of the `18.56 s` GPU
+    /// kernel budget to Merkle work, but not how that splits between the leaf
+    /// level and the parent cascade. Fusing the leaf hash with the first
+    /// parent level deletes one complete digest write-then-read round trip;
+    /// the size of that prize is bounded by what the first parent level
+    /// actually costs.
+    /// Head-to-head at production shapes: parallel CPU coset-LDE per column
+    /// versus the GPU NTT path, for the same commitment.
+    ///
+    /// The CPU profile attributes `41.5%` of compute to FFT/NTT while the GPU
+    /// sits about half idle, so the routing question is the largest one on the
+    /// board. The single prior attempt to move LDE work to the GPU tested one
+    /// degree-14 wire commitment inside an exclusive phase and lost at
+    /// `+3.14%`; this sweeps the real shapes instead.
+    ///
+    /// `build_from_coeffs` performs NTT **and** the Merkle build, so the
+    /// Merkle component is estimated from the separately measured
+    /// `~11.2 ns/hash` and subtracted to isolate the NTT comparison. Both the
+    /// combined and isolated numbers are reported.
+    #[test]
+    #[ignore = "manual focused CPU-LDE versus GPU-NTT routing benchmark"]
+    fn benchmark_cpu_lde_versus_gpu_ntt() {
+        use crate::field::polynomial::PolynomialCoeffs;
+        use plonky2_maybe_rayon::*;
+
+        let context = match CONTEXT.as_ref() {
+            Ok(context) => context,
+            Err(_) => return,
+        };
+        let cap_height = 4usize;
+        let rate_bits = 3usize;
+        // Production wire commitments: 136 columns over degree-14 and
+        // degree-16 shapes. Degree 18 needs 2.3 GiB of coefficients and is
+        // omitted here.
+        for (log_degree, cols) in [(14usize, 136usize), (16, 136)] {
+            let degree = 1usize << log_degree;
+            let lde_size = degree << rate_bits;
+            let mut rng = StdRng::seed_from_u64(0x4c44_454e_5454_0001);
+            let coeffs: Vec<Vec<GoldilocksField>> = (0..cols)
+                .map(|_| {
+                    (0..degree)
+                        .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
+                        .collect()
+                })
+                .collect();
+            let coeff_refs: Vec<&[GoldilocksField]> =
+                coeffs.iter().map(|c| c.as_slice()).collect();
+
+            let cpu_once = || {
+                let start = Instant::now();
+                let out: Vec<Vec<GoldilocksField>> = coeffs
+                    .par_iter()
+                    .map(|c| {
+                        PolynomialCoeffs::new(c.clone())
+                            .lde(rate_bits)
+                            .coset_fft_with_options(
+                                GoldilocksField::coset_shift(),
+                                Some(rate_bits),
+                                None,
+                            )
+                            .values
+                    })
+                    .collect();
+                let elapsed = start.elapsed();
+                core::hint::black_box(&out);
+                elapsed
+            };
+            let gpu_once = || {
+                let start = Instant::now();
+                let built = context
+                    .build_from_coeffs(&coeff_refs, degree, rate_bits, cap_height)
+                    .expect("gpu ntt commitment");
+                let elapsed = start.elapsed();
+                core::hint::black_box(&built);
+                elapsed
+            };
+
+            cpu_once();
+            gpu_once();
+            let mut cpu = Vec::with_capacity(5);
+            let mut gpu = Vec::with_capacity(5);
+            for sample in 0..5 {
+                if sample & 1 == 0 {
+                    cpu.push(cpu_once());
+                    gpu.push(gpu_once());
+                } else {
+                    gpu.push(gpu_once());
+                    cpu.push(cpu_once());
+                }
+            }
+            cpu.sort_unstable();
+            gpu.sort_unstable();
+            let cpu_median = cpu[cpu.len() / 2].as_secs_f64() * 1e3;
+            let gpu_median = gpu[gpu.len() / 2].as_secs_f64() * 1e3;
+            // Merkle: lde_size leaves plus the parent cascade down to the cap,
+            // at the separately measured ~11.2 ns per Poseidon2 permutation.
+            let cap_count = 1usize << cap_height;
+            let hashes = lde_size + (lde_size.saturating_sub(cap_count));
+            let merkle_ms = hashes as f64 * 11.2 / 1e6;
+            let gpu_ntt_only = gpu_median - merkle_ms;
+
+            eprintln!(
+                "degree 2^{log_degree} x {cols} cols (LDE 2^{}):\n  \
+                 CPU coset-LDE (rayon)      {cpu_median:>8.2} ms\n  \
+                 GPU build_from_coeffs      {gpu_median:>8.2} ms  (NTT + Merkle)\n  \
+                 estimated Merkle component {merkle_ms:>8.2} ms  ({hashes} hashes @ 11.2 ns)\n  \
+                 => GPU NTT alone          ~{gpu_ntt_only:>8.2} ms   vs CPU {cpu_median:.2} ms  \
+                 => {:.3}x",
+                lde_size.trailing_zeros(),
+                cpu_median / gpu_ntt_only,
+            );
+            eprintln!("  cpu samples {cpu:?}\n  gpu samples {gpu:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual focused Metal Merkle dispatch decomposition"]
+    fn benchmark_metal_merkle_dispatch_split() {
+        let leaf_count = 1usize << 19;
+        let leaf_width = 8usize;
+        let cap_height = 4usize;
+        let cap_count = 1usize << cap_height;
+        let total_node_count = 2 * leaf_count - cap_count;
+        let mut rng = StdRng::seed_from_u64(0x4d45_524b_5350_4c54);
+        let inputs: Vec<u64> = (0..leaf_count * leaf_width)
+            .map(|_| rng.next_u64() % GoldilocksField::ORDER)
+            .collect();
+        let harness = PoseidonBenchmarkHarness::new();
+        let input = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                inputs.as_ptr().cast::<c_void>(),
+                size_of_val(inputs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let output = autoreleasepool(|| {
+            harness.device.new_buffer(
+                (total_node_count * 4 * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+
+        let split = || {
+            harness.run_merkle_split(
+                &harness.limb_leaf,
+                &harness.limb,
+                &input,
+                &output,
+                leaf_width,
+                leaf_count,
+                cap_height,
+            )
+        };
+        let fused = || {
+            harness.run_merkle(
+                &harness.limb_leaf,
+                &harness.limb,
+                &input,
+                &output,
+                leaf_width,
+                leaf_count,
+                cap_height,
+            )
+        };
+        split();
+        fused();
+
+        // Median of five per stage, so one scheduling hiccup cannot dominate.
+        const SAMPLES: usize = 5;
+        let mut leaf_samples = Vec::with_capacity(SAMPLES);
+        let mut level_samples: Vec<Vec<Duration>> = Vec::new();
+        let mut fused_samples = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let (leaf, levels) = split();
+            leaf_samples.push(leaf);
+            if level_samples.is_empty() {
+                level_samples = vec![Vec::with_capacity(SAMPLES); levels.len()];
+            }
+            for (slot, (_, elapsed)) in level_samples.iter_mut().zip(levels.iter()) {
+                slot.push(*elapsed);
+            }
+            fused_samples.push(fused());
+        }
+        let median = |mut v: Vec<Duration>| {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let leaf = median(leaf_samples);
+        let fused_total = median(fused_samples);
+        let (_, level_shape) = split();
+        let levels: Vec<(usize, Duration)> = level_shape
+            .iter()
+            .zip(level_samples)
+            .map(|((count, _), samples)| (*count, median(samples)))
+            .collect();
+
+        let parents_total: Duration = levels.iter().map(|(_, d)| *d).sum();
+        let split_total = leaf + parents_total;
+        let ns = |d: Duration| d.as_secs_f64() * 1e9;
+
+        eprintln!("Metal Merkle 2^19x8 dispatch split (median of {SAMPLES}):");
+        eprintln!(
+            "  leaf   {:>9} hashes  {:>9.1} us  {:>5.1}% of split",
+            leaf_count,
+            ns(leaf) / 1e3,
+            ns(leaf) / ns(split_total) * 100.0
+        );
+        for (count, elapsed) in &levels {
+            eprintln!(
+                "  parent {count:>9} hashes  {:>9.1} us  {:>5.1}% of split",
+                ns(*elapsed) / 1e3,
+                ns(*elapsed) / ns(split_total) * 100.0
+            );
+        }
+        eprintln!(
+            "  parents total          {:>9.1} us  {:>5.1}% of split",
+            ns(parents_total) / 1e3,
+            ns(parents_total) / ns(split_total) * 100.0
+        );
+        eprintln!(
+            "  split total {:.1} us vs fused {:.1} us -> per-submission overhead {:.1} us over {} stages",
+            ns(split_total) / 1e3,
+            ns(fused_total) / 1e3,
+            (ns(split_total) - ns(fused_total)) / 1e3,
+            levels.len() + 1,
+        );
+        eprintln!(
+            "  NOTE: the ~100 us floor on small levels is the per-command-buffer cost, which\n  \
+             separate submission pays 16 times and production pays once. Marginal costs below."
+        );
+
+        // Production shape: one command buffer, prefixes of increasing depth.
+        // Differencing gives each level's real marginal cost, kernel plus its
+        // encoder barrier.
+        let level_count = levels.len();
+        let prefix = |k: usize| {
+            harness.run_merkle_prefix(
+                &harness.limb_leaf,
+                &harness.limb,
+                &input,
+                &output,
+                leaf_width,
+                leaf_count,
+                cap_height,
+                k,
+            )
+        };
+        for k in 0..=level_count {
+            let _ = prefix(k);
+        }
+        let mut cumulative = Vec::with_capacity(level_count + 1);
+        for k in 0..=level_count {
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                samples.push(prefix(k));
+            }
+            cumulative.push(median(samples));
+        }
+
+        eprintln!("\nMarginal cost per level in one command buffer (production shape):");
+        eprintln!(
+            "  leaf only                        {:>9.1} us",
+            ns(cumulative[0]) / 1e3
+        );
+        let mut tail_total = 0.0;
+        for k in 1..=level_count {
+            let marginal = ns(cumulative[k]) - ns(cumulative[k - 1]);
+            let count = levels[k - 1].0;
+            if count <= 4096 {
+                tail_total += marginal;
+            }
+            eprintln!(
+                "  + parent {count:>9} hashes      {:>9.1} us marginal   (cumulative {:.1} us)",
+                marginal / 1e3,
+                ns(cumulative[k]) / 1e3
+            );
+        }
+        let full = ns(cumulative[level_count]);
+        eprintln!(
+            "\n  full tree {:.1} us; leaf is {:.1}% of it",
+            full / 1e3,
+            ns(cumulative[0]) / full * 100.0
+        );
+        let first_parent = ns(cumulative[1]) - ns(cumulative[0]);
+        eprintln!(
+            "  CEILING leaf + first-parent fusion: at most {:.1} us = {:.2}% of the tree",
+            first_parent / 1e3,
+            first_parent / full * 100.0
+        );
+        eprintln!(
+            "  CEILING collapsing all <=4096-hash tail levels: at most {:.1} us = {:.2}% of the tree",
+            tail_total / 1e3,
+            tail_total / full * 100.0
+        );
+
+        // Is the per-level floor an encoder cost or a dispatch cost? One
+        // encoder holding every parent dispatch answers it, with no kernel
+        // change and no explicit barrier.
+        let one_encoder = || {
+            harness.run_merkle_single_encoder(
+                &harness.limb_leaf,
+                &harness.limb,
+                &input,
+                &output,
+                leaf_width,
+                leaf_count,
+                cap_height,
+            )
+        };
+        one_encoder();
+        fused();
+        let mut single = Vec::with_capacity(7);
+        let mut per_level = Vec::with_capacity(7);
+        for sample in 0..7 {
+            if sample & 1 == 0 {
+                single.push(one_encoder());
+                per_level.push(fused());
+            } else {
+                per_level.push(fused());
+                single.push(one_encoder());
+            }
+        }
+        let single_median = median(single.clone());
+        let per_level_median = median(per_level.clone());
+        eprintln!(
+            "\nEncoder-reuse probe, same binary, median of 7 alternating:\n  \
+             one encoder for all parents {:>9.1} us\n  \
+             one encoder per level       {:>9.1} us\n  \
+             delta {:.1} us = {:.2}% of the tree, speedup {:.4}x",
+            ns(single_median) / 1e3,
+            ns(per_level_median) / 1e3,
+            (ns(per_level_median) - ns(single_median)) / 1e3,
+            (ns(per_level_median) - ns(single_median)) / ns(per_level_median) * 100.0,
+            ns(per_level_median) / ns(single_median),
+        );
+        eprintln!("  one-encoder samples: {single:?}");
+        eprintln!("  per-level samples:   {per_level:?}");
     }
 
     #[test]

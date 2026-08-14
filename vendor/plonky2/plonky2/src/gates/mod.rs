@@ -29,6 +29,8 @@ pub mod arithmetic_extension;
 pub mod base_sum;
 pub mod constant;
 pub mod coset_interpolation;
+#[cfg(test)]
+mod cpu_survivor_bench;
 pub mod equality_base;
 pub mod exponentiation;
 pub mod gate;
