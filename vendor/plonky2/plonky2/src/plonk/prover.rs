@@ -130,7 +130,7 @@ where
         generate_partial_witness(inputs, prover_data, common_data)?
     );
 
-    prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
+    prove_with_partition_witness(prover_data, common_data, partition_witness, timing, None)
 }
 
 pub fn prove_with_partition_witness<
@@ -142,6 +142,7 @@ pub fn prove_with_partition_witness<
     common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
     timing: &mut TimingTree,
+    mut early_wire_lde: Option<crate::plonk::early_wire_lde::EarlyWireLde<F>>,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -210,34 +211,68 @@ where
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
     let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
+    let num_wires = witness.wire_values.len();
+    let (wires_coeffs, ready_ldes) = timed!(
         timing,
         "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
+        {
+            // Always IFFT from the finished witness (the production
+            // polynomials). Reuse an early LDE only when that IFFT matches
+            // the snapshot's coefficients bit-for-bit. 8020574 compared
+            // preimages and reused both coeffs and LDE; a mismatched LDE
+            // function then shipped a valid-looking proof that failed
+            // fixture 03.
+            let coeffs: Vec<PolynomialCoeffs<F>> = witness
+                .wire_values
+                .par_iter_mut()
+                .enumerate()
+                .map(|(j, column)| {
+                    if j < num_routed_wires {
+                        ifft_borrowed(column)
+                    } else {
+                        PolynomialValues::new(core::mem::take(column)).ifft()
+                    }
+                })
+                .collect();
+            let mut ready_ldes: Vec<Option<Vec<F>>> = vec![None; num_wires];
+            if let Some(early) = early_wire_lde.as_mut() {
+                for j in 0..num_wires {
+                    let same = matches!(
+                        (early.coeffs[j].as_ref(), coeffs.get(j)),
+                        (Some(saved), Some(now)) if saved.coeffs == now.coeffs
+                    );
+                    if same {
+                        ready_ldes[j] = early.ldes[j].take();
+                    }
                 }
-            })
-            .collect()
+            }
+            (coeffs, ready_ldes)
+        }
     );
 
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            wires_coeffs,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::WIRES.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        )
+        if ready_ldes.iter().any(Option::is_some) {
+            PolynomialBatch::<F, C, D>::from_coeffs_with_ready_ldes(
+                wires_coeffs,
+                ready_ldes,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        } else {
+            PolynomialBatch::<F, C, D>::from_coeffs(
+                wires_coeffs,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        }
     );
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
@@ -589,6 +624,34 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+/// Marker: perm-inv-merge-1786708000. The fused two-challenge path used to
+/// invert each challenge's denominators separately. One invert of the
+/// concatenation is the same inverses (Montgomery batch is elementwise) and
+/// one setup. Wrong inverse is a wrong Z — fail-closed.
+#[inline]
+fn divide_chunk_products_pair<F: Field>(
+    numerator_0: &mut [F],
+    denominator_0: &[F],
+    numerator_1: &mut [F],
+    denominator_1: &[F],
+    joined: &mut Vec<F>,
+    inverse_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(numerator_0.len(), denominator_0.len());
+    debug_assert_eq!(numerator_1.len(), denominator_1.len());
+    joined.clear();
+    joined.extend_from_slice(denominator_0);
+    joined.extend_from_slice(denominator_1);
+    F::batch_multiplicative_inverse_into(joined, inverse_scratch);
+    let n0 = denominator_0.len();
+    for (product, &inverse) in numerator_0.iter_mut().zip(&inverse_scratch[..n0]) {
+        *product *= inverse;
+    }
+    for (product, &inverse) in numerator_1.iter_mut().zip(&inverse_scratch[n0..]) {
+        *product *= inverse;
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -690,12 +753,13 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     (
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    let (denominators_0, denominators_1, joined, denominator_inverses) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
                     for (t, &x) in xs.iter().enumerate() {
@@ -747,8 +811,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    divide_chunk_products_pair(
+                        products_0,
+                        denominators_0,
+                        products_1,
+                        denominators_1,
+                        joined,
+                        denominator_inverses,
+                    );
                 },
             );
     }
@@ -2346,12 +2416,17 @@ fn compute_quotient_polys<
             },
         );
 
+    // Marker: fuse-gpu-quot-1786715000. On the perm-inv-merge 30.560
+    // keeper. Finish GPU quotient jobs into owned buffers and add them
+    // during the challenge-column scatter instead of a separate pass
+    // over `quotient_values`. Same `cpu + gpu * Z_H^{-1}` per cell.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let poseidon_gpu_values: Option<&[F]> = if let Some((_, job)) = &gpu_poseidon {
+        match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                debug_assert_eq!(values.len(), quotient_values.len());
+                Some(values)
             }
             Err(error) => {
                 GPU_POSEIDON_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2378,26 +2453,20 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let poseidon_gpu_values: Option<&[F]> = None;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let range_gpu_values: Option<&[F]> = if let Some((_, job)) = &gpu_range {
+        match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                values
+                debug_assert_eq!(values.len(), quotient_values.len());
+                Some(values)
             }
             Err(error) => {
                 GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2427,24 +2496,20 @@ fn compute_quotient_polys<
                 job.mark_cpu_recompute_completed_for_tests();
                 return result;
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let range_gpu_values: Option<&[F]> = None;
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
-            Ok(values) => values,
+    let perm_gpu_values: Option<&[F]> = if let Some(job) = &gpu_permutation {
+        match job.finish() {
+            Ok(values) => {
+                debug_assert_eq!(values.len(), quotient_values.len());
+                Some(values)
+            }
             Err(error) => {
                 log::warn!(
                     "Metal permutation quotient failed; recomputing quotient on CPU: {error}"
@@ -2464,19 +2529,12 @@ fn compute_quotient_polys<
                     false,
                 );
             }
-        };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let perm_gpu_values: Option<&[F]> = None;
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
     // Parallel scatter of the interleaved point-major buffer into the
@@ -2504,15 +2562,38 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
+    let poseidon_gpu = poseidon_gpu_values.as_deref();
+    let range_gpu = range_gpu_values.as_deref();
+    let perm_gpu = perm_gpu_values.as_deref();
+    let fuse_gpu = poseidon_gpu.is_some() || range_gpu.is_some() || perm_gpu.is_some();
     quotient_values
         .par_chunks(BATCH_SIZE * num_challenges)
         .enumerate()
         .for_each(|(chunk_i, chunk)| {
             let base = BATCH_SIZE * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                let i = base + k;
+                let inv = if fuse_gpu {
+                    z_h_on_coset.eval_inverse(i)
+                } else {
+                    F::ONE
+                };
+                for (c, (column, &cpu)) in column_ptrs.iter().zip(point_values).enumerate() {
+                    let mut value = cpu;
+                    if fuse_gpu {
+                        let slot = i * num_challenges + c;
+                        if let Some(gpu) = poseidon_gpu {
+                            value += gpu[slot] * inv;
+                        }
+                        if let Some(gpu) = range_gpu {
+                            value += gpu[slot] * inv;
+                        }
+                        if let Some(gpu) = perm_gpu {
+                            value += gpu[slot] * inv;
+                        }
+                    }
+                    // SAFETY: `i` lies in this chunk's disjoint range.
+                    unsafe { *column.0.add(i) = value };
                 }
             }
         });
