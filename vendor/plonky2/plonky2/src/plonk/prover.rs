@@ -130,7 +130,7 @@ where
         generate_partial_witness(inputs, prover_data, common_data)?
     );
 
-    prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
+    prove_with_partition_witness(prover_data, common_data, partition_witness, timing, None)
 }
 
 pub fn prove_with_partition_witness<
@@ -142,6 +142,7 @@ pub fn prove_with_partition_witness<
     common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
     timing: &mut TimingTree,
+    mut early_wire_lde: Option<crate::plonk::early_wire_lde::EarlyWireLde<F>>,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -210,34 +211,80 @@ where
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
     let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
+    let num_wires = witness.wire_values.len();
+    let (wires_coeffs, ready_ldes) = timed!(
         timing,
         "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
+        {
+            let mut ready_ldes: Vec<Option<Vec<F>>> = vec![None; num_wires];
+            let mut reused = 0usize;
+            if let Some(early) = early_wire_lde.as_mut() {
+                for j in 0..num_wires {
+                    if let (Some(pre), Some(_c), Some(_lde)) = (
+                        early.preimages[j].as_ref(),
+                        early.coeffs[j].as_ref(),
+                        early.ldes[j].as_ref(),
+                    ) {
+                        if pre.as_slice() == witness.wire_values[j].as_slice() {
+                            reused += 1;
+                            continue;
+                        }
+                        early.preimages[j] = None;
+                        early.coeffs[j] = None;
+                        early.ldes[j] = None;
+                    }
                 }
-            })
-            .collect()
+                let _ = reused;
+            }
+            let coeffs: Vec<PolynomialCoeffs<F>> = witness
+                .wire_values
+                .par_iter_mut()
+                .enumerate()
+                .map(|(j, column)| {
+                    if let Some(early) = early_wire_lde.as_ref() {
+                        if let Some(c) = early.coeffs.get(j).and_then(|c| c.as_ref()) {
+                            return c.clone();
+                        }
+                    }
+                    if j < num_routed_wires {
+                        ifft_borrowed(column)
+                    } else {
+                        PolynomialValues::new(core::mem::take(column)).ifft()
+                    }
+                })
+                .collect();
+            if let Some(early) = early_wire_lde.as_mut() {
+                for j in 0..num_wires {
+                    ready_ldes[j] = early.ldes[j].take();
+                }
+            }
+            (coeffs, ready_ldes)
+        }
     );
 
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            wires_coeffs,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::WIRES.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        )
+        if ready_ldes.iter().any(Option::is_some) {
+            PolynomialBatch::<F, C, D>::from_coeffs_with_ready_ldes(
+                wires_coeffs,
+                ready_ldes,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        } else {
+            PolynomialBatch::<F, C, D>::from_coeffs(
+                wires_coeffs,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        }
     );
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
