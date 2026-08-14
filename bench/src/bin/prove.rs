@@ -255,3 +255,5 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+
+// pow-quad-opening controlled redraw 3, 2026-08-14
