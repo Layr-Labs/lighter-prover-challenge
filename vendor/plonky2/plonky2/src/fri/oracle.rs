@@ -684,9 +684,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail(
+            coset_fft_zero_tail_cached_base::<F, D>(
                 &lde_final_poly,
-                F::coset_shift().into(),
                 live_coeffs,
                 Some(fri_params.config.rate_bits),
                 None,
@@ -709,6 +708,52 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
         fri_proof
     }
+}
+
+
+/// Prove-openings final FFT: the shift is always the base coset generator
+/// lifted (`F::coset_shift().into() = (g, 0)`). Scale the live prefix with
+/// the process-cached base `g^i` table (already built by every LDE) and
+/// `scalar_mul` instead of a serial extension `powers()` chain.
+///
+/// Bit-identical to `coset_fft_zero_tail(..., (g, 0), ...)`: `(g, 0)^i`
+/// is `(g^i, 0)`, and `ext2_mul((g^i, 0), c)` with `a1 = 0` is
+/// `reduce160(g^i * c_k, 0)` per limb, which is the same reduction as
+/// `reduce128(g^i * c_k)` that `scalar_mul` uses. Not an IFFT postscale
+/// fuse and not `fft_dispatch` (not 8496397 / 4db249a).
+fn coset_fft_zero_tail_cached_base<F: RichField + Extendable<D>, const D: usize>(
+    coeffs: &PolynomialCoeffs<F::Extension>,
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F::Extension>>,
+) -> PolynomialValues<F::Extension> {
+    use crate::field::extension::FieldExtension;
+    let len = coeffs.len();
+    debug_assert!(live <= len);
+    let zero_tail_is_unread =
+        matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
+    debug_assert!(zero_tail_is_unread || coeffs.coeffs[live..].iter().all(F::Extension::is_zero));
+    let base_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(live);
+    debug_assert_eq!(base_powers.len(), live);
+    let mut scaled = Vec::with_capacity(len);
+    scaled.extend(
+        coeffs.coeffs[..live]
+            .iter()
+            .zip(base_powers.iter())
+            .map(|(&c, &p)| c.scalar_mul(p)),
+    );
+    if zero_tail_is_unread {
+        // SAFETY: same unread-tail invariant as `coset_fft_zero_tail`.
+        unsafe { scaled.set_len(len) };
+    } else {
+        scaled.resize(len, F::Extension::ZERO);
+    }
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
+    } else {
+        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
 }
 
 /// `coeffs.coset_fft_with_options(shift, zero_factor, root_table)` for a
