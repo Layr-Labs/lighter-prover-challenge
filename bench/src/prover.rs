@@ -89,6 +89,7 @@ fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
         == TX_LIGHT
 }
 
+#[cfg(test)]
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
@@ -785,7 +786,7 @@ pub(crate) fn prove_block_after_pre(
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
+    let (light_chain_proof, block_target, block_data, block_pending) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
@@ -887,7 +888,10 @@ pub(crate) fn prove_block_after_pre(
                             .expect("final block heavy-chain witness inputs failed"),
                         )
                         .expect("final block heavy-chain witness feed failed");
-                    (block_target, block_data, pending, heavy_chain_proof)
+                    // `feed` copied every proof target into owned partition storage.
+                    // Release the source proof while the long light spine is still running.
+                    drop(heavy_chain_proof);
+                    (block_target, block_data, pending)
                 })
                 .expect("block circuit build thread must start");
             let light_chunks = std::mem::take(&mut light_chunks);
@@ -912,10 +916,9 @@ pub(crate) fn prove_block_after_pre(
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
-                block_circuit_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let (block_target, block_data, block_pending) = block_circuit_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             #[cfg(feature = "diagnostic_profile")]
             drop(_block_lane_wait);
             #[cfg(feature = "diagnostic_profile")]
@@ -933,13 +936,7 @@ pub(crate) fn prove_block_after_pre(
             // immediately — instead of holding them through the final witness
             // setup until the backstop below.
             circuits.release_light_circuit_extensions();
-            (
-                light_chain_proof,
-                heavy_chain_proof,
-                block_target,
-                block_data,
-                block_pending,
-            )
+            (light_chain_proof, block_target, block_data, block_pending)
         })
     };
 
@@ -954,8 +951,6 @@ pub(crate) fn prove_block_after_pre(
         plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "final_block_tail");
-    let (light_chain_input, heavy_chain_input) =
-        final_chain_inputs(&light_chain_proof, &heavy_chain_proof);
     // The final block witness runs on the serial tail with nothing else proving, so it alone
     // opts into parallel worklist rounds; tx-proof and chain witness generation run concurrently
     // with proving and stay sequential.
@@ -970,12 +965,14 @@ pub(crate) fn prove_block_after_pre(
         let _span = plonky2::util::profile::span("witness", "final_light_feed");
         block_pending
             .feed(
-                BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
+                BlockCircuit::witness_inputs_light_chain(&block_target, &light_chain_proof)
                     .expect("final block light-chain witness inputs failed"),
             )
             .expect("final block light-chain witness feed failed");
     }
-    let _ = heavy_chain_input;
+    // The pending witness owns all light-proof target values; free the source
+    // allocation graph before final-block proving reaches its memory peak.
+    drop(light_chain_proof);
     let final_proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "final_block_proof");
