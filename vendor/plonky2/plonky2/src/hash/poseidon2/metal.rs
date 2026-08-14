@@ -551,12 +551,49 @@ impl ColumnStorePool {
 
     fn recycle(&mut self, buffer: Buffer) {
         let bytes = buffer.length();
-        if bytes <= MAX_CACHED_COLUMN_STORE_BYTES
-            && self.total_bytes + bytes <= MAX_COLUMN_STORE_POOL_BYTES
-        {
-            self.total_bytes += bytes;
-            self.free.push(buffer);
+        if bytes > MAX_CACHED_COLUMN_STORE_BYTES {
+            return;
         }
+        // Size-priority admission. A larger free buffer can service any smaller
+        // request via [`Self::take_best_fit`], but a smaller buffer cannot
+        // service a larger request. When the pool is at capacity and the
+        // incoming buffer is larger than the smallest cached one, evict the
+        // smallest free buffer(s) to make room — biasing the cache toward the
+        // largest reusable shapes, which maximises the steady-state hit rate
+        // for the big recurring tx-wires/commitment stores. Total bytes never
+        // exceeds the cap: every iteration removes at least one byte before the
+        // matching admission, and we stop (dropping the incoming) as soon as
+        // the smallest cached buffer is already at least as large as it, since
+        // evicting an equal-or-larger buffer to cache a smaller one would only
+        // reduce the cache's service range. Scheduling/memory only: which free
+        // buffer is retained changes no computed value (every retained buffer is
+        // fully rewritten before any read — see the struct invariant).
+        while self.total_bytes + bytes > MAX_COLUMN_STORE_POOL_BYTES {
+            let Some((index, length)) = self
+                .free
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (i, b.length()))
+                .min_by_key(|(_, length)| *length)
+            else {
+                // `free` is empty, so `total_bytes` is 0; the only way the loop
+                // condition held is `bytes > cap`, impossible under the per-buffer
+                // cap above. Defensive: drop rather than over-commit.
+                return;
+            };
+            if length >= bytes {
+                return;
+            }
+            self.total_bytes -= length;
+            self.free.swap_remove(index);
+        }
+        self.total_bytes += bytes;
+        self.free.push(buffer);
+        debug_assert_eq!(
+            self.total_bytes,
+            self.free.iter().map(|b| b.length()).sum::<u64>(),
+            "column-store pool byte accounting drifted"
+        );
     }
 }
 

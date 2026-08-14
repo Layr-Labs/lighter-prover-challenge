@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -24,7 +24,7 @@ use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
-use plonky2::iop::witness::{PartitionWitness, Witness};
+use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
@@ -81,6 +81,39 @@ fn light_tx_proof_window() -> usize {
 }
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+
+/// Overlap-start step, overridable via `LIGHTER_OVERLAP_START_STEP` (0..=8) for
+/// experiments; read once. The light pipeline stays at ramp depth until this
+/// step, then opens to the full window. Default 3 (the heavy path's three-chunk
+/// horizon). Lowering it engages the full window earlier, but if the heavy tx
+/// proofs are still running the single GPU buffer set contends. Pure scheduling:
+/// no proof byte depends on the value.
+fn light_tx_proof_overlap_start_step() -> u64 {
+    static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *STEP.get_or_init(|| {
+        std::env::var("LIGHTER_OVERLAP_START_STEP")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|s| *s <= 8)
+            .unwrap_or(LIGHT_TX_PROOF_OVERLAP_START_STEP)
+    })
+}
+
+/// Ramp depth used while the heavy path's chunks are still active, overridable
+/// via `LIGHTER_RAMP_DEPTH` (1..=4) for experiments; read once. Default 2:
+/// fills the GPU idle left by depth 1 without exceeding the single buffer set's
+/// capacity (measured). Pure scheduling: each proof is identical regardless of
+/// concurrency, so no proof byte depends on the value.
+fn light_tx_proof_ramp_depth() -> usize {
+    static RAMP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RAMP.get_or_init(|| {
+        std::env::var("LIGHTER_RAMP_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|d| (1..=4).contains(d))
+            .unwrap_or(2)
+    })
+}
 
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
@@ -530,7 +563,7 @@ fn prove_path(
                 in_flight.len() as u64,
             );
             let max_in_flight =
-                if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
+                if path == TxPath::Light && current_step >= light_tx_proof_overlap_start_step() {
                     light_tx_proof_window()
                 } else if path == TxPath::Light {
                     // Ramp: while the heavy path's three chunks run, the old
@@ -538,7 +571,7 @@ fn prove_path(
                     // set held only 50% (measured). Depth 2 fills that idle
                     // without exceeding the single set's capacity; the full
                     // window still waits for the heavy path's step-3 horizon.
-                    2
+                    light_tx_proof_ramp_depth()
                 } else {
                     1
                 };
@@ -849,16 +882,23 @@ pub(crate) fn prove_block_after_pre(
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
-                    let mut pending = PendingPartitionWitness::start(
-                        early,
+                    // Seed the early block witness directly into the partition's
+                    // representative slots — the same targets `witness_inputs_early`
+                    // would accumulate in a `PartialWitness` map — deleting the map
+                    // build and its full replay pass. Every other witness path
+                    // (tx, chain step, pre-exec) already uses this direct-seeded
+                    // form; this is the last scored site still on the map path.
+                    let mut pending = PendingPartitionWitness::start_seeded(
                         &block_data.prover_only,
                         &block_data.common,
+                        |seeder| {
+                            BlockCircuit::seed_witness_early_into(
+                                &block_target,
+                                block_ref,
+                                pre_proof_ref,
+                                seeder,
+                            )
+                        },
                     )
                     .expect("final block early witness phase failed");
                     #[cfg(feature = "diagnostic_profile")]
@@ -879,13 +919,12 @@ pub(crate) fn prove_block_after_pre(
                     // of holding them across the whole light phase.
                     circuits.release_heavy_circuit_extensions();
                     pending
-                        .feed(
-                            BlockCircuit::witness_inputs_heavy_chain(
-                                &block_target,
+                        .feed_seeded(|feeder| {
+                            feeder.set_proof_with_pis_target(
+                                &block_target.heavy_tx_chain_proof,
                                 &heavy_chain_proof,
                             )
-                            .expect("final block heavy-chain witness inputs failed"),
-                        )
+                        })
                         .expect("final block heavy-chain witness feed failed");
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
@@ -969,10 +1008,12 @@ pub(crate) fn prove_block_after_pre(
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("witness", "final_light_feed");
         block_pending
-            .feed(
-                BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
-                    .expect("final block light-chain witness inputs failed"),
-            )
+            .feed_seeded(|feeder| {
+                feeder.set_proof_with_pis_target(
+                    &block_target.light_tx_chain_proof,
+                    light_chain_input,
+                )
+            })
             .expect("final block light-chain witness feed failed");
     }
     let _ = heavy_chain_input;

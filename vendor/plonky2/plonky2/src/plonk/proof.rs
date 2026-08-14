@@ -350,9 +350,15 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // and compares every entry by raw noncanonical limbs.
         let g_subgroup =
             crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
+        // Each `(ζ^i, g^i)` pair is independent — `scalar_mul` is a pure
+        // elementwise extension-by-base product with no cross-element
+        // dependency — so the degree-long pass parallelizes identically to the
+        // `eval_polynomials` dot products below. `par_iter` preserves output
+        // order via `collect`, so the table is bit-identical to the serial form
+        // (and `LIGHTER_GZETA_TABLE_ASSERT=1` checks every limb either way).
         let g_zeta_pows: Vec<F::Extension> = zeta_pows
-            .iter()
-            .zip(g_subgroup.iter())
+            .par_iter()
+            .zip(g_subgroup.par_iter())
             .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
             .collect();
         if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
