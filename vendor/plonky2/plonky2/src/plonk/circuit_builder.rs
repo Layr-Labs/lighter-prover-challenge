@@ -1462,10 +1462,16 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         )
         .expect("builder produced an invalid compressed representative map");
 
+        let generators_defer_until_ready = self
+            .generators
+            .iter()
+            .all(|generator| generator.0.defers_until_ready());
+
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
             generator_watch_counts,
+            generators_defer_until_ready,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
