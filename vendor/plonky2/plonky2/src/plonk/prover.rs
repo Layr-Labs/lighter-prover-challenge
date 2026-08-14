@@ -130,7 +130,7 @@ where
         generate_partial_witness(inputs, prover_data, common_data)?
     );
 
-    prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
+    prove_with_partition_witness(prover_data, common_data, partition_witness, timing, None)
 }
 
 pub fn prove_with_partition_witness<
@@ -142,6 +142,7 @@ pub fn prove_with_partition_witness<
     common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
     timing: &mut TimingTree,
+    mut early_wire_lde: Option<crate::plonk::early_wire_lde::EarlyWireLde<F>>,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -210,34 +211,88 @@ where
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
     let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
+    let num_wires = witness.wire_values.len();
+    let (wires_coeffs, ready_ldes) = timed!(
         timing,
         "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
+        {
+            // Always IFFT from the finished witness (the production
+            // polynomials). Reuse an early LDE only when that IFFT matches
+            // the snapshot's coefficients bit-for-bit. 8020574 compared
+            // preimages and reused both coeffs and LDE; a mismatched LDE
+            // function then shipped a valid-looking proof that failed
+            // fixture 03.
+            let coeffs: Vec<PolynomialCoeffs<F>> = witness
+                .wire_values
+                .par_iter_mut()
+                .enumerate()
+                .map(|(j, column)| {
+                    if j < num_routed_wires {
+                        ifft_borrowed(column)
+                    } else {
+                        PolynomialValues::new(core::mem::take(column)).ifft()
+                    }
+                })
+                .collect();
+            let mut ready_ldes: Vec<Option<Vec<F>>> = vec![None; num_wires];
+            if let Some(early) = early_wire_lde.as_mut() {
+                let expected_rate_bits = config.fri_config.rate_bits;
+                let expected_lde_len = common_data.degree() << expected_rate_bits;
+                if early.rate_bits == expected_rate_bits
+                    && early.coeffs.len() == num_wires
+                    && early.ldes.len() == num_wires
+                {
+                    ready_ldes
+                        .par_iter_mut()
+                        .zip(early.coeffs.par_iter())
+                        .zip(early.ldes.par_iter_mut())
+                        .zip(coeffs.par_iter())
+                        .for_each(|(((ready, saved), slot), now)| {
+                            let same = matches!(
+                                saved.as_ref(),
+                                Some(saved) if saved.coeffs == now.coeffs
+                            );
+                            if same {
+                                if let Some(lde) = slot.take() {
+                                    if lde.len() == expected_lde_len {
+                                        *ready = Some(lde);
+                                    }
+                                }
+                            }
+                        });
                 }
-            })
-            .collect()
+            }
+            // Saved coefficients and every non-reused LDE are speculative dead
+            // state after the gate. Drop them before commitment/quotient/FRI
+            // allocations, not at function return.
+            drop(early_wire_lde.take());
+            (coeffs, ready_ldes)
+        }
     );
 
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs(
-            wires_coeffs,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::WIRES.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_ref(),
-        )
+        if ready_ldes.iter().any(Option::is_some) {
+            PolynomialBatch::<F, C, D>::from_coeffs_with_ready_ldes(
+                wires_coeffs,
+                ready_ldes,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        } else {
+            PolynomialBatch::<F, C, D>::from_coeffs(
+                wires_coeffs,
+                config.fri_config.rate_bits,
+                config.zero_knowledge && PlonkOracle::WIRES.blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_ref(),
+            )
+        }
     );
 
     let mut challenger = Challenger::<F, C::Hasher>::new();

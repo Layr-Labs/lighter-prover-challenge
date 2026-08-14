@@ -606,6 +606,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         )
     }
 
+    /// Borrow the in-progress partition. Used by the final-block early-LDE
+    /// snapshot (complete columns only; later feeds are fail-closed by
+    /// preimage compare).
+    pub fn partition(&self) -> &PartitionWitness<'a, F> {
+        &self.witness
+    }
+
+    pub fn fft_root_table(&self) -> Option<&crate::field::fft::FftRootTable<F>> {
+        self.prover_data.fft_root_table.as_ref()
+    }
+
     /// Returns the fully populated witness, or an error if some generators still couldn't run.
     pub fn finish(self) -> Result<PartitionWitness<'a, F>> {
         if self.remaining_generators != 0 {
@@ -1451,12 +1462,14 @@ mod tests {
             &outer.common,
             single_shot,
             &mut crate::util::timing::TimingTree::default(),
+            None,
         )?;
         let two_phase_proof = crate::plonk::prover::prove_with_partition_witness(
             &outer.prover_only,
             &outer.common,
             two_phase,
             &mut crate::util::timing::TimingTree::default(),
+            None,
         )?;
         outer.verify(single_shot_proof)?;
         outer.verify(two_phase_proof)
@@ -1526,6 +1539,7 @@ mod tests {
             &outer.common,
             map_seeded,
             &mut crate::util::timing::TimingTree::default(),
+            None,
         )?;
         outer.verify(map_seeded_proof)?;
 
@@ -1534,6 +1548,7 @@ mod tests {
             &outer.common,
             direct_seeded,
             &mut crate::util::timing::TimingTree::default(),
+            None,
         )?;
         outer.verify(proof)
     }
@@ -1635,6 +1650,7 @@ mod tests {
             &outer.common,
             parallel_stress,
             &mut crate::util::timing::TimingTree::default(),
+            None,
         )?;
         outer.verify(parallel_proof)
     }

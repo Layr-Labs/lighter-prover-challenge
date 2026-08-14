@@ -348,6 +348,7 @@ fn prove_tx_witness(
         &tx_data.common,
         partition_witness,
         &mut TimingTree::default(),
+        None,
     )
     .unwrap_or_else(|error| {
         panic!("{path:?} block transaction chunk #{chunk_index} proof failed: {error:?}")
@@ -785,7 +786,7 @@ pub(crate) fn prove_block_after_pre(
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
+    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending, early_wire_lde) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
@@ -918,11 +919,44 @@ pub(crate) fn prove_block_after_pre(
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             #[cfg(feature = "diagnostic_profile")]
             drop(_block_lane_wait);
+            // Column-final early IFFT+LDE (colfinal-ifft-1786690000): heavy
+            // is done, light still running ~30 s. Transform every fully-set
+            // wire column on a utility thread (no global rayon) so the serial
+            // tail only hashes + late columns. Fail-closed: tail compares
+            // authoritative IFFT coefficients and recomputes on mismatch.
+            let early_started = std::time::Instant::now();
+            let rate_bits = block_data.common.config.fri_config.rate_bits;
+            let early_handle = std::thread::Builder::new()
+                .name("early-wire-lde".into())
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn(move || {
+                    mark_thread_utility();
+                    let num_wires = block_pending.partition().num_wires;
+                    let early = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        plonky2::plonk::early_wire_lde::precompute_complete_wire_ldes(
+                            block_pending.partition(),
+                            rate_bits,
+                            block_pending.fft_root_table(),
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        plonky2::plonk::early_wire_lde::EarlyWireLde::empty(
+                            num_wires, rate_bits,
+                        )
+                    });
+                    (block_pending, early)
+                })
+                .expect("early wire LDE thread must start");
             #[cfg(feature = "diagnostic_profile")]
             let _light_wait = plonky2::util::profile::span("wait", "light_path_join");
             let light_chain_proof = light_handle
                 .join()
                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let light_joined = std::time::Instant::now();
+            log::info!(
+                "bracket heavy_lane_done_to_light_join {:?}",
+                light_joined.duration_since(early_started)
+            );
             // The light path's thread has exited, so its shared guards on the
             // light transaction and chain circuits are gone, and the block lane
             // dropped its own light-chain guard when `build_block_circuit`
@@ -933,12 +967,21 @@ pub(crate) fn prove_block_after_pre(
             // immediately — instead of holding them through the final witness
             // setup until the backstop below.
             circuits.release_light_circuit_extensions();
+            let (block_pending, early_wire_lde) = early_handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            log::info!(
+                "bracket early_wire_lde_ready={} cols in {:?}",
+                early_wire_lde.ready_count(),
+                std::time::Instant::now().duration_since(early_started)
+            );
             (
                 light_chain_proof,
                 heavy_chain_proof,
                 block_target,
                 block_data,
                 block_pending,
+                early_wire_lde,
             )
         })
     };
@@ -976,12 +1019,17 @@ pub(crate) fn prove_block_after_pre(
             .expect("final block light-chain witness feed failed");
     }
     let _ = heavy_chain_input;
+    let tail_started = std::time::Instant::now();
     let final_proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "final_block_proof");
-        BlockCircuit::prove_prepared(block_pending, block_data)
+        BlockCircuit::prove_prepared_with_early(block_pending, block_data, Some(early_wire_lde))
             .expect("final block proof failed")
     };
+    log::info!(
+        "bracket light_join_to_final_done {:?}",
+        tail_started.elapsed()
+    );
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
     final_proof
 }
@@ -1197,6 +1245,7 @@ mod tests {
             &circuits.tx_data.common,
             witness,
             &mut tx_timing,
+            None,
         )
         .expect("tx proof failed");
         println!("tx chunk prove total {:?}", tx_prove_start.elapsed());
@@ -1273,6 +1322,7 @@ mod tests {
                 &circuits.chain_data.common,
                 witness,
                 &mut timing,
+                None,
             )
             .expect("chain step proof failed");
             let prove_elapsed = prove_start.elapsed();
