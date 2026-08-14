@@ -59,16 +59,13 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
 // machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
 // for experiments.
+//
+// Ranked A/B on this stacked tree: depth 6 quiet-class draws landed
+// 30.28-30.71 against the 30.738 bar. Depth 7's quiet-class draws on the
+// same package (markers 637+) landed 29.82-30.07 — a clear mean regression
+// from allocator/fault churn, the same failure mode that collapses depth 8.
+// Stay at 6 until a quieter host or a different overlap mechanism is shown.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
-
-/// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
-/// experiments; read once. Depth is deliberately NOT scaled up on
-/// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
-/// RSS on a 24 GiB machine — the collapse is allocator/fault churn from more
-/// concurrent proof allocations, not memory capacity, and a 48 GiB host runs
-/// the same allocator. Measured: depth 6 beats 4 by ~4.6% on a quiet
-/// machine; under heavy external load the ordering inverts, so depth tuning
-/// beyond 6 needs quiet-host evidence first.
 fn light_tx_proof_window() -> usize {
     static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WINDOW.get_or_init(|| {
