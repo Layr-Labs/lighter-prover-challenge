@@ -147,8 +147,10 @@ impl Circuits {
     /// and the block itself.
     ///
     /// Those five extensions are `2 * 2^19 * 88 + 3 * 2^17 * 86` field elements
-    /// = 1.01 GB, and on this host they are resident in CPU-visible Metal
-    /// shared buffers whose release returns the pages to the OS immediately.
+    /// = 1.01 GB, resident in CPU-visible Metal shared buffers. Dropping their
+    /// owners makes them reusable; the final-phase pool transition then keeps
+    /// only buffers matching the two remaining final commitments and returns
+    /// the rest to the OS before peak allocation.
     /// The final block proof is the process's peak-RSS moment — it stacks its
     /// own `2^21`-row wires, Z and quotient extensions (2.89 GB) on top of
     /// every retained extension — so releasing these first takes 1.01 GB
@@ -193,11 +195,10 @@ impl Circuits {
     /// The heavy path proves three chunks; the light path proves forty-nine.
     /// The heavy pair therefore stops being read after a small fraction of the
     /// process lifetime, but until now its two extensions — `2^19 * 88 + 2^17 *
-    /// 86` field elements = 438 MiB of CPU-visible Metal shared buffers whose
-    /// release returns the pages to the OS immediately — stayed resident until
-    /// the pipeline joined, i.e. across the whole light phase, which is exactly
-    /// the window in which five concurrent workers contend for the machine's
-    /// memory.
+    /// 86` field elements = 438 MiB of CPU-visible Metal shared buffers — stayed
+    /// resident until the pipeline joined, i.e. across the whole light phase.
+    /// Early retirement makes them eligible for reuse or for the fixed
+    /// final-phase trim rather than extending their logical ownership.
     ///
     /// The `RwLock` is what makes the release provable rather than merely
     /// plausible: acquiring the exclusive guard *is* the proof that no reader
@@ -251,6 +252,16 @@ impl Circuits {
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        // The block circuit is a pure function of the static circuit
+        // configuration and the three already-embedded verifier descriptions.
+        // Prefer the value constructed by build.rs outside the scored worker;
+        // retain the old construction as a safe fallback for development builds
+        // and deliberately forced rebuilds.
+        if !std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            if let Ok(block) = Self::load_block_embedded() {
+                return block;
+            }
+        }
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is

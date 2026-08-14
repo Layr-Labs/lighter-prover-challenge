@@ -558,6 +558,41 @@ impl ColumnStorePool {
             self.free.push(buffer);
         }
     }
+
+    /// Keeps at most one best-fit free buffer for each final-phase request and
+    /// returns every other cached buffer to the caller for destruction outside
+    /// the pool lock. Requests are matched largest-first so a large request
+    /// cannot lose its only usable buffer to a smaller one.
+    fn retain_best_fits(&mut self, requested_bytes: &[u64]) -> Vec<Buffer> {
+        let mut requests = requested_bytes.to_vec();
+        requests.sort_unstable_by(|a, b| b.cmp(a));
+        let mut keep = vec![false; self.free.len()];
+        for bytes in requests {
+            if let Some(index) = self
+                .free
+                .iter()
+                .enumerate()
+                .filter(|(index, buffer)| !keep[*index] && buffer.length() >= bytes)
+                .min_by_key(|(_, buffer)| buffer.length())
+                .map(|(index, _)| index)
+            {
+                keep[index] = true;
+            }
+        }
+
+        let mut retained = Vec::with_capacity(requested_bytes.len());
+        let mut removed = Vec::with_capacity(self.free.len());
+        for (index, buffer) in self.free.drain(..).enumerate() {
+            if keep[index] {
+                retained.push(buffer);
+            } else {
+                removed.push(buffer);
+            }
+        }
+        self.total_bytes = retained.iter().map(|buffer| buffer.length()).sum();
+        self.free = retained;
+        removed
+    }
 }
 
 /// One-slot stash for a pre-faulted large column store. The final block's
@@ -571,9 +606,10 @@ static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
 /// Allocates a `bytes`-sized shared buffer, touches one word per page so the
 /// kernel's zero-fill happens here (off the critical path) rather than under
 /// the final block's LDE fill, and stashes it for the next oversized
-/// [`take_or_new_column_buffer`] request. Scheduling-only: buffer contents
-/// are fully written by the fill before any read, exactly as a fresh
-/// allocation's would be.
+/// [`take_or_new_column_buffer`] request. The buffer is published only after
+/// the page walk completes, so the eventual fill can never race this helper's
+/// zero writes. Scheduling-only: buffer contents are fully written by the fill
+/// before any read, exactly as a fresh allocation's would be.
 pub fn prewarm_large_column_store(bytes: u64) {
     let Some(context) = shared_context() else {
         return;
@@ -587,12 +623,6 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
@@ -600,6 +630,21 @@ pub fn prewarm_large_column_store(bytes: u64) {
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
     }
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
+    }
+}
+
+/// Trims recurring column stores at the fixed transition into the final block
+/// proof. The two final commitments can reuse one best-fit buffer each; all
+/// other free stores are dead residency. Destruction occurs after releasing
+/// the mutex so VM reclamation cannot block a concurrent last-lease drop.
+pub fn prepare_final_block_column_stores(requested_bytes: [u64; 2]) {
+    let removed = COLUMN_STORE_POOL
+        .lock()
+        .map(|mut pool| pool.retain_best_fits(&requested_bytes))
+        .unwrap_or_default();
+    drop(removed);
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
@@ -4024,6 +4069,34 @@ mod tests {
 
         pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
         assert!(pool.free.is_empty(), "oversized output must not be cached");
+    }
+
+    #[test]
+    fn column_store_pool_retains_distinct_final_best_fits() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = |bytes| {
+            autoreleasepool(|| {
+                device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+            })
+        };
+        let mut pool = ColumnStorePool {
+            free: vec![buffer(128), buffer(256), buffer(384), buffer(512)],
+            total_bytes: 128 + 256 + 384 + 512,
+        };
+
+        let removed = pool.retain_best_fits(&[300, 200]);
+        let mut retained_lengths = pool
+            .free
+            .iter()
+            .map(|buffer| buffer.length())
+            .collect::<Vec<_>>();
+        retained_lengths.sort_unstable();
+
+        assert_eq!(retained_lengths, vec![256, 384]);
+        assert_eq!(pool.total_bytes, 256 + 384);
+        assert_eq!(removed.len(), 2);
     }
 
     #[test]

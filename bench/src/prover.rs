@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -15,8 +15,6 @@ use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
-#[cfg(test)]
-use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
@@ -91,6 +89,26 @@ fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
 
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
+}
+
+fn block_wires_store_bytes(block_data: &CircuitData<F, C, D>) -> u64 {
+    (block_data.common.lde_size() as u64)
+        * (block_data.common.config.num_wires as u64)
+        * (std::mem::size_of::<F>() as u64)
+}
+
+fn final_block_reusable_store_bytes(block_data: &CircuitData<F, C, D>) -> [u64; 2] {
+    let common = &block_data.common;
+    let lde_rows = common.lde_size() as u64;
+    let challenges = common.config.num_challenges as u64;
+    let zs_lookup_columns = challenges
+        * (1 + common.num_partial_products as u64 + common.num_lookup_polys as u64);
+    let quotient_columns = challenges * common.quotient_degree_factor as u64;
+    let element_bytes = std::mem::size_of::<F>() as u64;
+    [
+        lde_rows * zs_lookup_columns * element_bytes,
+        lde_rows * quotient_columns * element_bytes,
+    ]
 }
 
 /// Whether the calling transaction path may claim the process-global exclusive
@@ -658,28 +676,6 @@ fn prove_path(
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
     active_paths.fetch_sub(1, Ordering::Release);
-    if path == TxPath::Heavy {
-        // The heavy path retires far ahead of the light path; use the slack
-        // to pre-fault the final block's wires column store (larger than the
-        // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
-        // run's most serial window). Detached: only populates a stash the
-        // block's allocation consults; a size miss falls through unchanged.
-        std::thread::Builder::new()
-            .name("block-store-prewarm".to_owned())
-            .spawn(|| {
-                // Page-walking ~2 GiB at default QoS competes with the light
-                // pipeline for P-cores; utility class prefers the E-cores,
-                // whose memory-bound fault service is nearly as fast.
-                mark_thread_utility();
-                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
-                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
-                // num_wires; a drift just misses the stash harmlessly.
-                const BLOCK_WIRES_STORE_BYTES: u64 =
-                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
-                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
-            })
-            .ok();
-    }
     chain_proof
 }
 
@@ -785,19 +781,33 @@ pub(crate) fn prove_block_after_pre(
     // apart from "no other proof is running": each path retires itself when its
     // chain proof is finished, so only the last one standing claims the phase.
     let active_paths = AtomicUsize::new(2);
-    let (light_chain_proof, heavy_chain_proof, block_target, block_data, block_pending) = {
+    let (
+        light_chain_proof,
+        heavy_chain_proof,
+        block_target,
+        block_data,
+        block_pending,
+        block_store_prewarm,
+    ) = {
         // The pipeline only ever reads the circuits; the borrow ends with this
         // block so the finished extensions can be released below.
         let circuits = &circuits;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            // Two-phase final-block witness (H13): this lane also runs the
-            // EARLY witness phase (block data + pre-proof generators) after the
-            // build, then joins the heavy path — which finishes ~30 s before
-            // the light path — and feeds its verify subtree here, mid-pipeline.
+            // The final block circuit depends only on static circuit data and
+            // is not needed until the final proof. The heavy path finishes
+            // roughly 30 s before the light path, which is ample slack for the
+            // embedded block load and its early witness phase. Wait for that
+            // natural milestone before materializing the largest circuit:
+            // this avoids keeping its allocations live across the heavy path
+            // and avoids competing with both transaction producers for CPU
+            // and unified-memory bandwidth. The load and early witness still
+            // run underneath the long light tail, so no new serial tail is
+            // introduced.
+            // Two-phase final-block witness (H13): after the heavy milestone,
+            // this lane loads the compile-time embedding, runs the EARLY phase
+            // (block data + pre-proof generators), and feeds the already-ready
+            // heavy verify subtree here, mid-pipeline.
             // Measured feed split: light 0.018 s vs heavy 0.575 s; the heavy
             // verify subtree (ECDSA/keccak) owns the late witness cost, and
             // moving it here deletes it from the serial tail. Both phases run
@@ -841,6 +851,20 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _heavy_wait =
+                        plonky2::util::profile::span("wait", "heavy_path_join_before_final_load");
+                    let heavy_chain_proof = heavy_handle_outer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    #[cfg(feature = "diagnostic_profile")]
+                    drop(_heavy_wait);
+                    // The heavy path's thread and both of its shared guards are
+                    // gone. The embedded fast path does not read those circuit
+                    // extensions, and the construction fallback needs only
+                    // common/verifier data, so retire 438 MiB before allocating
+                    // the final block data rather than stacking both lifetimes.
+                    circuits.release_heavy_circuit_extensions();
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -861,23 +885,6 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    // The heavy path's thread has exited, so its shared guards
-                    // on the heavy transaction and chain circuits are gone, and
-                    // this lane dropped its own guard when `build_block_circuit`
-                    // returned above. Nothing reads those two circuits again:
-                    // the light pipeline uses the light pair, and the final
-                    // block proof uses only `block_data`, the three finished
-                    // proofs and the block. Retire their preprocessed
-                    // extensions here — 438 MiB of Metal shared buffers whose
-                    // release returns the pages to the OS immediately — instead
-                    // of holding them across the whole light phase.
-                    circuits.release_heavy_circuit_extensions();
                     pending
                         .feed(
                             BlockCircuit::witness_inputs_heavy_chain(
@@ -887,7 +894,29 @@ pub(crate) fn prove_block_after_pre(
                             .expect("final block heavy-chain witness inputs failed"),
                         )
                         .expect("final block heavy-chain witness feed failed");
-                    (block_target, block_data, pending, heavy_chain_proof)
+                    // The final artifact and its early witness are now resident,
+                    // so start the one large page walk without competing with
+                    // either of those allocation-heavy phases. The fixed light
+                    // tail still supplies ample overlap. Keep the handle so the
+                    // final allocator cannot race or duplicate an unfinished
+                    // approximately 2 GiB prewarm.
+                    let wires_store_bytes = block_wires_store_bytes(block_data);
+                    let block_store_prewarm = std::thread::Builder::new()
+                        .name("block-store-prewarm".to_owned())
+                        .spawn(move || {
+                            mark_thread_utility();
+                            plonky2::hash::poseidon2::prewarm_large_column_store(
+                                wires_store_bytes,
+                            );
+                        })
+                        .ok();
+                    (
+                        block_target,
+                        block_data,
+                        pending,
+                        heavy_chain_proof,
+                        block_store_prewarm,
+                    )
                 })
                 .expect("block circuit build thread must start");
             let light_chunks = std::mem::take(&mut light_chunks);
@@ -912,7 +941,13 @@ pub(crate) fn prove_block_after_pre(
             #[cfg(feature = "diagnostic_profile")]
             let _block_lane_wait =
                 plonky2::util::profile::span("wait", "final_block_build_lane_join");
-            let (block_target, block_data, block_pending, heavy_chain_proof) =
+            let (
+                block_target,
+                block_data,
+                block_pending,
+                heavy_chain_proof,
+                block_store_prewarm,
+            ) =
                 block_circuit_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -929,9 +964,9 @@ pub(crate) fn prove_block_after_pre(
             // returned long ago. Nothing reads the light pair again: the final
             // block proof uses only `block_data`, the three finished proofs and
             // the block. Retire their preprocessed extensions here — 438 MiB of
-            // Metal shared buffers whose release returns the pages to the OS
-            // immediately — instead of holding them through the final witness
-            // setup until the backstop below.
+            // Metal shared buffers become reusable now, and the fixed
+            // final-phase transition below retains only useful best fits,
+            // instead of holding them through the final witness setup.
             circuits.release_light_circuit_extensions();
             (
                 light_chain_proof,
@@ -939,6 +974,7 @@ pub(crate) fn prove_block_after_pre(
                 block_target,
                 block_data,
                 block_pending,
+                block_store_prewarm,
             )
         })
     };
@@ -948,6 +984,19 @@ pub(crate) fn prove_block_after_pre(
     // before the final block proof — the process's peak-RSS moment — stacks its
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
+
+    // Recurring transaction/chain stores can remain in the bounded Metal
+    // cache after their owners die. Keep only the two best-fit buffers the
+    // final Z/partial-product and quotient commitments can reuse, and return
+    // all other free recurring stores before the final peak. The large wires
+    // prewarm is published only after its page walk; joining here normally
+    // consumes hidden slack and otherwise prevents a duplicate allocation.
+    plonky2::hash::poseidon2::prepare_final_block_column_stores(
+        final_block_reusable_store_bytes(block_data),
+    );
+    if let Some(handle) = block_store_prewarm {
+        let _ = handle.join();
+    }
 
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
