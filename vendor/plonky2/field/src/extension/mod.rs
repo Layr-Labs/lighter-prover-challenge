@@ -99,6 +99,50 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute two independent dot products of extension-field values with
+    /// base-field scalars in one pass over the shared powers slice.
+    ///
+    /// The default is exactly two calls to [`Self::extension_base_dot_product`]
+    /// in input order, so every field and extension degree keeps its prior
+    /// semantics unless it explicitly specializes this hook. A base field may
+    /// specialize when one traversal loading each extension power once and
+    /// folding it into two independent accumulators deletes a full second
+    /// scan of the shared powers slice.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[Self::Extension],
+        base_polynomials: [&[Self]; 2],
+    ) -> [Self::Extension; 2] {
+        [
+            Self::extension_base_dot_product(extension_values, base_polynomials[0]),
+            Self::extension_base_dot_product(extension_values, base_polynomials[1]),
+        ]
+    }
+
+    /// Dot product `sum_i extension_values[i].scalar_mul(base_coefficients[i]
+    /// * subgroup_scales[i])`, zipped across all three slices. This is the
+    /// fused form of evaluating a base polynomial at `g·ζ` out of the
+    /// already-built `ζ` powers and the natural-order subgroup powers:
+    /// `P(g·ζ) = sum_i c_i · g^i · ζ^i`. The default performs ordinary field
+    /// arithmetic; a base field may specialize it to delay reduction.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_with_subgroup_scales(
+        extension_values: &[Self::Extension],
+        base_coefficients: &[Self],
+        subgroup_scales: &[Self],
+    ) -> Self::Extension {
+        extension_values
+            .iter()
+            .zip(base_coefficients)
+            .zip(subgroup_scales)
+            .map(|((&value, &coefficient), &scale)| {
+                <Self::Extension as FieldExtension<D>>::scalar_mul(&value, coefficient * scale)
+            })
+            .sum()
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.
