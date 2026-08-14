@@ -2049,15 +2049,19 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
-    // only when the GPU stream is unoccupied at entry, the same occupancy
-    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
-    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
-    // while an already-busy stream would just queue the absorb groups behind
-    // another tree and stretch both.
+    // Exclusive phases have the GPU stream to themselves, so streaming is
+    // worthwhile on every tree wide enough for group overlap (leaf_width>=16
+    // is required below). The chain-step / pre-exec Zs and quotient trees
+    // are 2^17 leaves by 16-20 columns: classic path is a full CPU fill of
+    // every column, then one GPU hash. Streaming turns that into
+    // max(fill, absorb) plus one leftover group — the serial critical path
+    // of every exclusive drain step. 2^20 was only admitting the final
+    // block's 2^21 wire tree, which already streamed; the 2^17 mid-size
+    // exclusive trees were still classic. Pipelined 2^19 commitments still
+    // stream only when the GPU is idle at entry: an already-busy stream
+    // would queue the absorb groups behind another tree and stretch both.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
@@ -6503,6 +6507,65 @@ kernel void goldilocks_mul_bench_native(
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
             .expect("classic tree");
         assert_eq!(streamed, classic);
+    }
+
+    /// The exclusive-phase admission floor is 2^17 so chain-step / pre-exec
+    /// Zs and quotient trees (16-20 columns) stream. Lock that the new floor
+    /// actually admits a 2^17 x 16 tree and that the digests match classic.
+    #[test]
+    fn streamed_merkle_exclusive_d17_matches_classic() {
+        type F = GoldilocksField;
+        struct ExclusiveReset;
+        impl Drop for ExclusiveReset {
+            fn drop(&mut self) {
+                set_exclusive_gpu_phase(false);
+            }
+        }
+
+        let context = shared_context().expect("Metal context");
+        let rows = 1usize << 17;
+        let cols = 16;
+        let cap_height = 4;
+        let columns = context
+            .allocate_columns::<F>(rows, cols)
+            .expect("shared columns");
+        set_exclusive_gpu_phase(true);
+        let _reset = ExclusiveReset;
+        let streamed = build_merkle_tree_shared_streamed(
+            &columns,
+            cap_height,
+            &|group, destinations| {
+                for (index, destination) in destinations.iter_mut().enumerate() {
+                    destination.fill(F::from_canonical_usize(group * 8 + index + 7));
+                }
+            },
+        )
+        .expect("exclusive d17 tree must be admitted and succeed");
+        assert!(streamed.0.nodes.is_shared());
+
+        let classic = context
+            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+            .expect("classic tree");
+        assert_eq!(streamed, classic);
+
+        // One step below the floor must still be rejected so we do not split
+        // tiny FRI folds into multi-pass command buffers.
+        let too_small = context
+            .allocate_columns::<F>(1 << 16, cols)
+            .expect("small columns");
+        assert!(
+            build_merkle_tree_shared_streamed(
+                &too_small,
+                cap_height,
+                &|_group, destinations| {
+                    for destination in destinations.iter_mut() {
+                        destination.fill(F::ONE);
+                    }
+                },
+            )
+            .is_none(),
+            "2^16 exclusive trees must stay on the classic path"
+        );
     }
 
     #[test]
