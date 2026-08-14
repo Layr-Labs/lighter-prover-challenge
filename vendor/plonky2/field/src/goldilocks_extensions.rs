@@ -352,6 +352,35 @@ pub fn ext2_base_scalar_dot_slots(
     assert_eq!(polys.len(), powers.len());
     assert!(polys.len() < 1 << 24);
     let end = start + out.len();
+
+    // FRI composition batches overwhelmingly have equal-degree polynomials.
+    // In that dense case every input covers the requested output block, so
+    // indexing the original slices directly avoids rebuilding `full` (and an
+    // empty `partial`) for every 2K-slot parallel block. Besides two heap
+    // allocations per block, this deletes the repeated copy of one
+    // slice/power pair per polynomial. Keep the split representation below
+    // only for the genuinely ragged boundary case.
+    if polys.iter().all(|p| p.len() >= end) {
+        for (i, o) in out.iter_mut().enumerate() {
+            let slot = start + i;
+            let (mut lo0, mut hi0) = (0u128, 0u32);
+            let (mut lo1, mut hi1) = (0u128, 0u32);
+            for (&p, &QuadraticExtension([b0, b1])) in polys.iter().zip(powers) {
+                // SAFETY: the dense predicate above proves every input reaches
+                // `end`, and `slot < end` for each output position.
+                let c = unsafe { p.get_unchecked(slot).0 };
+                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+            }
+            // SAFETY: identical accumulator bound to the general path below.
+            *o = QuadraticExtension([
+                unsafe { reduce160(lo0, hi0) },
+                unsafe { reduce160(lo1, hi1) },
+            ]);
+        }
+        return;
+    }
+
     // Split once so the dense inner loop over fully-covering polynomials
     // runs without per-slot bounds checks; only boundary-length polynomials
     // take the checked loop.
@@ -897,6 +926,72 @@ mod tests {
         let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
+    }
+
+    #[test]
+    fn ext2_base_scalar_dot_slots_dense_matches_scalar_reference() {
+        let mut state = 0x94D0_49BB_1331_11EBu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let polys: Vec<Vec<GF>> = (0..37)
+            .map(|_| (0..73).map(|_| GoldilocksField(next())).collect())
+            .collect();
+        let powers: Vec<Q2> = (0..polys.len())
+            .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+            .collect();
+        let slices: Vec<&[GF]> = polys.iter().map(Vec::as_slice).collect();
+
+        let start = 11;
+        let mut actual = vec![Q2::ZERO; 41];
+        super::ext2_base_scalar_dot_slots(&mut actual, start, &slices, &powers);
+
+        // Force the retained full/partial fallback without changing the dot
+        // product: an empty polynomial with a zero power fails the dense
+        // predicate, then contributes no slots. This is the pre-fast-path
+        // execution shape for all original polynomials and must agree even in
+        // raw limb representation because term order and reduce160 calls are
+        // identical.
+        let empty: [GF; 0] = [];
+        let mut fallback_slices = slices.clone();
+        fallback_slices.push(&empty);
+        let mut fallback_powers = powers.clone();
+        fallback_powers.push(Q2::ZERO);
+        let mut fallback = vec![Q2::ZERO; actual.len()];
+        super::ext2_base_scalar_dot_slots(
+            &mut fallback,
+            start,
+            &fallback_slices,
+            &fallback_powers,
+        );
+
+        for (i, got) in actual.iter().enumerate() {
+            let expected: Q2 = slices
+                .iter()
+                .zip(&powers)
+                .map(|(p, power)| {
+                    <Q2 as FieldExtension<2>>::scalar_mul(power, p[start + i])
+                })
+                .sum();
+            for limb in 0..2 {
+                assert_eq!(
+                    got.0[limb].0,
+                    fallback[i].0[limb].0,
+                    "raw limb {limb} mismatch at slot {}",
+                    start + i
+                );
+                assert_eq!(
+                    got.0[limb].to_canonical_u64(),
+                    expected.0[limb].to_canonical_u64(),
+                    "canonical limb {limb} mismatch at slot {}",
+                    start + i
+                );
+            }
+        }
     }
 
     #[test]

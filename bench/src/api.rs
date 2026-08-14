@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// Controlled isolate redraw marker codex-dense-ext2-dot-after-5c3fffcd-20260814
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
