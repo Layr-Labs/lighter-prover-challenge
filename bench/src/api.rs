@@ -62,7 +62,7 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
-// Revalidate the fixed permutation-mask and release-log stack on the ranked host.
+// Revalidate the fused permutation survivor stack on an independent ranked draw.
 // Repeat the validated stack after the official runner spread exceeded four percent.
 // Keep the production diff fixed while sampling the ranked-host tail once more.
 
