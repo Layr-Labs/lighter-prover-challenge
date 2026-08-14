@@ -5,6 +5,8 @@ use alloc::{sync::Arc, vec, vec::Vec};
 use core::cmp::max;
 #[cfg(feature = "std")]
 use std::sync::Arc;
+#[cfg(feature = "diagnostic_profile")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hashbrown::HashMap;
 use itertools::Itertools;
@@ -61,6 +63,16 @@ use crate::util::{log2_ceil, log2_strict, transpose_poly_values_ref};
 /// A coin is a randomly sampled extension field element from the verifier,
 /// consisting internally of `CircuitConfig::num_challenges` field elements.
 pub const NUM_COINS_LOOKUP: usize = 4;
+
+#[cfg(feature = "diagnostic_profile")]
+static EM_REFERENCE_GENERATORS: AtomicBool = AtomicBool::new(false);
+
+/// Selects the pre-change gate-generator collection route for the EM semantic oracle.
+/// Ordinary release builds do not compile this control.
+#[cfg(feature = "diagnostic_profile")]
+pub fn em_set_reference_generators(reference: bool) {
+    EM_REFERENCE_GENERATORS.store(reference, Ordering::SeqCst);
+}
 
 /// Enum listing the different types of lookup challenges.
 /// `ChallengeA` is used for the linear combination of input and output pairs in Sum and LDC.
@@ -1306,21 +1318,55 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .flat_map(|current_slot| current_slot.current_slot.values().copied())
             .collect::<HashMap<_, _>>();
 
-        // Add gate generators.
-        self.add_generators(
-            self.gate_instances
-                .iter()
-                .enumerate()
-                .flat_map(|(index, gate)| {
-                    let mut gens = gate.gate_ref.0.generators(index, &gate.constants);
-                    // Remove unused generators, if any.
-                    if let Some(&op) = incomplete_gates.get(&index) {
-                        gens.drain(op..);
-                    }
-                    gens
-                })
-                .collect(),
-        );
+        #[cfg(feature = "diagnostic_profile")]
+        let em_reference_generators = EM_REFERENCE_GENERATORS.load(Ordering::SeqCst);
+        #[cfg(not(feature = "diagnostic_profile"))]
+        let em_reference_generators = false;
+
+        if em_reference_generators {
+            // Exact pre-change route, compiled only for the focused semantic oracle.
+            self.add_generators(
+                self.gate_instances
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, gate)| {
+                        let mut gens = gate.gate_ref.0.generators(index, &gate.constants);
+                        if let Some(&op) = incomplete_gates.get(&index) {
+                            gens.drain(op..);
+                        }
+                        gens
+                    })
+                    .collect(),
+            );
+        } else {
+            // Append gate generators directly to persistent storage. The object-safe default on
+            // `Gate` retains the old row-Vec behavior for arbitrary gates, while high-volume gate
+            // implementations can avoid that allocation. Truncating to the original operation
+            // count preserves the exact prefix selected for an incomplete final row.
+            let gate_instances = &self.gate_instances;
+            let generators = &mut self.generators;
+            for (index, gate) in gate_instances.iter().enumerate() {
+                let start = generators.len();
+                gate.gate_ref
+                    .0
+                    .append_generators(index, &gate.constants, generators);
+                let added = generators
+                    .len()
+                    .checked_sub(start)
+                    .expect("gate generator append shortened persistent output");
+                if let Some(&op) = incomplete_gates.get(&index) {
+                    assert!(
+                        op <= added,
+                        "incomplete gate operation {op} exceeds {added} generators at row {index}"
+                    );
+                    generators.truncate(
+                        start
+                            .checked_add(op)
+                            .expect("gate generator prefix endpoint overflow"),
+                    );
+                }
+            }
+        }
 
         // Index generator indices by their watched targets.
         //

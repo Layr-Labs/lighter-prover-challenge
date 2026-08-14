@@ -312,6 +312,20 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// **Note**: This should return exactly 1 generator per operation in the gate.
     fn generators(&self, row: usize, local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>>;
 
+    /// Appends this row's witness generators in the same order as [`Gate::generators`].
+    ///
+    /// The default preserves compatibility with arbitrary gates. High-volume gates can override
+    /// it to construct directly in the builder's persistent generator vector, avoiding a
+    /// separately allocated row vector.
+    fn append_generators(
+        &self,
+        row: usize,
+        local_constants: &[F],
+        out: &mut Vec<WitnessGeneratorRef<F, D>>,
+    ) {
+        out.extend(self.generators(row, local_constants));
+    }
+
     /// The number of wires used by this gate.
     ///
     /// While vanilla Plonk can only evaluate one addition/multiplication at a time, a wider

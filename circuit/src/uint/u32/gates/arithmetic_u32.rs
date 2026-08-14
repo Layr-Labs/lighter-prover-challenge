@@ -453,6 +453,25 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
             .collect()
     }
 
+    fn append_generators(
+        &self,
+        row: usize,
+        _local_constants: &[F],
+        out: &mut Vec<WitnessGeneratorRef<F, D>>,
+    ) {
+        out.extend((0..self.num_ops).map(|i| {
+            WitnessGeneratorRef::new(
+                U32ArithmeticGenerator {
+                    gate: *self,
+                    row,
+                    i,
+                    _phantom: PhantomData,
+                }
+                .adapter(),
+            )
+        }));
+    }
+
     fn num_wires(&self) -> usize {
         self.num_ops * (Self::routed_wires_per_op() + Self::num_limbs())
     }

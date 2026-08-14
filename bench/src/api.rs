@@ -299,6 +299,165 @@ mod tests {
         let _: Proof = bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
             .expect("embedded light dummy proof is invalid");
     }
+
+    #[cfg(feature = "diagnostic_profile")]
+    fn em_generator_stream(data: &CircuitData<F, C, D>) -> Vec<u8> {
+        use circuit::embed::EmbedGeneratorSerializer;
+        use plonky2::util::serialization::Write as _;
+
+        let serializer = EmbedGeneratorSerializer {
+            _phantom: Default::default(),
+            _phantom2: Default::default(),
+        };
+        let mut bytes = Vec::new();
+        for generator in &data.prover_only.generators {
+            bytes
+                .write_generator::<F, D>(generator, &serializer, &data.common)
+                .expect("EM generator must serialize");
+        }
+        bytes
+    }
+
+    #[cfg(feature = "diagnostic_profile")]
+    fn em_build_requested_shape(shape: &'static str) -> (Vec<u8>, CircuitData<F, C, D>) {
+        match shape {
+            "pre" => {
+                let circuit = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+                (bincode::serialize(&circuit.target).unwrap(), circuit.builder.build::<C>())
+            }
+            "heavy_tx" | "light_tx" => {
+                let (per_proof, mode) = if shape == "heavy_tx" {
+                    (HEAVY_TX_PER_PROOF, HEAVY_TX_MODE)
+                } else {
+                    (LIGHT_TX_PER_PROOF, LIGHT_TX_MODE)
+                };
+                let circuit = BlockTxCircuit::define(CIRCUIT_CONFIG, per_proof, CHAIN_ID, mode);
+                (bincode::serialize(&circuit.target).unwrap(), circuit.builder.build::<C>())
+            }
+            "heavy_chain" | "light_chain" => {
+                let (per_proof, mode) = if shape == "heavy_chain" {
+                    (HEAVY_TX_PER_PROOF, HEAVY_TX_MODE)
+                } else {
+                    (LIGHT_TX_PER_PROOF, LIGHT_TX_MODE)
+                };
+                let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, per_proof, CHAIN_ID, mode);
+                let tx_data = tx.builder.build::<C>();
+                let circuit = BlockTxChainCircuit::define(
+                    CIRCUIT_CONFIG,
+                    &tx_data,
+                    ON_CHAIN_OPERATIONS_LIMIT,
+                );
+                (bincode::serialize(&circuit.target).unwrap(), circuit.builder.build::<C>())
+            }
+            "block" => {
+                let circuits = Circuits::new();
+                let (target, data) = circuits.build_block_circuit();
+                (bincode::serialize(&target).unwrap(), data)
+            }
+            _ => panic!("unsupported EM production-oracle shape {shape}"),
+        }
+    }
+
+    #[cfg(feature = "diagnostic_profile")]
+    fn em_assert_generator_identity(
+        shape: &str,
+        reference: &(Vec<u8>, CircuitData<F, C, D>),
+        append: &(Vec<u8>, CircuitData<F, C, D>),
+    ) -> usize {
+        assert_eq!(reference.0, append.0, "{shape}: target bytes diverge");
+        assert_eq!(reference.1.common, append.1.common, "{shape}: common diverges");
+        assert_eq!(
+            reference.1.verifier_only, append.1.verifier_only,
+            "{shape}: verifier diverges"
+        );
+        let reference_prover = &reference.1.prover_only;
+        let append_prover = &append.1.prover_only;
+        assert_eq!(
+            reference_prover.circuit_digest, append_prover.circuit_digest,
+            "{shape}: circuit digest"
+        );
+        assert_eq!(
+            reference_prover.representative_map, append_prover.representative_map,
+            "{shape}: representative map"
+        );
+        assert_eq!(
+            reference_prover.fixed_routed_wires, append_prover.fixed_routed_wires,
+            "{shape}: fixed routed wires"
+        );
+        assert_eq!(
+            reference_prover.generator_indices_by_watches,
+            append_prover.generator_indices_by_watches,
+            "{shape}: generator watch CSR"
+        );
+        assert_eq!(
+            reference_prover.generator_watch_counts,
+            append_prover.generator_watch_counts,
+            "{shape}: generator watch counts"
+        );
+        assert_eq!(
+            reference_prover.generators.len(),
+            append_prover.generators.len(),
+            "{shape}: generator count"
+        );
+        for (index, (reference_generator, append_generator)) in reference_prover
+            .generators
+            .iter()
+            .zip(&append_prover.generators)
+            .enumerate()
+        {
+            assert_eq!(
+                reference_generator.0.id(),
+                append_generator.0.id(),
+                "{shape}: generator id {index}"
+            );
+            assert_eq!(
+                reference_generator.0.watch_list(),
+                append_generator.0.watch_list(),
+                "{shape}: generator watch list {index}"
+            );
+        }
+        let reference_stream = em_generator_stream(&reference.1);
+        let append_stream = em_generator_stream(&append.1);
+        assert_eq!(reference_stream, append_stream, "{shape}: generator bytes");
+        reference_stream.len()
+    }
+
+    #[cfg(feature = "diagnostic_profile")]
+    #[test]
+    #[ignore = "exact EM production append semantic oracle; run one named shape explicitly"]
+    fn em_production_append_shape_oracle() {
+        std::thread::Builder::new()
+            .name("em-production-append-oracle".to_owned())
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                let requested = std::env::var("PLONKY2_EM_REQUESTED_SHAPE")
+                    .expect("PLONKY2_EM_REQUESTED_SHAPE is required");
+                let shape = match requested.as_str() {
+                    "pre" => "pre",
+                    "heavy_tx" => "heavy_tx",
+                    "heavy_chain" => "heavy_chain",
+                    "light_tx" => "light_tx",
+                    "light_chain" => "light_chain",
+                    "block" => "block",
+                    _ => panic!("unsupported EM production-oracle shape {requested}"),
+                };
+                let _ = rayon::ThreadPoolBuilder::new()
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .build_global();
+                use plonky2::plonk::circuit_builder::em_set_reference_generators;
+                em_set_reference_generators(true);
+                let reference = em_build_requested_shape(shape);
+                em_set_reference_generators(false);
+                let append = em_build_requested_shape(shape);
+                let generator_bytes = em_assert_generator_identity(shape, &reference, &append);
+                println!(
+                    "EM_PRODUCTION_ORACLE_PASS shape={shape} generator_bytes={generator_bytes}"
+                );
+            })
+            .expect("spawning EM production-oracle stack thread")
+            .join()
+            .expect("EM production-oracle stack thread panicked");
+    }
 }
 
 #[cfg(test)]

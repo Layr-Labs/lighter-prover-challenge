@@ -523,6 +523,19 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         vec![WitnessGeneratorRef::new(g.adapter())]
     }
 
+    fn append_generators(
+        &self,
+        row: usize,
+        _local_constants: &[F],
+        out: &mut Vec<WitnessGeneratorRef<F, D>>,
+    ) {
+        let g = Poseidon2Generator::<F, D> {
+            row,
+            _phantom: PhantomData,
+        };
+        out.push(WitnessGeneratorRef::new(g.adapter()));
+    }
+
     fn num_wires(&self) -> usize {
         Self::end()
     }

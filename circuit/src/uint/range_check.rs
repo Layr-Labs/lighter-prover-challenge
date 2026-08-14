@@ -493,6 +493,24 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         result
     }
 
+    fn append_generators(
+        &self,
+        row: usize,
+        _local_constants: &[F],
+        out: &mut Vec<WitnessGeneratorRef<F, D>>,
+    ) {
+        out.extend((0..self.num_ops).map(|i| {
+            WitnessGeneratorRef::new(
+                RangeCheckGenerator {
+                    gate: *self,
+                    row,
+                    i,
+                }
+                .adapter(),
+            )
+        }));
+    }
+
     fn num_wires(&self) -> usize {
         self.num_ops * (1 + self.aux_limbs_per_input())
     }

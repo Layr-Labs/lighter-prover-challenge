@@ -152,6 +152,25 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for AdditionGate {
             .collect()
     }
 
+    fn append_generators(
+        &self,
+        row: usize,
+        local_constants: &[F],
+        out: &mut Vec<WitnessGeneratorRef<F, D>>,
+    ) {
+        out.extend((0..self.num_ops).map(|i| {
+            WitnessGeneratorRef::new(
+                AdditionBaseGenerator {
+                    row,
+                    const_0: local_constants[0],
+                    const_1: local_constants[1],
+                    i,
+                }
+                .adapter(),
+            )
+        }));
+    }
+
     fn num_wires(&self) -> usize {
         self.num_ops * 3
     }
