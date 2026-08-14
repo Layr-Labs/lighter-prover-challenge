@@ -107,6 +107,13 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Build-host-compiled AIR containing only the optional two-level parent
+/// specialization. It is empty on non-Mac builders or whenever the optional
+/// Metal compiler is unavailable; all established pipelines continue to come
+/// from [`SHADER_METALLIB`].
+const SHADER_PARENT2_METALLIB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_parent2.metallib"));
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
@@ -1083,12 +1090,20 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    /// Returns a finished optional specialization without joining its builder.
+    /// Callers with a complete established fallback use this so an early tree
+    /// never turns background Metal lowering into startup latency.
+    fn get_if_ready(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static PARENT2_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1104,6 +1119,10 @@ fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.get()
+}
+
+fn parent2_pipeline() -> Option<&'static ComputePipelineState> {
+    PARENT2_PIPELINE.get_if_ready()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1153,6 +1172,45 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             Err(_) => {
                 let _ = slot.built.set(None);
             }
+        }
+    }
+}
+
+/// Lowers the auxiliary two-level parent kernel off the required-context path.
+/// Missing build tools, AIR incompatibility, or pipeline failure settle the
+/// slot to `None`, and every tree then retains the promoted one-level loop.
+fn spawn_optional_parent2_pipeline(device: &Device, library: Option<metal::Library>) {
+    let Some(library) = library else {
+        let _ = PARENT2_PIPELINE.built.set(None);
+        return;
+    };
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-parent2".to_owned())
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                library
+                    .get_function("poseidon2_hash_parent2", None)
+                    .ok()
+                    .and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
+            });
+            if pipeline.is_none() {
+                log::debug!("two-level parent pipeline unavailable; using promoted schedule");
+            }
+            let _ = PARENT2_PIPELINE.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = PARENT2_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = PARENT2_PIPELINE.built.set(None);
         }
     }
 }
@@ -2153,6 +2211,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 
     // Parent levels over the completed leaf digests, exactly as in the
     // classic single-command build.
+    let fused_parent_pipeline = parent2_pipeline();
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
     let parents_command = autoreleasepool(|| -> CommandBuffer {
         let command_buffer = context.queue.new_command_buffer();
@@ -2160,30 +2219,67 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         let mut child_count = leaf_count;
         level_offsets.push(level_offset);
         while child_count > cap_count {
-            let parent_count = child_count / 2;
-            let child_offset = level_offset;
-            level_offset += child_count * 4;
-            level_offsets.push(level_offset);
+            if let Some(fused) = fused_parent_pipeline.filter(|_| child_count / 4 >= cap_count) {
+                let child_offset = level_offset;
+                let parent_count = child_count / 2;
+                level_offset += child_count * 4;
+                let parent_offset = level_offset;
+                level_offsets.push(parent_offset);
 
-            let parent_count_u32 = parent_count as u32;
-            let parent_encoder = command_buffer.new_compute_command_encoder();
-            parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
-            parent_encoder.set_buffer(
-                0,
-                Some(output_buffer),
-                (child_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(
-                1,
-                Some(output_buffer),
-                (level_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
-            set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
+                let grandparent_count = child_count / 4;
+                level_offset += parent_count * 4;
+                let grandparent_offset = level_offset;
+                level_offsets.push(grandparent_offset);
 
-            child_count = parent_count;
+                let parent_encoder = command_buffer.new_compute_command_encoder();
+                parent_encoder.set_compute_pipeline_state(fused);
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (parent_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    2,
+                    Some(output_buffer),
+                    (grandparent_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(parent_encoder, 4, grandparent_count as u32);
+                dispatch(parent_encoder, fused, grandparent_count);
+                parent_encoder.end_encoding();
+
+                child_count = grandparent_count;
+            } else {
+                let parent_count = child_count / 2;
+                let child_offset = level_offset;
+                level_offset += child_count * 4;
+                level_offsets.push(level_offset);
+
+                let parent_count_u32 = parent_count as u32;
+                let parent_encoder = command_buffer.new_compute_command_encoder();
+                parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (level_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(parent_encoder, 3, parent_count_u32);
+                dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+                parent_encoder.end_encoding();
+
+                child_count = parent_count;
+            }
         }
         #[cfg(feature = "diagnostic_profile")]
         profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
@@ -2393,6 +2489,17 @@ impl MetalShared {
             //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
             // and `metallib_matches_shader_source` fails the test run if you
             // forget.
+            // The auxiliary artifact is generated by the native ranked build
+            // and is deliberately not allowed to replace any established
+            // pipeline. Only its new parent2 function is ever resolved.
+            let parent2_library = (!SHADER_PARENT2_METALLIB.is_empty())
+                .then(|| device.new_library_with_data(SHADER_PARENT2_METALLIB).ok())
+                .flatten()
+                .filter(|library| {
+                    library
+                        .get_function("poseidon2_hash_parent2", None)
+                        .is_ok()
+                });
             let library = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
@@ -2511,6 +2618,7 @@ impl MetalShared {
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
             spawn_optional_pipelines(&device, &library);
+            spawn_optional_parent2_pipeline(&device, parent2_library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
