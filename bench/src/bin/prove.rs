@@ -44,6 +44,19 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // Keep the promoted writer path while exercising a second submission from that baseline.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
+/// Leave two logical CPUs outside the bulk Rayon pool for the prover's own
+/// latency-critical chain thread, block-build lane, and Metal driver work.
+/// Those threads run alongside Rayon rather than inside it, so using every
+/// logical CPU for pool workers oversubscribes the machine. On the local 10-CPU
+/// Apple host this selects the measured optimum of eight workers; unlike a
+/// fixed count it scales to the ranked M4 Pro runner's larger topology.
+fn prover_rayon_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(8, usize::from)
+        .saturating_sub(2)
+        .max(1)
+}
+
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
@@ -65,6 +78,7 @@ fn main() {
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
+        .num_threads(prover_rayon_threads())
         .stack_size(PROVER_THREAD_STACK_BYTES)
         .build_global()
         .expect("cannot configure prover thread pool");
