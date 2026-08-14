@@ -255,3 +255,5 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+
+// b256-octal-opening controlled redraw 2, 2026-08-14
