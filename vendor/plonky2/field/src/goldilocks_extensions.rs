@@ -219,6 +219,15 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     *hi += carry as u32;
 }
 
+/// Add one little-endian 160-bit value to another.
+/// Callers prove that the exact sum remains below `2^160`.
+#[inline(always)]
+fn u160_add(lo: &mut u128, hi: &mut u32, rhs_lo: u128, rhs_hi: u32) {
+    let (sum, carry) = lo.overflowing_add(rhs_lo);
+    *lo = sum;
+    *hi += rhs_hi + carry as u32;
+}
+
 /// Compute `sum_i extension_values[i].scalar_mul(base_scalars[i])` in
 /// GF(p^2), delaying reduction across the complete dot product.
 ///
@@ -255,16 +264,55 @@ fn ext2_base_scalar_dot_product(
                         scalars: &[GoldilocksField]| {
         debug_assert_eq!(values.len(), scalars.len());
         debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for (&QuadraticExtension([a0, a1]), &scalar) in values.iter().zip(scalars) {
-            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
-            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        // Four independent accumulators per coefficient break the serial
+        // carry dependency between adjacent products. Combining the exact
+        // partial sums before the one final reduction preserves the raw
+        // representative produced by the scalar accumulator.
+        let mut lo0 = [0u128; 4];
+        let mut hi0 = [0u32; 4];
+        let mut lo1 = [0u128; 4];
+        let mut hi1 = [0u32; 4];
+        let mut value_chunks = values.chunks_exact(4);
+        let mut scalar_chunks = scalars.chunks_exact(4);
+        for (value_chunk, scalar_chunk) in value_chunks.by_ref().zip(scalar_chunks.by_ref()) {
+            let QuadraticExtension([a00, a01]) = value_chunk[0];
+            let QuadraticExtension([a10, a11]) = value_chunk[1];
+            let QuadraticExtension([a20, a21]) = value_chunk[2];
+            let QuadraticExtension([a30, a31]) = value_chunk[3];
+            let s0 = scalar_chunk[0].0;
+            let s1 = scalar_chunk[1].0;
+            let s2 = scalar_chunk[2].0;
+            let s3 = scalar_chunk[3].0;
+
+            u160_add_product(&mut lo0[0], &mut hi0[0], a00.0, s0);
+            u160_add_product(&mut lo1[0], &mut hi1[0], a01.0, s0);
+            u160_add_product(&mut lo0[1], &mut hi0[1], a10.0, s1);
+            u160_add_product(&mut lo1[1], &mut hi1[1], a11.0, s1);
+            u160_add_product(&mut lo0[2], &mut hi0[2], a20.0, s2);
+            u160_add_product(&mut lo1[2], &mut hi1[2], a21.0, s2);
+            u160_add_product(&mut lo0[3], &mut hi0[3], a30.0, s3);
+            u160_add_product(&mut lo1[3], &mut hi1[3], a31.0, s3);
+        }
+
+        let (mut total_lo0, mut total_hi0) = (lo0[0], hi0[0]);
+        let (mut total_lo1, mut total_hi1) = (lo1[0], hi1[0]);
+        for lane in 1..4 {
+            u160_add(&mut total_lo0, &mut total_hi0, lo0[lane], hi0[lane]);
+            u160_add(&mut total_lo1, &mut total_hi1, lo1[lane], hi1[lane]);
+        }
+
+        for (&QuadraticExtension([a0, a1]), &scalar) in value_chunks
+            .remainder()
+            .iter()
+            .zip(scalar_chunks.remainder())
+        {
+            u160_add_product(&mut total_lo0, &mut total_hi0, a0.0, scalar.0);
+            u160_add_product(&mut total_lo1, &mut total_hi1, a1.0, scalar.0);
         }
         // SAFETY: the exact worst-case bound above covers arbitrary u64
         // representatives for every term in this chunk.
-        QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
-            reduce160(lo1, hi1)
+        QuadraticExtension([unsafe { reduce160(total_lo0, total_hi0) }, unsafe {
+            reduce160(total_lo1, total_hi1)
         }])
     };
 
@@ -760,11 +808,12 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 
 #[cfg(test)]
 mod tests {
+    use super::u160_add_product;
     use crate::extension::quadratic::QuadraticExtension;
     use crate::extension::quartic::QuarticExtension;
     use crate::extension::quintic::{QuinticExtension, QuinticFirstCoeff};
     use crate::extension::{Extendable, FieldExtension, Frobenius, OEF};
-    use crate::goldilocks_field::GoldilocksField;
+    use crate::goldilocks_field::{reduce160, GoldilocksField};
     use crate::types::{Field, Field64, PrimeField64};
 
     type GF = GoldilocksField;
@@ -778,6 +827,27 @@ mod tests {
             .zip(scalars)
             .map(|(&value, &scalar)| <Q2 as FieldExtension<2>>::scalar_mul(&value, scalar))
             .sum()
+    }
+
+    fn scalar_ext2_base_scalar_dot_product(values: &[Q2], scalars: &[GF]) -> Q2 {
+        let len = values.len().min(scalars.len());
+        if len == 0 {
+            return Q2::ZERO;
+        }
+
+        let (mut lo0, mut hi0) = (0u128, 0u32);
+        let (mut lo1, mut hi1) = (0u128, 0u32);
+        for (&QuadraticExtension([a0, a1]), &scalar) in
+            values[..len].iter().zip(&scalars[..len])
+        {
+            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
+            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        }
+        // SAFETY: every test length is below the production per-reduction
+        // bound, and the production worst-case proof applies to raw u64 limbs.
+        QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
+            reduce160(lo1, hi1)
+        }])
     }
 
     #[test]
@@ -884,6 +954,69 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_product_interleaved_matches_scalar_raw() {
+        let p = GF::ORDER;
+        let raw_specials = [0, 1, p - 1, p, p + 1, u64::MAX];
+        let lengths = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (7, 7),
+            (5, 7),
+            (7, 5),
+            (65_537, 65_537),
+            (65_539, 65_539),
+        ];
+
+        let mut state = 0xE703_7ED1_A0B4_28DBu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (values_len, scalars_len) in lengths {
+            let values: Vec<Q2> = (0..values_len)
+                .map(|i| {
+                    let a0 = if i < raw_specials.len() {
+                        raw_specials[i]
+                    } else {
+                        next()
+                    };
+                    let a1 = if i < raw_specials.len() {
+                        raw_specials[raw_specials.len() - 1 - i]
+                    } else {
+                        next()
+                    };
+                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
+                })
+                .collect();
+            let scalars: Vec<GF> = (0..scalars_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+
+            let expected = scalar_ext2_base_scalar_dot_product(&values, &scalars);
+            let actual = <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars);
+            assert_eq!(
+                [actual.0[0].0, actual.0[1].0],
+                [expected.0[0].0, expected.0[1].0],
+                "raw limbs mismatch at ({values_len}, {scalars_len})"
+            );
+        }
     }
 
     #[test]
