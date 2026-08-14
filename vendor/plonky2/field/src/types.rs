@@ -241,6 +241,81 @@ pub trait Field:
         }
     }
 
+    /// Montgomery-invert `x` and multiply the inverses directly into two product slices.
+    ///
+    /// This is the same four-lane algorithm as [`Self::batch_multiplicative_inverse_into`],
+    /// but the backward pass consumes each inverse immediately instead of materializing a
+    /// complete inverse vector for a later multiply pass. `x` is logically split at
+    /// `first_products.len()`.
+    #[inline]
+    fn batch_multiplicative_inverse_multiply_split_into(
+        x: &[Self],
+        first_products: &mut [Self],
+        second_products: &mut [Self],
+        scratch: &mut Vec<Self>,
+    ) {
+        const WIDTH: usize = 4;
+        let split = first_products.len();
+        let n = x.len();
+        debug_assert_eq!(split + second_products.len(), n);
+
+        if n < WIDTH {
+            Self::batch_multiplicative_inverse_into(x, scratch);
+            for (product, &inverse) in first_products.iter_mut().zip(&scratch[..split]) {
+                *product *= inverse;
+            }
+            for (product, &inverse) in second_products.iter_mut().zip(&scratch[split..]) {
+                *product *= inverse;
+            }
+            return;
+        }
+
+        scratch.clear();
+        scratch.reserve(n);
+        let mut cumul_prod: [Self; WIDTH] = x[..WIDTH].try_into().unwrap();
+        scratch.extend(cumul_prod);
+        for (i, &xi) in x[WIDTH..].iter().enumerate() {
+            cumul_prod[i % WIDTH] *= xi;
+            scratch.push(cumul_prod[i % WIDTH]);
+        }
+        debug_assert_eq!(scratch.len(), n);
+
+        let mut a_inv = {
+            let c01 = cumul_prod[0] * cumul_prod[1];
+            let c23 = cumul_prod[2] * cumul_prod[3];
+            let c0123 = c01 * c23;
+            let c0123inv = c0123.inverse();
+            let c01inv = c0123inv * c23;
+            let c23inv = c0123inv * c01;
+            [
+                c01inv * cumul_prod[1],
+                c01inv * cumul_prod[0],
+                c23inv * cumul_prod[3],
+                c23inv * cumul_prod[2],
+            ]
+        };
+
+        for i in (WIDTH..n).rev() {
+            let inverse = scratch[i - WIDTH] * a_inv[i % WIDTH];
+            debug_assert_eq!(inverse * x[i], Self::ONE);
+            if i < split {
+                first_products[i] *= inverse;
+            } else {
+                second_products[i - split] *= inverse;
+            }
+            a_inv[i % WIDTH] *= x[i];
+        }
+        for i in (0..WIDTH).rev() {
+            let inverse = a_inv[i];
+            debug_assert_eq!(inverse * x[i], Self::ONE);
+            if i < split {
+                first_products[i] *= inverse;
+            } else {
+                second_products[i - split] *= inverse;
+            }
+        }
+    }
+
     /// Compute the inverse of 2^exp in this field.
     #[inline]
     fn inverse_2exp(exp: usize) -> Self {

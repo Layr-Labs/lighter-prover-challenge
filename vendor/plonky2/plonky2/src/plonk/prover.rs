@@ -589,6 +589,28 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+/// Divide both production challenges with one Montgomery inversion. The caller
+/// constructs `denominator_products` directly as challenge 0 followed by
+/// challenge 1, so this deletes the second inversion without copying either
+/// denominator vector into a temporary joined buffer.
+#[inline]
+fn divide_chunk_products_pair_direct<F: Field>(
+    numerator_0: &mut [F],
+    numerator_1: &mut [F],
+    denominator_products: &[F],
+    first_len: usize,
+    prefix_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(numerator_0.len(), first_len);
+    debug_assert_eq!(numerator_1.len(), denominator_products.len() - first_len);
+    F::batch_multiplicative_inverse_multiply_split_into(
+        denominator_products,
+        numerator_0,
+        numerator_1,
+        prefix_scratch,
+    );
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -688,16 +710,19 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (denominators, prefix_scratch) = scratch;
+                    let denominator_count = products_0.len();
+                    denominators.clear();
+                    let denominator_slots = crate::hash::merkle_tree::capacity_up_to_mut(
+                        denominators,
+                        2 * denominator_count,
+                    );
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -731,9 +756,15 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            denominator_slots[output].write(denominator_0);
+                            denominator_slots[denominator_count + output].write(denominator_1);
                         }
+                    }
+                    // SAFETY: the loop wrote both denominator halves completely:
+                    // `output` covers `0..denominator_count`, and the second
+                    // challenge is stored at the disjoint offset `denominator_count`.
+                    unsafe {
+                        denominators.set_len(2 * denominator_count);
                     }
                     // SAFETY: the loop above wrote every slot of both
                     // sub-slices — `t` covers `0..xs.len()` and `chunk` covers
@@ -747,8 +778,13 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    divide_chunk_products_pair_direct(
+                        products_0,
+                        products_1,
+                        denominators,
+                        denominator_count,
+                        prefix_scratch,
+                    );
                 },
             );
     }
@@ -3081,7 +3117,7 @@ mod flat_chunk_products_tests {
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{divide_chunk_products, divide_chunk_products_pair_direct};
 
     type F = GoldilocksField;
 
@@ -3135,6 +3171,50 @@ mod flat_chunk_products_tests {
 
     fn raw(values: &[F]) -> Vec<u64> {
         values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    #[test]
+    fn fused_batch_divide_matches_materialized_inverses() {
+        for &(n0, n1) in &[
+            (0usize, 0usize),
+            (0, 1),
+            (1, 0),
+            (1, 2),
+            (2, 2),
+            (3, 4),
+            (4, 3),
+            (5, 7),
+            (10, 10),
+            (127, 129),
+        ] {
+            let denominators = (0..n0 + n1)
+                .map(|i| F::from_canonical_usize(37 * i + 5))
+                .collect::<Vec<_>>();
+            let mut expected_0 = noncanonical_vec(n0, 11);
+            let mut expected_1 = noncanonical_vec(n1, 29);
+            let inverses = F::batch_multiplicative_inverse(&denominators);
+            for (product, &inverse) in expected_0.iter_mut().zip(&inverses[..n0]) {
+                *product *= inverse;
+            }
+            for (product, &inverse) in expected_1.iter_mut().zip(&inverses[n0..]) {
+                *product *= inverse;
+            }
+
+            let mut actual_0 = noncanonical_vec(n0, 11);
+            let mut actual_1 = noncanonical_vec(n1, 29);
+            let mut scratch = vec![F::ONE; n0 + n1 + 3];
+            divide_chunk_products_pair_direct(
+                &mut actual_0,
+                &mut actual_1,
+                &denominators,
+                n0,
+                &mut scratch,
+            );
+
+            assert_eq!(raw(&actual_0), raw(&expected_0), "first slice ({n0}, {n1})");
+            assert_eq!(raw(&actual_1), raw(&expected_1), "second slice ({n0}, {n1})");
+            assert_eq!(scratch.len(), denominators.len());
+        }
     }
 
     /// The Z accumulation exactly as `wires_permutation_partial_products_and_zs` performs it,
