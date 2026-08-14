@@ -2056,12 +2056,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
     // while an already-busy stream would just queue the absorb groups behind
     // another tree and stretch both.
-    let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
-    } else {
-        leaf_count >= 1 << 19
-            && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
-    };
+    // nostream19-1786672000: drop the pipelined 2^19-and-idle arm.
+    // Exclusive 2^20+ trees still stream; everything else classic fill+hash.
+    let stream_admitted = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+        && leaf_count >= 1 << 20;
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width < 16
