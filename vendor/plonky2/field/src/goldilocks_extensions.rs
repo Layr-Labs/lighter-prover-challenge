@@ -219,6 +219,16 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     *hi += carry as u32;
 }
 
+/// Merge two exact 160-bit partial sums. Callers prove that the combined sum
+/// is below `2^160`, so computing the high word through `u64` cannot truncate.
+#[inline(always)]
+fn u160_add_accumulators(a: (u128, u32), b: (u128, u32)) -> (u128, u32) {
+    let (lo, carry) = a.0.overflowing_add(b.0);
+    let hi = a.1 as u64 + b.1 as u64 + carry as u64;
+    debug_assert!(hi <= u32::MAX as u64);
+    (lo, hi as u32)
+}
+
 /// Compute `sum_i extension_values[i].scalar_mul(base_scalars[i])` in
 /// GF(p^2), delaying reduction across the complete dot product.
 ///
@@ -255,12 +265,30 @@ fn ext2_base_scalar_dot_product(
                         scalars: &[GoldilocksField]| {
         debug_assert_eq!(values.len(), scalars.len());
         debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for (&QuadraticExtension([a0, a1]), &scalar) in values.iter().zip(scalars) {
-            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
-            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        // Two accumulator banks break the loop-carried dependency between
+        // adjacent products. Each bank receives alternating terms; merging
+        // their exact 160-bit sums before the sole reduction preserves the
+        // historical delayed-reduction representative.
+        let (mut lo00, mut hi00) = (0u128, 0u32);
+        let (mut lo01, mut hi01) = (0u128, 0u32);
+        let (mut lo10, mut hi10) = (0u128, 0u32);
+        let (mut lo11, mut hi11) = (0u128, 0u32);
+        for (value_pair, scalar_pair) in values.chunks_exact(2).zip(scalars.chunks_exact(2)) {
+            let QuadraticExtension([a00, a10]) = value_pair[0];
+            let QuadraticExtension([a01, a11]) = value_pair[1];
+            u160_add_product(&mut lo00, &mut hi00, a00.0, scalar_pair[0].0);
+            u160_add_product(&mut lo10, &mut hi10, a10.0, scalar_pair[0].0);
+            u160_add_product(&mut lo01, &mut hi01, a01.0, scalar_pair[1].0);
+            u160_add_product(&mut lo11, &mut hi11, a11.0, scalar_pair[1].0);
         }
+        if values.len() % 2 != 0 {
+            let QuadraticExtension([a0, a1]) = values[values.len() - 1];
+            let scalar = scalars[scalars.len() - 1];
+            u160_add_product(&mut lo00, &mut hi00, a0.0, scalar.0);
+            u160_add_product(&mut lo10, &mut hi10, a1.0, scalar.0);
+        }
+        let (lo0, hi0) = u160_add_accumulators((lo00, hi00), (lo01, hi01));
+        let (lo1, hi1) = u160_add_accumulators((lo10, hi10), (lo11, hi11));
         // SAFETY: the exact worst-case bound above covers arbitrary u64
         // representatives for every term in this chunk.
         QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
@@ -780,6 +808,21 @@ mod tests {
             .sum()
     }
 
+    fn single_bank_extension_base_dot_product(values: &[Q2], scalars: &[GF]) -> Q2 {
+        let mut lo0 = 0u128;
+        let mut hi0 = 0u32;
+        let mut lo1 = 0u128;
+        let mut hi1 = 0u32;
+        for (&QuadraticExtension([a0, a1]), &scalar) in values.iter().zip(scalars) {
+            super::u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
+            super::u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        }
+        QuadraticExtension([
+            unsafe { crate::goldilocks_field::reduce160(lo0, hi0) },
+            unsafe { crate::goldilocks_field::reduce160(lo1, hi1) },
+        ])
+    }
+
     #[test]
     fn extension_base_dot_product_default_matches_scalar_mul_sum() {
         let values: Vec<Q4> = (0..17)
@@ -873,17 +916,84 @@ mod tests {
 
             let expected = generic_extension_base_dot_product(&values, &scalars);
             let actual = <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars);
+            let raw_reference = single_bank_extension_base_dot_product(&values, &scalars);
             for limb in 0..2 {
                 assert_eq!(
                     actual.0[limb].to_canonical_u64(),
                     expected.0[limb].to_canonical_u64(),
                     "canonical limb {limb} mismatch at ({values_len}, {scalars_len})"
                 );
+                assert_eq!(
+                    actual.0[limb].0,
+                    raw_reference.0[limb].0,
+                    "raw limb {limb} mismatch at ({values_len}, {scalars_len})"
+                );
             }
         }
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    #[ignore = "release-only production-shape microbenchmark"]
+    fn ext2_extension_base_dot_product_two_bank_benchmark() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const LEN: usize = 1 << 16;
+        const REPEATS: usize = 32;
+        const SAMPLES: usize = 41;
+        let values: Vec<Q2> = (0..LEN)
+            .map(|i| {
+                QuadraticExtension([
+                    GoldilocksField((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                    GoldilocksField(
+                        (i as u64)
+                            .wrapping_add(1)
+                            .wrapping_mul(0xD1B5_4A32_D192_ED03),
+                    ),
+                ])
+            })
+            .collect();
+        let scalars: Vec<GF> = (0..LEN)
+            .map(|i| GoldilocksField((i as u64).wrapping_mul(0xA076_1D64_78BD_642F)))
+            .collect();
+        let old = || single_bank_extension_base_dot_product(&values, &scalars);
+        let new = || <GF as Extendable<2>>::extension_base_dot_product(&values, &scalars);
+        assert_eq!(old(), new());
+        for _ in 0..3 {
+            black_box(old());
+            black_box(new());
+        }
+        let measure = |f: &dyn Fn() -> Q2| {
+            let start = Instant::now();
+            for _ in 0..REPEATS {
+                black_box(f());
+            }
+            start.elapsed()
+        };
+        let mut old_samples = Vec::with_capacity(SAMPLES);
+        let mut new_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let (old_elapsed, new_elapsed) = if sample % 2 == 0 {
+                (measure(&old), measure(&new))
+            } else {
+                let new_elapsed = measure(&new);
+                let old_elapsed = measure(&old);
+                (old_elapsed, new_elapsed)
+            };
+            old_samples.push(old_elapsed);
+            new_samples.push(new_elapsed);
+        }
+        old_samples.sort_unstable();
+        new_samples.sort_unstable();
+        let old_median: Duration = old_samples[SAMPLES / 2];
+        let new_median: Duration = new_samples[SAMPLES / 2];
+        eprintln!(
+            "single_bank={old_median:?} two_bank={new_median:?} speedup={:.4}x",
+            old_median.as_secs_f64() / new_median.as_secs_f64()
+        );
     }
 
     #[test]

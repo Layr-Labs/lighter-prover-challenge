@@ -587,18 +587,17 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    // Publish only after the page walk. Publishing first lets the final LDE
+    // fill race a trailing zero store from this thread.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
@@ -2866,11 +2865,18 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // Wake every waiter: with a spine waiter queued, whichever non-spine
-        // waiter the OS would hand a `notify_one` to would just re-block, so
-        // the wake must reach the spine thread. Waiter counts here are tiny
-        // (window depth + one spine), so the thundering herd is a few threads.
-        self.available.notify_all();
+        if pool.waiters == 0 {
+            return;
+        }
+        if pool.spine_waiters == 0 {
+            // One released singleton set can satisfy one interchangeable
+            // non-spine waiter; avoid waking the rest only to re-block.
+            self.available.notify_one();
+        } else {
+            // A broadcast is required to ensure a priority spine waiter wakes
+            // even if the OS would otherwise choose a non-spine waiter.
+            self.available.notify_all();
+        }
     }
 
     fn try_detach_completed_output(
