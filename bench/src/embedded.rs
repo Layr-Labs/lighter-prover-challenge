@@ -3,7 +3,7 @@
 
 //! Embedded startup circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
+//! `build.rs` constructs the five startup circuits and final block circuit during the untimed compile
 //! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
 //! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
 //! exact `Circuits` value `Circuits::new` builds, several times faster than
@@ -14,6 +14,7 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -81,6 +83,14 @@ fn load_blob<T: serde::de::DeserializeOwned>(
 }
 
 impl Circuits {
+    /// Loads the final block circuit built in the untimed compile job. Unlike
+    /// the five startup circuits this value is not retained in `Circuits`: it
+    /// is handed directly to the final-witness lane, preserving its lifetime
+    /// and early-release behavior while deleting repeated runtime construction.
+    pub(crate) fn load_block_embedded() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockTarget>("block", BLOCK_BLOB)
+    }
+
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
     /// behind the remaining circuit loads.
@@ -424,11 +434,67 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),
                 "embedded circuit blob {name} is an empty stub"
             );
         }
+    }
+
+    /// Loading the separately embedded final circuit exercises every encoded
+    /// section and the verifier-cap check without running a proof.
+    #[test]
+    fn embedded_block_loads() {
+        on_big_stack(|| {
+            let (target, data) = Circuits::load_block_embedded()
+                .expect("embedded final block circuit must deserialize");
+            assert!(!bincode::serialize(&target).unwrap().is_empty());
+            assert!(!data.prover_only.generators.is_empty());
+            assert!(!data.verifier_only.constants_sigmas_cap.0.is_empty());
+        });
+    }
+
+    /// Manual bounded A/B for the scored final-circuit lane. This constructs
+    /// circuit data but never creates a witness or runs the prover.
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn embedded_block_load_timing() {
+        use std::time::Instant;
+
+        use circuit::block_constraints::{BlockCircuit, Circuit as _};
+        use circuit::types::config::CIRCUIT_CONFIG;
+        use crate::api::ON_CHAIN_OPERATIONS_LIMIT;
+
+        on_big_stack(|| {
+            let circuits = Circuits::from_embedded().expect("startup circuits must load");
+
+            let started = Instant::now();
+            let embedded = Circuits::load_block_embedded().expect("block embedding must load");
+            let embedded_elapsed = started.elapsed();
+
+            let heavy = circuits.heavy_chain_data.read().unwrap();
+            let light = circuits.light_chain_data.read().unwrap();
+            let started = Instant::now();
+            let block = BlockCircuit::define(
+                CIRCUIT_CONFIG,
+                &circuits.pre_data,
+                &light,
+                &heavy,
+                ON_CHAIN_OPERATIONS_LIMIT,
+            );
+            let rebuilt = (block.target, block.builder.build::<C>());
+            let rebuilt_elapsed = started.elapsed();
+
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt.0, &rebuilt.1),
+                (&embedded.0, &embedded.1),
+            );
+
+            println!("embedded final block load: {embedded_elapsed:.3?}");
+            println!("runtime final block build: {rebuilt_elapsed:.3?}");
+        });
     }
 }
