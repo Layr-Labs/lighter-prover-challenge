@@ -52,6 +52,14 @@ pub enum ColumnStore<F> {
 }
 
 impl<F: RichField> ColumnStore<F> {
+    pub fn is_shared(&self) -> bool {
+        match self {
+            ColumnStore::Owned(_) => false,
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            ColumnStore::Shared(_) => true,
+        }
+    }
+
     pub fn num_cols(&self) -> usize {
         match self {
             ColumnStore::Owned(columns) => columns.len(),
@@ -76,7 +84,11 @@ impl<F: RichField> ColumnStore<F> {
         }
     }
 
-    pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
+    /// Returns exclusive mutable views of every natural-order column while
+    /// the store is uniquely owned. This is also the initialization path for
+    /// callers restoring a precomputed commitment into retained shared Metal
+    /// storage; cloned shared stores correctly decline mutable access.
+    pub fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
         match self {
             ColumnStore::Owned(columns) => {
                 Some(columns.iter_mut().map(Vec::as_mut_slice).collect())
