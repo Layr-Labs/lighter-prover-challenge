@@ -8,7 +8,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::oracle::coset_fft_zero_tail;
+use crate::fri::oracle::coset_fft_zero_tail_base_shift;
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
@@ -216,9 +216,9 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // unread — everything below this loop uses only `coeffs` — so the
         // last round's transform is entirely dead work. Skip it.
         if round + 1 < num_rounds {
-            values = coset_fft_zero_tail(
+            values = coset_fft_zero_tail_base_shift::<F, D>(
                 &coeffs,
-                shift.into(),
+                shift,
                 live_chunks,
                 Some(fri_params.config.rate_bits),
                 None,
