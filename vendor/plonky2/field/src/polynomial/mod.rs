@@ -63,15 +63,13 @@ impl<F: Field> PolynomialValues<F> {
 
     /// Returns the polynomial whose evaluation on the coset `shift*H` is `self`.
     pub fn coset_ifft(self, shift: F) -> PolynomialCoeffs<F> {
-        let mut shifted_coeffs = self.ifft();
-        shifted_coeffs
-            .coeffs
-            .iter_mut()
-            .zip(shift.inverse().powers())
-            .for_each(|(c, r)| {
-                *c *= r;
-            });
-        shifted_coeffs
+        // Fuse `n_inv` reverse + `shift^{-i}` into one postscale pass
+        // (`ifft_with_options_and_postscale`). Same mul order as
+        // `ifft()` then `*= r`: `(buf[j] * n_inv) * shift^{-i}`.
+        // Does not change `fft_dispatch` (not 4db249a).
+        let n = self.len();
+        let inverse_powers: Vec<F> = shift.inverse().powers().take(n).collect();
+        self.coset_ifft_with_powers(&inverse_powers)
     }
 
     /// Returns the polynomial evaluated by `self` on a coset when the caller
