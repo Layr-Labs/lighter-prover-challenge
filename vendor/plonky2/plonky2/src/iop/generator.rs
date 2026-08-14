@@ -129,6 +129,9 @@ fn run_generator_worklist<
 ) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+    // When every generator defers until ready, a queued-but-unready generator's `run` is a
+    // proven no-op, so avoid the scattered boxed-generator load and indirect call entirely.
+    let skip_unready = prover_data.generators_defer_until_ready;
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
@@ -181,10 +184,14 @@ fn run_generator_worklist<
                         if round_generator_is_expired[generator_idx] {
                             continue;
                         }
+                        let ready = round_unresolved_watches[generator_idx] == 0;
+                        if skip_unready && !ready {
+                            continue;
+                        }
                         let finished = generators[generator_idx].0.run_with_ready_hint(
                             round_witness,
                             &mut round_buffer,
-                            round_unresolved_watches[generator_idx] == 0,
+                            ready,
                         );
                         entries.push((generator_idx, finished, round_buffer.target_values.len()));
                         for (t, v) in round_buffer.target_values.drain(..) {
@@ -243,12 +250,15 @@ fn run_generator_worklist<
             if generator_is_expired[generator_idx] {
                 continue;
             }
+            let ready = unresolved_watches[generator_idx] == 0;
+            if skip_unready && !ready {
+                continue;
+            }
 
-            let finished = generators[generator_idx].0.run_with_ready_hint(
-                witness,
-                &mut buffer,
-                unresolved_watches[generator_idx] == 0,
-            );
+            let finished =
+                generators[generator_idx]
+                    .0
+                    .run_with_ready_hint(witness, &mut buffer, ready);
             if finished {
                 generator_is_expired[generator_idx] = true;
                 *remaining_generators -= 1;
@@ -649,6 +659,15 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         self.run(witness, out_buffer)
     }
 
+    /// Whether `run_with_ready_hint(_, _, false)` is guaranteed to be a pure no-op: it writes
+    /// nothing to `out_buffer`, reads nothing from the witness, and returns `false`.
+    ///
+    /// The conservative default preserves incremental witness generators. Implementations that
+    /// opt in let the scheduler skip an otherwise inert virtual dispatch.
+    fn defers_until_ready(&self) -> bool {
+        false
+    }
+
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
     fn deserialize(src: &mut Buffer, common_data: &CommonCircuitData<F, D>) -> IoResult<Self>
@@ -800,6 +819,10 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated: bool,
     ) -> bool {
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
+    }
+
+    fn defers_until_ready(&self) -> bool {
+        true
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -1123,6 +1146,7 @@ mod tests {
         builder.register_public_input(output);
 
         let circuit = builder.build::<C>();
+        assert!(circuit.prover_only.generators_defer_until_ready);
         let dependency_calls_after_build = dependency_calls.load(Ordering::Relaxed);
         let mut inputs = PartialWitness::new();
         inputs
@@ -1786,6 +1810,7 @@ mod tests {
         builder.register_public_inputs(&[early_output, final_output]);
 
         let circuit = builder.build::<C>();
+        assert!(!circuit.prover_only.generators_defer_until_ready);
         let witness =
             generate_partial_witness(PartialWitness::new(), &circuit.prover_only, &circuit.common)
                 .unwrap();
