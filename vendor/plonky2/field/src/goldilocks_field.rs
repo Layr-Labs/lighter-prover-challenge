@@ -95,6 +95,28 @@ impl Field for GoldilocksField {
         Self::order()
     }
 
+    /// `2^{-exp}` via `p - (p-1)/2^exp`. Same formula as the `Field` default,
+    /// but `p` is `ORDER` so every IFFT `n_inv` skips `characteristic()` (a
+    /// BigUint alloc). Production `lg_n <= 21 < TWO_ADICITY`. Not a `mul`
+    /// rewrite (not ea04bf2).
+    #[inline]
+    fn inverse_2exp(exp: usize) -> Self {
+        const P: u64 = Self::ORDER;
+        if exp <= Self::CHARACTERISTIC_TWO_ADICITY {
+            Self::from_canonical_u64(P - ((P - 1) >> exp))
+        } else {
+            let inverse_2_pow_adicity =
+                Self::from_canonical_u64(P - ((P - 1) >> Self::CHARACTERISTIC_TWO_ADICITY));
+            let mut res = inverse_2_pow_adicity;
+            let mut e = exp - Self::CHARACTERISTIC_TWO_ADICITY;
+            while e > Self::CHARACTERISTIC_TWO_ADICITY {
+                res *= inverse_2_pow_adicity;
+                e -= Self::CHARACTERISTIC_TWO_ADICITY;
+            }
+            res * Self::from_canonical_u64(P - ((P - 1) >> e))
+        }
+    }
+
     /// Returns the inverse of the field element, computed with a least-absolute-remainder
     /// (centered) extended Euclidean algorithm on 64-bit integers.
     ///
