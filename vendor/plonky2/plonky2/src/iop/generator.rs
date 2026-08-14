@@ -129,6 +129,14 @@ fn run_generator_worklist<
 ) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
+    // When every generator defers until ready, a queued-but-unready generator's `run` is a
+    // proven no-op (`ProverOnlyCircuitData::generators_defer_until_ready`), so the loops below
+    // drop straight through instead of dispatching. Both loops already load the counter to
+    // form the hint, so the test itself reads nothing new; what disappears is the scattered
+    // `generators[idx]` load and the indirect call behind it. Skipping an inert call leaves
+    // the witness, `generator_is_expired`, `remaining_generators` and the pending queue
+    // byte-for-byte as they were, so the fixpoint and every value in it are unchanged.
+    let skip_unready = prover_data.generators_defer_until_ready;
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
@@ -181,10 +189,14 @@ fn run_generator_worklist<
                         if round_generator_is_expired[generator_idx] {
                             continue;
                         }
+                        let ready = round_unresolved_watches[generator_idx] == 0;
+                        if skip_unready && !ready {
+                            continue;
+                        }
                         let finished = generators[generator_idx].0.run_with_ready_hint(
                             round_witness,
                             &mut round_buffer,
-                            round_unresolved_watches[generator_idx] == 0,
+                            ready,
                         );
                         entries.push((generator_idx, finished, round_buffer.target_values.len()));
                         for (t, v) in round_buffer.target_values.drain(..) {
@@ -243,12 +255,15 @@ fn run_generator_worklist<
             if generator_is_expired[generator_idx] {
                 continue;
             }
+            let ready = unresolved_watches[generator_idx] == 0;
+            if skip_unready && !ready {
+                continue;
+            }
 
-            let finished = generators[generator_idx].0.run_with_ready_hint(
-                witness,
-                &mut buffer,
-                unresolved_watches[generator_idx] == 0,
-            );
+            let finished =
+                generators[generator_idx]
+                    .0
+                    .run_with_ready_hint(witness, &mut buffer, ready);
             if finished {
                 generator_is_expired[generator_idx] = true;
                 *remaining_generators -= 1;
@@ -649,6 +664,24 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         self.run(witness, out_buffer)
     }
 
+    /// Whether `run_with_ready_hint(_, _, false)` is guaranteed to be a pure no-op: it writes
+    /// nothing to `out_buffer`, reads nothing from the witness, and returns `false`.
+    ///
+    /// The worklist calls every queued generator once per round even when the generator's
+    /// watched representatives are not all populated yet, because the default implementation
+    /// above forwards to [`Self::run`], which may legitimately emit partial output on such a
+    /// call (see `readiness_hint_preserves_incremental_witness_generator_fallback`). A
+    /// generator that opts in here promises that call is inert, which lets the worklist drop
+    /// the dispatch entirely instead of paying a scattered load of the boxed generator and an
+    /// indirect call to reach a short circuit.
+    ///
+    /// Conservative default: `false`. Only [`SimpleGeneratorAdapter`] overrides it, and its
+    /// `run_with_ready_hint` is literally `all_watches_populated && run_once(..)`, whose `&&`
+    /// short-circuits before `run_once` is reached.
+    fn defers_until_ready(&self) -> bool {
+        false
+    }
+
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
     fn deserialize(src: &mut Buffer, common_data: &CommonCircuitData<F, D>) -> IoResult<Self>
@@ -800,6 +833,12 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated: bool,
     ) -> bool {
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
+    }
+
+    /// `&&` short-circuits, so a `false` hint returns `false` without reaching `run_once`:
+    /// nothing is read and nothing is written. See [`WitnessGenerator::defers_until_ready`].
+    fn defers_until_ready(&self) -> bool {
+        true
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
