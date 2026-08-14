@@ -35,12 +35,18 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
-use plonky2::field::polynomial::PolynomialValues;
+use plonky2::field::goldilocks_field::GoldilocksField;
+use plonky2::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
+use plonky2::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS};
+use plonky2::hash::merkle_tree::{
+    ColumnStore, DigestStore, LevelOrderDigests, MerkleCap, MerkleLeaves, MerkleTree,
+};
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
+use plonky2::plonk::config::{GenericConfig, Hasher};
 use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
@@ -67,6 +73,12 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
 const EMBED_VERSION: u32 = 1;
+const COMMITMENT_CACHE_MAGIC: u32 = 0x4C43_4331; // "LCC1"
+const COMMITMENT_CACHE_VERSION: u32 = 1;
+const CACHE_LEAVES_ROWS: u64 = 0;
+const CACHE_LEAVES_COLUMNS: u64 = 1;
+const CACHE_DIGESTS_INTERLEAVED: u64 = 0;
+const CACHE_DIGESTS_LEVEL_ORDER: u64 = 1;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -161,6 +173,88 @@ fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
         raw.len()
     );
     Ok(raw)
+}
+
+fn write_cache_u64(out: &mut Vec<u8>, value: usize) -> Result<()> {
+    out.extend_from_slice(
+        &u64::try_from(value)
+            .context("commitment cache length exceeds u64")?
+            .to_le_bytes(),
+    );
+    Ok(())
+}
+
+fn read_cache_u64(bytes: &[u8], pos: &mut usize) -> Result<u64> {
+    let end = pos
+        .checked_add(8)
+        .context("commitment cache offset overflow")?;
+    ensure!(end <= bytes.len(), "commitment cache is truncated");
+    let value = u64::from_le_bytes(bytes[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(value)
+}
+
+fn read_cache_usize(bytes: &[u8], pos: &mut usize, what: &str) -> Result<usize> {
+    usize::try_from(read_cache_u64(bytes, pos)?)
+        .with_context(|| format!("commitment cache {what} exceeds usize"))
+}
+
+fn write_cache_fields(out: &mut Vec<u8>, values: &[F]) {
+    for value in values {
+        out.extend_from_slice(&value.0.to_le_bytes());
+    }
+}
+
+fn read_cache_fields_into(bytes: &[u8], pos: &mut usize, values: &mut [F]) -> Result<()> {
+    let byte_len = values
+        .len()
+        .checked_mul(core::mem::size_of::<u64>())
+        .context("commitment cache field byte length overflow")?;
+    let end = pos
+        .checked_add(byte_len)
+        .context("commitment cache field offset overflow")?;
+    ensure!(end <= bytes.len(), "commitment cache field data is truncated");
+    for (value, chunk) in values.iter_mut().zip(bytes[*pos..end].chunks_exact(8)) {
+        *value = GoldilocksField(u64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    *pos = end;
+    Ok(())
+}
+
+fn read_cache_fields(bytes: &[u8], pos: &mut usize, len: usize) -> Result<Vec<F>> {
+    let byte_len = len
+        .checked_mul(core::mem::size_of::<u64>())
+        .context("commitment cache field byte length overflow")?;
+    let end = pos
+        .checked_add(byte_len)
+        .context("commitment cache field offset overflow")?;
+    ensure!(end <= bytes.len(), "commitment cache field data is truncated");
+    let mut values = vec![F::ZERO; len];
+    read_cache_fields_into(bytes, pos, &mut values)?;
+    Ok(values)
+}
+
+fn write_cache_hash(out: &mut Vec<u8>, hash: &HashOut<F>) {
+    write_cache_fields(out, &hash.elements);
+}
+
+fn read_cache_hash(bytes: &[u8], pos: &mut usize) -> Result<HashOut<F>> {
+    let elements: [F; NUM_HASH_OUT_ELTS] = read_cache_fields(bytes, pos, NUM_HASH_OUT_ELTS)?
+        .try_into()
+        .unwrap();
+    Ok(HashOut { elements })
+}
+
+fn read_cache_hashes(bytes: &[u8], pos: &mut usize, len: usize) -> Result<Vec<HashOut<F>>> {
+    let byte_len = len
+        .checked_mul(NUM_HASH_OUT_ELTS)
+        .and_then(|fields| fields.checked_mul(core::mem::size_of::<u64>()))
+        .context("commitment cache hash byte length overflow")?;
+    let end = pos
+        .checked_add(byte_len)
+        .context("commitment cache hash offset overflow")?;
+    ensure!(end <= bytes.len(), "commitment cache hash data is truncated");
+    (0..len).map(|_| read_cache_hash(bytes, pos)).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +384,320 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     Ok(out)
 }
 
+/// Serializes only the already-built constants/sigmas polynomial commitment.
+///
+/// Unlike Plonky2's generic circuit wire format, this cache retains natural
+/// poly-major leaves and level-order digests. At runtime those leaves are
+/// restored into uniquely owned Metal-shared storage when the backend accepts
+/// the shape, so GPU quotient specializations keep seeing the same storage
+/// class as a freshly built commitment. The cache remains an external
+/// `OUT_DIR` file and is deliberately not linked into the signed executable.
+pub fn serialize_embedded_commitment_cache(data: &CircuitData<F, C, D>) -> Result<Vec<u8>> {
+    let commitment = &data.prover_only.constants_sigmas_commitment;
+    let tree = &commitment.merkle_tree;
+    let degree = 1usize
+        .checked_shl(
+            u32::try_from(commitment.degree_log)
+                .context("commitment degree_log exceeds u32")?,
+        )
+        .context("commitment degree overflows usize")?;
+    let expected_leaves = degree
+        .checked_shl(
+            u32::try_from(commitment.rate_bits)
+                .context("commitment rate_bits exceeds u32")?,
+        )
+        .context("commitment LDE size overflows usize")?;
+    ensure!(
+        tree.num_leaves == expected_leaves,
+        "commitment tree has {} leaves, expected {expected_leaves}",
+        tree.num_leaves
+    );
+    ensure!(
+        commitment
+            .polynomials
+            .iter()
+            .all(|poly| poly.coeffs.len() == degree),
+        "commitment coefficient polynomial length mismatch"
+    );
+
+    let cap_height = tree.cap.height();
+    let cap_len = 1usize
+        .checked_shl(u32::try_from(cap_height).context("cap height exceeds u32")?)
+        .context("commitment cap length overflows usize")?;
+    ensure!(tree.cap.len() == cap_len, "commitment cap length mismatch");
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&COMMITMENT_CACHE_MAGIC.to_le_bytes());
+    out.extend_from_slice(&COMMITMENT_CACHE_VERSION.to_le_bytes());
+    write_cache_u64(&mut out, commitment.degree_log)?;
+    write_cache_u64(&mut out, commitment.rate_bits)?;
+    write_cache_u64(&mut out, usize::from(commitment.blinding))?;
+    write_cache_u64(&mut out, cap_height)?;
+
+    write_cache_u64(&mut out, commitment.polynomials.len())?;
+    for polynomial in &commitment.polynomials {
+        write_cache_u64(&mut out, polynomial.coeffs.len())?;
+        write_cache_fields(&mut out, &polynomial.coeffs);
+    }
+
+    match &tree.leaves {
+        MerkleLeaves::Rows { data, width } => {
+            out.extend_from_slice(&CACHE_LEAVES_ROWS.to_le_bytes());
+            write_cache_u64(&mut out, tree.num_leaves)?;
+            write_cache_u64(&mut out, *width)?;
+            ensure!(
+                data.len()
+                    == tree
+                        .num_leaves
+                        .checked_mul(*width)
+                        .context("row-major commitment leaf length overflow")?,
+                "row-major commitment leaf length mismatch"
+            );
+            write_cache_fields(&mut out, data);
+        }
+        MerkleLeaves::Columns { columns, log_rows } => {
+            out.extend_from_slice(&CACHE_LEAVES_COLUMNS.to_le_bytes());
+            write_cache_u64(&mut out, tree.num_leaves)?;
+            write_cache_u64(&mut out, columns.num_cols())?;
+            write_cache_u64(&mut out, *log_rows)?;
+            ensure!(
+                columns.num_rows() == tree.num_leaves,
+                "column-major commitment row count mismatch"
+            );
+            for column in 0..columns.num_cols() {
+                write_cache_fields(&mut out, columns.col(column));
+            }
+        }
+    }
+
+    match &tree.level_digests {
+        Some(levels) => {
+            ensure!(
+                tree.digests.is_empty(),
+                "commitment has both interleaved and level-order digests"
+            );
+            out.extend_from_slice(&CACHE_DIGESTS_LEVEL_ORDER.to_le_bytes());
+            write_cache_u64(&mut out, levels.level_offsets.len())?;
+            for &offset in &levels.level_offsets {
+                write_cache_u64(&mut out, offset)?;
+            }
+            write_cache_u64(&mut out, levels.nodes.len())?;
+            for hash in levels.nodes.iter() {
+                write_cache_hash(&mut out, hash);
+            }
+        }
+        None => {
+            out.extend_from_slice(&CACHE_DIGESTS_INTERLEAVED.to_le_bytes());
+            write_cache_u64(&mut out, tree.digests.len())?;
+            for hash in &tree.digests {
+                write_cache_hash(&mut out, hash);
+            }
+        }
+    }
+
+    write_cache_u64(&mut out, tree.cap.len())?;
+    for hash in &tree.cap.0 {
+        write_cache_hash(&mut out, hash);
+    }
+    Ok(out)
+}
+
+fn deserialize_embedded_commitment_cache(bytes: &[u8]) -> Result<PolynomialBatch<F, C, D>> {
+    ensure!(bytes.len() >= 8, "commitment cache is too short");
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    ensure!(magic == COMMITMENT_CACHE_MAGIC, "commitment cache magic mismatch");
+    ensure!(
+        version == COMMITMENT_CACHE_VERSION,
+        "commitment cache version {version} unsupported"
+    );
+    let mut pos = 8usize;
+
+    let degree_log = read_cache_usize(bytes, &mut pos, "degree_log")?;
+    let rate_bits = read_cache_usize(bytes, &mut pos, "rate_bits")?;
+    let blinding_raw = read_cache_u64(bytes, &mut pos)?;
+    ensure!(blinding_raw <= 1, "commitment cache blinding flag is invalid");
+    let blinding = blinding_raw == 1;
+    let cap_height = read_cache_usize(bytes, &mut pos, "cap height")?;
+    let degree = 1usize
+        .checked_shl(u32::try_from(degree_log).context("cache degree_log exceeds u32")?)
+        .context("cache degree overflows usize")?;
+    let num_leaves_expected = degree
+        .checked_shl(u32::try_from(rate_bits).context("cache rate_bits exceeds u32")?)
+        .context("cache LDE size overflows usize")?;
+    let tree_height = degree_log
+        .checked_add(rate_bits)
+        .context("commitment cache tree height overflow")?;
+    ensure!(
+        cap_height <= tree_height,
+        "commitment cache cap height exceeds tree height"
+    );
+
+    let polynomial_count = read_cache_usize(bytes, &mut pos, "polynomial count")?;
+    ensure!(
+        polynomial_count <= bytes.len().saturating_sub(pos) / 8,
+        "commitment cache polynomial count exceeds remaining data"
+    );
+    let mut polynomials = Vec::with_capacity(polynomial_count);
+    for _ in 0..polynomial_count {
+        let len = read_cache_usize(bytes, &mut pos, "polynomial length")?;
+        ensure!(len == degree, "commitment cache polynomial degree mismatch");
+        polynomials.push(PolynomialCoeffs::new(read_cache_fields(
+            bytes, &mut pos, len,
+        )?));
+    }
+
+    let leaves_tag = read_cache_u64(bytes, &mut pos)?;
+    let num_leaves = read_cache_usize(bytes, &mut pos, "leaf count")?;
+    ensure!(
+        num_leaves == num_leaves_expected,
+        "commitment cache leaf count mismatch"
+    );
+    let leaves = match leaves_tag {
+        CACHE_LEAVES_ROWS => {
+            let width = read_cache_usize(bytes, &mut pos, "row width")?;
+            ensure!(
+                width == polynomial_count,
+                "commitment cache row width does not match polynomial count"
+            );
+            let len = num_leaves
+                .checked_mul(width)
+                .context("commitment cache row data length overflow")?;
+            MerkleLeaves::Rows {
+                data: read_cache_fields(bytes, &mut pos, len)?,
+                width,
+            }
+        }
+        CACHE_LEAVES_COLUMNS => {
+            let num_columns = read_cache_usize(bytes, &mut pos, "column count")?;
+            let log_rows = read_cache_usize(bytes, &mut pos, "log_rows")?;
+            ensure!(
+                num_columns == polynomial_count,
+                "commitment cache column count does not match polynomial count"
+            );
+            ensure!(
+                log_rows == tree_height,
+                "commitment cache column log_rows mismatch"
+            );
+            let column_bytes = num_columns
+                .checked_mul(num_leaves)
+                .and_then(|fields| fields.checked_mul(core::mem::size_of::<u64>()))
+                .context("commitment cache column byte length overflow")?;
+            ensure!(
+                column_bytes <= bytes.len().saturating_sub(pos),
+                "commitment cache column data is truncated"
+            );
+            // Use the same nonblocking Metal routing decision as a normal
+            // commitment build. If the background context is ready this is a
+            // shared GPU-visible store; otherwise the first small startup
+            // request deliberately uses owned columns rather than stalling on
+            // shader compilation, exactly like the compact rebuild path.
+            let mut columns =
+                <<C as GenericConfig<D>>::Hasher as Hasher<F>>::try_allocate_merkle_tree_columns(
+                    num_columns,
+                    num_leaves,
+                    cap_height,
+                )
+                .unwrap_or_else(|| {
+                    ColumnStore::Owned(vec![vec![F::ZERO; num_leaves]; num_columns])
+                });
+            {
+                let mut destinations = columns
+                    .columns_mut()
+                    .context("commitment cache column storage is not uniquely writable")?;
+                ensure!(
+                    destinations.len() == num_columns,
+                    "commitment cache allocated column count mismatch"
+                );
+                for destination in &mut destinations {
+                    ensure!(
+                        destination.len() == num_leaves,
+                        "commitment cache allocated column length mismatch"
+                    );
+                    read_cache_fields_into(bytes, &mut pos, destination)?;
+                }
+            }
+            MerkleLeaves::Columns { columns, log_rows }
+        }
+        other => bail!("commitment cache leaf-layout tag {other} unsupported"),
+    };
+
+    let cap_len = 1usize
+        .checked_shl(u32::try_from(cap_height).context("cache cap height exceeds u32")?)
+        .context("cache cap length overflows usize")?;
+    let digest_tag = read_cache_u64(bytes, &mut pos)?;
+    let (digests, level_digests) = match digest_tag {
+        CACHE_DIGESTS_INTERLEAVED => {
+            let len = read_cache_usize(bytes, &mut pos, "interleaved digest count")?;
+            let expected = num_leaves
+                .checked_sub(cap_len)
+                .and_then(|n| n.checked_mul(2))
+                .context("commitment cache interleaved digest count overflow")?;
+            ensure!(len == expected, "commitment cache interleaved digest count mismatch");
+            (read_cache_hashes(bytes, &mut pos, len)?, None)
+        }
+        CACHE_DIGESTS_LEVEL_ORDER => {
+            let offset_count = read_cache_usize(bytes, &mut pos, "level offset count")?;
+            let expected_levels = tree_height
+                .checked_sub(cap_height)
+                .and_then(|levels_below_cap| levels_below_cap.checked_add(1))
+                .context("commitment cache level count overflow")?;
+            ensure!(
+                offset_count == expected_levels,
+                "commitment cache level offset count mismatch"
+            );
+            ensure!(
+                offset_count <= bytes.len().saturating_sub(pos) / 8,
+                "commitment cache level offset count exceeds remaining data"
+            );
+            let mut level_offsets = Vec::with_capacity(offset_count);
+            for _ in 0..offset_count {
+                level_offsets.push(read_cache_usize(bytes, &mut pos, "level offset")?);
+            }
+            let mut expected_offset = 0usize;
+            for (level, &offset) in level_offsets.iter().enumerate() {
+                ensure!(offset == expected_offset, "commitment cache level offset mismatch");
+                expected_offset = expected_offset
+                    .checked_add(num_leaves >> level)
+                    .context("commitment cache level size overflow")?;
+            }
+            let node_count = read_cache_usize(bytes, &mut pos, "level digest count")?;
+            ensure!(
+                node_count == expected_offset,
+                "commitment cache level digest count mismatch"
+            );
+            let nodes = read_cache_hashes(bytes, &mut pos, node_count)?;
+            (
+                Vec::new(),
+                Some(LevelOrderDigests {
+                    nodes: DigestStore::from(nodes),
+                    level_offsets,
+                }),
+            )
+        }
+        other => bail!("commitment cache digest-layout tag {other} unsupported"),
+    };
+
+    let stored_cap_len = read_cache_usize(bytes, &mut pos, "cap length")?;
+    ensure!(stored_cap_len == cap_len, "commitment cache cap length mismatch");
+    let cap = MerkleCap(read_cache_hashes(bytes, &mut pos, stored_cap_len)?);
+    ensure!(pos == bytes.len(), "trailing bytes in commitment cache");
+
+    Ok(PolynomialBatch {
+        polynomials,
+        merkle_tree: MerkleTree {
+            leaves,
+            num_leaves,
+            digests,
+            level_digests,
+            cap,
+        },
+        degree_log,
+        rate_bits,
+        blinding,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Read side (runtime)
 // ---------------------------------------------------------------------------
@@ -304,6 +712,24 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
 /// itself runs, from the same inputs. The recomputed commitment cap is checked
 /// against the embedded verifier data before returning.
 pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+    deserialize_embedded_inner(bytes, None)
+}
+
+/// Reconstructs a compact embedded circuit while restoring its fixed
+/// constants/sigmas commitment from an external cache. The compact blob still
+/// supplies and validates every semantic circuit component; the cache replaces
+/// only the deterministic IFFT/LDE/Merkle build.
+pub fn deserialize_embedded_with_commitment<T: DeserializeOwned>(
+    bytes: &[u8],
+    commitment_cache: &[u8],
+) -> Result<(T, CircuitData<F, C, D>)> {
+    deserialize_embedded_inner(bytes, Some(commitment_cache))
+}
+
+fn deserialize_embedded_inner<T: DeserializeOwned>(
+    bytes: &[u8],
+    precomputed_commitment: Option<&[u8]>,
+) -> Result<(T, CircuitData<F, C, D>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -508,18 +934,62 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
-    // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
-    let mut constants_sigmas_vecs = constant_values;
-    constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
+    // The default path mirrors the builder: values in, IFFT inside, LDE and
+    // Merkle. A supplied external cache replaces only that deterministic
+    // station and is checked against every shape parameter plus the verifier
+    // cap before it can enter prover data.
+    let constants_sigmas_commitment = if let Some(commitment_cache) = precomputed_commitment {
+        let commitment = deserialize_embedded_commitment_cache(commitment_cache)?;
+        let expected_polynomials = num_constants + num_routed;
+        let expected_leaves = degree
+            .checked_shl(u32::try_from(rate_bits).context("rate_bits exceeds u32")?)
+            .context("constants/sigmas LDE size overflows usize")?;
+        ensure!(
+            commitment.degree_log == degree_bits,
+            "cached constants/sigmas degree_log diverges from common circuit data"
+        );
+        ensure!(
+            commitment.rate_bits == rate_bits,
+            "cached constants/sigmas rate_bits diverges from common circuit data"
+        );
+        ensure!(
+            !commitment.blinding,
+            "cached constants/sigmas commitment unexpectedly uses blinding"
+        );
+        ensure!(
+            commitment.polynomials.len() == expected_polynomials,
+            "cached constants/sigmas polynomial count mismatch"
+        );
+        ensure!(
+            commitment
+                .polynomials
+                .iter()
+                .all(|polynomial| polynomial.coeffs.len() == degree),
+            "cached constants/sigmas coefficient length mismatch"
+        );
+        ensure!(
+            commitment.merkle_tree.num_leaves == expected_leaves,
+            "cached constants/sigmas leaf count mismatch"
+        );
+        ensure!(
+            commitment.merkle_tree.leaf_width() == expected_polynomials,
+            "cached constants/sigmas leaf width mismatch"
+        );
+        commitment
+    } else {
+        // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` for these
+        // non-zero-knowledge ranked circuits.
+        let mut constants_sigmas_vecs = constant_values;
+        constants_sigmas_vecs.extend(sigma_vecs);
+        PolynomialBatch::<F, C, D>::from_values(
+            constants_sigmas_vecs,
+            rate_bits,
+            false,
+            cap_height,
+            &mut TimingTree::default(),
+            Some(&root_table),
+        )
+    };
     if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
         bail!(
             "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
