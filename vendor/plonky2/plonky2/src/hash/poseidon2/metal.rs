@@ -314,7 +314,7 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Poseidon2 gate quotient command buffer ended with status {:?}",
@@ -330,7 +330,7 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "RangeCheck gate quotient command buffer ended with status {:?}",
@@ -362,7 +362,7 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 
 impl<F: RichField> PermutationQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Permutation quotient command buffer ended with status {:?}",
@@ -1293,6 +1293,40 @@ pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Completion wait that skips kernel-wakeup latency while an exclusive
+/// serial phase (the chain drain / final block) owns the machine: the spine
+/// thread has the whole CPU, so a bounded spin returns the instant the GPU
+/// completes instead of paying roughly a millisecond of scheduling latency
+/// per command buffer. Outside exclusive phases this is exactly the blocking
+/// wait, so the steady pipeline's pool threads are untouched. Value-exact:
+/// scheduling only; every computed value is identical.
+#[inline]
+pub(crate) fn wait_command_buffer(command_buffer: &metal::CommandBufferRef) {
+    #[cfg(test)]
+    {
+        command_buffer.wait_until_completed();
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        if !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+            command_buffer.wait_until_completed();
+            return;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            if command_buffer.status() == MTLCommandBufferStatus::Completed {
+                return;
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(250) {
+                command_buffer.wait_until_completed();
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Runnable-but-unproven chain steps: incremented by the orchestrator when a
 /// chain step's transaction proof is ready (the step could prove right now),
 /// decremented when its proof completes. While this backlog is at or above
@@ -2191,12 +2225,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         command_buffer.to_owned()
     });
 
-    parents_command.wait_until_completed();
+    wait_command_buffer(&parents_command);
     let all_ok = absorb_commands
         .iter()
         .chain(core::iter::once(&parents_command))
         .all(|command_buffer| {
-            command_buffer.wait_until_completed();
+            wait_command_buffer(command_buffer);
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
     drop(job);
@@ -3293,7 +3327,7 @@ impl MetalShared {
                 command_buffer.to_owned()
             });
 
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(format!(
                     "command buffer ended with status {:?}",
@@ -3557,7 +3591,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -3786,7 +3820,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
