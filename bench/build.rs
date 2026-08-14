@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
-use circuit::embed::serialize_embedded;
+use circuit::embed::{serialize_embedded, serialize_embedded_commitment_cache};
 use circuit::types::config::{C, CIRCUIT_CONFIG};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 
@@ -36,8 +36,9 @@ const LIGHT_TX_PER_PROOF: usize = 10;
 const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-const BLOB_NAMES: [&str; 5] = [
+const BLOB_NAMES: [&str; 6] = [
     "pre.embed",
+    "pre.commitment-cache",
     "heavy_tx.embed",
     "heavy_chain.embed",
     "light_tx.embed",
@@ -103,13 +104,16 @@ fn main() {
         .spawn(move || {
             // Same layout as `Circuits::new`: pre-execution circuit in
             // parallel with the heavy and light transaction paths.
-            let (pre_blob, (heavy_blobs, light_blobs)) = rayon::join(
+            let (pre_blobs, (heavy_blobs, light_blobs)) = rayon::join(
                 || {
                     let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
                     let pre_target = pre.target;
                     let pre_data = pre.builder.build::<C>();
-                    serialize_embedded(&pre_target, &pre_data)
-                        .expect("serializing block pre-execution circuit for embedding")
+                    let blob = serialize_embedded(&pre_target, &pre_data)
+                        .expect("serializing block pre-execution circuit for embedding");
+                    let commitment_cache = serialize_embedded_commitment_cache(&pre_data)
+                        .expect("serializing block pre-execution commitment cache");
+                    (blob, commitment_cache)
                 },
                 || {
                     rayon::join(
@@ -119,7 +123,8 @@ fn main() {
                 },
             );
 
-            write_blob(&out_dir, "pre.embed", &pre_blob);
+            write_blob(&out_dir, "pre.embed", &pre_blobs.0);
+            write_blob(&out_dir, "pre.commitment-cache", &pre_blobs.1);
             write_blob(&out_dir, "heavy_tx.embed", &heavy_blobs.0);
             write_blob(&out_dir, "heavy_chain.embed", &heavy_blobs.1);
             write_blob(&out_dir, "light_tx.embed", &light_blobs.0);

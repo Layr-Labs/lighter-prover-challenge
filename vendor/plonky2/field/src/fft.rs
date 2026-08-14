@@ -525,6 +525,30 @@ fn fft_classic_simd_single_layer_neon(
     lg_half_m: usize,
     omega_row: &[crate::goldilocks_field::GoldilocksField],
 ) {
+    use crate::types::Field;
+
+    // Cache-blocked production FFTs use standard root rows, whose first
+    // twiddle is exactly one. Multiplication by raw one preserves every u64
+    // representative, so the first lane of each block can bypass the widening
+    // multiply and reduction. Keep arbitrary/nonstandard rows on the general
+    // kernel so this private primitive remains useful to differential tests.
+    if values.len() < (1 << 14)
+        && lg_half_m >= 2
+        && omega_row.first().map(|w| w.0)
+            == Some(crate::goldilocks_field::GoldilocksField::ONE.0)
+    {
+        return fft_classic_simd_single_layer_neon_unity(values, lg_half_m, omega_row);
+    }
+    fft_classic_simd_single_layer_neon_general(values, lg_half_m, omega_row);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_general(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
     use core::arch::aarch64::*;
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 
@@ -571,6 +595,86 @@ fn fft_classic_simd_single_layer_neon(
                 values[k + j] = u + t;
                 values[k + half + j] = u - t;
                 j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
+/// Cache-blocked base-field layer with the unity twiddle removed from every
+/// block. Lane zero is copied raw; lane one uses the same nine-instruction
+/// reduction as one lane of `NeonGoldilocksField`.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_unity(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    #[inline(always)]
+    fn mul_reduce_single(a: u64, b: u64) -> u64 {
+        use core::arch::asm;
+
+        let mut result = a;
+        let scratch = b;
+        unsafe {
+            asm!(
+                "umulh {hi}, {result}, {scratch}",
+                "mul   {result}, {result}, {scratch}",
+                "umull {scratch}, {hi:w}, {epsilon:w}",
+                "subs  {result}, {result}, {hi}, lsr #32",
+                "csetm {hi:w}, cc",
+                "sub   {result}, {result}, {hi}",
+                "adds  {result}, {result}, {scratch}",
+                "csetm {scratch:w}, cs",
+                "add   {result}, {result}, {scratch}",
+                result = inout(reg) result,
+                scratch = inout(reg) scratch => _,
+                hi = out(reg) _,
+                epsilon = in(reg) ((1u64 << 32) - 1),
+                options(pure, nomem, nostack),
+            );
+        }
+        result
+    }
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(lg_half_m >= 2);
+    debug_assert_eq!(omega_row[0].0, 1);
+    let base = values.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let v0 = values.get_unchecked(k + half).0;
+            let v1 = values.get_unchecked(k + half + 1).0;
+            let t1 = mul_reduce_single(omega_row.get_unchecked(1).0, v1);
+            let tv = vcombine_u64(vcreate_u64(v0), vcreate_u64(t1));
+            let u = vld1q_u64(base.add(k));
+            vst1q_u64(base.add(k), gl_add_neon(u, tv, eps));
+            vst1q_u64(base.add(k + half), gl_sub_neon(u, tv, eps));
+
+            let mut j = 2;
+            while j + 2 <= half {
+                let v = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let t = w * v;
+                let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                let u = vld1q_u64(base.add(k + j));
+                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                j += 2;
             }
             k += m;
         }
@@ -3455,6 +3559,46 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn unity_twiddle_kernel_matches_general_raw_words() {
+        use super::{
+            fft_classic_simd_single_layer_neon_general,
+            fft_classic_simd_single_layer_neon_unity,
+        };
+
+        let roots = fft_root_table::<GoldilocksField>(1 << 13);
+        for lg_half_m in 4usize..13 {
+            let input: Vec<_> = (0..1usize << 13)
+                .map(|i| {
+                    GoldilocksField(
+                        0xffff_ffff_0000_0000u64.wrapping_add(
+                            0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1),
+                        ),
+                    )
+                })
+                .collect();
+            let mut general = input.clone();
+            let mut unity = input;
+            fft_classic_simd_single_layer_neon_general(
+                &mut general,
+                lg_half_m,
+                &roots[lg_half_m],
+            );
+            fft_classic_simd_single_layer_neon_unity(
+                &mut unity,
+                lg_half_m,
+                &roots[lg_half_m],
+            );
+            assert_eq!(
+                general.iter().map(|x| x.0).collect::<Vec<_>>(),
+                unity.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "raw mismatch at lg_half_m={lg_half_m}",
+            );
+        }
+    }
+
 
     /// Contended timing: 14 default-QoS threads (production topology), each
     /// hammering its own 2^19 buffer with the production fused schedule.

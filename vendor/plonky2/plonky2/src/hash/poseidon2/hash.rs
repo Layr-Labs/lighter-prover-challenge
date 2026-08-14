@@ -964,6 +964,16 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_allocate_merkle_tree_columns_blocking(
+        num_columns: usize,
+        num_rows: usize,
+        cap_height: usize,
+    ) -> Option<crate::hash::merkle_tree::ColumnStore<F>> {
+        super::metal::allocate_columns_blocking(num_columns, num_rows, cap_height)
+            .map(crate::hash::merkle_tree::ColumnStore::Shared)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     fn try_build_merkle_tree_column_store(
         columns: &crate::hash::merkle_tree::ColumnStore<F>,
         cap_height: usize,
