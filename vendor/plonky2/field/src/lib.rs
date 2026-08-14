@@ -25,6 +25,7 @@ pub mod packed;
 pub mod polynomial;
 pub mod secp256k1_base;
 pub mod secp256k1_scalar;
+mod secp_limbs;
 pub mod types;
 pub mod zero_poly_coset;
 

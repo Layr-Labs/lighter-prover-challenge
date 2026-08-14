@@ -113,8 +113,11 @@ impl Field for Secp256K1Base {
             return None;
         }
 
-        // Fermat's Little Theorem
-        Some(self.exp_biguint(&(Self::order() - BigUint::one() - BigUint::one())))
+        // Extended Euclidean inverse. Bit-identical to the Fermat `x^(p-2)`
+        // value (the unique inverse in 0..p) and far cheaper than ~256
+        // BigUint-mod muls. Used by every ECDSA point-add/double inversion.
+        let inv = egcd_modinv(&self.to_canonical_biguint(), &Self::order())?;
+        Some(Self::from_noncanonical_biguint(inv))
     }
 
     fn from_noncanonical_biguint(val: BigUint) -> Self {
@@ -157,6 +160,20 @@ impl Field for Secp256K1Base {
     }
 }
 
+fn egcd_modinv(x: &BigUint, modulus: &BigUint) -> Option<BigUint> {
+    use num::bigint::{BigInt, Sign};
+    let egcd = BigInt::from(x.clone()).extended_gcd(&BigInt::from(modulus.clone()));
+    if !egcd.gcd.is_one() {
+        return None;
+    }
+    let p = BigInt::from(modulus.clone());
+    let mut inv = egcd.x % &p;
+    if inv.sign() == Sign::Minus {
+        inv += &p;
+    }
+    inv.to_biguint()
+}
+
 impl PrimeField for Secp256K1Base {
     fn to_canonical_biguint(&self) -> BigUint {
         let mut result = biguint_from_array(self.0);
@@ -172,11 +189,7 @@ impl Neg for Secp256K1Base {
 
     #[inline]
     fn neg(self) -> Self {
-        if self.is_zero() {
-            Self::ZERO
-        } else {
-            Self::from_noncanonical_biguint(Self::order() - self.to_canonical_biguint())
-        }
+        Self(crate::secp_limbs::neg_mod(self.0, crate::secp_limbs::SECP_P))
     }
 }
 
@@ -185,11 +198,11 @@ impl Add for Secp256K1Base {
 
     #[inline]
     fn add(self, rhs: Self) -> Self {
-        let mut result = self.to_canonical_biguint() + rhs.to_canonical_biguint();
-        if result >= Self::order() {
-            result -= Self::order();
-        }
-        Self::from_noncanonical_biguint(result)
+        Self(crate::secp_limbs::add_mod(
+            self.0,
+            rhs.0,
+            crate::secp_limbs::SECP_P,
+        ))
     }
 }
 
@@ -228,9 +241,7 @@ impl Mul for Secp256K1Base {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-        Self::from_noncanonical_biguint(
-            (self.to_canonical_biguint() * rhs.to_canonical_biguint()).mod_floor(&Self::order()),
-        )
+        Self(crate::secp_limbs::mul_mod_p(self.0, rhs.0))
     }
 }
 
@@ -265,7 +276,30 @@ impl DivAssign for Secp256K1Base {
 
 #[cfg(test)]
 mod tests {
+    use num::bigint::BigUint;
+    use num::One;
+
+    use super::*;
     use crate::test_field_arithmetic;
+    use crate::types::Sample;
 
     test_field_arithmetic!(crate::secp256k1_base::Secp256K1Base);
+
+    fn fermat_inverse(x: Secp256K1Base) -> Secp256K1Base {
+        x.exp_biguint(&(Secp256K1Base::order() - BigUint::one() - BigUint::one()))
+    }
+
+    #[test]
+    fn egcd_inverse_matches_fermat() {
+        for _ in 0..32 {
+            let x = Secp256K1Base::rand();
+            if x.is_zero() {
+                continue;
+            }
+            let egcd = x.inverse();
+            let fermat = fermat_inverse(x);
+            assert_eq!(egcd, fermat);
+            assert_eq!(x * egcd, Secp256K1Base::ONE);
+        }
+    }
 }

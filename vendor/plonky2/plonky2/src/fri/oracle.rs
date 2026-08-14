@@ -272,6 +272,85 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    pub fn from_coeffs_with_ready_ldes(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        ready_ldes: Vec<Option<Vec<F>>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        if blinding || ready_ldes.iter().all(Option::is_none) {
+            return Self::from_coeffs(
+                polynomials,
+                rate_bits,
+                blinding,
+                cap_height,
+                timing,
+                fft_root_table,
+            );
+        }
+        let degree = polynomials[0].len();
+        let lde_len = degree << rate_bits;
+        if let Some(mut columns) = C::Hasher::try_allocate_merkle_tree_columns(
+            polynomials.len(),
+            lde_len,
+            cap_height,
+        ) {
+            if let Some(destinations) = columns.columns_mut() {
+                let coset_powers =
+                    crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+                destinations.into_par_iter().enumerate().for_each(|(j, destination)| {
+                    if let Some(lde) = ready_ldes.get(j).and_then(|c| c.as_ref()) {
+                        destination.copy_from_slice(lde);
+                        return;
+                    }
+                    let polynomial = &polynomials[j];
+                    batch_multiply_into(
+                        &mut destination[..degree],
+                        &polynomial.coeffs,
+                        &coset_powers,
+                    );
+                    if rate_bits == 0 || degree < 2 {
+                        destination[degree..].fill(F::ZERO);
+                    }
+                    fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                });
+                let merkle_tree = timed!(
+                    timing,
+                    "build Merkle tree",
+                    MerkleTree::new_column_store(columns, cap_height)
+                );
+                return Self {
+                    polynomials,
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding,
+                };
+            }
+        }
+        let mut lde_values = Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table);
+        for (j, ready) in ready_ldes.into_iter().enumerate() {
+            if let Some(lde) = ready {
+                lde_values[j] = lde;
+            }
+        }
+        let merkle_tree = timed!(
+            timing,
+            "build Merkle tree",
+            MerkleTree::new_columns(lde_values, cap_height)
+        );
+        Self {
+            polynomials,
+            merkle_tree,
+            degree_log: log2_strict(degree),
+            rate_bits,
+            blinding,
+        }
+    }
+
     pub(crate) fn lde_values(
         polynomials: &[PolynomialCoeffs<F>],
         rate_bits: usize,

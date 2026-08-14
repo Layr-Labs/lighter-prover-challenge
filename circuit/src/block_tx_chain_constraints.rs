@@ -327,6 +327,7 @@ impl BlockTxChainCircuit {
                 &circuit_data.common,
                 partition_witness,
                 &mut prove_timing,
+                None,
             )?;
             prove_timing.print();
             proof
