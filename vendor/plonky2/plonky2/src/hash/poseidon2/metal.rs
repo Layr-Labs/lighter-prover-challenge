@@ -2056,8 +2056,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
     // while an already-busy stream would just queue the absorb groups behind
     // another tree and stretch both.
+    // Marker: stream-floor-17-1786717000. On the perm-inv-merge 30.560
+    // keeper. Exclusive-phase admission was `2^20`, so chain-step Zs and
+    // quotient trees (`2^17` leaves) ran fill-then-hash on the serial
+    // spine while the GPU stream was idle. The tree's own break-even is
+    // well below `2^17`. Same absorb, same bytes; only the gate.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
