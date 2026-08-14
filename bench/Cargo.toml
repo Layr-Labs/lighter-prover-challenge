@@ -14,6 +14,13 @@ path = "src/bin/bench.rs"
 name = "prove"
 path = "src/bin/prove.rs"
 
+# Regenerates bench/embedded/*.embed and bench/embedded/STAMP. Never
+# selected by the scored build (`-p bench --bin prove`), so its use of
+# `circuit` costs that build nothing.
+[[bin]]
+name = "embed_gen"
+path = "src/bin/embed_gen.rs"
+
 [features]
 default = ["parallel", "std"]
 parallel = ["plonky2/parallel"]
@@ -42,11 +49,6 @@ clap = { workspace = true }
 clap_derive = { workspace = true }
 tiny-keccak =  { workspace = true }
 paste = { workspace = true }
-circuit = { path = "../circuit", default-features = true }
-
-[build-dependencies]
-anyhow = { workspace = true }
-rayon = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
 
 [dev-dependencies]
