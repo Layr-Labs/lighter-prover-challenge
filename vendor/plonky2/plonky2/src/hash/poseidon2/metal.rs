@@ -217,7 +217,6 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -231,7 +230,6 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     len: usize,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -243,7 +241,6 @@ pub(crate) struct PermutationQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
-    _job: GpuJobGuard,
     _phantom: PhantomData<F>,
 }
 
@@ -1367,11 +1364,21 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // The width-135 wires tree stays on the GPU unconditionally: its CPU
     // build (~17 permutations per leaf) costs about as much as the queue
     // wait and measurably starves the fold's pure-CPU phases.
-    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
-    if serial_critical_shape {
-        return exclusive
-            || leaf_width > 64
-            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    //
+    // The occupancy veto used to apply only to leaf_count == 2^17. Pipelined
+    // 2^19 width-16/20 Zs and quotient trees then always passed the
+    // permutation cutoff and sat 200-320 ms behind the 136-wide wires tree.
+    // Scaled from the 2^17 width-8 measurement, a 2^19 width-20 CPU build
+    // is ~60 ms — still well under that queue wait. CPU is ~58% idle.
+    let idle = GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    if leaf_width > 4 && leaf_width <= 64 {
+        if !exclusive && !idle {
+            return false;
+        }
+        // 2^17 is below MIN_GPU (1<<19) but measured 2x on an idle GPU.
+        if leaf_count == 1 << 17 {
+            return true;
+        }
     }
     leaf_permutations + parent_permutations >= min_permutations
 }
@@ -2049,13 +2056,29 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
-    // only when the GPU stream is unoccupied at entry, the same occupancy
-    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
-    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
-    // while an already-busy stream would just queue the absorb groups behind
-    // another tree and stretch both.
+    // Exclusive phases have the GPU stream to themselves, so streaming is
+    // worthwhile on every tree wide enough for group overlap (leaf_width>=16
+    // is required below). The chain-step / pre-exec Zs and quotient trees
+    // are 2^17 leaves by 16-20 columns: classic path is a full CPU fill of
+    // every column, then one GPU hash. Streaming turns that into
+    // max(fill, absorb) plus one leftover group.
+    //
+    // Exclusive-only admission (v14) almost never fired: exclusive is
+    // claimed only after the last in-flight tx proof joins, so it covered
+    // one chain step plus the final block — and the final block is 2^21,
+    // already admitted at 1<<20. The 2^17 trees that matter are the ~52
+    // chain-step commitments, most of them built while a sibling tx proof
+    // is in a CPU phase and the GPU is idle. `gpu_worthwhile` already
+    // routes those to the GPU when `GPU_JOBS_IN_FLIGHT == 0`; streaming
+    // them under the same idle gate converts classic (fill-then-hash)
+    // into overlapped fill/absorb without ever queueing absorb groups
+    // behind a 2^19 chunk tree. A busy stream still refuses, same as
+    // before.
+    // Promoted floors. A 2^17 streamed admission (v14/v15) is a known
+    // local negative: the streamed GpuJobGuard covers the group-0 CPU
+    // fill, so sibling spine trees observe a busy stream and fall back
+    // to CPU. Occupancy of classic 2^19 narrow trees is handled in
+    // gpu_worthwhile instead.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
         leaf_count >= 1 << 20
     } else {
@@ -2603,7 +2626,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2641,7 +2663,6 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2673,7 +2694,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2725,7 +2745,6 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -2765,7 +2784,6 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("permutation quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2810,7 +2828,6 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
-            _job: job_guard,
             _phantom: PhantomData,
         })
     }
@@ -4044,7 +4061,6 @@ mod tests {
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         assert!(pool.lock().unwrap().free.is_empty());
@@ -4063,7 +4079,6 @@ mod tests {
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -4088,7 +4103,6 @@ mod tests {
             output_pool: Arc::clone(&pool),
             len: 8,
             failure_observer: None,
-            _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
         });
         let reused = pool
@@ -6503,6 +6517,69 @@ kernel void goldilocks_mul_bench_native(
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
             .expect("classic tree");
         assert_eq!(streamed, classic);
+    }
+
+    #[test]
+    fn streamed_floors_reject_d17() {
+        type F = GoldilocksField;
+        set_exclusive_gpu_phase(false);
+        let context = shared_context().expect("Metal context");
+        let columns = context
+            .allocate_columns::<F>(1 << 17, 16)
+            .expect("shared columns");
+        let fill = |_: usize, destinations: &mut [&mut [F]]| {
+            for destination in destinations.iter_mut() {
+                destination.fill(F::ONE);
+            }
+        };
+        assert!(
+            build_merkle_tree_shared_streamed(&columns, 4, &fill).is_none(),
+            "idle 2^17 must stay classic (streamed floor is 2^19)"
+        );
+        set_exclusive_gpu_phase(true);
+        assert!(
+            build_merkle_tree_shared_streamed(&columns, 4, &fill).is_none(),
+            "exclusive 2^17 must stay classic (streamed floor is 2^20)"
+        );
+        set_exclusive_gpu_phase(false);
+    }
+
+    #[test]
+    fn narrow_trees_leave_the_gpu_when_a_wide_job_is_in_flight() {
+        set_exclusive_gpu_phase(false);
+        let _job = GpuJobGuard::begin();
+        assert!(
+            !gpu_worthwhile(16, 1 << 19, 4),
+            "2^19 x 16 must not queue behind an in-flight Merkle job"
+        );
+        assert!(
+            !gpu_worthwhile(20, 1 << 19, 4),
+            "2^19 x 20 must not queue behind an in-flight Merkle job"
+        );
+        assert!(
+            !gpu_worthwhile(8, 1 << 17, 4),
+            "2^17 x 8 must keep the existing occupancy veto"
+        );
+        assert!(
+            gpu_worthwhile(136, 1 << 19, 4),
+            "wide wires stay on the GPU unconditionally"
+        );
+        drop(_job);
+        assert!(
+            gpu_worthwhile(16, 1 << 19, 4),
+            "idle 2^19 x 16 still wants the GPU"
+        );
+        assert!(
+            gpu_worthwhile(8, 1 << 17, 4),
+            "idle 2^17 x 8 still wants the GPU"
+        );
+        set_exclusive_gpu_phase(true);
+        let _job = GpuJobGuard::begin();
+        assert!(
+            gpu_worthwhile(16, 1 << 19, 4),
+            "exclusive phase keeps the documented GPU bypass"
+        );
+        set_exclusive_gpu_phase(false);
     }
 
     #[test]
