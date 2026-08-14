@@ -107,6 +107,11 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// Optional build-host device archive for the 128-thread Merkle subtree
+/// reducer. Empty or incompatible bytes retain the promoted parent schedule.
+const SHADER_SUBTREE_METALLIB: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/poseidon2_subtree.metallib"));
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
@@ -180,6 +185,7 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
+    subtree_pipeline: Option<ComputePipelineState>,
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
@@ -2160,30 +2166,78 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         let mut child_count = leaf_count;
         level_offsets.push(level_offset);
         while child_count > cap_count {
-            let parent_count = child_count / 2;
-            let child_offset = level_offset;
-            level_offset += child_count * 4;
-            level_offsets.push(level_offset);
+            const SUBTREE_CHILDREN: usize = 256;
+            const SUBTREE_THREADS: usize = 128;
+            const SUBTREE_MAX_LEVELS: u32 = 8;
+            const SUBTREE_MIN_LEVELS: u32 = 4;
+            let remaining_levels = (child_count / cap_count).ilog2();
+            let subtree_levels = remaining_levels.min(SUBTREE_MAX_LEVELS);
+            if let Some(subtree_pipeline) = context.subtree_pipeline.as_ref().filter(|_| {
+                child_count >= SUBTREE_CHILDREN && subtree_levels >= SUBTREE_MIN_LEVELS
+            }) {
+                let subtree_child_count = child_count;
+                let child_offset = level_offset;
+                let parent_offset = level_offset + child_count * 4;
+                for _ in 0..subtree_levels {
+                    level_offset += child_count * 4;
+                    level_offsets.push(level_offset);
+                    child_count /= 2;
+                }
 
-            let parent_count_u32 = parent_count as u32;
-            let parent_encoder = command_buffer.new_compute_command_encoder();
-            parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
-            parent_encoder.set_buffer(
-                0,
-                Some(output_buffer),
-                (child_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(
-                1,
-                Some(output_buffer),
-                (level_offset * size_of::<u64>()) as NSUInteger,
-            );
-            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
-            set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
-            parent_encoder.end_encoding();
+                let parent_encoder = command_buffer.new_compute_command_encoder();
+                parent_encoder.set_compute_pipeline_state(subtree_pipeline);
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (parent_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(parent_encoder, 3, subtree_child_count as u32);
+                set_u32(parent_encoder, 4, subtree_levels);
+                parent_encoder.dispatch_thread_groups(
+                    MTLSize {
+                        width: (subtree_child_count / SUBTREE_CHILDREN) as NSUInteger,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: SUBTREE_THREADS as NSUInteger,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                parent_encoder.end_encoding();
+            } else {
+                let parent_count = child_count / 2;
+                let child_offset = level_offset;
+                level_offset += child_count * 4;
+                level_offsets.push(level_offset);
 
-            child_count = parent_count;
+                let parent_count_u32 = parent_count as u32;
+                let parent_encoder = command_buffer.new_compute_command_encoder();
+                parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
+                parent_encoder.set_buffer(
+                    0,
+                    Some(output_buffer),
+                    (child_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(
+                    1,
+                    Some(output_buffer),
+                    (level_offset * size_of::<u64>()) as NSUInteger,
+                );
+                parent_encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(parent_encoder, 3, parent_count_u32);
+                dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+                parent_encoder.end_encoding();
+
+                child_count = parent_count;
+            }
         }
         #[cfg(feature = "diagnostic_profile")]
         profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
@@ -2510,6 +2564,27 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
+            let subtree_pipeline = (!SHADER_SUBTREE_METALLIB.is_empty())
+                .then(|| device.new_library_with_data(SHADER_SUBTREE_METALLIB).ok())
+                .flatten()
+                .and_then(|library| {
+                    library
+                        .get_function("poseidon2_hash_subtree128", None)
+                        .ok()
+                        .and_then(|function| {
+                            device
+                                .new_compute_pipeline_state_with_function(&function)
+                                .ok()
+                        })
+                })
+                .filter(|pipeline| {
+                    pipeline.max_total_threads_per_threadgroup() >= 128
+                        && 128 % pipeline.thread_execution_width() == 0
+                });
+            if subtree_pipeline.is_none() {
+                log::debug!("subtree pipeline unavailable; using one-level Merkle parents");
+            }
+
             spawn_optional_pipelines(&device, &library);
 
             let mut parameter_values = Vec::with_capacity(130);
@@ -2529,6 +2604,7 @@ impl MetalShared {
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
+                subtree_pipeline,
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
