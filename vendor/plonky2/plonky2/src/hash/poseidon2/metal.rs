@@ -568,16 +568,26 @@ impl ColumnStorePool {
 /// mismatch simply misses and falls through to a fresh allocation.
 static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
 
-/// Allocates a `bytes`-sized shared buffer, touches one word per page so the
-/// kernel's zero-fill happens here (off the critical path) rather than under
-/// the final block's LDE fill, and stashes it for the next oversized
-/// [`take_or_new_column_buffer`] request. Scheduling-only: buffer contents
-/// are fully written by the fill before any read, exactly as a fresh
-/// allocation's would be.
-pub fn prewarm_large_column_store(bytes: u64) {
-    let Some(context) = shared_context() else {
-        return;
-    };
+/// One-off final-block buffer stashes. The final degree-2^18 proof's three
+/// streamed Merkle builds each need a ~128 MiB digest output and the first
+/// one also allocates the ~192 MiB streamed sponge state; the three GPU
+/// quotient jobs each need a ~32 MiB output. All of those sizes exceed the
+/// corresponding pool caps by design (`MAX_CACHED_DIGEST_OUTPUT_BYTES`,
+/// `MAX_CACHED_QUOTIENT_OUTPUT_BYTES`), so every one is a fresh
+/// kernel-zeroed allocation in the run's most serial window. The prewarm
+/// thread allocates and page-walks them while the light pipeline is still
+/// running, then hands them only to requests above the pool caps so smaller
+/// recurring shapes cannot consume them.
+static PREWARMED_FINAL_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+static PREWARMED_FINAL_QUOTIENTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+static PREWARMED_FINAL_STREAMED_STATE: Mutex<Option<Buffer>> = Mutex::new(None);
+
+/// Allocates a `bytes`-sized shared buffer and touches one word per page so
+/// the kernel's zero-fill happens off the critical path. Scheduling-only:
+/// buffer contents are fully written by the fill before any read, exactly as
+/// a fresh allocation's would be.
+fn prewarm_device_buffer(bytes: u64) -> Option<Buffer> {
+    let context = shared_context()?;
     let buffer = autoreleasepool(|| {
         context
             .device
@@ -585,13 +595,7 @@ pub fn prewarm_large_column_store(bytes: u64) {
     });
     let base = buffer.contents().cast::<u8>();
     if base.is_null() {
-        return;
-    }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
+        return None;
     }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
@@ -600,6 +604,83 @@ pub fn prewarm_large_column_store(bytes: u64) {
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
     }
+    Some(buffer)
+}
+
+/// Allocates a `bytes`-sized shared buffer, touches one word per page so the
+/// kernel's zero-fill happens here (off the critical path) rather than under
+/// the final block's LDE fill, and stashes it for the next oversized
+/// [`take_or_new_column_buffer`] request.
+pub fn prewarm_large_column_store(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    // Publish only after the whole walk has finished. Stashing earlier lets a
+    // final block that arrives mid-walk take a buffer another thread is still
+    // writing; if that late `write_volatile(0)` lands after the block's LDE
+    // fill wrote the same location, the committed evaluation diverges from
+    // the coefficient polynomial and the quotient's vanishing identity fails
+    // intermittently. A consumer now receives either the fully walked buffer
+    // (no other CPU thread can mutate it) or the fresh-allocation fallback.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
+    }
+}
+
+/// Pre-faults one final-block digest output and reserves it for requests
+/// above [`MAX_CACHED_DIGEST_OUTPUT_BYTES`].
+pub fn prewarm_final_digest_output(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_DIGESTS.lock() {
+        stash.push(buffer);
+    }
+}
+
+/// Pre-faults one final-block GPU quotient output and reserves it for
+/// requests above [`MAX_CACHED_QUOTIENT_OUTPUT_BYTES`].
+pub fn prewarm_final_quotient_output(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_QUOTIENTS.lock() {
+        stash.push(buffer);
+    }
+}
+
+/// Pre-faults the final block's streamed sponge state buffer and reserves it
+/// for the oversized first streamed build.
+pub fn prewarm_final_streamed_state(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_STREAMED_STATE.lock() {
+        *stash = Some(buffer);
+    }
+}
+
+fn take_prewarmed_final_digest(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_DIGESTS.try_lock().ok()?;
+    let index = stash
+        .iter()
+        .position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+fn take_prewarmed_final_quotient(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_QUOTIENTS.try_lock().ok()?;
+    let index = stash
+        .iter()
+        .position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+fn take_prewarmed_final_streamed_state(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_STREAMED_STATE.try_lock().ok()?;
+    stash
+        .take()
+        .filter(|buffer| buffer.length() >= bytes)
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
@@ -2057,7 +2138,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // while an already-busy stream would just queue the absorb groups behind
     // another tree and stretch both.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        // Exclusive phases own an otherwise idle GPU stream (the pipelined
+        // chunk trees have retired), so the 2^17-leaf chain-step Zs and
+        // quotient trees can stream their CPU fill against GPU absorb
+        // instead of running fill-then-hash serially on the spine. The
+        // 2^20 gate was sized for the final block's wire tree; the measured
+        // GPU/CPU break-even for the mid-size shapes is far below 2^17.
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
@@ -2091,14 +2178,33 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     if needs_new {
         *buffers = Some(autoreleasepool(|| {
             (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
+                // Only the degree-2^18 final proof's streamed state (2^21 rows
+                // x 12 lanes x 8 B) exceeds 64 MiB; every earlier streamed
+                // shape is at most 2^19 x 12 x 8 B = 48 MiB. Reserving the
+                // prewarmed buffer for the final size prevents a mid-pipeline
+                // build from consuming it.
+                if state_bytes > 64 << 20 {
+                    take_prewarmed_final_streamed_state(state_bytes as u64).unwrap_or_else(|| {
+                        context
+                            .device
+                            .new_buffer(state_bytes as u64, MTLResourceOptions::StorageModeShared)
+                    })
+                } else {
+                    context
+                        .device
+                        .new_buffer(state_bytes as u64, MTLResourceOptions::StorageModeShared)
+                },
+                if output_bytes > MAX_CACHED_DIGEST_OUTPUT_BYTES as usize {
+                    take_prewarmed_final_digest(output_bytes as u64).unwrap_or_else(|| {
+                        context
+                            .device
+                            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+                    })
+                } else {
+                    context
+                        .device
+                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+                },
             )
         }));
     }
@@ -2205,18 +2311,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         return None;
     }
 
-    let replacement = context
-        .digest_output_pool
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take_best_fit(output_bytes as u64)
-        .unwrap_or_else(|| {
-            autoreleasepool(|| {
-                context
-                    .device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            })
-        });
+    let replacement = context.acquire_digest_output(output_bytes as u64);
     let completed = core::mem::replace(output_buffer, replacement);
     drop(buffers);
     let nodes = MetalDigests::with_buffer(
@@ -2568,11 +2663,33 @@ impl MetalShared {
     }
 
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
+        if bytes > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
+            if let Some(buffer) = take_prewarmed_final_quotient(bytes) {
+                return buffer;
+            }
+        }
         if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
             if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
                 if let Some(buffer) = pool.take_best_fit(bytes) {
                     return buffer;
                 }
+            }
+        }
+        autoreleasepool(|| {
+            self.device
+                .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+        })
+    }
+
+    fn acquire_digest_output(&self, bytes: u64) -> Buffer {
+        if bytes > MAX_CACHED_DIGEST_OUTPUT_BYTES {
+            if let Some(buffer) = take_prewarmed_final_digest(bytes) {
+                return buffer;
+            }
+        }
+        if let Ok(mut pool) = self.digest_output_pool.try_lock() {
+            if let Some(buffer) = pool.take_best_fit(bytes) {
+                return buffer;
             }
         }
         autoreleasepool(|| {
@@ -2888,18 +3005,7 @@ impl MetalShared {
             .position(|buffer| buffer.length() >= output_bytes as u64);
         let replacement = spare_index
             .map(|index| pool.spare_outputs.swap_remove(index))
-            .or_else(|| {
-                self.digest_output_pool
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take_best_fit(output_bytes as u64)
-            })
-            .unwrap_or_else(|| {
-                autoreleasepool(|| {
-                    self.device
-                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-                })
-            });
+            .unwrap_or_else(|| self.acquire_digest_output(output_bytes as u64));
         let completed = set
             .output
             .replace(replacement)
