@@ -44,6 +44,7 @@ pub mod byte;
 pub mod circuit_logger;
 pub mod circuit_serializer;
 pub mod comparison;
+pub mod cs_merkle;
 pub mod delta;
 pub mod deserializers;
 pub mod ecdsa;
