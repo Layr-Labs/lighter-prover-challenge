@@ -81,6 +81,10 @@ name = "ffts"
 harness = false
 
 [[bench]]
+name = "lab_zero_pad_fft"
+harness = false
+
+[[bench]]
 name = "hashing"
 harness = false
 
