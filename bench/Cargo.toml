@@ -47,6 +47,7 @@ circuit = { path = "../circuit", default-features = true }
 [build-dependencies]
 anyhow = { workspace = true }
 rayon = { workspace = true }
+plonky2 = { workspace = true, default-features = false }
 circuit = { path = "../circuit", default-features = true }
 
 [dev-dependencies]

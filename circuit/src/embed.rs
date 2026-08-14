@@ -36,12 +36,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
-use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -66,7 +65,7 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -287,6 +286,12 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // The fixed-routed mask is already known in the untimed build job and is
+    // only one bit per routed position. Store it directly so each scored
+    // worker does not re-derive it while six large circuit blobs are faulting
+    // into unified memory. Zstd compresses its long structural runs well.
+    write_compressed_section(&mut out, &prover.fixed_routed_wires);
+
     Ok(out)
 }
 
@@ -468,6 +473,13 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+
+    // Fixed-routed mask, computed once by the build-time circuit builder.
+    let fixed_routed_wires = read_compressed_section(bytes, &mut pos)?;
+    ensure!(
+        fixed_routed_wires.len() == (degree * common.config.num_routed_wires).div_ceil(8),
+        "embedded fixed-routed mask length mismatch"
+    );
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -496,9 +508,6 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let wire_partition = forest.wire_partition();
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
-    let fixed_routed_wires =
-        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
-            .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
