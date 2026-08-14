@@ -378,21 +378,37 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
                 .collect::<Vec<_>>()
         };
-        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
-            eval_polynomials(pows, &c.polynomials)
-        };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
-
-        // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
-        let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
+        // Marker: open-wave-1786698000. One indexed `par_iter` over every
+        // zeta-opened polynomial (constants/sigmas, wires, Z/partial/lookup,
+        // quotient) instead of four separate parallel maps. Same
+        // `extension_base_dot_product`, same slice order, same transcript.
+        let cs_polys = &constants_sigmas_commitment.polynomials;
+        let wire_polys = &wires_commitment.polynomials;
+        let zs_polys = &zs_partial_products_lookup_commitment.polynomials;
+        let quot_polys = &quotient_polys_commitment.polynomials;
+        let n_cs = cs_polys.len();
+        let n_w = wire_polys.len();
+        let n_zs = zs_polys.len();
+        let zeta_refs: Vec<&PolynomialCoeffs<F>> = cs_polys
+            .iter()
+            .chain(wire_polys.iter())
+            .chain(zs_polys.iter())
+            .chain(quot_polys.iter())
+            .collect();
+        let zeta_evals: Vec<F::Extension> = zeta_refs
+            .into_par_iter()
+            .map(|p| F::extension_base_dot_product(&zeta_pows, &p.coeffs))
+            .collect();
+        let constants_sigmas_eval = &zeta_evals[..n_cs];
+        let wires_eval = &zeta_evals[n_cs..n_cs + n_w];
+        let zs_partial_products_lookup_eval = &zeta_evals[n_cs + n_w..n_cs + n_w + n_zs];
+        let quotient_polys = zeta_evals[n_cs + n_w + n_zs..].to_vec();
+        let shifted_polynomials = zs_polys;
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
+            wires: wires_eval.to_vec(),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             // Partial-product polynomials are opened only at `zeta`, never at
             // `g * zeta`; evaluate only the shifted Z polynomials consumed by
