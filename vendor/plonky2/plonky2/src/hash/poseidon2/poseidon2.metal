@@ -276,6 +276,61 @@ inline ulong lazy_materialize(lazy_t a) {
     return reduce_top(r0, r1, (int)carry - (int)under);
 }
 
+// Deferred-reduction accumulator for one alpha-weighted constraint sum.
+//
+// `gl_mul_add` folds every product back to a single 64-bit representative, but
+// a gate family's running sum never looks at those intermediates: reduction mod
+// p is a ring homomorphism, so summing the raw 128-bit products and reducing
+// once is congruent to summing the reduced products. `mul_128` already delivers
+// each product as four base-2^32 limbs (l0, l1, h0, h1), and adding those limbs
+// into four 64-bit registers is carry-free -- exactly the split `lazy_t`
+// already uses, here as two pairs: (l0, l1) with weight 2^0 and (h0, h1) with
+// weight 2^64.
+//
+// Headroom. Every limb is at most 2^32 - 1, so after n accumulations each of
+// the four sums is at most n * (2^32 - 1) < n * 2^32, and the widest quantity
+// `alpha_acc_materialize` forms is low.hi + high.lo < 2 * n * 2^32. That stays
+// inside the 2^64 - 2^32 bound the fold needs for every n < 2^31 - 1, so no
+// intermediate fold is ever required: n is a family's constraint count, which
+// indexes `alpha_powers` and is at most `alpha_stride` (136 in the largest
+// production shape, giving sums below 2^40 -- twenty-four spare bits).
+struct alpha_acc_t {
+    lazy_t low;
+    lazy_t high;
+};
+
+inline void alpha_acc_mul_add(thread alpha_acc_t& acc, ulong a, ulong b) {
+    uint l0;
+    uint l1;
+    uint h0;
+    uint h1;
+    mul_128(a, b, l0, l1, h0, h1);
+    acc.low.lo += l0;
+    acc.low.hi += l1;
+    acc.high.lo += h0;
+    acc.high.hi += h1;
+}
+
+// Collapses the four limb sums to an ordinary 64-bit representative. With
+// 2^64 == EPSILON and 2^96 == 2^32 * EPSILON == -1 (mod p) the accumulated
+// value is
+//   low.lo + low.hi * 2^32 + high.lo * 2^64 + high.hi * 2^96
+//     == (low.lo - high.lo - high.hi) + (low.hi + high.lo) * 2^32   (mod p).
+// The positive part is precisely `lazy_t`'s (lo, hi) shape, so
+// `lazy_materialize` folds it; its proof needs only that the high word leave
+// room for `e = hh + carry` not to wrap, i.e. low.hi + high.lo < 2^64 - 2^32,
+// which the headroom note above establishes. The subtracted part is below
+// 2^33 * n <= 2^41 < p and the minuend is an arbitrary value < 2^64, which is
+// the operand range `gl_sub` is written for, so the result is a 64-bit
+// representative of the exact residue. Every consumer downstream
+// (`gl_mul_add` by the filter, then `gl_canonicalize`) is residue-exact for
+// any 64-bit representative, so the kernel's output is bit-identical to the
+// per-constraint reduction it replaces.
+inline ulong alpha_acc_materialize(alpha_acc_t acc) {
+    lazy_t positive = { acc.low.lo, acc.low.hi + acc.high.lo };
+    return gl_sub(lazy_materialize(positive), acc.high.lo + acc.high.hi);
+}
+
 // r = a * b + addend (mod p): the 128-bit product absorbs the addend before
 // one shared reduction, deleting the separate post-multiply gl_add. mulhi is
 // at most 2^64 - 2, so the absorbed carry cannot overflow the high word. The
@@ -433,12 +488,12 @@ inline ulong poseidon2_gate_wire(
 inline void poseidon2_gate_emit(
     ulong constraint,
     constant ulong* alpha_powers,
-    thread ulong accumulators[2],
+    thread alpha_acc_t accumulators[2],
     thread uint& constraint_index) {
-    accumulators[0] =
-        gl_mul_add(constraint, alpha_powers[constraint_index], accumulators[0]);
-    accumulators[1] =
-        gl_mul_add(constraint, alpha_powers[123 + constraint_index], accumulators[1]);
+    alpha_acc_mul_add(
+        accumulators[0], constraint, alpha_powers[constraint_index]);
+    alpha_acc_mul_add(
+        accumulators[1], constraint, alpha_powers[123 + constraint_index]);
     ++constraint_index;
 }
 
@@ -478,8 +533,22 @@ kernel void poseidon2_gate_quotient(
         filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
     }
 
+    // The filter is the only witness-independent factor of this row's
+    // contribution. Rows where it vanishes (every row that is not this
+    // gate family) contribute exactly zero to both quotient challenges;
+    // skip the full constraint evaluation and write the canonical zeros
+    // explicitly so the pooled output buffer is well-defined everywhere.
+    if (filter == 0) {
+        output[(ulong)gid * 2] = 0;
+        output[(ulong)gid * 2 + 1] = 0;
+        return;
+    }
+
     // parameters buffer kept for ABI; RCs from compile-time tables.
-    ulong accumulators[2] = { 0, 0 };
+    alpha_acc_t accumulators[2] = {
+        { { 0, 0 }, { 0, 0 } },
+        { { 0, 0 }, { 0, 0 } },
+    };
     uint constraint_index = 0;
 
     ulong swap = poseidon2_gate_wire(wires, 24, lde_rows, source_row);
@@ -575,8 +644,10 @@ kernel void poseidon2_gate_quotient(
             constraint_index);
     }
 
-    output[(ulong)gid * 2] = gl_canonicalize(gl_mul(filter, accumulators[0]));
-    output[(ulong)gid * 2 + 1] = gl_canonicalize(gl_mul(filter, accumulators[1]));
+    output[(ulong)gid * 2] = gl_canonicalize(
+        gl_mul(filter, alpha_acc_materialize(accumulators[0])));
+    output[(ulong)gid * 2 + 1] = gl_canonicalize(
+        gl_mul(filter, alpha_acc_materialize(accumulators[1])));
 }
 
 // Evaluates the no-lookup permutation partial-product constraints at one
@@ -681,61 +752,6 @@ kernel void permutation_quotient(
 
     output[(ulong)gid * 2u] = gl_canonicalize(totals[0]);
     output[(ulong)gid * 2u + 1u] = gl_canonicalize(totals[1]);
-}
-
-// Deferred-reduction accumulator for one alpha-weighted constraint sum.
-//
-// `gl_mul_add` folds every product back to a single 64-bit representative, but
-// a gate family's running sum never looks at those intermediates: reduction mod
-// p is a ring homomorphism, so summing the raw 128-bit products and reducing
-// once is congruent to summing the reduced products. `mul_128` already delivers
-// each product as four base-2^32 limbs (l0, l1, h0, h1), and adding those limbs
-// into four 64-bit registers is carry-free -- exactly the split `lazy_t`
-// already uses, here as two pairs: (l0, l1) with weight 2^0 and (h0, h1) with
-// weight 2^64.
-//
-// Headroom. Every limb is at most 2^32 - 1, so after n accumulations each of
-// the four sums is at most n * (2^32 - 1) < n * 2^32, and the widest quantity
-// `alpha_acc_materialize` forms is low.hi + high.lo < 2 * n * 2^32. That stays
-// inside the 2^64 - 2^32 bound the fold needs for every n < 2^31 - 1, so no
-// intermediate fold is ever required: n is a family's constraint count, which
-// indexes `alpha_powers` and is at most `alpha_stride` (136 in the largest
-// production shape, giving sums below 2^40 -- twenty-four spare bits).
-struct alpha_acc_t {
-    lazy_t low;
-    lazy_t high;
-};
-
-inline void alpha_acc_mul_add(thread alpha_acc_t& acc, ulong a, ulong b) {
-    uint l0;
-    uint l1;
-    uint h0;
-    uint h1;
-    mul_128(a, b, l0, l1, h0, h1);
-    acc.low.lo += l0;
-    acc.low.hi += l1;
-    acc.high.lo += h0;
-    acc.high.hi += h1;
-}
-
-// Collapses the four limb sums to an ordinary 64-bit representative. With
-// 2^64 == EPSILON and 2^96 == 2^32 * EPSILON == -1 (mod p) the accumulated
-// value is
-//   low.lo + low.hi * 2^32 + high.lo * 2^64 + high.hi * 2^96
-//     == (low.lo - high.lo - high.hi) + (low.hi + high.lo) * 2^32   (mod p).
-// The positive part is precisely `lazy_t`'s (lo, hi) shape, so
-// `lazy_materialize` folds it; its proof needs only that the high word leave
-// room for `e = hh + carry` not to wrap, i.e. low.hi + high.lo < 2^64 - 2^32,
-// which the headroom note above establishes. The subtracted part is below
-// 2^33 * n <= 2^41 < p and the minuend is an arbitrary value < 2^64, which is
-// the operand range `gl_sub` is written for, so the result is a 64-bit
-// representative of the exact residue. Every consumer downstream
-// (`gl_mul_add` by the filter, then `gl_canonicalize`) is residue-exact for
-// any 64-bit representative, so the kernel's output is bit-identical to the
-// per-constraint reduction it replaces.
-inline ulong alpha_acc_materialize(alpha_acc_t acc) {
-    lazy_t positive = { acc.low.lo, acc.low.hi + acc.high.lo };
-    return gl_sub(lazy_materialize(positive), acc.high.lo + acc.high.hi);
 }
 
 inline void range_check_gate_emit(
@@ -868,6 +884,7 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
+        if (filter != 0u) {
         alpha_acc_t gate_accumulators[2] = {
             { { 0, 0 }, { 0, 0 } },
             { { 0, 0 }, { 0, 0 } },
@@ -913,6 +930,7 @@ kernel void range_check_gate_quotient(
             filter, alpha_acc_materialize(gate_accumulators[0]), total[0]);
         total[1] = gl_mul_add(
             filter, alpha_acc_materialize(gate_accumulators[1]), total[1]);
+        }
     }
 
     constant uint* u32_metadata = metadata + range_count * 10u;
@@ -942,6 +960,7 @@ kernel void range_check_gate_quotient(
             filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
         }
 
+        if (filter != 0u) {
         alpha_acc_t gate_accumulators[2] = {
             { { 0, 0 }, { 0, 0 } },
             { { 0, 0 }, { 0, 0 } },
@@ -1596,6 +1615,7 @@ kernel void range_check_gate_quotient(
             filter, alpha_acc_materialize(gate_accumulators[0]), total[0]);
         total[1] = gl_mul_add(
             filter, alpha_acc_materialize(gate_accumulators[1]), total[1]);
+        }
     }
 
     output[(ulong)gid * 2] = gl_canonicalize(total[0]);
