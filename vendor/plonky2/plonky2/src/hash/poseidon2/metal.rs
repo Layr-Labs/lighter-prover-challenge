@@ -1267,6 +1267,49 @@ pub fn prewarm() {
                 }
             }
             let _ = force_context();
+            // Marker: prefault-txstore-1786706000. The fatlib hid pipeline
+            // lowering; the first tx-wires column store (136 × 2^19 × 8 =
+            // 544 MiB) still zero-faults on the first transaction proof of
+            // every cold worker. After the compiler-service work, drop to
+            // UTILITY and page-touch that shape into COLUMN_STORE_POOL so
+            // take_or_new_column_buffer hits a resident buffer. Scheduling
+            // only: LDE fill overwrites every word before any read. A size
+            // miss is a harmless fresh allocation.
+            #[allow(non_camel_case_types)]
+            {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+            }
+            const TX_WIRES_STORE_BYTES: u64 = 136 * (1u64 << 19) * 8;
+            if let Some(context) = shared_context() {
+                let buffer = autoreleasepool(|| {
+                    context.device.new_buffer(
+                        TX_WIRES_STORE_BYTES,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                });
+                let base = buffer.contents().cast::<u8>();
+                if !base.is_null() {
+                    const PAGE: isize = 16 * 1024;
+                    let mut offset: isize = 0;
+                    while (offset as u64) < TX_WIRES_STORE_BYTES {
+                        // SAFETY: offset stays within the allocated length.
+                        unsafe { base.offset(offset).write_volatile(0) };
+                        offset += PAGE;
+                    }
+                    if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
+                        pool.recycle(buffer);
+                    }
+                }
+            }
         })
         .ok();
 }
