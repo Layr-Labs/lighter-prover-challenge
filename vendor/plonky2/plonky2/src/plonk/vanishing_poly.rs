@@ -8,7 +8,7 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::types::Field;
+use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
 use crate::gates::lookup::LookupGate;
@@ -222,6 +222,12 @@ const INTERLEAVE_PAIR_CONSTRAINTS: usize = 136;
 const INTERLEAVE_OPS: usize = 4;
 const UNINTERLEAVE_OPS: usize = 2;
 const INTERLEAVE_PAIR_STACK_BATCH: usize = 32;
+/// How many base-4 spread bits may share one delayed reduction. A stage seeded
+/// by a sub-`2^64` representative and running `k` steps holds at most
+/// `(2^64 - 1)(4·4^k - 1)/3`, which stays under `2^96` exactly while
+/// `k <= 15`; `11` splits the 32-bit chain into 11/11/10 with wide margin.
+const BASE4_SPREAD_STAGE: usize = 11;
+const _: () = assert!(BASE4_SPREAD_STAGE <= 15 && BASE4_SPREAD_STAGE > 0);
 
 /// Proof-local recognition of the exact CPU-owned pair used by the ranked
 /// final-block circuit. The plan is evaluator-only and changes no circuit data.
@@ -321,7 +327,33 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
 /// the corresponding interleave range row, so those values use two packed
 /// MACs. The second half lands on the same row and uses one packed MAC with the
 /// pre-summed filters. No range column survives past the current bit.
-fn eval_interleave_pair_dense_fused<F: Field>(
+///
+/// The three per-bit recompositions (`x`, the base-4 spread, and the two
+/// parity columns) are accumulated in 128 bit integers and reduced once per
+/// chain instead of once per bit. Each accumulator is written and read only by
+/// its own recurrence inside the bit loop, so deferring its reduction reorders
+/// nothing; the range column and the packed MACs are untouched.
+///
+/// Bounds, derived from `raw < 2^64` only — bit wires are *not* restricted to
+/// `{0, 1}` on the quotient domain, so no Boolean argument is used:
+///
+/// - `x` and each parity column are 32-term base-2 chains, so the exact
+///   accumulator is at most `(2^32 - 1)(2^64 - 1) = 2^96 - 2^64 - 2^32 + 1`,
+///   strictly below `2^96`. A parity column spans two operations (it is seeded
+///   once, before the operation loop), which is why its wide lane is hoisted
+///   out of that loop.
+/// - the base-4 spread chain would reach `((4^32 - 1)/3)(2^64 - 1) > 2^126`,
+///   so it is reduced every `BASE4_SPREAD_STAGE` bits. A stage seeded by a
+///   sub-`2^64` representative and running `k` steps holds at most
+///   `(2^64 - 1)(4·4^k - 1)/3`; with `k = 11` that is below `2^87`.
+///
+/// Staying below `2^96` is what makes this bit-identical rather than merely
+/// congruent: the high 32 bits of the accumulator are then zero, so
+/// `from_noncanonical_u128` skips its borrow correction and lands on exactly
+/// the representative the multiply/add chain produces, including for the
+/// non-canonical `value + ORDER` representatives that arise when the chain's
+/// field value is below `2^32 - 1`.
+fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     wires: &[F],
     batch_size: usize,
     interleave_filter: &[F],
@@ -348,30 +380,51 @@ fn eval_interleave_pair_dense_fused<F: Field>(
     let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
     let (parity_accumulators, rest) = rest.split_at_mut(4 * batch_size);
     let (base4_accumulator, range) = rest.split_at_mut(batch_size);
-    parity_accumulators.fill(F::ZERO);
 
-    let base2 = F::from_canonical_usize(2);
-    let base4 = F::from_canonical_usize(4);
+    // Wide lanes for the three delayed chains: one `x` lane and one base-4
+    // spread lane (both reset per operation), plus the four parity lanes,
+    // which are seeded once because a parity chain spans two operations.
+    const WIDE_COLS: usize = 6;
+    let wide_required = WIDE_COLS * batch_size;
+    let mut wide_stack = [0u128; WIDE_COLS * INTERLEAVE_PAIR_STACK_BATCH];
+    let mut wide_heap;
+    let wide: &mut [u128] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
+        &mut wide_stack[..wide_required]
+    } else {
+        wide_heap = vec![0u128; wide_required];
+        &mut wide_heap
+    };
+    let (wide_x, rest) = wide.split_at_mut(batch_size);
+    let (wide_spread, wide_parity) = rest.split_at_mut(batch_size);
+    wide_parity.fill(0);
 
     for operation in 0..INTERLEAVE_OPS {
         let interleave_row = operation * 34;
         let bit_offset = operation * 32;
         let x = &mut x_accumulators[operation * batch_size..(operation + 1) * batch_size];
-        x.fill(F::ZERO);
-        base4_accumulator.fill(F::ZERO);
+        wide_x.fill(0);
+        wide_spread.fill(0);
 
         for bit_index in 0..32 {
             let bit_number = bit_offset + bit_index;
             let bit_col = &wires[(8 + bit_number) * batch_size..][..batch_size];
             let parity_index = 2 * (operation / 2) + bit_index % 2;
-            let parity = &mut parity_accumulators
-                [parity_index * batch_size..(parity_index + 1) * batch_size];
+            let parity =
+                &mut wide_parity[parity_index * batch_size..(parity_index + 1) * batch_size];
             for point in 0..batch_size {
                 let bit = bit_col[point];
-                x[point] = x[point] * base2 + bit;
-                base4_accumulator[point] = base4_accumulator[point] * base4 + bit;
-                parity[point] = parity[point] * base2 + bit;
+                let raw = bit.to_noncanonical_u64() as u128;
+                wide_x[point] = (wide_x[point] << 1) + raw;
+                wide_spread[point] = (wide_spread[point] << 2) + raw;
+                parity[point] = (parity[point] << 1) + raw;
                 range[point] = bit * (bit - F::ONE);
+            }
+            if bit_index % BASE4_SPREAD_STAGE == BASE4_SPREAD_STAGE - 1 {
+                for point in 0..batch_size {
+                    debug_assert!(wide_spread[point] < 1u128 << 96);
+                    wide_spread[point] = F::from_noncanonical_u128(wide_spread[point])
+                        .to_noncanonical_u64() as u128;
+                }
             }
 
             let row = interleave_row + 2 + bit_index;
@@ -389,6 +442,8 @@ fn eval_interleave_pair_dense_fused<F: Field>(
 
         let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
         for point in 0..batch_size {
+            debug_assert!(wide_x[point] < 1u128 << 96);
+            x[point] = F::from_noncanonical_u128(wide_x[point]);
             range[point] = x[point] - x_col[point];
         }
         let output = &mut combined
@@ -397,11 +452,18 @@ fn eval_interleave_pair_dense_fused<F: Field>(
 
         let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
         for point in 0..batch_size {
+            debug_assert!(wide_spread[point] < 1u128 << 96);
+            base4_accumulator[point] = F::from_noncanonical_u128(wide_spread[point]);
             range[point] = base4_accumulator[point] - spread_col[point];
         }
         let output = &mut combined
             [(interleave_row + 1) * batch_size..(interleave_row + 2) * batch_size];
         batch_multiply_add_inplace(output, range, interleave_filter);
+    }
+
+    for (accumulator, &lane) in parity_accumulators.iter_mut().zip(wide_parity.iter()) {
+        debug_assert!(lane < 1u128 << 96);
+        *accumulator = F::from_noncanonical_u128(lane);
     }
 
     let split = F::from_canonical_u64(1 << 32u64);
@@ -1777,6 +1839,221 @@ mod tests {
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
             assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+
+    /// The pre-transformation fused evaluator, kept compiled as the
+    /// differential's reference: one modular reduction per bit in each of the
+    /// three Horner chains. Only the scratch allocation differs (heap instead
+    /// of the conditional stack buffer), which cannot change any value.
+    fn eval_interleave_pair_dense_fused_termwise_reference<F: Field>(
+        wires: &[F],
+        batch_size: usize,
+        interleave_filter: &[F],
+        uninterleave_filter: &[F],
+        summed_filter: &[F],
+        combined: &mut [F],
+    ) {
+        let mut x_accumulators = vec![F::ZERO; INTERLEAVE_OPS * batch_size];
+        let mut parity_accumulators = vec![F::ZERO; 4 * batch_size];
+        let mut base4_accumulator = vec![F::ZERO; batch_size];
+        let mut range = vec![F::ZERO; batch_size];
+
+        let base2 = F::from_canonical_usize(2);
+        let base4 = F::from_canonical_usize(4);
+
+        for operation in 0..INTERLEAVE_OPS {
+            let interleave_row = operation * 34;
+            let bit_offset = operation * 32;
+            let x = &mut x_accumulators[operation * batch_size..(operation + 1) * batch_size];
+            x.fill(F::ZERO);
+            base4_accumulator.fill(F::ZERO);
+
+            for bit_index in 0..32 {
+                let bit_number = bit_offset + bit_index;
+                let bit_col = &wires[(8 + bit_number) * batch_size..][..batch_size];
+                let parity_index = 2 * (operation / 2) + bit_index % 2;
+                let parity = &mut parity_accumulators
+                    [parity_index * batch_size..(parity_index + 1) * batch_size];
+                for point in 0..batch_size {
+                    let bit = bit_col[point];
+                    x[point] = x[point] * base2 + bit;
+                    base4_accumulator[point] = base4_accumulator[point] * base4 + bit;
+                    parity[point] = parity[point] * base2 + bit;
+                    range[point] = bit * (bit - F::ONE);
+                }
+
+                let row = interleave_row + 2 + bit_index;
+                let interleave_output = &mut combined[row * batch_size..(row + 1) * batch_size];
+                if operation % 2 == 0 {
+                    batch_multiply_add_inplace(interleave_output, &range, interleave_filter);
+                    let uninterleave_row = row + 2;
+                    let uninterleave_output = &mut combined
+                        [uninterleave_row * batch_size..(uninterleave_row + 1) * batch_size];
+                    batch_multiply_add_inplace(uninterleave_output, &range, uninterleave_filter);
+                } else {
+                    batch_multiply_add_inplace(interleave_output, &range, summed_filter);
+                }
+            }
+
+            let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
+            for point in 0..batch_size {
+                range[point] = x[point] - x_col[point];
+            }
+            let output =
+                &mut combined[interleave_row * batch_size..(interleave_row + 1) * batch_size];
+            batch_multiply_add_inplace(output, &range, interleave_filter);
+
+            let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
+            for point in 0..batch_size {
+                range[point] = base4_accumulator[point] - spread_col[point];
+            }
+            let output = &mut combined
+                [(interleave_row + 1) * batch_size..(interleave_row + 2) * batch_size];
+            batch_multiply_add_inplace(output, &range, interleave_filter);
+        }
+
+        let split = F::from_canonical_u64(1 << 32u64);
+        let u32_max = F::from_canonical_u32(u32::MAX);
+        for operation in 0..UNINTERLEAVE_OPS {
+            let row = operation * 68;
+            let high =
+                &x_accumulators[(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
+            let low =
+                &x_accumulators[(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
+            let evens = &parity_accumulators
+                [(2 * operation) * batch_size..(2 * operation + 1) * batch_size];
+            let odds = &parity_accumulators
+                [(2 * operation + 1) * batch_size..(2 * operation + 2) * batch_size];
+            let interleaved = &wires[(4 * operation) * batch_size..][..batch_size];
+            let x_evens = &wires[(4 * operation + 1) * batch_size..][..batch_size];
+            let x_odds = &wires[(4 * operation + 2) * batch_size..][..batch_size];
+            let inverse = &wires[(4 * operation + 3) * batch_size..][..batch_size];
+
+            for point in 0..batch_size {
+                range[point] = (inverse[point] * (u32_max - high[point]) - F::ONE) * low[point];
+            }
+            let output = &mut combined[row * batch_size..(row + 1) * batch_size];
+            batch_multiply_add_inplace(output, &range, uninterleave_filter);
+
+            for point in 0..batch_size {
+                range[point] = high[point] * split + low[point] - interleaved[point];
+            }
+            let output = &mut combined[(row + 1) * batch_size..(row + 2) * batch_size];
+            batch_multiply_add_inplace(output, &range, uninterleave_filter);
+
+            for point in 0..batch_size {
+                range[point] = evens[point] - x_evens[point];
+            }
+            let output = &mut combined[(row + 2) * batch_size..(row + 3) * batch_size];
+            batch_multiply_add_inplace(output, &range, uninterleave_filter);
+
+            for point in 0..batch_size {
+                range[point] = odds[point] - x_odds[point];
+            }
+            let output = &mut combined[(row + 3) * batch_size..(row + 4) * batch_size];
+            batch_multiply_add_inplace(output, &range, uninterleave_filter);
+        }
+    }
+
+    /// Raw-limb differential between the delayed and the per-bit reduction in
+    /// the fused interleave pair, over arbitrary `u64` representatives:
+    /// canonical, non-canonical and boundary. Bit wires are deliberately NOT
+    /// restricted to `{0, 1}`; quotient-domain bit-wire evaluations are not,
+    /// so every bound here comes from `raw < 2^64` alone.
+    #[test]
+    fn delayed_interleave_pair_accumulators_match_termwise_reduction_in_raw_limbs() {
+        use plonky2_field::types::Field64;
+
+        type F = GoldilocksField;
+
+        let boundary: [u64; 15] = [
+            0,
+            1,
+            2,
+            3,
+            (u32::MAX as u64) - 1,
+            u32::MAX as u64,
+            1u64 << 32,
+            F::ORDER - 2,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            F::ORDER + 2,
+            1u64 << 63,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // 32 is the production batch width of the quotient walker; 1 and 7
+        // exercise the tail, 33 forces the heap scratch path.
+        for batch_size in [32usize, 1, 7, 33] {
+            for trial in 0..16usize {
+                let mut draw = |k: usize| -> F {
+                    if trial == 0 {
+                        GoldilocksField(boundary[k % boundary.len()])
+                    } else {
+                        let r = next();
+                        if r % 3 == 0 {
+                            GoldilocksField(boundary[(r >> 2) as usize % boundary.len()])
+                        } else {
+                            GoldilocksField(r)
+                        }
+                    }
+                };
+
+                let wires: Vec<F> = (0..INTERLEAVE_PAIR_WIRES * batch_size)
+                    .map(&mut draw)
+                    .collect();
+                let interleave_filter: Vec<F> = (0..batch_size).map(&mut draw).collect();
+                let uninterleave_filter: Vec<F> = (0..batch_size).map(&mut draw).collect();
+                let summed_filter: Vec<F> = interleave_filter
+                    .iter()
+                    .zip(&uninterleave_filter)
+                    .map(|(&interleave, &uninterleave)| interleave + uninterleave)
+                    .collect();
+                // A nonzero seed proves the evaluator accumulates onto prior
+                // rows rather than assigning them.
+                let seed: Vec<F> = (0..INTERLEAVE_PAIR_CONSTRAINTS * batch_size)
+                    .map(&mut draw)
+                    .collect();
+
+                let mut expected = seed.clone();
+                eval_interleave_pair_dense_fused_termwise_reference(
+                    &wires,
+                    batch_size,
+                    &interleave_filter,
+                    &uninterleave_filter,
+                    &summed_filter,
+                    &mut expected,
+                );
+
+                let mut actual = seed;
+                eval_interleave_pair_dense_fused(
+                    &wires,
+                    batch_size,
+                    &interleave_filter,
+                    &uninterleave_filter,
+                    &summed_filter,
+                    &mut actual,
+                );
+
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_noncanonical_u64(),
+                        e.to_noncanonical_u64(),
+                        "raw-limb mismatch at slot {index} (batch {batch_size}, trial {trial})"
+                    );
+                }
+            }
         }
     }
 
