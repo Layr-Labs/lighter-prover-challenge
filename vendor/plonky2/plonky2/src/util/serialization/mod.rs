@@ -947,10 +947,16 @@ pub trait Read {
             lut_to_lookups.push(self.read_target_lut()?);
         }
 
+        // Runtime-only, like `generator_watch_counts`: a pure function of `generators`.
+        let generators_defer_until_ready = generators
+            .iter()
+            .all(|generator| generator.0.defers_until_ready());
+
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
             generator_watch_counts,
+            generators_defer_until_ready,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1930,6 +1936,8 @@ pub trait Write {
             // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
             // contributes no bytes and the serialized format is unchanged.
             generator_watch_counts: _,
+            // Runtime-only: re-derived from `generators` on read; contributes no bytes.
+            generators_defer_until_ready: _,
             // Runtime-only: contributes no bytes; the serialized format is unchanged.
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
