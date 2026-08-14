@@ -30,6 +30,7 @@ use crate::uint::u32::gadgets::arithmetic_u32::{CircuitBuilderU32, U32Target};
 use crate::uint::u32::serialization::{ReadU32, WriteU32};
 use crate::uint::u32::witness::GeneratedValuesU32;
 use crate::utils::ceil_div_usize;
+pub mod inv_batch;
 pub mod split_nonnative;
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -509,6 +510,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderNonNative<F, D>
             div: div.clone(),
             _phantom: PhantomData,
         });
+        inv_batch::push_inv_site(inv_batch::InvSite {
+            x_limbs: x.value.limbs.iter().map(|l| l.0).collect(),
+            inv_limbs: inv_biguint.limbs.iter().map(|l| l.0).collect(),
+            div_limbs: div.limbs.iter().map(|l| l.0).collect(),
+        });
 
         let product = self.mul_biguint(&x.value, &inv_biguint);
 
@@ -539,6 +545,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilderNonNative<F, D>
             inv: inv_biguint.clone(),
             div: div.clone(),
             _phantom: PhantomData,
+        });
+        inv_batch::push_inv_site(inv_batch::InvSite {
+            x_limbs: x.value.limbs.iter().map(|l| l.0).collect(),
+            inv_limbs: inv_biguint.limbs.iter().map(|l| l.0).collect(),
+            div_limbs: div.limbs.iter().map(|l| l.0).collect(),
         });
 
         let product = self.mul_biguint(&x.value, &inv_biguint);
@@ -1308,20 +1319,9 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
         let x = FF::from_noncanonical_biguint(witness.get_biguint_target(self.x.value.clone()));
-        let inv = x.try_inverse();
-        if inv.is_none() {
-            out_buffer.set_biguint_target(&self.div, &BigUint::ZERO)?;
-            out_buffer.set_biguint_target(&self.inv, &BigUint::ZERO)?;
-
-            return Ok(());
-        }
-        let inv = inv.unwrap();
-
-        let x_biguint = x.to_canonical_biguint();
-        let inv_biguint = inv.to_canonical_biguint();
-        let prod = x_biguint * &inv_biguint;
-        let modulus = FF::order();
-        let (div, _rem) = prod.div_rem(&modulus);
+        let x_limbs: Vec<Target> = self.x.value.limbs.iter().map(|l| l.0).collect();
+        let (inv_biguint, div) =
+            inv_batch::invert_nonnative_batched::<F, FF>(witness, &x_limbs, x);
 
         out_buffer.set_biguint_target(&self.div, &div)?;
         out_buffer.set_biguint_target(&self.inv, &inv_biguint)?;
@@ -1363,6 +1363,13 @@ impl<F: RichField + Extendable<D>, const D: usize, FF: PrimeField> SimpleGenerat
         let x = src.read_target_vec()?;
         let inv = src.read_target_vec()?;
         let div = src.read_target_vec()?;
+
+        let site = inv_batch::InvSite {
+            x_limbs: x.clone(),
+            inv_limbs: inv.clone(),
+            div_limbs: div.clone(),
+        };
+        inv_batch::push_inv_site(site);
 
         Ok(Self {
             x: NonNativeTarget::from(BigUintTarget::from(

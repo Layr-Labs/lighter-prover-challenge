@@ -121,8 +121,10 @@ impl Field for Secp256K1Scalar {
             return None;
         }
 
-        // Fermat's Little Theorem
-        Some(self.exp_biguint(&(Self::order() - BigUint::one() - BigUint::one())))
+        // Extended Euclidean inverse. Bit-identical to the Fermat `x^(n-2)`
+        // value (the unique inverse in 0..n).
+        let inv = egcd_modinv(&self.to_canonical_biguint(), &Self::order())?;
+        Some(Self::from_noncanonical_biguint(inv))
     }
 
     fn from_noncanonical_biguint(val: BigUint) -> Self {
@@ -163,6 +165,20 @@ impl Field for Secp256K1Scalar {
     fn from_noncanonical_u64(n: u64) -> Self {
         Self::from_canonical_u64(n)
     }
+}
+
+fn egcd_modinv(x: &BigUint, modulus: &BigUint) -> Option<BigUint> {
+    use num::bigint::{BigInt, Sign};
+    let egcd = BigInt::from(x.clone()).extended_gcd(&BigInt::from(modulus.clone()));
+    if !egcd.gcd.is_one() {
+        return None;
+    }
+    let p = BigInt::from(modulus.clone());
+    let mut inv = egcd.x % &p;
+    if inv.sign() == Sign::Minus {
+        inv += &p;
+    }
+    inv.to_biguint()
 }
 
 impl PrimeField for Secp256K1Scalar {

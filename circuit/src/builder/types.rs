@@ -58,6 +58,7 @@ where
     F: RichField + Extendable<D>,
 {
     pub fn new(config: CircuitConfig) -> Self {
+        crate::nonnative::inv_batch::begin_inv_group();
         Self {
             builder: CircuitBuilder::<F, D>::new(config),
 
@@ -99,6 +100,7 @@ where
             );
         }
 
+        crate::nonnative::inv_batch::end_inv_group();
         self.builder.build()
     }
 

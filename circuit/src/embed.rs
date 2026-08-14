@@ -392,6 +392,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         .read_usize()
         .map_err(|e| anyhow::anyhow!("deserializing generators: {e:?}"))?;
     let mut generators = Vec::with_capacity(generator_count);
+    crate::nonnative::inv_batch::begin_inv_group();
     for _ in 0..generator_count {
         generators.push(
             reader
@@ -399,6 +400,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
                 .map_err(|e| anyhow::anyhow!("deserializing generator: {e:?}"))?,
         );
     }
+    crate::nonnative::inv_batch::end_inv_group();
 
     // watch index
     let section = read_compressed_section(bytes, &mut pos)?;

@@ -994,6 +994,11 @@ impl QuinticQuotientGenerator {
         denominator: QuinticExtensionTarget,
         quotient: QuinticExtensionTarget,
     ) -> Self {
+        crate::nonnative::inv_batch::push_quintic_site(crate::nonnative::inv_batch::QuinticSite {
+            numerator: numerator.0,
+            denominator: denominator.0,
+            quotient: quotient.0,
+        });
         QuinticQuotientGenerator {
             numerator,
             denominator,
@@ -1033,10 +1038,14 @@ impl<F: RichField + Extendable<5> + Extendable<D>, const D: usize> SimpleGenerat
         // denominator while deleting the separate pre-division zero check (five
         // canonicalizing limb compares per run). The nonzero case is `numerator * inv`
         // with the same operand order the `Div` impl (`self * rhs.inverse()`) used.
-        let quotient = match denominator.try_inverse() {
-            None => QuinticExtension::<F>::ZERO,
-            Some(inv) => numerator * inv,
-        };
+        let quotient = crate::nonnative::inv_batch::invert_quintic_batched(
+            witness,
+            self.numerator.0,
+            self.denominator.0,
+            self.quotient.0,
+            numerator,
+            denominator,
+        );
         for (lhs, rhs) in self.quotient.to_target_array().into_iter().zip(
             <QuinticExtension<F> as FieldExtension<5>>::to_basefield_array(&quotient).into_iter(),
         ) {
@@ -1063,6 +1072,11 @@ impl<F: RichField + Extendable<5> + Extendable<D>, const D: usize> SimpleGenerat
         let denominator = src.read_target_array()?;
         let numerator = src.read_target_array()?;
         let quotient = src.read_target_array()?;
+        crate::nonnative::inv_batch::push_quintic_site(crate::nonnative::inv_batch::QuinticSite {
+            numerator,
+            denominator,
+            quotient,
+        });
         Ok(Self {
             numerator: QuinticExtensionTarget::new(numerator),
             denominator: QuinticExtensionTarget::new(denominator),
