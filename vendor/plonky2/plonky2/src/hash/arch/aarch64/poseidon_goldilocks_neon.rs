@@ -5,9 +5,8 @@ use core::arch::asm;
 use core::mem::transmute;
 
 use static_assertions::const_assert;
-use unroll::unroll_for_loops;
 
-use crate::field::goldilocks_field::GoldilocksField;
+use crate::field::goldilocks_field::{GoldilocksField, mul_reduce_pair};
 use crate::hash::poseidon::Poseidon;
 use crate::util::branch_hint;
 
@@ -57,6 +56,9 @@ const_assert!(check_mds_matrix());
 // ====================================== SCALAR ARITHMETIC =======================================
 
 /// Addition modulo ORDER accounting for wraparound. Correct only when a + b < 2**64 + ORDER.
+/// Retired: superseded by `mul_reduce_pair` in `sbox_layer_full`, which this
+/// helper's form is the bit-for-bit reference for. Kept for that comparison.
+#[allow(dead_code)]
 #[inline(always)]
 pub unsafe fn add_with_wraparound(a: u64, b: u64) -> u64 {
     let res: u64;
@@ -76,6 +78,9 @@ pub unsafe fn add_with_wraparound(a: u64, b: u64) -> u64 {
 }
 
 /// Subtraction of a and (b >> 32) modulo ORDER accounting for wraparound.
+/// Retired: superseded by `mul_reduce_pair` in `sbox_layer_full`, which this
+/// helper's form is the bit-for-bit reference for. Kept for that comparison.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn sub_with_wraparound_lsr32(a: u64, b: u64) -> u64 {
     let mut b_hi = b >> 32;
@@ -103,6 +108,9 @@ unsafe fn sub_with_wraparound_lsr32(a: u64, b: u64) -> u64 {
 }
 
 /// Multiplication of the low word (i.e., x as u32) by EPSILON.
+/// Retired: superseded by `mul_reduce_pair` in `sbox_layer_full`, which this
+/// helper's form is the bit-for-bit reference for. Kept for that comparison.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn mul_epsilon(x: u64) -> u64 {
     let res;
@@ -118,6 +126,9 @@ unsafe fn mul_epsilon(x: u64) -> u64 {
     res
 }
 
+/// Retired: superseded by `mul_reduce_pair` in `sbox_layer_full`, which this
+/// helper's form is the bit-for-bit reference for. Kept for that comparison.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn multiply(x: u64, y: u64) -> u64 {
     let xy = (x as u128) * (y as u128);
@@ -135,30 +146,65 @@ unsafe fn multiply(x: u64, y: u64) -> u64 {
 // ========================================== FULL ROUNDS ==========================================
 
 /// Full S-box.
+///
+/// Stays scalar: S-boxes in vector are only slightly slower throughput-wise but
+/// have an insane latency (~100 cycles) on the M1, and AArch64 has no widening
+/// 64x64 vector multiply to build the reduction out of.
+///
+/// Each product goes through `mul_reduce_pair`, the nine-instruction
+/// multiply-reduce kernel the packed field and `multiply_accumulate` already
+/// use, rather than the twelve-instruction `multiply` above. The kernel folds
+/// the `lsr #32` into the subtraction's shifted-register operand and builds
+/// `(x_hi & EPSILON) * EPSILON` with one `umull`, and it keeps the rare-borrow
+/// correction branchless where `multiply`'s `checked_sub` takes a
+/// `branch_hint` path. Both conditional folds stay separate in both forms, so
+/// the intermediates -- and therefore the raw, possibly non-canonical `u64`
+/// representative each lane carries -- are bit-for-bit identical.
+///
+/// The pairing is free: at every one of the three stages the twenty-four
+/// products are independent, so two of them always fit one asm block.
 #[inline(always)]
-#[unroll_for_loops]
 unsafe fn sbox_layer_full(state: [u64; WIDTH]) -> [u64; WIDTH] {
-    // This is done in scalar. S-boxes in vector are only slightly slower throughput-wise but have
-    // an insane latency (~100 cycles) on the M1.
+    const_assert!(WIDTH == 12);
 
+    // x^2, two lanes per block.
     let mut state2 = [0u64; WIDTH];
-    assert!(WIDTH == 12);
-    for i in 0..12 {
-        state2[i] = multiply(state[i], state[i]);
+    let mut i = 0;
+    while i < WIDTH {
+        let (lo, hi) = mul_reduce_pair(state[i], state[i], state[i + 1], state[i + 1]);
+        state2[i] = lo;
+        state2[i + 1] = hi;
+        i += 2;
     }
 
+    // x^3 = x * x^2 and x^4 = x^2 * x^2 are independent within one lane, so
+    // each lane's two products share a block.
     let mut state3 = [0u64; WIDTH];
     let mut state4 = [0u64; WIDTH];
-    assert!(WIDTH == 12);
-    for i in 0..12 {
-        state3[i] = multiply(state[i], state2[i]);
-        state4[i] = multiply(state2[i], state2[i]);
+    let mut i = 0;
+    while i < WIDTH {
+        let (a3, a4) = mul_reduce_pair(state[i], state2[i], state2[i], state2[i]);
+        state3[i] = a3;
+        state4[i] = a4;
+        let (b3, b4) = mul_reduce_pair(
+            state[i + 1],
+            state2[i + 1],
+            state2[i + 1],
+            state2[i + 1],
+        );
+        state3[i + 1] = b3;
+        state4[i + 1] = b4;
+        i += 2;
     }
 
+    // x^7 = x^3 * x^4, two lanes per block.
     let mut state7 = [0u64; WIDTH];
-    assert!(WIDTH == 12);
-    for i in 0..12 {
-        state7[i] = multiply(state3[i], state4[i]);
+    let mut i = 0;
+    while i < WIDTH {
+        let (lo, hi) = mul_reduce_pair(state3[i], state4[i], state3[i + 1], state4[i + 1]);
+        state7[i] = lo;
+        state7[i + 1] = hi;
+        i += 2;
     }
 
     state7
