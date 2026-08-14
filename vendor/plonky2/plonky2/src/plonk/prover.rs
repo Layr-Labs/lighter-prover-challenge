@@ -634,10 +634,11 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// two Rayon fork/joins over the subgroup, into one.
 ///
 /// Value-exactness: each challenge keeps its own accumulators, its own
-/// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// numerator/denominator multiplication order (`for j in start..end`), and its
+/// own Z chain. Denominators from the two challenges are interleaved into one
+/// Montgomery batch, which removes one field inversion without changing any
+/// individual inverse. The raw-limb differential below compares the complete
+/// output with two independent per-challenge passes.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -688,16 +689,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
-                    denominators_0.clear();
-                    denominators_1.clear();
+                    let (denominators, denominator_inverses) = scratch;
+                    denominators.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -731,8 +730,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            denominators.push(denominator_0);
+                            denominators.push(denominator_1);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -747,8 +746,16 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
+                    debug_assert_eq!(denominator_inverses.len(), 2 * products_0.len());
+                    for ((product_0, product_1), inverses) in products_0
+                        .iter_mut()
+                        .zip(products_1.iter_mut())
+                        .zip(denominator_inverses.chunks_exact(2))
+                    {
+                        *product_0 *= inverses[0];
+                        *product_1 *= inverses[1];
+                    }
                 },
             );
     }
