@@ -35,6 +35,14 @@ impl Extendable<2> for GoldilocksField {
         ext2_base_scalar_dot_product(extension_values, base_scalars)
     }
 
+    #[inline]
+    fn extension_base_dot_products_2(
+        extension_values: &[QuadraticExtension<Self>],
+        base_polynomials: [&[Self]; 2],
+    ) -> [QuadraticExtension<Self>; 2] {
+        ext2_base_scalar_dot_products_2(extension_values, base_polynomials)
+    }
+
     #[inline(always)]
     fn mul_fft_quadratic_base_twiddle(twiddle: [Self; 2], value: [Self; 2]) -> [Self; 2] {
         // FFT rows below the quadratic extension's extra two-adic level
@@ -279,6 +287,96 @@ fn ext2_base_scalar_dot_product(
     result
 }
 
+/// Compute two dot products sharing one powers-table read:
+/// `out[k] = sum_i extension_values[i].scalar_mul(base_polynomials[k][i])`
+/// for `k in 0..2`, in GF(p^2), delaying reduction across each complete dot.
+///
+/// Each extension value is loaded once and folded into two independent
+/// 160-bit accumulator pairs (one per output polynomial, two limbs each). The
+/// per-accumulator bound is identical to the single-point case, so
+/// `reduce160`'s precondition holds through `n = 2^32 - 1` terms per chunk.
+/// Each output retains its own coefficient length (zip/minimum-length), so
+/// uneven polynomials fall back to the two independent single dots exactly.
+#[inline]
+fn ext2_base_scalar_dot_products_2(
+    extension_values: &[QuadraticExtension<GoldilocksField>],
+    base_polynomials: [&[GoldilocksField]; 2],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    const MAX_TERMS_PER_REDUCTION: usize = u32::MAX as usize;
+
+    let len_0 = extension_values.len().min(base_polynomials[0].len());
+    let len_1 = extension_values.len().min(base_polynomials[1].len());
+    let len = len_0.max(len_1);
+    if len == 0 {
+        return [QuadraticExtension::ZERO, QuadraticExtension::ZERO];
+    }
+
+    let reduce_chunk = |values: &[QuadraticExtension<GoldilocksField>],
+                        poly_a: &[GoldilocksField],
+                        poly_b: &[GoldilocksField],
+                        a_terms: usize,
+                        b_terms: usize| {
+        debug_assert!(a_terms <= poly_a.len());
+        debug_assert!(b_terms <= poly_b.len());
+        debug_assert!(a_terms <= values.len());
+        debug_assert!(b_terms <= values.len());
+        let (mut a0_lo, mut a0_hi) = (0u128, 0u32);
+        let (mut a1_lo, mut a1_hi) = (0u128, 0u32);
+        let (mut b0_lo, mut b0_hi) = (0u128, 0u32);
+        let (mut b1_lo, mut b1_hi) = (0u128, 0u32);
+        for i in 0..a_terms.max(b_terms) {
+            let QuadraticExtension([v0, v1]) = values[i];
+            if i < a_terms {
+                let c = poly_a[i].0;
+                u160_add_product(&mut a0_lo, &mut a0_hi, v0.0, c);
+                u160_add_product(&mut a1_lo, &mut a1_hi, v1.0, c);
+            }
+            if i < b_terms {
+                let c = poly_b[i].0;
+                u160_add_product(&mut b0_lo, &mut b0_hi, v0.0, c);
+                u160_add_product(&mut b1_lo, &mut b1_hi, v1.0, c);
+            }
+        }
+        // SAFETY: the exact worst-case bound documented above covers arbitrary
+        // u64 representatives for every term in this chunk.
+        [
+            QuadraticExtension([unsafe { reduce160(a0_lo, a0_hi) }, unsafe {
+                reduce160(a1_lo, a1_hi)
+            }]),
+            QuadraticExtension([unsafe { reduce160(b0_lo, b0_hi) }, unsafe {
+                reduce160(b1_lo, b1_hi)
+            }]),
+        ]
+    };
+
+    let first_a = len_0.min(MAX_TERMS_PER_REDUCTION);
+    let first_b = len_1.min(MAX_TERMS_PER_REDUCTION);
+    let mut out = reduce_chunk(
+        &extension_values[..len.min(MAX_TERMS_PER_REDUCTION)],
+        &base_polynomials[0][..first_a],
+        &base_polynomials[1][..first_b],
+        first_a,
+        first_b,
+    );
+    let mut start = len.min(MAX_TERMS_PER_REDUCTION);
+    while start < len {
+        let end = len.min(start + MAX_TERMS_PER_REDUCTION);
+        let a_end = len_0.min(end);
+        let b_end = len_1.min(end);
+        let [ta, tb] = reduce_chunk(
+            &extension_values[start..end],
+            &base_polynomials[0][start..a_end],
+            &base_polynomials[1][start..b_end],
+            a_end - start,
+            b_end - start,
+        );
+        out[0] += ta;
+        out[1] += tb;
+        start = end;
+    }
+    out
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///
@@ -429,6 +527,130 @@ fn ext2_add_prods1(a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
     let cumul_hi = cy as u32;
 
     unsafe { reduce160(cumul_lo, cumul_hi) }
+}
+
+/// One barycentric `partial_interpolate` step in GF(p^2), fusing the two
+/// products that are immediately summed.
+///
+/// `CosetInterpolationGate`'s inner loop is
+///
+/// ```text
+/// term      = x - domain_i                  (second limb is x's, unchanged)
+/// next_eval = eval * term + val * prod
+/// next_prod = prod * term
+/// ```
+///
+/// Evaluating that as written costs three `ext2_mul`s -- six `reduce160`s and
+/// three `u160_times_7`s -- plus a canonicalizing extension add. Because
+/// reduction is a ring homomorphism, the two products feeding `next_eval` can
+/// share accumulators: four `reduce160`s and two `u160_times_7`s, with the add
+/// absorbed. `term`'s second limb is `x`'s second limb for every point, so it
+/// is passed as `x1` rather than rebuilt, and only the first limb is
+/// subtracted.
+///
+/// Bounds, with every raw limb below `2^64` so each product is below `2^128`:
+/// the plain part of `c0` holds two products, the `W`-weighted part holds two
+/// and is then tripled-and-quadrupled by `u160_times_7`, so `c0 < 2^129 +
+/// 7 * 2^129 = 2^132`; `c1` holds four products, so `c1 < 2^130`; `d0 <
+/// 2^128 + 7 * 2^128 = 2^131` and `d1 < 2^129`. All are far below
+/// `reduce160`'s `2^160 - 2^128 + 2^96` precondition, and the `u32` high
+/// accumulators stay in single digits.
+#[inline(always)]
+fn ext2_interpolate_step(
+    eval: [u64; 2],
+    val: [u64; 2],
+    prod: [u64; 2],
+    t0: u64,
+    x1: u64,
+) -> ([GoldilocksField; 2], [GoldilocksField; 2]) {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let [e0, e1] = eval;
+    let [v0, v1] = val;
+    let [p0, p1] = prod;
+
+    // next_eval = eval * (t0, x1) + val * (p0, p1)
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, e0, t0);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, v0, p0);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, e1, x1);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, v1, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e0, x1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e1, t0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v0, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v1, p0);
+
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+
+    // next_prod = prod * (t0, x1)
+    let (mut d0_plain_lo, mut d0_plain_hi) = (0u128, 0u32);
+    let (mut d0_w_lo, mut d0_w_hi) = (0u128, 0u32);
+    let (mut d1_lo, mut d1_hi) = (0u128, 0u32);
+    u160_add_product(&mut d0_plain_lo, &mut d0_plain_hi, p0, t0);
+    u160_add_product(&mut d0_w_lo, &mut d0_w_hi, p1, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p0, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p1, t0);
+
+    let (d0_w_lo, d0_w_hi) = u160_times_7(d0_w_lo, d0_w_hi);
+    let (d0_lo, carry) = d0_plain_lo.overflowing_add(d0_w_lo);
+    let d0_hi = d0_plain_hi + d0_w_hi + carry as u32;
+
+    // SAFETY: the bounds documented above are far below reduce160's
+    // `2^160 - 2^128 + 2^96` precondition.
+    unsafe {
+        (
+            [reduce160(c0_lo, c0_hi), reduce160(c1_lo, c1_hi)],
+            [reduce160(d0_lo, d0_hi), reduce160(d1_lo, d1_hi)],
+        )
+    }
+}
+
+/// Goldilocks specialization of `CosetInterpolationGate`'s `partial_interpolate`.
+///
+/// Value-identical to the generic fold modulo `p`, which is all the quotient
+/// pass observes; like the other delayed-reduction helpers here, the returned
+/// representative need not match reduce-per-term evaluation bit for bit.
+pub fn ext2_partial_interpolate(
+    domain: &[GoldilocksField],
+    values: &[QuadraticExtension<GoldilocksField>],
+    barycentric_weights: &[GoldilocksField],
+    x: QuadraticExtension<GoldilocksField>,
+    initial_eval: QuadraticExtension<GoldilocksField>,
+    initial_partial_prod: QuadraticExtension<GoldilocksField>,
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    debug_assert_eq!(domain.len(), values.len());
+    debug_assert_eq!(domain.len(), barycentric_weights.len());
+
+    let QuadraticExtension([x0, x1]) = x;
+    let QuadraticExtension([e0, e1]) = initial_eval;
+    let QuadraticExtension([p0, p1]) = initial_partial_prod;
+    let mut eval = [e0.0, e1.0];
+    let mut prod = [p0.0, p1.0];
+
+    for i in 0..domain.len() {
+        let QuadraticExtension([v0, v1]) = values[i];
+        let weight = barycentric_weights[i];
+        let val = [(v0 * weight).0, (v1 * weight).0];
+        // Only the first limb differs from `x`; the generic path builds a full
+        // extension element for `domain[i]` and subtracts both limbs.
+        let t0 = (x0 - domain[i]).0;
+
+        let (next_eval, next_prod) = ext2_interpolate_step(eval, val, prod, t0, x1.0);
+        eval = [next_eval[0].0, next_eval[1].0];
+        prod = [next_prod[0].0, next_prod[1].0];
+    }
+
+    (
+        QuadraticExtension([GoldilocksField(eval[0]), GoldilocksField(eval[1])]),
+        QuadraticExtension([GoldilocksField(prod[0]), GoldilocksField(prod[1])]),
+    )
 }
 
 /// Multiply a and b considered as elements of GF(p^2).
@@ -884,6 +1106,113 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    #[test]
+    fn ext2_extension_base_dot_products_2_matches_two_singles_at_boundaries() {
+        let p = GF::ORDER;
+        let raw_specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX];
+        let lengths = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (2, 1),
+            (2, 2),
+            (3, 2),
+            (15, 15),
+            (16, 16),
+            (17, 17),
+            (63, 64),
+            (64, 63),
+            (65, 65),
+            (256, 256),
+            (257, 257),
+            (4095, 4096),
+            (4096, 4095),
+            (4097, 4097),
+        ];
+
+        let mut state = 0x0F1E_2D3C_4B5A_6978u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (values_len, a_len, b_len) in lengths
+            .iter()
+            .flat_map(|&(a, b)| [(a, a, b), (b, a, b), (a, b, a)])
+        {
+            let values: Vec<Q2> = (0..values_len)
+                .map(|i| {
+                    let a0 = if i < raw_specials.len() {
+                        raw_specials[i]
+                    } else {
+                        next()
+                    };
+                    let a1 = if i < raw_specials.len() {
+                        raw_specials[raw_specials.len() - 1 - i]
+                    } else {
+                        next()
+                    };
+                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
+                })
+                .collect();
+            let poly_a: Vec<GF> = (0..a_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 7) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+            let poly_b: Vec<GF> = (0..b_len)
+                .map(|i| {
+                    GoldilocksField(if i < raw_specials.len() {
+                        raw_specials[(i * 5 + 1) % raw_specials.len()]
+                    } else {
+                        next()
+                    })
+                })
+                .collect();
+
+            let expected = [
+                generic_extension_base_dot_product(&values, &poly_a),
+                generic_extension_base_dot_product(&values, &poly_b),
+            ];
+            let expected_single = [
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &poly_a),
+                <GF as Extendable<2>>::extension_base_dot_product(&values, &poly_b),
+            ];
+            let actual = <GF as Extendable<2>>::extension_base_dot_products_2(
+                &values,
+                [&poly_a, &poly_b],
+            );
+            for side in 0..2 {
+                for limb in 0..2 {
+                    assert_eq!(
+                        actual[side].0[limb].to_canonical_u64(),
+                        expected[side].0[limb].to_canonical_u64(),
+                        "canonical limb {limb} side {side} at \
+                         (values={values_len}, a={a_len}, b={b_len})"
+                    );
+                    assert_eq!(
+                        actual[side].0[limb].0,
+                        expected_single[side].0[limb].0,
+                        "raw limb {limb} side {side} at \
+                         (values={values_len}, a={a_len}, b={b_len})"
+                    );
+                }
+            }
+        }
+        let empty: [&[GF]; 2] = [&[], &[]];
+        assert_eq!(
+            <GF as Extendable<2>>::extension_base_dot_products_2(&[], empty),
+            [Q2::ZERO, Q2::ZERO]
+        );
     }
 
     #[test]
