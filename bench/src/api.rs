@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// Controlled isolate redraw marker codex-first-fri-batch-buffer-reuse-after-0e77a5c5-20260814
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
