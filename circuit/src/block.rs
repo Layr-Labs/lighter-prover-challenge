@@ -147,6 +147,99 @@ where
         Self::from_json_with_empty_txs(data, tx_per_proof, light_tx_per_proof, 0, 0)
     }
 
+    /// Replace the top-level `"txs"` JSON array with `[]` so a header-only
+    /// serde pass never tokenizes the 2500-tx payload. Strings (including
+    /// escaped quotes) and nested arrays are skipped exactly. `None` if no
+    /// top-level `txs` array is found.
+    ///
+    /// Marker: decode-overlap-1786697000.
+    pub fn json_blank_top_level_txs(src: &[u8]) -> Option<Vec<u8>> {
+        let mut i = 0usize;
+        let mut depth = 0i32;
+        while i < src.len() {
+            let b = src[i];
+            if b == b'"' {
+                let start = i + 1;
+                i += 1;
+                while i < src.len() {
+                    if src[i] == b'\\' {
+                        i = i.saturating_add(2);
+                        continue;
+                    }
+                    if src[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i >= src.len() {
+                    return None;
+                }
+                let key = &src[start..i];
+                i += 1;
+                if depth == 1 && key == b"txs" {
+                    while i < src.len() && src[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i >= src.len() || src[i] != b':' {
+                        return None;
+                    }
+                    i += 1;
+                    while i < src.len() && src[i].is_ascii_whitespace() {
+                        i += 1;
+                    }
+                    if i >= src.len() || src[i] != b'[' {
+                        return None;
+                    }
+                    let arr_start = i;
+                    let mut arr_depth = 0i32;
+                    let mut in_str = false;
+                    let mut escape = false;
+                    let mut j = i;
+                    while j < src.len() {
+                        let c = src[j];
+                        if in_str {
+                            if escape {
+                                escape = false;
+                            } else if c == b'\\' {
+                                escape = true;
+                            } else if c == b'"' {
+                                in_str = false;
+                            }
+                            j += 1;
+                            continue;
+                        }
+                        match c {
+                            b'"' => in_str = true,
+                            b'[' => arr_depth += 1,
+                            b']' => {
+                                arr_depth -= 1;
+                                if arr_depth == 0 {
+                                    let mut out =
+                                        Vec::with_capacity(src.len() - (j - arr_start) + 2);
+                                    out.extend_from_slice(&src[..arr_start]);
+                                    out.extend_from_slice(b"[]");
+                                    out.extend_from_slice(&src[j + 1..]);
+                                    return Some(out);
+                                }
+                            }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    return None;
+                }
+                continue;
+            }
+            match b {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Like [`Self::from_json`], but when the block consists only of empty txs, appends
     /// `heavy_empty_tx_count` heavy and `light_empty_tx_count` light copies of the block's
     /// trailing empty tx before chunking. Blocks with active txs are parsed unchanged.

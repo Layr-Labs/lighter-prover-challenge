@@ -21,6 +21,7 @@ use api::{
 use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
 use circuit::types::config::{C, F};
+use serde_json;
 use plonky2::fri::oracle::PolynomialBatch;
 
 #[cfg(not(target_env = "msvc"))]
@@ -80,20 +81,26 @@ fn main() {
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
     assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
+    // Decode-overlap (decode-overlap-1786697000): blank the top-level `txs`
+    // array and parse the header for pre-execution while the pre circuit
+    // loads. The full 2500-tx parse runs under the remaining-circuit loads
+    // and the pre proof. Pre never reads `txs`; the full parse remains the
+    // authority for every transaction. Header fields are checked against the
+    // full block before the pipeline starts.
+    let json = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span = plonky2::util::profile::span("startup", "fixture_read");
+        fs::read(&fixture).expect("cannot read prover fixture")
+    };
+    let header_json = Block::<F>::json_blank_top_level_txs(&json);
+    let (pre_exec, pre_circuits) = rayon::join(
         || {
             #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
-            Block::<F>::from_json_with_empty_txs(
-                &json,
-                HEAVY_TX_PER_PROOF,
-                LIGHT_TX_PER_PROOF,
-                PUBLIC_HEAVY_TX_COUNT,
-                PUBLIC_LIGHT_TX_COUNT,
-            )
-            .expect("invalid prover fixture")
+            let _span = plonky2::util::profile::span("startup", "header_parse");
+            let src = header_json.as_deref().unwrap_or(&json);
+            let header: Block<F> =
+                serde_json::from_slice(src).expect("invalid prover fixture header");
+            circuit::block_pre_execution::BlockPreExec::from_block(&header)
         },
         || {
             #[cfg(feature = "diagnostic_profile")]
@@ -111,25 +118,29 @@ fn main() {
             }
         },
     );
-    // The pre-execution witness is pure block-derived data (no circuit
-    // dependency), and the remaining four circuit blobs take ~5x longer to
-    // load than it takes to compute. Load the blobs on a scoped thread while
-    // the main thread derives the pre-execution witness, then start the pre
-    // proof the moment its witness exists — the pre proof runs underneath the
-    // tail of the blob loads instead of waiting for them to finish first.
-    // Value-exact: no quantity is computed differently, only in parallel.
-    let (pre_handle, remaining) = std::thread::scope(|scope| {
+    // Remaining four circuit blobs + full tx parse overlap the pre proof.
+    let header_created_at = pre_exec.created_at;
+    let header_block_number = pre_exec.block_number;
+    let header_old_state_root = pre_exec.old_state_root;
+    let (pre_handle, remaining, block) = std::thread::scope(|scope| {
         let remaining_handle = scope.spawn(|| {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
             (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
                 .then(Circuits::load_remaining_embedded)
         });
-        let pre_exec = {
+        let full_handle = scope.spawn(|| {
             #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
-            circuit::block_pre_execution::BlockPreExec::from_block(&block)
-        };
+            let _span = plonky2::util::profile::span("startup", "fixture_full_parse");
+            Block::<F>::from_json_with_empty_txs(
+                &json,
+                HEAVY_TX_PER_PROOF,
+                LIGHT_TX_PER_PROOF,
+                PUBLIC_HEAVY_TX_COUNT,
+                PUBLIC_LIGHT_TX_COUNT,
+            )
+            .expect("invalid prover fixture")
+        });
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -167,8 +178,23 @@ fn main() {
         let remaining = remaining_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (pre_handle, remaining)
+        let block = full_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (pre_handle, remaining, block)
     });
+    assert_eq!(
+        header_created_at, block.created_at,
+        "header parse created_at must match full fixture"
+    );
+    assert_eq!(
+        header_block_number, block.block_number,
+        "header parse block_number must match full fixture"
+    );
+    assert_eq!(
+        header_old_state_root, block.old_state_root,
+        "header parse old_state_root must match full fixture"
+    );
     // The pre circuit is owned by the startup proof until it completes; only
     // the other four blobs are loaded above (loading all five here would
     // deserialize the same pre circuit twice on the scored critical path).
