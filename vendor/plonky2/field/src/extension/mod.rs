@@ -99,6 +99,32 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Dot product `sum_i extension_values[i].scalar_mul(base_coefficients[i]
+    /// * subgroup_scales[i])`, zipped across all three slices. This is the
+    /// fused form of evaluating a base polynomial at `g * zeta` from the
+    /// already-built `zeta` powers and the natural-order subgroup powers:
+    /// `P(g*zeta) = sum_i c_i * g^i * zeta^i`. The default performs ordinary
+    /// field arithmetic; a base field may specialize it to delay reduction.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_with_subgroup_scales(
+        extension_values: &[Self::Extension],
+        base_coefficients: &[Self],
+        subgroup_scales: &[Self],
+    ) -> Self::Extension {
+        extension_values
+            .iter()
+            .zip(base_coefficients)
+            .zip(subgroup_scales)
+            .map(|((&value, &coefficient), &scale)| {
+                <Self::Extension as FieldExtension<D>>::scalar_mul(
+                    &value,
+                    coefficient * scale,
+                )
+            })
+            .sum()
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

@@ -1,15 +1,20 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
 
+use core::any::TypeId;
+
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::Extendable;
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
+use crate::field::goldilocks_extensions::ext2_mul_add;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -794,6 +799,42 @@ fn accumulate_linear_quotient<F: Field>(
     }
     // Highest slot: the quotient coefficient there is the explicit zero pad.
     buf[d - 1] *= shift;
+    // Production Goldilocks-quadratic fast path: the two Horner steps per
+    // slot are each a multiply and an add, and `ext2_mul_add` folds the
+    // addend into the multiply's 160-bit accumulators before one reduction
+    // pair. The generic loop performs a delayed ext2 multiply (two
+    // `reduce160`) followed by a canonicalizing extension add (two more
+    // reductions) per step; the fused form keeps exactly two `reduce160`
+    // per step. Field-equal by construction; the raw representative may
+    // differ, under the same license as the other delayed reducers in this
+    // file.
+    if TypeId::of::<F>() == TypeId::of::<QuadraticExtension<GoldilocksField>>() {
+        // SAFETY: the TypeId comparison proves `F` is exactly
+        // `QuadraticExtension<GoldilocksField>`; the pointer casts below
+        // preserve layout, length and alignment.
+        let buf_q = unsafe {
+            core::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                buf.len(),
+            )
+        };
+        let coeffs_q = unsafe {
+            core::slice::from_raw_parts(
+                coeffs.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                coeffs.len(),
+            )
+        };
+        let z_q =
+            unsafe { *(&z as *const F as *const QuadraticExtension<GoldilocksField>) };
+        let shift_q =
+            unsafe { *(&shift as *const F as *const QuadraticExtension<GoldilocksField>) };
+        let mut acc = QuadraticExtension::<GoldilocksField>::ZERO;
+        for i in (0..d - 1).rev() {
+            acc = ext2_mul_add(acc, z_q, coeffs_q[i + 1]);
+            buf_q[i] = ext2_mul_add(buf_q[i], shift_q, acc);
+        }
+        return;
+    }
     // Synthetic division, highest coefficient first: the quotient's
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
     let mut acc = F::ZERO;
