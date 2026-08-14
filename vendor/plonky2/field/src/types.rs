@@ -185,6 +185,57 @@ pub trait Field:
             buf.extend([x01inv * x[1], x01inv * x[0], x012inv * x01]);
             return;
         }
+        if n >= 8 {
+            // Eight independent cumulative-product chains halve the long dependency depth of
+            // the historical width-four path at production batch sizes. Join the lanes through
+            // a balanced tree, take the same single inverse, then reconstruct in input order.
+            const WIDE_WIDTH: usize = 8;
+            let mut cumul_prod: [Self; WIDE_WIDTH] = x[..WIDE_WIDTH].try_into().unwrap();
+            buf.extend(cumul_prod);
+            for (i, &xi) in x[WIDE_WIDTH..].iter().enumerate() {
+                cumul_prod[i % WIDE_WIDTH] *= xi;
+                buf.push(cumul_prod[i % WIDE_WIDTH]);
+            }
+
+            let mut a_inv = {
+                let c01 = cumul_prod[0] * cumul_prod[1];
+                let c23 = cumul_prod[2] * cumul_prod[3];
+                let c45 = cumul_prod[4] * cumul_prod[5];
+                let c67 = cumul_prod[6] * cumul_prod[7];
+                let c0123 = c01 * c23;
+                let c4567 = c45 * c67;
+                let c01234567_inv = (c0123 * c4567).inverse();
+                let c0123_inv = c01234567_inv * c4567;
+                let c4567_inv = c01234567_inv * c0123;
+                let c01_inv = c0123_inv * c23;
+                let c23_inv = c0123_inv * c01;
+                let c45_inv = c4567_inv * c67;
+                let c67_inv = c4567_inv * c45;
+                [
+                    c01_inv * cumul_prod[1],
+                    c01_inv * cumul_prod[0],
+                    c23_inv * cumul_prod[3],
+                    c23_inv * cumul_prod[2],
+                    c45_inv * cumul_prod[5],
+                    c45_inv * cumul_prod[4],
+                    c67_inv * cumul_prod[7],
+                    c67_inv * cumul_prod[6],
+                ]
+            };
+
+            for i in (WIDE_WIDTH..n).rev() {
+                buf[i] = buf[i - WIDE_WIDTH] * a_inv[i % WIDE_WIDTH];
+                a_inv[i % WIDE_WIDTH] *= x[i];
+            }
+            for i in (0..WIDE_WIDTH).rev() {
+                buf[i] = a_inv[i];
+            }
+
+            for (&bi, &xi) in buf.iter().zip(x) {
+                debug_assert_eq!(bi * xi, Self::ONE);
+            }
+            return;
+        }
         debug_assert!(n >= WIDTH);
 
         // Buf is reused for a few things to save allocations.
