@@ -710,7 +710,7 @@ fn prove_path(
 pub(crate) fn prove_pre_execution_parallel(
     pre_data: &CircuitData<F, C, D>,
     pre_target: &BlockPreExecutionTarget,
-    pre_exec: &BlockPreExec<F>,
+    pre_exec: &BlockPreExec<'_, F>,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
@@ -1035,6 +1035,56 @@ mod tests {
             .expect("orchestration test thread must start")
             .join()
             .expect("orchestration test thread must finish");
+    }
+
+    #[test]
+    fn pre_execution_view_borrows_every_cloned_block_component() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let block = Block::<F>::from_json_with_empty_txs(
+                    include_bytes!("../bench_test.json"),
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("public fixture must parse");
+                let pre_exec = BlockPreExec::from_block(&block);
+
+                assert!(std::ptr::eq(
+                    pre_exec.old_system_config,
+                    &block.old_system_config
+                ));
+                assert!(std::ptr::eq(
+                    pre_exec.register_stack_before,
+                    &block.register_stack_before
+                ));
+                assert!(std::ptr::eq(pre_exec.all_assets, &block.all_assets));
+                assert!(std::ptr::eq(
+                    pre_exec.all_margined_assets,
+                    &block.all_margined_assets
+                ));
+                assert!(std::ptr::eq(
+                    pre_exec.all_market_details,
+                    &block.all_market_details
+                ));
+                assert!(std::ptr::eq(
+                    pre_exec.all_market_risk_details,
+                    &block.all_market_risk_details
+                ));
+                assert!(std::ptr::eq(pre_exec.price_updates, &block.price_updates));
+                assert!(std::ptr::eq(pre_exec.state_metadata, &block.state_metadata));
+                assert_eq!(pre_exec.calculate_premium, block.calculate_premium);
+                assert_eq!(pre_exec.calculate_funding, block.calculate_funding);
+                assert_eq!(
+                    pre_exec.calculate_oracle_prices,
+                    block.calculate_oracle_prices
+                );
+            })
+            .expect("spawn")
+            .join()
+            .expect("borrow view test thread must finish");
     }
 
     #[test]

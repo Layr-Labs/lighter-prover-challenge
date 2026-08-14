@@ -62,14 +62,14 @@ pub trait Circuit<
 
     /// Fills partial witness for block target with given block data
     fn generate_witness(
-        block: &BlockPreExec<F>,
+        block: &BlockPreExec<'_, F>,
         target: &BlockPreExecutionTarget,
     ) -> Result<PartialWitness<F>>;
     /// Takes `circuit`, block witness and `target` defined in [`BlockPreExecutionCircuit::define()`] function
     /// and returns the (not-compressed) proof with public inputs
     fn prove(
         circuit: &CircuitData<F, C, D>,
-        block: &BlockPreExec<F>,
+        block: &BlockPreExec<'_, F>,
         bt: &BlockPreExecutionTarget,
     ) -> Result<ProofWithPublicInputs<F, C, D>>;
 }
@@ -156,7 +156,7 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
 
     fn prove(
         circuit: &CircuitData<F, C, D>,
-        block: &BlockPreExec<F>,
+        block: &BlockPreExec<'_, F>,
         target: &BlockPreExecutionTarget,
     ) -> Result<ProofWithPublicInputs<F, C, D>> {
         let mut timing = TimingTree::new("BlockPreExecutionCircuit::prove", Level::Debug);
@@ -186,7 +186,7 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
 
 
     fn generate_witness(
-        block: &BlockPreExec<F>,
+        block: &BlockPreExec<'_, F>,
         target: &BlockPreExecutionTarget,
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
@@ -199,7 +199,7 @@ impl BlockPreExecutionCircuit {
     /// Seeded form of [`Circuit::generate_witness`]: writes the same targets directly
     /// through `pw` (any partition seeder or map).
     fn seed_witness_into<W: Witness<F> + WitnessWrite<F>>(
-        block: &BlockPreExec<F>,
+        block: &BlockPreExec<'_, F>,
         target: &BlockPreExecutionTarget,
         pw: &mut W,
     ) -> Result<()> {
@@ -210,8 +210,8 @@ impl BlockPreExecutionCircuit {
             F::from_canonical_u64(block.block_number),
         )?;
 
-        pw.set_register_info_target(&target.register_stack_before, &block.register_stack_before)?;
-        pw.set_system_config_target(&target.old_system_config, &block.old_system_config)?;
+        pw.set_register_info_target(&target.register_stack_before, block.register_stack_before)?;
+        pw.set_system_config_target(&target.old_system_config, block.old_system_config)?;
 
         target
             .all_assets_before
@@ -237,7 +237,7 @@ impl BlockPreExecutionCircuit {
             .zip(block.all_market_risk_details.iter())
             .try_for_each(|(t, mrd)| pw.set_market_risk_details_target(t, mrd))?;
 
-        pw.set_price_updates_target(&target.price_updates, &block.price_updates)?;
+        pw.set_price_updates_target(&target.price_updates, block.price_updates)?;
         pw.set_bool_target(target.calculate_premium, block.calculate_premium)?;
         pw.set_bool_target(target.calculate_funding, block.calculate_funding)?;
         pw.set_bool_target(
@@ -251,7 +251,7 @@ impl BlockPreExecutionCircuit {
             block.old_account_pub_data_tree_root,
         )?;
         pw.set_hash_target(target.old_market_tree_root, block.old_market_tree_root)?;
-        pw.set_state_metadata_target(&target.state_metadata_target, &block.state_metadata)?;
+        pw.set_state_metadata_target(&target.state_metadata_target, block.state_metadata)?;
 
         pw.set_hash_target(target.old_state_root, block.old_state_root)?;
 

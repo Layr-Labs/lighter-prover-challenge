@@ -118,7 +118,7 @@ fn main() {
     // proof the moment its witness exists — the pre proof runs underneath the
     // tail of the blob loads instead of waiting for them to finish first.
     // Value-exact: no quantity is computed differently, only in parallel.
-    let (pre_handle, remaining) = std::thread::scope(|scope| {
+    let (pre_target, pre_data, pre_proof, remaining) = std::thread::scope(|scope| {
         let remaining_handle = scope.spawn(|| {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
@@ -133,7 +133,7 @@ fn main() {
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
-            .spawn(move || {
+            .spawn_scoped(scope, move || {
                 let (pre_target, mut pre_data) = pre_circuits;
                 let pre_proof =
                     prover::prove_pre_execution_parallel(&pre_data, &pre_target, &pre_exec);
@@ -167,19 +167,15 @@ fn main() {
         let remaining = remaining_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (pre_handle, remaining)
+        let (pre_target, pre_data, pre_proof) = pre_handle
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        (pre_target, pre_data, pre_proof, remaining)
     });
     // The pre circuit is owned by the startup proof until it completes; only
     // the other four blobs are loaded above (loading all five here would
     // deserialize the same pre circuit twice on the scored critical path).
     // Keep the forced-build mode's established behavior unchanged.
-    #[cfg(feature = "diagnostic_profile")]
-    let _pre_wait = plonky2::util::profile::span("wait", "pre_execution_join");
-    let (pre_target, pre_data, pre_proof) = pre_handle
-        .join()
-        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-    #[cfg(feature = "diagnostic_profile")]
-    drop(_pre_wait);
     let circuits = match remaining {
         Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
         Some(Err(error)) => {

@@ -8,7 +8,6 @@ use plonky2::iop::target::Target;
 
 use crate::block::Block;
 use crate::types::asset::Asset;
-use crate::types::config::F;
 use crate::types::constants::{ASSET_LIST_SIZE, MARGINED_ASSET_LIST_SIZE, POSITION_LIST_SIZE};
 use crate::types::margined_asset::{MARGINED_ASSET_SIZE, MarginedAsset, MarginedAssetTarget};
 use crate::types::market_details::{
@@ -19,25 +18,25 @@ use crate::types::register::RegisterStack;
 use crate::types::state_metadata::{STATE_METADATA_SIZE, StateMetadata, StateMetadataTarget};
 use crate::types::system_config::SystemConfig;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 /// Public + Secret Witness for single block pre-exec
-pub struct BlockPreExec<F>
+pub struct BlockPreExec<'a, F>
 where
     F: Field + Extendable<5> + RichField,
 {
     pub created_at: i64,
     pub block_number: u64,
 
-    pub old_system_config: SystemConfig,
-    pub register_stack_before: RegisterStack,
-    pub all_assets: [Asset; ASSET_LIST_SIZE],
-    pub all_margined_assets: [MarginedAsset; MARGINED_ASSET_LIST_SIZE],
+    pub old_system_config: &'a SystemConfig,
+    pub register_stack_before: &'a RegisterStack,
+    pub all_assets: &'a [Asset; ASSET_LIST_SIZE],
+    pub all_margined_assets: &'a [MarginedAsset; MARGINED_ASSET_LIST_SIZE],
 
-    pub all_market_details: [MarketDetails; POSITION_LIST_SIZE],
-    pub all_market_risk_details: [MarketRiskDetails; POSITION_LIST_SIZE],
-    pub state_metadata: StateMetadata,
+    pub all_market_details: &'a [MarketDetails; POSITION_LIST_SIZE],
+    pub all_market_risk_details: &'a [MarketRiskDetails; POSITION_LIST_SIZE],
+    pub state_metadata: &'a StateMetadata,
 
-    pub price_updates: PriceUpdates,
+    pub price_updates: &'a PriceUpdates,
     pub calculate_premium: bool,
     pub calculate_funding: bool,
     pub calculate_oracle_prices: bool,
@@ -48,18 +47,25 @@ where
     pub old_state_root: HashOut<F>,
 }
 
-impl BlockPreExec<F> {
-    pub fn from_block(block: &Block<F>) -> Self {
+impl<'a, F> BlockPreExec<'a, F>
+where
+    F: Field + Extendable<5> + RichField,
+{
+    /// Borrows the pre-execution portion of a block instead of cloning it.
+    /// The startup prover reads this data while the original block remains
+    /// alive for the final-block witness, so the former duplicate arrays and
+    /// metadata allocation were pure transport work.
+    pub fn from_block(block: &'a Block<F>) -> Self {
         Self {
             created_at: block.created_at,
             block_number: block.block_number,
-            old_system_config: block.old_system_config,
-            register_stack_before: block.register_stack_before,
-            all_assets: block.all_assets.clone(),
-            all_margined_assets: block.all_margined_assets.clone(),
-            all_market_details: block.all_market_details.clone(),
-            all_market_risk_details: block.all_market_risk_details.clone(),
-            price_updates: block.price_updates.clone(),
+            old_system_config: &block.old_system_config,
+            register_stack_before: &block.register_stack_before,
+            all_assets: &block.all_assets,
+            all_margined_assets: &block.all_margined_assets,
+            all_market_details: &block.all_market_details,
+            all_market_risk_details: &block.all_market_risk_details,
+            price_updates: &block.price_updates,
             calculate_premium: block.calculate_premium,
             calculate_funding: block.calculate_funding,
             calculate_oracle_prices: block.calculate_oracle_prices,
@@ -67,7 +73,7 @@ impl BlockPreExec<F> {
             old_account_pub_data_tree_root: block.old_account_pub_data_tree_root,
             old_market_tree_root: block.old_market_tree_root,
             old_state_root: block.old_state_root,
-            state_metadata: block.state_metadata.clone(),
+            state_metadata: &block.state_metadata,
         }
     }
 }
