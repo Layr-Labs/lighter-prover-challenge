@@ -27,6 +27,26 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(not(target_env = "msvc"))]
+union JemallocConfigPtr {
+    byte: &'static u8,
+    c_char: &'static core::ffi::c_char,
+}
+
+// The worker uses ten long-lived Rayon threads and repeatedly recycles the
+// same large witness/coefficient shapes. Four arenas retain enough independent
+// allocation lanes for parallel proving while reducing fragmentation and the
+// allocator metadata/cache footprint versus jemalloc's CPU-scaled default.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static core::ffi::c_char> = Some(unsafe {
+    JemallocConfigPtr {
+        byte: &b"narenas:4\0"[0],
+    }
+    .c_char
+});
+
 // jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
 // mapped long enough for the next identically-shaped allocation to reuse them.
 //
