@@ -77,7 +77,13 @@ impl<F: Field> PolynomialValues<F> {
     /// Returns the polynomial evaluated by `self` on a coset when the caller
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
-        ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+        ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers), false)
+    }
+
+    /// Like `coset_ifft_with_powers`, but `scaled_powers[i]` must already equal
+    /// `n^-1 * coset_shift^-i` so the IFFT post-pass needs one multiply per slot.
+    pub fn coset_ifft_with_scaled_powers(self, scaled_powers: &[F]) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_postscale(self, None, None, Some(scaled_powers), true)
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -540,12 +546,30 @@ mod tests {
             );
             let shift = F::coset_shift();
             let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
+            let n_inv = F::inverse_2exp(k);
+            let scaled_inverse_powers = inverse_powers
+                .iter()
+                .map(|&power| power * n_inv)
+                .collect::<Vec<_>>();
 
             let expected = evals.clone().coset_ifft(shift);
-            let actual = evals.coset_ifft_with_powers(&inverse_powers);
+            let actual = evals.clone().coset_ifft_with_powers(&inverse_powers);
+            let actual_scaled = evals.coset_ifft_with_scaled_powers(&scaled_inverse_powers);
 
             assert_eq!(
                 actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected
+                    .coeffs
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                actual_scaled
+                    .coeffs
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>(),
                 expected
                     .coeffs
                     .iter()
