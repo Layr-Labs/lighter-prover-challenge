@@ -589,6 +589,36 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+/// Divide the products for both production permutation challenges with one
+/// Montgomery batch inversion. Batch inversion is elementwise, so inverting
+/// `denominator_products_0 || denominator_products_1` is value-identical to
+/// two separate calls while paying the primitive's scalar inversion once.
+#[inline]
+fn divide_chunk_products_pair<F: Field>(
+    numerator_products_0: &mut [F],
+    denominator_products_0: &[F],
+    numerator_products_1: &mut [F],
+    denominator_products_1: &[F],
+    joined_denominators: &mut Vec<F>,
+    inverse_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(numerator_products_0.len(), denominator_products_0.len());
+    debug_assert_eq!(numerator_products_1.len(), denominator_products_1.len());
+
+    joined_denominators.clear();
+    joined_denominators.extend_from_slice(denominator_products_0);
+    joined_denominators.extend_from_slice(denominator_products_1);
+    F::batch_multiplicative_inverse_into(joined_denominators, inverse_scratch);
+
+    let (inverses_0, inverses_1) = inverse_scratch.split_at(denominator_products_0.len());
+    for (product, &inverse) in numerator_products_0.iter_mut().zip(inverses_0) {
+        *product *= inverse;
+    }
+    for (product, &inverse) in numerator_products_1.iter_mut().zip(inverses_1) {
+        *product *= inverse;
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -690,12 +720,18 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     (
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    let (
+                        denominators_0,
+                        denominators_1,
+                        joined_denominators,
+                        denominator_inverses,
+                    ) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
                     for (t, &x) in xs.iter().enumerate() {
@@ -747,8 +783,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    divide_chunk_products_pair(
+                        products_0,
+                        denominators_0,
+                        products_1,
+                        denominators_1,
+                        joined_denominators,
+                        denominator_inverses,
+                    );
                 },
             );
     }
@@ -3081,7 +3123,7 @@ mod flat_chunk_products_tests {
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
-    use super::divide_chunk_products;
+    use super::{divide_chunk_products, divide_chunk_products_pair};
 
     type F = GoldilocksField;
 
@@ -3118,6 +3160,58 @@ mod flat_chunk_products_tests {
             divide_chunk_products(&mut actual, &denominator_products, &mut scratch);
             assert_eq!(actual, expected, "width={width}, chunk_size={chunk_size}");
             assert_eq!(scratch.len(), actual.len());
+        }
+    }
+
+    #[test]
+    fn paired_chunk_division_matches_two_independent_batches_raw() {
+        for &(n0, n1) in &[
+            (1usize, 1usize),
+            (7, 9),
+            (127, 128),
+            (128, 129),
+            (1280, 1280),
+        ] {
+            let denominators_0 = (0..n0)
+                .map(|i| F::from_canonical_usize(29 * i + 5))
+                .collect::<Vec<_>>();
+            let denominators_1 = (0..n1)
+                .map(|i| F::from_canonical_usize(31 * i + 7))
+                .collect::<Vec<_>>();
+            let initial_0 = noncanonical_vec(n0, 11);
+            let initial_1 = noncanonical_vec(n1, 17);
+
+            let mut expected_0 = initial_0.clone();
+            let mut expected_1 = initial_1.clone();
+            let mut independent_scratch = Vec::new();
+            divide_chunk_products(&mut expected_0, &denominators_0, &mut independent_scratch);
+            divide_chunk_products(&mut expected_1, &denominators_1, &mut independent_scratch);
+
+            let mut actual_0 = initial_0;
+            let mut actual_1 = initial_1;
+            let mut joined = Vec::new();
+            let mut paired_scratch = Vec::new();
+            divide_chunk_products_pair(
+                &mut actual_0,
+                &denominators_0,
+                &mut actual_1,
+                &denominators_1,
+                &mut joined,
+                &mut paired_scratch,
+            );
+
+            assert_eq!(
+                raw(&actual_0),
+                raw(&expected_0),
+                "first batch n0={n0} n1={n1}"
+            );
+            assert_eq!(
+                raw(&actual_1),
+                raw(&expected_1),
+                "second batch n0={n0} n1={n1}"
+            );
+            assert_eq!(joined.len(), n0 + n1);
+            assert_eq!(paired_scratch.len(), n0 + n1);
         }
     }
 
