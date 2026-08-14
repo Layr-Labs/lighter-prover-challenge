@@ -281,6 +281,14 @@ impl BlockCircuit {
         pending: PendingPartitionWitness<'_, F, C, D>,
         circuit_data: &CircuitData<F, C, D>,
     ) -> Result<ProofWithPublicInputs<F, C, D>> {
+        Self::prove_prepared_with_early(pending, circuit_data, None)
+    }
+
+    pub fn prove_prepared_with_early(
+        pending: PendingPartitionWitness<'_, F, C, D>,
+        circuit_data: &CircuitData<F, C, D>,
+        early_wire_lde: Option<plonky2::plonk::early_wire_lde::EarlyWireLde<F>>,
+    ) -> Result<ProofWithPublicInputs<F, C, D>> {
         let mut timing = TimingTree::new("BlockCircuit", Level::Debug);
 
         let partition_witness = pending.finish()?;
@@ -289,6 +297,7 @@ impl BlockCircuit {
             &circuit_data.common,
             partition_witness,
             &mut timing,
+            early_wire_lde,
         )?;
         // The trusted benchmark verifies the final proof; keep the eager check for tests.
         #[cfg(debug_assertions)]
@@ -820,6 +829,7 @@ impl Circuit<C, F, D> for BlockCircuit {
             &circuit_data.common,
             partition_witness,
             &mut timing,
+            None,
         )?;
         // The trusted benchmark verifies the final proof; keep the eager check for tests.
         #[cfg(debug_assertions)]
