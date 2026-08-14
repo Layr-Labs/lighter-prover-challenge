@@ -589,6 +589,34 @@ fn divide_chunk_products<F: Field>(
     }
 }
 
+/// Marker: perm-inv-merge-1786708000. The fused two-challenge path used to
+/// invert each challenge's denominators separately. One invert of the
+/// concatenation is the same inverses (Montgomery batch is elementwise) and
+/// one setup. Wrong inverse is a wrong Z — fail-closed.
+#[inline]
+fn divide_chunk_products_pair<F: Field>(
+    numerator_0: &mut [F],
+    denominator_0: &[F],
+    numerator_1: &mut [F],
+    denominator_1: &[F],
+    joined: &mut Vec<F>,
+    inverse_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(numerator_0.len(), denominator_0.len());
+    debug_assert_eq!(numerator_1.len(), denominator_1.len());
+    joined.clear();
+    joined.extend_from_slice(denominator_0);
+    joined.extend_from_slice(denominator_1);
+    F::batch_multiplicative_inverse_into(joined, inverse_scratch);
+    let n0 = denominator_0.len();
+    for (product, &inverse) in numerator_0.iter_mut().zip(&inverse_scratch[..n0]) {
+        *product *= inverse;
+    }
+    for (product, &inverse) in numerator_1.iter_mut().zip(&inverse_scratch[n0..]) {
+        *product *= inverse;
+    }
+}
+
 /// Accumulate the sequential Z chain directly into the column-major output
 /// polynomials, deleting the per-point row Vec, the row-major intermediate,
 /// and the whole-phase transpose. Values and their order are identical to the
@@ -690,12 +718,13 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     (
                         Vec::with_capacity(num_chunks * INV_BATCH),
                         Vec::with_capacity(num_chunks * INV_BATCH),
-                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    let (denominators_0, denominators_1, joined, denominator_inverses) = scratch;
                     denominators_0.clear();
                     denominators_1.clear();
                     for (t, &x) in xs.iter().enumerate() {
@@ -747,8 +776,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
-                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
+                    divide_chunk_products_pair(
+                        products_0,
+                        denominators_0,
+                        products_1,
+                        denominators_1,
+                        joined,
+                        denominator_inverses,
+                    );
                 },
             );
     }
