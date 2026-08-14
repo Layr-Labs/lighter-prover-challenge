@@ -849,16 +849,24 @@ pub(crate) fn prove_block_after_pre(
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
-                    let mut pending = PendingPartitionWitness::start(
-                        early,
+                    // The early final-block values used to make a complete
+                    // `PartialWitness` hash map and then replay it into the
+                    // partition. This lane has a single, known seed phase, so
+                    // write those same values straight to the representative
+                    // slots instead. The later chain-proof feeds deliberately
+                    // remain separate: their generators must stay pending
+                    // until their respective proof arrives.
+                    let mut pending = PendingPartitionWitness::start_seeded(
                         &block_data.prover_only,
                         &block_data.common,
+                        |seeder| {
+                            BlockCircuit::seed_witness_early_into(
+                                &block_target,
+                                block_ref,
+                                pre_proof_ref,
+                                seeder,
+                            )
+                        },
                     )
                     .expect("final block early witness phase failed");
                     #[cfg(feature = "diagnostic_profile")]
