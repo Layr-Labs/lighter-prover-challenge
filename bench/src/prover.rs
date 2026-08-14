@@ -119,21 +119,16 @@ fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
     active_paths.load(Ordering::Acquire) == 1
 }
 
-/// Marks the calling thread as latency-critical to the macOS scheduler.
+/// Marks a serialized proof-spine thread as latency-critical to the macOS scheduler.
 ///
-/// The 49 sequential chain folds are the whole critical path of a block
-/// bundle: every serial section of a fold (witness feed, opening
-/// evaluation, FRI reduce, transcript work) runs on a chain-step thread
-/// while the global worker pool is saturated by transaction proving that
-/// hides behind the spine anyway. At default QoS those serial sections
-/// compete for cores on equal terms with hideable bulk work and are
-/// eligible for efficiency-core placement; per-statement profiling of the
-/// fold pipeline shows episodic multi-hundred-millisecond stalls between
-/// instrumented spans under exactly this contention. `USER_INTERACTIVE`
-/// asks the scheduler to keep the fold thread on a performance core and
-/// schedule it ahead of default-QoS pool workers. This changes thread
-/// scheduling only: no work is added, moved, or reordered, and proof
-/// bytes are untouched. On non-macOS targets this is a no-op.
+/// The 49 sequential chain folds are the whole pipelined critical path, and
+/// the final block proof is the serial tail after both transaction paths have
+/// joined. Their serial sections (witness feed, opening evaluation, FRI
+/// reduce, transcript work) otherwise remain eligible for efficiency-core
+/// placement. `USER_INTERACTIVE` asks the scheduler to keep the spine on a
+/// performance core. This changes thread scheduling only: no work is added,
+/// moved, or reordered, and proof bytes are untouched. On non-macOS targets
+/// this is a no-op.
 #[cfg(target_os = "macos")]
 fn mark_spine_thread_latency_critical() {
     // `QOS_CLASS_USER_INTERACTIVE` is 0x21 in <sys/qos.h>.
@@ -948,6 +943,14 @@ pub(crate) fn prove_block_after_pre(
     // before the final block proof — the process's peak-RSS moment — stacks its
     // own extensions on top of them.
     circuits.release_finished_circuit_extensions();
+
+    // The tx/chain pipelines have joined, so the final block proof is now the
+    // only proof on the critical path. Chain-step threads mark themselves
+    // latency-critical above, but this tail runs on the original main thread,
+    // whose inherited default QoS otherwise leaves its serial sections eligible
+    // for E-core placement. Raising it here cannot starve hidden sibling proof
+    // work because none remains; Rayon workers retain their existing QoS.
+    mark_spine_thread_latency_critical();
 
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
