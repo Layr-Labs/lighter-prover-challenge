@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -287,15 +287,37 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
+    // Marker: pow-quad-1786696000. Four-lane Poseidon2 permute (bit-identical
+    // to four scalar `permute`s). Each rayon task still searches independently;
+    // the quad just shares the round-function stream inside one task.
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let n_groups = max_candidate / 4 + 1;
+    let pow_witness = (0..n_groups)
         .into_par_iter()
-        .find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
+        .find_map_any(|group: u64| {
+            let base = group * 4;
+            let c0 = base;
+            let c1 = base.saturating_add(1).min(max_candidate);
+            let c2 = base.saturating_add(2).min(max_candidate);
+            let c3 = base.saturating_add(3).min(max_candidate);
+            let mut s0 = duplex_intermediate_state;
+            let mut s1 = duplex_intermediate_state;
+            let mut s2 = duplex_intermediate_state;
+            let mut s3 = duplex_intermediate_state;
+            s0.set_elt(F::from_canonical_u64(c0), witness_input_pos);
+            s1.set_elt(F::from_canonical_u64(c1), witness_input_pos);
+            s2.set_elt(F::from_canonical_u64(c2), witness_input_pos);
+            s3.set_elt(F::from_canonical_u64(c3), witness_input_pos);
+            <C::Hasher as Hasher<F>>::Permutation::permute_quad(
+                &mut s0, &mut s1, &mut s2, &mut s3,
+            );
+            for (candidate, state) in [(c0, &s0), (c1, &s1), (c2, &s2), (c3, &s3)] {
+                let pow_response = state.squeeze().iter().last().unwrap();
+                if pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros {
+                    return Some(candidate);
+                }
+            }
+            None
         })
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");

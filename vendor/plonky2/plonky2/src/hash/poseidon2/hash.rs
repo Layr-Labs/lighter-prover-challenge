@@ -680,11 +680,28 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
+    fn permute_x4(
+        a: [Self; WIDTH],
+        b: [Self; WIDTH],
+        c: [Self; WIDTH],
+        d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        (Self::permute(a), Self::permute(b), Self::permute(c), Self::permute(d))
+    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
+    }
+
+    fn permute_x4(
+        a: [Self; WIDTH],
+        b: [Self; WIDTH],
+        c: [Self; WIDTH],
+        d: [Self; WIDTH],
+    ) -> ([Self; WIDTH], [Self; WIDTH], [Self; WIDTH], [Self; WIDTH]) {
+        <F as Poseidon2>::poseidon2_x4(a, b, c, d)
     }
 }
 
@@ -726,6 +743,14 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
+    }
+
+    fn permute_quad(a: &mut Self, b: &mut Self, c: &mut Self, d: &mut Self) {
+        let (sa, sb, sc, sd) = T::permute_x4(a.state, b.state, c.state, d.state);
+        a.state = sa;
+        b.state = sb;
+        c.state = sc;
+        d.state = sd;
     }
 
     fn squeeze(&self) -> &[T] {

@@ -89,6 +89,15 @@ pub trait PlonkyPermutation<T: Copy + Default>:
     /// Apply permutation to internal state
     fn permute(&mut self);
 
+    /// Permute four independent states. Default is four scalar `permute`s;
+    /// Poseidon2 overrides this with `poseidon2_x4` (bit-identical).
+    fn permute_quad(a: &mut Self, b: &mut Self, c: &mut Self, d: &mut Self) {
+        a.permute();
+        b.permute();
+        c.permute();
+        d.permute();
+    }
+
     /// Return a slice of `RATE` elements
     fn squeeze(&self) -> &[T];
 }
