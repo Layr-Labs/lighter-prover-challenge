@@ -431,6 +431,130 @@ fn ext2_add_prods1(a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
     unsafe { reduce160(cumul_lo, cumul_hi) }
 }
 
+/// One barycentric `partial_interpolate` step in GF(p^2), fusing the two
+/// products that are immediately summed.
+///
+/// `CosetInterpolationGate`'s inner loop is
+///
+/// ```text
+/// term      = x - domain_i                  (second limb is x's, unchanged)
+/// next_eval = eval * term + val * prod
+/// next_prod = prod * term
+/// ```
+///
+/// Evaluating that as written costs three `ext2_mul`s -- six `reduce160`s and
+/// three `u160_times_7`s -- plus a canonicalizing extension add. Because
+/// reduction is a ring homomorphism, the two products feeding `next_eval` can
+/// share accumulators: four `reduce160`s and two `u160_times_7`s, with the add
+/// absorbed. `term`'s second limb is `x`'s second limb for every point, so it
+/// is passed as `x1` rather than rebuilt, and only the first limb is
+/// subtracted.
+///
+/// Bounds, with every raw limb below `2^64` so each product is below `2^128`:
+/// the plain part of `c0` holds two products, the `W`-weighted part holds two
+/// and is then tripled-and-quadrupled by `u160_times_7`, so `c0 < 2^129 +
+/// 7 * 2^129 = 2^132`; `c1` holds four products, so `c1 < 2^130`; `d0 <
+/// 2^128 + 7 * 2^128 = 2^131` and `d1 < 2^129`. All are far below
+/// `reduce160`'s `2^160 - 2^128 + 2^96` precondition, and the `u32` high
+/// accumulators stay in single digits.
+#[inline(always)]
+fn ext2_interpolate_step(
+    eval: [u64; 2],
+    val: [u64; 2],
+    prod: [u64; 2],
+    t0: u64,
+    x1: u64,
+) -> ([GoldilocksField; 2], [GoldilocksField; 2]) {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let [e0, e1] = eval;
+    let [v0, v1] = val;
+    let [p0, p1] = prod;
+
+    // next_eval = eval * (t0, x1) + val * (p0, p1)
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, e0, t0);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, v0, p0);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, e1, x1);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, v1, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e0, x1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e1, t0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v0, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v1, p0);
+
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+
+    // next_prod = prod * (t0, x1)
+    let (mut d0_plain_lo, mut d0_plain_hi) = (0u128, 0u32);
+    let (mut d0_w_lo, mut d0_w_hi) = (0u128, 0u32);
+    let (mut d1_lo, mut d1_hi) = (0u128, 0u32);
+    u160_add_product(&mut d0_plain_lo, &mut d0_plain_hi, p0, t0);
+    u160_add_product(&mut d0_w_lo, &mut d0_w_hi, p1, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p0, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p1, t0);
+
+    let (d0_w_lo, d0_w_hi) = u160_times_7(d0_w_lo, d0_w_hi);
+    let (d0_lo, carry) = d0_plain_lo.overflowing_add(d0_w_lo);
+    let d0_hi = d0_plain_hi + d0_w_hi + carry as u32;
+
+    // SAFETY: the bounds documented above are far below reduce160's
+    // `2^160 - 2^128 + 2^96` precondition.
+    unsafe {
+        (
+            [reduce160(c0_lo, c0_hi), reduce160(c1_lo, c1_hi)],
+            [reduce160(d0_lo, d0_hi), reduce160(d1_lo, d1_hi)],
+        )
+    }
+}
+
+/// Goldilocks specialization of `CosetInterpolationGate`'s `partial_interpolate`.
+///
+/// Value-identical to the generic fold modulo `p`, which is all the quotient
+/// pass observes; like the other delayed-reduction helpers here, the returned
+/// representative need not match reduce-per-term evaluation bit for bit.
+pub fn ext2_partial_interpolate(
+    domain: &[GoldilocksField],
+    values: &[QuadraticExtension<GoldilocksField>],
+    barycentric_weights: &[GoldilocksField],
+    x: QuadraticExtension<GoldilocksField>,
+    initial_eval: QuadraticExtension<GoldilocksField>,
+    initial_partial_prod: QuadraticExtension<GoldilocksField>,
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    debug_assert_eq!(domain.len(), values.len());
+    debug_assert_eq!(domain.len(), barycentric_weights.len());
+
+    let QuadraticExtension([x0, x1]) = x;
+    let QuadraticExtension([e0, e1]) = initial_eval;
+    let QuadraticExtension([p0, p1]) = initial_partial_prod;
+    let mut eval = [e0.0, e1.0];
+    let mut prod = [p0.0, p1.0];
+
+    for i in 0..domain.len() {
+        let QuadraticExtension([v0, v1]) = values[i];
+        let weight = barycentric_weights[i];
+        let val = [(v0 * weight).0, (v1 * weight).0];
+        // Only the first limb differs from `x`; the generic path builds a full
+        // extension element for `domain[i]` and subtracts both limbs.
+        let t0 = (x0 - domain[i]).0;
+
+        let (next_eval, next_prod) = ext2_interpolate_step(eval, val, prod, t0, x1.0);
+        eval = [next_eval[0].0, next_eval[1].0];
+        prod = [next_prod[0].0, next_prod[1].0];
+    }
+
+    (
+        QuadraticExtension([GoldilocksField(eval[0]), GoldilocksField(eval[1])]),
+        QuadraticExtension([GoldilocksField(prod[0]), GoldilocksField(prod[1])]),
+    )
+}
+
 /// Multiply a and b considered as elements of GF(p^2).
 #[inline(always)]
 pub(crate) fn ext2_mul(a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
