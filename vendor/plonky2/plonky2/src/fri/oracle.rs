@@ -644,9 +644,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // (where the in-place division runs the classic `divide_by_linear`
             // Horner recurrence and leaves its top slot as the power-of-two
             // pad), writing straight into `final_poly`'s reusable buffer
-            // instead of a division pass + shift pass + add pass.
+            // instead of a division pass + shift pass + add pass. On the first
+            // nonempty batch, `final_poly` has no prior value to shift or add,
+            // so donate `composition_poly`'s allocation directly to the
+            // in-place quotient instead of allocating and zero-filling a
+            // second full-degree buffer.
             let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            if final_poly.coeffs.is_empty() {
+                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
+            } else {
+                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            }
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
