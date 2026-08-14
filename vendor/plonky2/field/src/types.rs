@@ -185,6 +185,54 @@ pub trait Field:
             buf.extend([x01inv * x[1], x01inv * x[0], x012inv * x01]);
             return;
         }
+
+        if n >= 8 {
+            const WIDE_WIDTH: usize = 8;
+            let mut cumul_prod: [Self; WIDE_WIDTH] = x[..WIDE_WIDTH].try_into().unwrap();
+            buf.extend(cumul_prod);
+            for (i, &xi) in x[WIDE_WIDTH..].iter().enumerate() {
+                cumul_prod[i % WIDE_WIDTH] *= xi;
+                buf.push(cumul_prod[i % WIDE_WIDTH]);
+            }
+            debug_assert_eq!(buf.len(), n);
+
+            let c01 = cumul_prod[0] * cumul_prod[1];
+            let c23 = cumul_prod[2] * cumul_prod[3];
+            let c45 = cumul_prod[4] * cumul_prod[5];
+            let c67 = cumul_prod[6] * cumul_prod[7];
+            let c0123 = c01 * c23;
+            let c4567 = c45 * c67;
+            let root = c0123 * c4567;
+            let root_inv = root.inverse();
+            let c0123_inv = root_inv * c4567;
+            let c4567_inv = root_inv * c0123;
+            let c01_inv = c0123_inv * c23;
+            let c23_inv = c0123_inv * c01;
+            let c45_inv = c4567_inv * c67;
+            let c67_inv = c4567_inv * c45;
+            let mut a_inv = [
+                c01_inv * cumul_prod[1],
+                c01_inv * cumul_prod[0],
+                c23_inv * cumul_prod[3],
+                c23_inv * cumul_prod[2],
+                c45_inv * cumul_prod[5],
+                c45_inv * cumul_prod[4],
+                c67_inv * cumul_prod[7],
+                c67_inv * cumul_prod[6],
+            ];
+
+            for i in (WIDE_WIDTH..n).rev() {
+                buf[i] = buf[i - WIDE_WIDTH] * a_inv[i % WIDE_WIDTH];
+                a_inv[i % WIDE_WIDTH] *= x[i];
+            }
+            for i in (0..WIDE_WIDTH).rev() {
+                buf[i] = a_inv[i];
+            }
+            for (&bi, &xi) in buf.iter().zip(x) {
+                debug_assert_eq!(bi * xi, Self::ONE);
+            }
+            return;
+        }
         debug_assert!(n >= WIDTH);
 
         // Buf is reused for a few things to save allocations.
@@ -643,8 +691,142 @@ impl<F: Field> Powers<F> {
 
 #[cfg(test)]
 mod tests {
-    use super::Field;
+    use super::{Field, Field64, PrimeField64};
     use crate::goldilocks_field::GoldilocksField;
+
+    fn width_four_batch_inverse(x: &[GoldilocksField]) -> Vec<GoldilocksField> {
+        let n = x.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        if n == 1 {
+            return vec![x[0].inverse()];
+        }
+        if n == 2 {
+            let x01 = x[0] * x[1];
+            let x01inv = x01.inverse();
+            return vec![x01inv * x[1], x01inv * x[0]];
+        }
+        if n == 3 {
+            let x01 = x[0] * x[1];
+            let x012 = x01 * x[2];
+            let x012inv = x012.inverse();
+            let x01inv = x012inv * x[2];
+            return vec![x01inv * x[1], x01inv * x[0], x012inv * x01];
+        }
+
+        const WIDTH: usize = 4;
+        let mut buf = Vec::with_capacity(n);
+        let mut cumul_prod: [GoldilocksField; WIDTH] = x[..WIDTH].try_into().unwrap();
+        buf.extend(cumul_prod);
+        for (i, &xi) in x[WIDTH..].iter().enumerate() {
+            cumul_prod[i % WIDTH] *= xi;
+            buf.push(cumul_prod[i % WIDTH]);
+        }
+        let c01 = cumul_prod[0] * cumul_prod[1];
+        let c23 = cumul_prod[2] * cumul_prod[3];
+        let c0123inv = (c01 * c23).inverse();
+        let c01inv = c0123inv * c23;
+        let c23inv = c0123inv * c01;
+        let mut a_inv = [
+            c01inv * cumul_prod[1],
+            c01inv * cumul_prod[0],
+            c23inv * cumul_prod[3],
+            c23inv * cumul_prod[2],
+        ];
+        for i in (WIDTH..n).rev() {
+            buf[i] = buf[i - WIDTH] * a_inv[i % WIDTH];
+            a_inv[i % WIDTH] *= x[i];
+        }
+        for i in (0..WIDTH).rev() {
+            buf[i] = a_inv[i];
+        }
+        buf
+    }
+
+    #[test]
+    fn width_eight_batch_inverse_matches_width_four_raw() {
+        for n in 0usize..=64 {
+            let x = (0..n)
+                .map(|i| {
+                    let raw = u64::MAX
+                        .wrapping_sub((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15));
+                    GoldilocksField(if raw == 0 || raw == GoldilocksField::ORDER {
+                        1
+                    } else {
+                        raw
+                    })
+                })
+                .collect::<Vec<_>>();
+            let expected = width_four_batch_inverse(&x);
+            let mut actual = Vec::new();
+            GoldilocksField::batch_multiplicative_inverse_into(&x, &mut actual);
+            assert_eq!(actual.len(), expected.len());
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(PrimeField64::to_noncanonical_u64)
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(PrimeField64::to_noncanonical_u64)
+                    .collect::<Vec<_>>(),
+                "n={n}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn width_eight_batch_inverse_benchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const N: usize = 1280;
+        const REPEATS: usize = 64;
+        let x = (0..N)
+            .map(|i| GoldilocksField::from_canonical_usize(17 * i + 3))
+            .collect::<Vec<_>>();
+        let mut four_samples = Vec::new();
+        let mut eight_samples = Vec::new();
+
+        for sample in 0..31 {
+            let run_four = || {
+                let start = Instant::now();
+                for _ in 0..REPEATS {
+                    black_box(width_four_batch_inverse(black_box(&x)));
+                }
+                start.elapsed()
+            };
+            let run_eight = || {
+                let start = Instant::now();
+                for _ in 0..REPEATS {
+                    black_box(GoldilocksField::batch_multiplicative_inverse(black_box(&x)));
+                }
+                start.elapsed()
+            };
+            let (four, eight) = if sample % 2 == 0 {
+                (run_four(), run_eight())
+            } else {
+                let eight = run_eight();
+                (run_four(), eight)
+            };
+            if sample >= 3 {
+                four_samples.push(four);
+                eight_samples.push(eight);
+            }
+        }
+        four_samples.sort_unstable();
+        eight_samples.sort_unstable();
+        let four = four_samples[four_samples.len() / 2];
+        let eight = eight_samples[eight_samples.len() / 2];
+        eprintln!(
+            "width4={:?} width8={:?} speedup={:.4}x",
+            four,
+            eight,
+            four.as_secs_f64() / eight.as_secs_f64()
+        );
+    }
 
     #[test]
     fn test_powers_nth() {
