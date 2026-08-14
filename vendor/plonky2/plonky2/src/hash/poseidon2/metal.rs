@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "2339718e567ecf796171da59f78bd1e1191e7cadb9a5d763de49d5c797dba6a8";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1371,6 +1371,24 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     if serial_critical_shape {
         return exclusive
             || leaf_width > 64
+            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    }
+    // FRI fold trees: extension leaves (width = arity x D = 32 for the
+    // arity-16 rounds, 16 for arity-8 configs) built from the folded LDE
+    // codewords, shrinking by arity each round. Their permutation counts
+    // (width-32: 2^13 at 2^11 leaves .. 2^18 at 2^16 leaves) sit below
+    // MIN_GPU_PERMUTATIONS, so they hash on the CPU by default. Like the
+    // serial-critical shapes, the CPU build beats the queue wait when the
+    // stream is busy, so route them to the GPU only while it is unoccupied
+    // (or during an exclusive phase, where nothing can contend).
+    let fold_tree_shape = leaf_width > 16
+        && leaf_width <= 64
+        && leaf_count >= 1 << 14
+        && leaf_count <= 1 << 17;
+    if fold_tree_shape
+        && leaf_permutations + parent_permutations < min_permutations
+    {
+        return exclusive
             || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
     leaf_permutations + parent_permutations >= min_permutations
