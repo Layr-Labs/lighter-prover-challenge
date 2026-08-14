@@ -172,24 +172,6 @@ fn mark_thread_user_initiated() {
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_user_initiated() {}
 
-/// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
-/// walks prefer E-cores instead of competing with the light pipeline's
-/// P-core work. Best-effort.
-#[cfg(target_os = "macos")]
-fn mark_thread_utility() {
-    #[allow(non_camel_case_types)]
-    type qos_class_t = u32;
-    unsafe extern "C" {
-        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
-    }
-    unsafe {
-        let _ = pthread_set_qos_class_self_np(0x11, 0);
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn mark_thread_utility() {}
-
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -658,28 +640,6 @@ fn prove_path(
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
     active_paths.fetch_sub(1, Ordering::Release);
-    if path == TxPath::Heavy {
-        // The heavy path retires far ahead of the light path; use the slack
-        // to pre-fault the final block's wires column store (larger than the
-        // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
-        // run's most serial window). Detached: only populates a stash the
-        // block's allocation consults; a size miss falls through unchanged.
-        std::thread::Builder::new()
-            .name("block-store-prewarm".to_owned())
-            .spawn(|| {
-                // Page-walking ~2 GiB at default QoS competes with the light
-                // pipeline for P-cores; utility class prefers the E-cores,
-                // whose memory-bound fault service is nearly as fast.
-                mark_thread_utility();
-                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
-                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
-                // num_wires; a drift just misses the stash harmlessly.
-                const BLOCK_WIRES_STORE_BYTES: u64 =
-                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
-                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
-            })
-            .ok();
-    }
     chain_proof
 }
 
