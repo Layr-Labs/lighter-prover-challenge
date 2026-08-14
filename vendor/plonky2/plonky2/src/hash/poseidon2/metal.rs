@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -180,9 +180,11 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
-    ntt_prepare_pipeline: ComputePipelineState,
-    ntt_stage_pipeline: ComputePipelineState,
-    ifft_finalize_pipeline: ComputePipelineState,
+    /// The ranked path keeps GPU NTT commitments disabled after their official
+    /// regression, so do not lower these kernels in every scored worker. The
+    /// dormant API and its differential tests still get identical pipelines,
+    /// compiled on their first actual use.
+    ntt_pipelines: OnceLock<Result<NttPipelines, String>>,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     /// Small, nonblocking cache for completed gate-quotient output buffers.
@@ -203,6 +205,12 @@ struct MetalShared {
     /// Deterministic shifted quotient-domain points, uploaded once per size and
     /// reused by every no-lookup permutation job in this worker.
     permutation_points: Mutex<HashMap<u32, Buffer>>,
+}
+
+struct NttPipelines {
+    prepare: ComputePipelineState,
+    stage: ComputePipelineState,
+    ifft_finalize: ComputePipelineState,
 }
 
 struct NttRoots {
@@ -314,7 +322,7 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Poseidon2 gate quotient command buffer ended with status {:?}",
@@ -330,7 +338,7 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "RangeCheck gate quotient command buffer ended with status {:?}",
@@ -362,7 +370,7 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 
 impl<F: RichField> PermutationQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Permutation quotient command buffer ended with status {:?}",
@@ -568,16 +576,26 @@ impl ColumnStorePool {
 /// mismatch simply misses and falls through to a fresh allocation.
 static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
 
-/// Allocates a `bytes`-sized shared buffer, touches one word per page so the
-/// kernel's zero-fill happens here (off the critical path) rather than under
-/// the final block's LDE fill, and stashes it for the next oversized
-/// [`take_or_new_column_buffer`] request. Scheduling-only: buffer contents
-/// are fully written by the fill before any read, exactly as a fresh
-/// allocation's would be.
-pub fn prewarm_large_column_store(bytes: u64) {
-    let Some(context) = shared_context() else {
-        return;
-    };
+/// One-off final-block buffer stashes. The final degree-2^18 proof's three
+/// streamed Merkle builds each need a ~128 MiB digest output and the first
+/// one also allocates the ~192 MiB streamed sponge state; the three GPU
+/// quotient jobs each need a ~32 MiB output. All of those sizes exceed the
+/// corresponding pool caps by design (`MAX_CACHED_DIGEST_OUTPUT_BYTES`,
+/// `MAX_CACHED_QUOTIENT_OUTPUT_BYTES`), so every one is a fresh
+/// kernel-zeroed allocation in the run's most serial window. The prewarm
+/// thread allocates and page-walks them while the light pipeline is still
+/// running, then hands them only to requests above the pool caps so smaller
+/// recurring shapes cannot consume them.
+static PREWARMED_FINAL_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+static PREWARMED_FINAL_QUOTIENTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+static PREWARMED_FINAL_STREAMED_STATE: Mutex<Option<Buffer>> = Mutex::new(None);
+
+/// Allocates a `bytes`-sized shared buffer and touches one word per page so
+/// the kernel's zero-fill happens off the critical path. Scheduling-only:
+/// buffer contents are fully written by the fill before any read, exactly as
+/// a fresh allocation's would be.
+fn prewarm_device_buffer(bytes: u64) -> Option<Buffer> {
+    let context = shared_context()?;
     let buffer = autoreleasepool(|| {
         context
             .device
@@ -585,13 +603,7 @@ pub fn prewarm_large_column_store(bytes: u64) {
     });
     let base = buffer.contents().cast::<u8>();
     if base.is_null() {
-        return;
-    }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
+        return None;
     }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
@@ -600,6 +612,83 @@ pub fn prewarm_large_column_store(bytes: u64) {
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
     }
+    Some(buffer)
+}
+
+/// Allocates a `bytes`-sized shared buffer, touches one word per page so the
+/// kernel's zero-fill happens here (off the critical path) rather than under
+/// the final block's LDE fill, and stashes it for the next oversized
+/// [`take_or_new_column_buffer`] request.
+pub fn prewarm_large_column_store(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    // Publish only after the whole walk has finished. Stashing earlier lets a
+    // final block that arrives mid-walk take a buffer another thread is still
+    // writing; if that late `write_volatile(0)` lands after the block's LDE
+    // fill wrote the same location, the committed evaluation diverges from
+    // the coefficient polynomial and the quotient's vanishing identity fails
+    // intermittently. A consumer now receives either the fully walked buffer
+    // (no other CPU thread can mutate it) or the fresh-allocation fallback.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
+    }
+}
+
+/// Pre-faults one final-block digest output and reserves it for requests
+/// above [`MAX_CACHED_DIGEST_OUTPUT_BYTES`].
+pub fn prewarm_final_digest_output(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_DIGESTS.lock() {
+        stash.push(buffer);
+    }
+}
+
+/// Pre-faults one final-block GPU quotient output and reserves it for
+/// requests above [`MAX_CACHED_QUOTIENT_OUTPUT_BYTES`].
+pub fn prewarm_final_quotient_output(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_QUOTIENTS.lock() {
+        stash.push(buffer);
+    }
+}
+
+/// Pre-faults the final block's streamed sponge state buffer and reserves it
+/// for the oversized first streamed build.
+pub fn prewarm_final_streamed_state(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_STREAMED_STATE.lock() {
+        *stash = Some(buffer);
+    }
+}
+
+fn take_prewarmed_final_digest(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_DIGESTS.try_lock().ok()?;
+    let index = stash
+        .iter()
+        .position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+fn take_prewarmed_final_quotient(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_QUOTIENTS.try_lock().ok()?;
+    let index = stash
+        .iter()
+        .position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+fn take_prewarmed_final_streamed_state(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_STREAMED_STATE.try_lock().ok()?;
+    stash
+        .take()
+        .filter(|buffer| buffer.length() >= bytes)
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
@@ -1291,6 +1380,44 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
 /// idle CPU workers without changing proof semantics.
 pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Completion wait that skips kernel-wakeup latency while an exclusive
+/// serial phase (the chain drain / final block) owns the machine: the spine
+/// thread has the whole CPU, so a bounded spin returns the instant the GPU
+/// completes instead of paying roughly a millisecond of scheduling latency
+/// per command buffer. Outside exclusive phases this is exactly the blocking
+/// wait, so the steady pipeline's pool threads are untouched. Value-exact:
+/// scheduling only; every computed value is identical.
+fn wait_command_buffer(command_buffer: &metal::CommandBufferRef) {
+    // The spin path only exists in production builds: the metal test suite
+    // sets the process-global exclusive flag in one test while ~25 other GPU
+    // tests run concurrently, so spinning there would saturate the test
+    // harness's cores and starve the completion-signal reader. Tests exercise
+    // every computed value; the spin is scheduling-only.
+    #[cfg(test)]
+    {
+        command_buffer.wait_until_completed();
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        if !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+            command_buffer.wait_until_completed();
+            return;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            if command_buffer.status() == MTLCommandBufferStatus::Completed {
+                return;
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(250) {
+                command_buffer.wait_until_completed();
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Runnable-but-unproven chain steps: incremented by the orchestrator when a
@@ -2057,7 +2184,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // while an already-busy stream would just queue the absorb groups behind
     // another tree and stretch both.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        // Exclusive phases own an otherwise idle GPU stream (the pipelined
+        // chunk trees have retired), so the 2^17-leaf chain-step Zs and
+        // quotient trees can stream their CPU fill against GPU absorb
+        // instead of running fill-then-hash serially on the spine. The
+        // 2^20 gate was sized for the final block's wire tree; the measured
+        // GPU/CPU break-even for the mid-size shapes is far below 2^17.
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
@@ -2091,14 +2224,33 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     if needs_new {
         *buffers = Some(autoreleasepool(|| {
             (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
+                // Only the degree-2^18 final proof's streamed state (2^21 rows
+                // x 12 lanes x 8 B) exceeds 64 MiB; every earlier streamed
+                // shape is at most 2^19 x 12 x 8 B = 48 MiB. Reserving the
+                // prewarmed buffer for the final size prevents a mid-pipeline
+                // build from consuming it.
+                if state_bytes > 64 << 20 {
+                    take_prewarmed_final_streamed_state(state_bytes as u64).unwrap_or_else(|| {
+                        context
+                            .device
+                            .new_buffer(state_bytes as u64, MTLResourceOptions::StorageModeShared)
+                    })
+                } else {
+                    context
+                        .device
+                        .new_buffer(state_bytes as u64, MTLResourceOptions::StorageModeShared)
+                },
+                if output_bytes > MAX_CACHED_DIGEST_OUTPUT_BYTES as usize {
+                    take_prewarmed_final_digest(output_bytes as u64).unwrap_or_else(|| {
+                        context
+                            .device
+                            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+                    })
+                } else {
+                    context
+                        .device
+                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+                },
             )
         }));
     }
@@ -2191,12 +2343,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         command_buffer.to_owned()
     });
 
-    parents_command.wait_until_completed();
+    wait_command_buffer(&parents_command);
     let all_ok = absorb_commands
         .iter()
         .chain(core::iter::once(&parents_command))
         .all(|command_buffer| {
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
     drop(job);
@@ -2205,18 +2357,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         return None;
     }
 
-    let replacement = context
-        .digest_output_pool
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take_best_fit(output_bytes as u64)
-        .unwrap_or_else(|| {
-            autoreleasepool(|| {
-                context
-                    .device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            })
-        });
+    let replacement = context.acquire_digest_output(output_bytes as u64);
     let completed = core::mem::replace(output_buffer, replacement);
     drop(buffers);
     let nodes = MetalDigests::with_buffer(
@@ -2409,18 +2550,17 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
-            // Build the compute pipelines concurrently, one thread each.
+            // Build only the three pipelines used by the ranked path,
+            // concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
-            // AIR to a GPU binary through MTLCompilerService, and the three
-            // Poseidon2 permutation kernels plus the two gate-quotient kernels
-            // are large enough that each takes hundreds of milliseconds when the
-            // result is not already in the OS shader cache. The benchmark
-            // sandbox denies writes to that cache, which disables it outright —
-            // reads miss too — so *every* scored worker process pays the full
-            // cold lowering, serialized at ~2.36 s. The compiler service handles
-            // the requests in parallel, so issuing all eight at once collapses
-            // that to the cost of the single slowest kernel (~0.67 s).
+            // AIR to a GPU binary through MTLCompilerService. The benchmark
+            // sandbox disables the OS shader cache, so every scored worker pays
+            // for every pipeline requested here. Only the row/column leaf and
+            // parent kernels are unconditional on the ranked path: optional
+            // quotient/absorb pipelines are started in the background below,
+            // while GPU NTT commitments are hard-disabled after an official
+            // regression and now compile only if that dormant API is called.
             //
             // This is a scheduling change only: the pipelines, and therefore
             // every value the GPU later computes, are identical. `Device`,
@@ -2442,61 +2582,38 @@ impl MetalShared {
                     })
                 }
             };
-            // The two gate-quotient kernels are the two most expensive to lower
-            // and the only two the context can do without: every caller already
-            // treats an absent pipeline as "run this on the CPU". Lowering them
-            // on the blocking path makes the whole context wait for the slowest
-            // kernel in the shader; measured cold under the benchmark's sandbox
-            // profile, where the OS shader cache is disabled:
+            // The optional quotient pipelines are the most expensive to lower,
+            // and every caller already treats an absent pipeline as "run this on
+            // the CPU". Measured cold under the benchmark's sandbox profile:
             //
             //     range_check_gate_quotient   679 ms
             //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
+            //     the formerly required NTT kernels 491 ms and below
             //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
-            // maximum and add contention on MTLCompilerService. Building them
-            // off the blocking path instead leaves the context ready in 838 ms
-            // rather than 1270 ms, and they land shortly after, long before the
-            // first quotient evaluation of a proof asks for them.
+            // Extra kernels both raise the maximum and add contention on
+            // MTLCompilerService. Building optional kernels off the blocking
+            // path lets the context become usable after the three hash kernels;
+            // the quotient pipelines land before their first proof use.
             //
-            // Started below, once the required six have finished, so they do not
+            // Started below, once the required three have finished, so they do not
             // simply move their MTLCompilerService contention onto the path they
             // are being taken off.
-            let (
-                leaf_pipeline,
-                leaf_colmajor_pipeline,
-                parent_pipeline,
-                ntt_prepare_pipeline,
-                ntt_stage_pipeline,
-                ifft_finalize_pipeline,
-            ) = std::thread::scope(|scope| {
-                let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
-                let leaf_colmajor =
-                    scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
-                let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
-                let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
-                let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
-                let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
-                // A panic inside a pipeline build is a bug, not a runtime
-                // condition; propagate it rather than papering over it.
-                (
-                    leaf.join().expect("leaf pipeline thread panicked"),
-                    leaf_colmajor
-                        .join()
-                        .expect("col-major leaf pipeline thread panicked"),
-                    parent.join().expect("parent pipeline thread panicked"),
-                    ntt_prepare
-                        .join()
-                        .expect("ntt prepare pipeline thread panicked"),
-                    ntt_stage
-                        .join()
-                        .expect("ntt stage pipeline thread panicked"),
-                    ifft_finalize
-                        .join()
-                        .expect("ifft finalize pipeline thread panicked"),
-                )
-            });
+            let (leaf_pipeline, leaf_colmajor_pipeline, parent_pipeline) =
+                std::thread::scope(|scope| {
+                    let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
+                    let leaf_colmajor =
+                        scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
+                    let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
+                    // A panic inside a pipeline build is a bug, not a runtime
+                    // condition; propagate it rather than papering over it.
+                    (
+                        leaf.join().expect("leaf pipeline thread panicked"),
+                        leaf_colmajor
+                            .join()
+                            .expect("col-major leaf pipeline thread panicked"),
+                        parent.join().expect("parent pipeline thread panicked"),
+                    )
+                });
             // Surfaced in kernel order, so a single missing or unbuildable
             // kernel yields the same error string the sequential construction
             // produced. Only the tie-break between two simultaneous failures
@@ -2506,9 +2623,6 @@ impl MetalShared {
             let leaf_pipeline = leaf_pipeline?;
             let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
             let parent_pipeline = parent_pipeline?;
-            let ntt_prepare_pipeline = ntt_prepare_pipeline?;
-            let ntt_stage_pipeline = ntt_stage_pipeline?;
-            let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
             spawn_optional_pipelines(&device, &library);
 
@@ -2529,9 +2643,7 @@ impl MetalShared {
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
                 parent_pipeline,
-                ntt_prepare_pipeline,
-                ntt_stage_pipeline,
-                ifft_finalize_pipeline,
+                ntt_pipelines: OnceLock::new(),
                 parameters,
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
@@ -2552,6 +2664,75 @@ impl MetalShared {
         })
     }
 
+    /// Lowers the dormant GPU-NTT pipelines only if that path is explicitly
+    /// used. Ranked proving has `GPU_NTT_COMMITMENTS = false`, so normal
+    /// workers never enter this initializer and avoid three cold compiler
+    /// requests. Keeping the initializer here preserves the experimental API
+    /// and its CPU/GPU differential tests without taxing every fixture.
+    fn ntt_pipelines(&self) -> Result<&NttPipelines, String> {
+        self.ntt_pipelines
+            .get_or_init(|| {
+                // Reloading the small precompiled library here keeps it out of
+                // the ranked context's lifetime. This branch is dormant in
+                // production, while experimental GPU-NTT users retain the same
+                // source fallback as context initialization.
+                let options = CompileOptions::new();
+                let library = self
+                    .device
+                    .new_library_with_data(SHADER_METALLIB)
+                    .ok()
+                    .filter(|library| {
+                        METALLIB_REQUIRED_KERNELS
+                            .iter()
+                            .all(|name| library.get_function(name, None).is_ok())
+                    })
+                    .map_or_else(
+                        || {
+                            self.device
+                                .new_library_with_source(SHADER_SOURCE, &options)
+                                .map_err(|error| format!("shader compilation failed: {error}"))
+                        },
+                        Ok,
+                    )?;
+                let device_ref = &self.device;
+                let library_ref = &library;
+                let build = |name: &'static str, kind: &'static str| {
+                    move || -> Result<ComputePipelineState, String> {
+                        autoreleasepool(|| {
+                            let function = library_ref
+                                .get_function(name, None)
+                                .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                            device_ref
+                                .new_compute_pipeline_state_with_function(&function)
+                                .map_err(|error| {
+                                    format!("{kind} pipeline creation failed: {error}")
+                                })
+                        })
+                    }
+                };
+                let (prepare, stage, ifft_finalize) = std::thread::scope(|scope| {
+                    let prepare = scope.spawn(build("ntt_prepare", "ntt prepare"));
+                    let stage = scope.spawn(build("ntt_stage", "ntt stage"));
+                    let ifft_finalize =
+                        scope.spawn(build("ifft_finalize", "ifft finalize"));
+                    (
+                        prepare.join().expect("ntt prepare pipeline thread panicked"),
+                        stage.join().expect("ntt stage pipeline thread panicked"),
+                        ifft_finalize
+                            .join()
+                            .expect("ifft finalize pipeline thread panicked"),
+                    )
+                });
+                Ok(NttPipelines {
+                    prepare: prepare?,
+                    stage: stage?,
+                    ifft_finalize: ifft_finalize?,
+                })
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     fn allocate_columns<F: RichField>(
         &self,
         rows: usize,
@@ -2568,11 +2749,33 @@ impl MetalShared {
     }
 
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
+        if bytes > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
+            if let Some(buffer) = take_prewarmed_final_quotient(bytes) {
+                return buffer;
+            }
+        }
         if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
             if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
                 if let Some(buffer) = pool.take_best_fit(bytes) {
                     return buffer;
                 }
+            }
+        }
+        autoreleasepool(|| {
+            self.device
+                .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+        })
+    }
+
+    fn acquire_digest_output(&self, bytes: u64) -> Buffer {
+        if bytes > MAX_CACHED_DIGEST_OUTPUT_BYTES {
+            if let Some(buffer) = take_prewarmed_final_digest(bytes) {
+                return buffer;
+            }
+        }
+        if let Ok(mut pool) = self.digest_output_pool.try_lock() {
+            if let Some(buffer) = pool.take_best_fit(bytes) {
+                return buffer;
             }
         }
         autoreleasepool(|| {
@@ -2888,18 +3091,7 @@ impl MetalShared {
             .position(|buffer| buffer.length() >= output_bytes as u64);
         let replacement = spare_index
             .map(|index| pool.spare_outputs.swap_remove(index))
-            .or_else(|| {
-                self.digest_output_pool
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take_best_fit(output_bytes as u64)
-            })
-            .unwrap_or_else(|| {
-                autoreleasepool(|| {
-                    self.device
-                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-                })
-            });
+            .unwrap_or_else(|| self.acquire_digest_output(output_bytes as u64));
         let completed = set
             .output
             .replace(replacement)
@@ -3076,6 +3268,7 @@ impl MetalShared {
         ),
         String,
     > {
+        let ntt = self.ntt_pipelines()?;
         let cols = value_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -3173,7 +3366,7 @@ impl MetalShared {
                 // column buffer serves as scratch; it is dead once the IFFT
                 // finalize gather has produced the coefficients.
                 let gather = command_buffer.new_compute_command_encoder();
-                gather.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                gather.set_compute_pipeline_state(&ntt.prepare);
                 gather.set_buffer(0, Some(input_buffer), 0);
                 gather.set_buffer(1, Some(&ones_buffer), 0);
                 gather.set_buffer(2, Some(&column_buffer), 0);
@@ -3181,12 +3374,12 @@ impl MetalShared {
                 set_u32(gather, 4, degree_u32);
                 set_u32(gather, 5, log_degree_u32);
                 set_u32(gather, 6, 0);
-                dispatch2d(gather, &self.ntt_prepare_pipeline, degree, cols);
+                dispatch2d(gather, &ntt.prepare, degree, cols);
                 gather.end_encoding();
 
                 for stage in 0..log_degree_u32 {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(&ntt.stage);
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -3196,12 +3389,12 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, degree_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, 0);
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, degree / 2, cols);
+                    dispatch2d(stage_encoder, &ntt.stage, degree / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
                 let finalize = command_buffer.new_compute_command_encoder();
-                finalize.set_compute_pipeline_state(&self.ifft_finalize_pipeline);
+                finalize.set_compute_pipeline_state(&ntt.ifft_finalize);
                 finalize.set_buffer(0, Some(&column_buffer), 0);
                 finalize.set_buffer(1, Some(&coeffs_buffer), 0);
                 set_u32(finalize, 2, degree_u32);
@@ -3210,12 +3403,12 @@ impl MetalShared {
                     size_of::<u64>() as NSUInteger,
                     (&n_inv as *const u64).cast::<c_void>(),
                 );
-                dispatch2d(finalize, &self.ifft_finalize_pipeline, degree, cols);
+                dispatch2d(finalize, &ntt.ifft_finalize, degree, cols);
                 finalize.end_encoding();
 
                 // Coset LDE of the coefficients, exactly as build_from_coeffs.
                 let prepare = command_buffer.new_compute_command_encoder();
-                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_compute_pipeline_state(&ntt.prepare);
                 prepare.set_buffer(0, Some(&coeffs_buffer), 0);
                 prepare.set_buffer(1, Some(&shift_buffer), 0);
                 prepare.set_buffer(2, Some(&column_buffer), 0);
@@ -3223,12 +3416,12 @@ impl MetalShared {
                 set_u32(prepare, 4, lde_size_u32);
                 set_u32(prepare, 5, log_degree_u32);
                 set_u32(prepare, 6, rate_bits_u32);
-                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+                dispatch2d(prepare, &ntt.prepare, lde_size, cols);
                 prepare.end_encoding();
 
                 for stage in rate_bits as u32..log_lde {
                     let stage_encoder = command_buffer.new_compute_command_encoder();
-                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_compute_pipeline_state(&ntt.stage);
                     stage_encoder.set_buffer(0, Some(&column_buffer), 0);
                     stage_encoder.set_buffer(
                         1,
@@ -3238,7 +3431,7 @@ impl MetalShared {
                     set_u32(stage_encoder, 2, lde_size_u32);
                     set_u32(stage_encoder, 3, stage);
                     set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
-                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    dispatch2d(stage_encoder, &ntt.stage, lde_size / 2, cols);
                     stage_encoder.end_encoding();
                 }
 
@@ -3293,7 +3486,7 @@ impl MetalShared {
                 command_buffer.to_owned()
             });
 
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(format!(
                     "command buffer ended with status {:?}",
@@ -3422,6 +3615,7 @@ impl MetalShared {
         output_len: usize,
         output_bytes: usize,
     ) -> Result<TreeReadback<'_, F>, String> {
+        let ntt = self.ntt_pipelines()?;
         let cols = coeff_columns.len();
         let lde_size = degree << rate_bits;
         let log_lde = lde_size.ilog2();
@@ -3475,7 +3669,7 @@ impl MetalShared {
             let command_buffer = self.queue.new_command_buffer();
 
             let prepare = command_buffer.new_compute_command_encoder();
-            prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+            prepare.set_compute_pipeline_state(&ntt.prepare);
             prepare.set_buffer(0, Some(input_buffer), 0);
             prepare.set_buffer(1, Some(shift_buffer), 0);
             prepare.set_buffer(2, Some(column_buffer), 0);
@@ -3483,12 +3677,12 @@ impl MetalShared {
             set_u32(prepare, 4, lde_size_u32);
             set_u32(prepare, 5, log_degree_u32);
             set_u32(prepare, 6, rate_bits_u32);
-            dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+            dispatch2d(prepare, &ntt.prepare, lde_size, cols);
             prepare.end_encoding();
 
             for stage in rate_bits as u32..log_lde {
                 let stage_encoder = command_buffer.new_compute_command_encoder();
-                stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                stage_encoder.set_compute_pipeline_state(&ntt.stage);
                 stage_encoder.set_buffer(0, Some(column_buffer), 0);
                 stage_encoder.set_buffer(
                     1,
@@ -3502,7 +3696,7 @@ impl MetalShared {
                     4,
                     u32::from(stage == log_lde - 1),
                 );
-                dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                dispatch2d(stage_encoder, &ntt.stage, lde_size / 2, cols);
                 stage_encoder.end_encoding();
             }
 
@@ -3557,7 +3751,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -3786,7 +3980,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -3995,6 +4189,21 @@ mod tests {
         }
     }
 
+    /// Initializing the ranked Metal backend must not lower the dormant NTT
+    /// pipelines. The NTT differential tests below exercise their lazy first
+    /// use separately.
+    #[test]
+    fn ranked_context_defers_ntt_pipelines() {
+        let Some(_) = Device::system_default() else {
+            return;
+        };
+        let context = MetalShared::new().expect("Metal context must initialize");
+        assert!(
+            context.ntt_pipelines.get().is_none(),
+            "ranked context eagerly lowered disabled GPU NTT pipelines"
+        );
+    }
+
     #[test]
     fn quotient_output_pool_is_bounded_and_best_fit() {
         let Some(device) = Device::system_default() else {
@@ -4052,7 +4261,7 @@ mod tests {
         let completed = autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
             command_buffer.commit();
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
             command_buffer.to_owned()
         });
@@ -4077,7 +4286,7 @@ mod tests {
         let completed = autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
             command_buffer.commit();
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             command_buffer.to_owned()
         });
         let completed_output = output();
@@ -5724,7 +5933,7 @@ kernel void goldilocks_mul_bench_native(
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(
                 command_buffer.status(),
                 MTLCommandBufferStatus::Completed,
@@ -5814,7 +6023,7 @@ kernel void goldilocks_mul_bench_native(
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(
                 command_buffer.status(),
                 MTLCommandBufferStatus::Completed,
@@ -5876,7 +6085,7 @@ kernel void goldilocks_mul_bench_native(
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(
                 command_buffer.status(),
                 MTLCommandBufferStatus::Completed,
