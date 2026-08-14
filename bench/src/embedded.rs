@@ -159,6 +159,8 @@ impl Circuits {
 mod tests {
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
+    use plonky2::field::types::PrimeField64;
+    use plonky2::plonk::permutation_argument::Forest;
     use plonky2::util::serialization::Write as _;
 
     use super::*;
@@ -430,5 +432,116 @@ mod tests {
                 "embedded circuit blob {name} is an empty stub"
             );
         }
+    }
+
+    /// Exact ER production-roster oracle. The five startup candidates come through the compact
+    /// loader and the final BlockCircuit through the production builder; neither side is rebuilt
+    /// merely to obtain a reference. For each retained representative map, the independent
+    /// generic successor-vector path rederives every sigma value and compares the raw field limb
+    /// against the candidate's retained row-major transpose.
+    #[test]
+    #[ignore = "loads five production circuits and builds the final BlockCircuit"]
+    fn fused_sigma_values_match_generic_all_six_shapes() {
+        fn check_shape(name: &str, data: &CircuitData<F, C, D>) -> (usize, usize, u64) {
+            let degree_log = data.common.degree_bits();
+            let degree = 1usize << degree_log;
+            let width = data.common.config.num_routed_wires;
+            assert_eq!(width, 80, "{name}: routed width");
+            assert_eq!(data.prover_only.subgroup.len(), degree, "{name}: subgroup length");
+            assert_eq!(data.prover_only.sigmas.len(), degree, "{name}: sigma row count");
+            assert!(data.prover_only.sigmas.iter().all(|row| row.len() == width));
+
+            let original_parents = data.prover_only.representative_map.clone();
+            let mut reference = Forest::from_parents(
+                original_parents.clone(),
+                data.common.config.num_wires,
+                width,
+                degree,
+            );
+            let reference_columns = reference.wire_partition().get_sigma_polys(
+                degree_log,
+                &data.common.k_is,
+                &data.prover_only.subgroup,
+            );
+            assert_eq!(
+                reference.into_parents(),
+                original_parents,
+                "{name}: generic reference mutated representative map"
+            );
+            assert_eq!(reference_columns.len(), width, "{name}: reference width");
+
+            let mut receipt = 0xcbf2_9ce4_8422_2325u64;
+            for (column, reference) in reference_columns.iter().enumerate() {
+                assert_eq!(reference.len(), degree, "{name}: reference column {column}");
+                for row in 0..degree {
+                    let expected = reference.values[row].to_noncanonical_u64();
+                    let actual = data.prover_only.sigmas[row][column].to_noncanonical_u64();
+                    assert_eq!(actual, expected, "{name}: raw sigma ({column},{row})");
+                    receipt ^= (column as u64).rotate_left(7)
+                        ^ (row as u64).rotate_left(29)
+                        ^ actual;
+                    receipt = receipt.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            println!(
+                "ER fused sigma shape={name} d={degree_log} width={width} positions={} receipt={receipt:016x}",
+                degree * width
+            );
+            (degree_log, degree * width, receipt)
+        }
+
+        on_big_stack(|| {
+            let circuits = Circuits::from_embedded()
+                .expect("all five nonempty production blobs must load without fallback");
+            let mut degree_counts = [0usize; 19];
+            let mut positions = 0usize;
+            let mut engagements = 0usize;
+            let mut combined_receipt = 0u64;
+
+            macro_rules! check {
+                ($name:literal, $data:expr) => {{
+                    let (degree_log, shape_positions, receipt) = check_shape($name, $data);
+                    degree_counts[degree_log] += 1;
+                    positions += shape_positions;
+                    engagements += 1;
+                    combined_receipt ^= receipt.rotate_left(engagements as u32);
+                }};
+            }
+
+            check!("pre", &circuits.pre_data);
+            {
+                let data = circuits.heavy_tx_data.read().unwrap();
+                check!("heavy_tx", &data);
+            }
+            {
+                let data = circuits.heavy_chain_data.read().unwrap();
+                check!("heavy_chain", &data);
+            }
+            {
+                let data = circuits.light_tx_data.read().unwrap();
+                check!("light_tx", &data);
+            }
+            {
+                let data = circuits.light_chain_data.read().unwrap();
+                check!("light_chain", &data);
+            }
+
+            // This is the sole production runtime build; it uses the same fused builder route and
+            // is constructed once, after all five embedded candidates have been checked.
+            let (_block_target, block_data) = circuits.build_block_circuit();
+            check!("block", &block_data);
+
+            assert_eq!(degree_counts[14], 3, "exact d14 roster");
+            assert_eq!(degree_counts[16], 2, "exact d16 roster");
+            assert_eq!(degree_counts[18], 1, "exact d18 roster");
+            assert_eq!(degree_counts.iter().sum::<usize>(), 6);
+            assert_eq!(positions, 35_389_440);
+            assert_eq!(engagements, 6);
+            let fallback = 0usize; // No generic production fallback exists after admission.
+            assert_eq!(fallback, 0);
+            println!(
+                "ER fused sigma roster d14=3 d16=2 d18=1 width=80 positions={positions} engagements={engagements} fallback={fallback} receipt={combined_receipt:016x}"
+            );
+        });
     }
 }

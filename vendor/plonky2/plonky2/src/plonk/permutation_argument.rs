@@ -1,5 +1,6 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+use core::mem::{ManuallyDrop, MaybeUninit};
 
 use plonky2_maybe_rayon::*;
 
@@ -14,6 +15,44 @@ use crate::iop::wire::Wire;
 /// column order and the sequential element order within every column are unchanged; only task
 /// placement moves. Flip to `false` to restore the previous sequential-outer schedule exactly.
 const OUTER_PARALLEL_SIGMA_COLUMNS: bool = false;
+
+/// A typed optimization-eligibility decline that may select the unchanged generic route.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FusedSigmaEligibilityError {
+    /// The generic route accepts unused suffixes, while the fused production specialization keeps
+    /// an exact auxiliary-shape contract. This decline occurs before output allocation.
+    NonExactAuxiliaryLengths,
+}
+
+/// A malformed or contradictory sigma shape. These errors must propagate and never fall back.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FusedSigmaShapeError {
+    DegreeLogMismatch,
+    RoutedWiresExceedTotal,
+    RoutedCosetCountTooSmall,
+    SubgroupTooShort,
+    RepresentativeMapTooShort,
+    RoutedPositionCountExceedsU32,
+}
+
+/// Exact fused-route failure boundary. Only [`Self::Ineligible`] permits generic fallback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FusedSigmaError {
+    Ineligible(FusedSigmaEligibilityError),
+    InvalidShape(FusedSigmaShapeError),
+}
+
+/// Converts a fully initialized `Vec<MaybeUninit<F>>` without copying its allocation.
+///
+/// # Safety
+///
+/// Every element in `values[..values.len()]` must contain a valid initialized `F`.
+unsafe fn assume_init_vec<F>(values: Vec<MaybeUninit<F>>) -> Vec<F> {
+    let mut values = ManuallyDrop::new(values);
+    // SAFETY: guaranteed by the caller; `MaybeUninit<F>` has the same layout as `F`, and the
+    // `ManuallyDrop` above leaves exactly one owner for the allocation returned here.
+    unsafe { Vec::from_raw_parts(values.as_mut_ptr().cast::<F>(), values.len(), values.capacity()) }
+}
 
 /// Derive one bit per routed `(row, column)` position, in row-major order, that is set exactly
 /// when the position is the only routed member of its copy-constraint component.
@@ -271,6 +310,130 @@ impl Forest {
 
         WirePartition { sigma }
     }
+
+    /// Emits the final sigma field columns while constructing the copy cycles, without
+    /// materializing the transient `u32` successor vector.
+    ///
+    /// `compress_paths` must already have run. The checked embedded loader additionally validates
+    /// every routed representative (bounds and self-root) before constructing this forest; the
+    /// circuit builder satisfies the same invariant by construction. Shape eligibility is checked
+    /// before any output allocation. A caller may use the unchanged generic route only for
+    /// `FusedSigmaError::Ineligible`; `InvalidShape` must propagate.
+    pub fn fused_sigma_polys<F: Field>(
+        &self,
+        degree_log: usize,
+        k_is: &[F],
+        subgroup: &[F],
+    ) -> Result<Vec<PolynomialValues<F>>, FusedSigmaError> {
+        if degree_log >= usize::BITS as usize {
+            return Err(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::DegreeLogMismatch,
+            ));
+        }
+        let degree = 1usize << degree_log;
+        if degree != self.degree {
+            return Err(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::DegreeLogMismatch,
+            ));
+        }
+        if self.num_routed_wires > self.num_wires {
+            return Err(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::RoutedWiresExceedTotal,
+            ));
+        }
+        if k_is.len() < self.num_routed_wires {
+            return Err(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::RoutedCosetCountTooSmall,
+            ));
+        }
+        if subgroup.len() < degree {
+            return Err(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::SubgroupTooShort,
+            ));
+        }
+        if k_is.len() != self.num_routed_wires || subgroup.len() != degree {
+            return Err(FusedSigmaError::Ineligible(
+                FusedSigmaEligibilityError::NonExactAuxiliaryLengths,
+            ));
+        }
+        let wire_targets = degree
+            .checked_mul(self.num_wires)
+            .ok_or(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::RepresentativeMapTooShort,
+            ))?;
+        if self.parents.len() < wire_targets {
+            return Err(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::RepresentativeMapTooShort,
+            ));
+        }
+        let routed_positions = degree
+            .checked_mul(self.num_routed_wires)
+            .filter(|&positions| positions <= u32::MAX as usize)
+            .ok_or(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::RoutedPositionCountExceedsU32,
+            ))?;
+
+        // `MaybeUninit` gives each final column its one retained allocation without first writing
+        // an eager field-zero pass. Its length may be set before initialization because dropping
+        // `MaybeUninit<F>` after an unwind never observes or drops an `F`.
+        let mut sigma_values = (0..self.num_routed_wires)
+            .map(|_| {
+                let mut values = Vec::<MaybeUninit<F>>::with_capacity(degree);
+                // SAFETY: the elements are `MaybeUninit<F>`, and every slot is written below
+                // before the allocation is converted to `Vec<F>`.
+                unsafe { values.set_len(degree) };
+                values
+            })
+            .collect::<Vec<_>>();
+        debug_assert_eq!(routed_positions, sigma_values.len() * degree);
+        let mut last = vec![u32::MAX; self.parents.len()];
+        let mask = degree - 1;
+
+        // Every routed slot is visited exactly once. The first visit writes its own encoded
+        // successor before publishing it as the class tail. A later visit therefore reads only a
+        // previously initialized old-tail slot, copies its exact field representation into the
+        // new slot, then splices `encode(index)` into the old tail.
+        for row in 0..degree {
+            let target_base = row * self.num_wires;
+            for column in 0..self.num_routed_wires {
+                let parent = self.parents[target_base + column] as usize;
+                // The builder establishes this by construction. The checked loader establishes it
+                // with `fixed_routed_wire_mask` before `Forest::from_parents`.
+                debug_assert!(parent < self.parents.len());
+                debug_assert_eq!(self.parents[parent] as usize, parent);
+
+                let index = column * degree + row;
+                let encoded_index = k_is[column] * subgroup[row];
+                let old_tail = last[parent];
+                if old_tail == u32::MAX {
+                    sigma_values[column][row].write(encoded_index);
+                } else {
+                    let old_tail = old_tail as usize;
+                    let old_column = old_tail >> degree_log;
+                    let old_row = old_tail & mask;
+                    // SAFETY: `last[parent]` is published only after the corresponding slot's
+                    // unique loop visit writes it. It cannot name the current, not-yet-visited
+                    // slot, and all later overwrites remain initialized `F` values.
+                    let old_successor = unsafe {
+                        *sigma_values[old_column][old_row].assume_init_ref()
+                    };
+                    sigma_values[column][row].write(old_successor);
+                    sigma_values[old_column][old_row].write(encoded_index);
+                }
+                last[parent] = index as u32;
+            }
+        }
+
+        Ok(sigma_values
+            .into_iter()
+            .map(|values| {
+                // SAFETY: the nested loop writes each of the `num_routed_wires * degree` slots
+                // exactly once on its own visit; later cycle splices only overwrite initialized
+                // old-tail slots. No early return exists after allocation begins.
+                PolynomialValues::new(unsafe { assume_init_vec(values) })
+            })
+            .collect())
+    }
 }
 
 #[derive(Debug)]
@@ -318,6 +481,8 @@ impl WirePartition {
 
 #[cfg(test)]
 mod tests {
+    use crate::field::types::{Field64, PrimeField64};
+
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
 
@@ -872,6 +1037,178 @@ mod tests {
 
         let actual = partition.get_sigma_polys(degree_log, &k_is, &subgroup);
         assert_eq!(actual, expected);
+    }
+
+    /// The fused route is compared only against the independent, unchanged successor-vector
+    /// implementation. It covers the exact first/later splice, aliases, redundant merges,
+    /// interleaved classes, widths through production 80, power-of-two degrees on both sides of
+    /// the parallel grain, and deliberately noncanonical Goldilocks storage. Odd sizes remain in
+    /// the raw integer-cycle tests above because `get_sigma_polys` itself takes `degree_log`.
+    #[test]
+    fn fused_sigma_values_match_generic_successors_raw() {
+        type F = GoldilocksField;
+
+        let configs = [
+            // num_wires, num_routed_wires, degree, virtual targets, random merges
+            (2usize, 0usize, 1usize, 1usize, 0usize),
+            (1, 1, 1, 0, 0),
+            (1, 1, 2, 0, 0),
+            (5, 3, 8, 4, 0),
+            (13, 11, 1 << 8, 17, 1 << 10),
+            (83, 80, 1 << 12, 257, 1 << 14),
+        ];
+
+        let mut total_positions = 0usize;
+        let mut receipt = 0xcbf2_9ce4_8422_2325u64;
+        for (case, (num_wires, num_routed, degree, num_virtual, random_merge_count)) in
+            configs.into_iter().enumerate()
+        {
+            let mut rng = Lcg(0xe2f0_5a11 ^ ((case as u64) << 40) ^ degree as u64);
+            let mut merges = Vec::new();
+            if num_routed > 0 && num_virtual > 0 {
+                // A routed singleton with a virtual alias.
+                merges.push((
+                    Target::Wire(Wire { row: 0, column: 0 }),
+                    Target::VirtualTarget { index: 0 },
+                ));
+            }
+            if num_routed > 1 && degree > 1 {
+                // A deliberately interleaved multi-routed class, repeated by `build_forest`.
+                merges.push((
+                    Target::Wire(Wire { row: 0, column: num_routed - 1 }),
+                    Target::Wire(Wire { row: 1, column: 0 }),
+                ));
+                merges.push((
+                    Target::Wire(Wire { row: 1, column: 0 }),
+                    Target::Wire(Wire {
+                        row: degree - 1,
+                        column: num_routed / 2,
+                    }),
+                ));
+            }
+            if num_routed > 0 && num_wires > num_routed {
+                // A routed component with a non-routed/advice-wire alias.
+                merges.push((
+                    Target::Wire(Wire { row: 0, column: 0 }),
+                    Target::Wire(Wire {
+                        row: degree - 1,
+                        column: num_routed,
+                    }),
+                ));
+            }
+            merges.extend(random_merges(
+                &mut rng,
+                num_wires,
+                degree,
+                num_virtual,
+                random_merge_count,
+            ));
+
+            let mut forest = build_forest(
+                num_wires,
+                num_routed,
+                degree,
+                num_virtual,
+                &merges,
+            );
+            forest.compress_paths();
+            let compressed_parents = forest.parents.clone();
+            let mut reference =
+                Forest::from_parents(compressed_parents.clone(), num_wires, num_routed, degree);
+            let candidate =
+                Forest::from_parents(compressed_parents.clone(), num_wires, num_routed, degree);
+
+            // These are valid raw Goldilocks representations above ORDER but below u64::MAX.
+            // The independent route performs the same multiplication; raw-limb equality catches
+            // any representation-changing recomputation or operand-order difference.
+            let k_is = (0..num_routed)
+                .map(|column| {
+                    GoldilocksField(F::ORDER + 1 + ((17 * column + case) as u64 & 0xffff))
+                })
+                .collect::<Vec<_>>();
+            let subgroup = (0..degree)
+                .map(|row| {
+                    GoldilocksField(F::ORDER + 1 + ((29 * row + 3 * case) as u64 & 0xffff))
+                })
+                .collect::<Vec<_>>();
+            let degree_log = degree.trailing_zeros() as usize;
+
+            let expected = reference
+                .wire_partition()
+                .get_sigma_polys(degree_log, &k_is, &subgroup);
+            let actual = candidate
+                .fused_sigma_polys(degree_log, &k_is, &subgroup)
+                .expect("power-of-two test shape must be fused-eligible");
+
+            assert_eq!(reference.parents, compressed_parents, "case {case}: reference mutated map");
+            assert_eq!(candidate.parents, compressed_parents, "case {case}: candidate mutated map");
+            assert_eq!(actual.len(), expected.len(), "case {case}: column count");
+            for (column, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(actual.len(), degree, "case {case}, column {column}: length");
+                for (row, (&actual, &expected)) in
+                    actual.values.iter().zip(&expected.values).enumerate()
+                {
+                    let actual = actual.to_noncanonical_u64();
+                    let expected = expected.to_noncanonical_u64();
+                    assert_eq!(actual, expected, "case {case}, ({column},{row}) raw limb");
+                    receipt ^= (column as u64).rotate_left(7)
+                        ^ (row as u64).rotate_left(29)
+                        ^ actual;
+                    receipt = receipt.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            total_positions += degree * num_routed;
+            println!(
+                "ER fused sigma case={case} degree={degree} width={num_routed} positions={} receipt={receipt:016x}",
+                degree * num_routed
+            );
+        }
+
+        assert_eq!(total_positions, 330_523);
+        println!(
+            "ER fused sigma exact cases={} total_positions={total_positions} receipt={receipt:016x}",
+            configs.len()
+        );
+    }
+
+    /// Only a typed shape-eligibility decline may select the retained generic route. Invalid
+    /// representative topology is rejected by the complete validator and is never a fallback.
+    #[test]
+    fn fused_sigma_fallback_is_typed_and_malformed_maps_fail_closed() {
+        type F = GoldilocksField;
+
+        let mut forest = build_forest(3, 2, 4, 0, &[]);
+        forest.compress_paths();
+        let k_is = vec![F::ONE; 2];
+        let subgroup = vec![F::ONE; 4];
+        assert!(matches!(
+            forest.fused_sigma_polys(1, &k_is, &subgroup),
+            Err(FusedSigmaError::InvalidShape(
+                FusedSigmaShapeError::DegreeLogMismatch
+            ))
+        ));
+
+        // An unused auxiliary suffix is the explicit typed eligibility decline. It is detected
+        // before allocation; only this variant may select the generic route.
+        let mut k_is_with_unused_suffix = k_is.clone();
+        k_is_with_unused_suffix.push(F::ONE);
+        assert_eq!(
+            forest.fused_sigma_polys(2, &k_is_with_unused_suffix, &subgroup),
+            Err(FusedSigmaError::Ineligible(
+                FusedSigmaEligibilityError::NonExactAuxiliaryLengths
+            ))
+        );
+        let before = forest.parents.clone();
+        let generic = forest
+            .wire_partition()
+            .get_sigma_polys(2, &k_is_with_unused_suffix, &subgroup);
+        assert_eq!(forest.parents, before);
+        assert_eq!(generic.len(), 2);
+
+        assert!(fixed_routed_wire_mask(&[0, 1, 2], 2, 2, 2).is_none());
+        assert!(fixed_routed_wire_mask(&[9, 1, 2, 3], 2, 2, 2).is_none());
+        assert!(fixed_routed_wire_mask(&[1, 2, 2, 3], 2, 2, 2).is_none());
+        assert!(fixed_routed_wire_mask(&[0], usize::MAX, 1, 2).is_none());
     }
 
     /// The runtime cancellation mask is derived from copy-component cardinality, not from a

@@ -15,8 +15,8 @@
 //!
 //! * the 80 sigma coefficient polynomials (~40 MiB/tx circuit) are **not**
 //!   stored — sigma *values* are re-derived from the representative map with
-//!   the same [`Forest::wire_partition`] + [`WirePartition::get_sigma_polys`]
-//!   code the builder itself uses, and the constants/sigmas commitment is
+//!   the same fused [`Forest::fused_sigma_polys`] route the builder itself uses,
+//!   and the constants/sigmas commitment is
 //!   recomputed through [`PolynomialBatch::from_values`], the builder's own
 //!   commitment path, guaranteeing a bit-identical Merkle cap;
 //! * the representative map is stored as zigzag-varint deltas against the
@@ -490,15 +490,22 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         1usize << (degree_bits + rate_bits.max(log2_ceil(common.quotient_degree_factor)));
     let root_table = cached_fft_root_table::<F>(max_fft_points);
 
-    // Sigma values from the representative map, through the builder's own
-    // forest partition code (`sigma_vecs` post-`compress_paths` state).
-    let mut forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
-    let wire_partition = forest.wire_partition();
-    let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
-    let representative_map = forest.into_parents();
+    // Validate the complete routed topology before constructing a Forest or entering the fused
+    // scan. Besides producing the retained cancellation mask, this checks the routed/wire shape,
+    // checked map extent, every routed representative's bound and self-root, and all routed-index
+    // arithmetic. Malformed topology is a hard loader error and never reaches a generic route.
     let fixed_routed_wires =
         fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
             .context("embedded circuit has an invalid compressed representative map")?;
+
+    // Sigma values from the representative map, fused directly into final field columns. Shape
+    // eligibility is checked before output allocation; an eligibility decline is propagated so
+    // the outer complete-circuit loader can fail closed rather than retrying malformed state.
+    let forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
+    let sigma_vecs = forest
+        .fused_sigma_polys(degree_bits, &common.k_is, &subgroup)
+        .map_err(|reason| anyhow::anyhow!("embedded sigma shape is ineligible: {reason:?}"))?;
+    let representative_map = forest.into_parents();
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the

@@ -1069,11 +1069,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         forest.compress_paths();
 
-        let wire_partition = forest.wire_partition();
-        (
-            wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
-            forest,
-        )
+        let sigma_values = forest
+            .fused_sigma_polys(degree_log, k_is, subgroup)
+            .expect("builder sigma shape must be eligible for fused construction");
+        (sigma_values, forest)
     }
 
     pub fn print_gate_counts(&self, min_delta: usize) {
