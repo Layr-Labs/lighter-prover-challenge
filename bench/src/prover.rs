@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -15,8 +15,6 @@ use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
-#[cfg(test)]
-use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
@@ -791,13 +789,20 @@ pub(crate) fn prove_block_after_pre(
         let circuits = &circuits;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
-            // Two-phase final-block witness (H13): this lane also runs the
-            // EARLY witness phase (block data + pre-proof generators) after the
-            // build, then joins the heavy path — which finishes ~30 s before
-            // the light path — and feeds its verify subtree here, mid-pipeline.
+            // The final block circuit depends only on static circuit data and
+            // is not needed until the final proof. The heavy path finishes
+            // roughly 30 s before the light path, which is ample slack for the
+            // embedded block load and its early witness phase. Wait for that
+            // natural milestone before materializing the largest circuit:
+            // this avoids keeping its allocations live across the heavy path
+            // and avoids competing with both transaction producers for CPU
+            // and unified-memory bandwidth. The load and early witness still
+            // run underneath the long light tail, so no new serial tail is
+            // introduced.
+            // Two-phase final-block witness (H13): after the heavy milestone,
+            // this lane loads the compile-time embedding, runs the EARLY phase
+            // (block data + pre-proof generators), and feeds the already-ready
+            // heavy verify subtree here, mid-pipeline.
             // Measured feed split: light 0.018 s vs heavy 0.575 s; the heavy
             // verify subtree (ECDSA/keccak) owns the late witness cost, and
             // moving it here deletes it from the serial tail. Both phases run
@@ -841,6 +846,20 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _heavy_wait =
+                        plonky2::util::profile::span("wait", "heavy_path_join_before_final_load");
+                    let heavy_chain_proof = heavy_handle_outer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    #[cfg(feature = "diagnostic_profile")]
+                    drop(_heavy_wait);
+                    // The heavy path's thread and both of its shared guards are
+                    // gone. The embedded fast path does not read those circuit
+                    // extensions, and the construction fallback needs only
+                    // common/verifier data, so retire 438 MiB before allocating
+                    // the final block data rather than stacking both lifetimes.
+                    circuits.release_heavy_circuit_extensions();
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -861,23 +880,6 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                    // The heavy path's thread has exited, so its shared guards
-                    // on the heavy transaction and chain circuits are gone, and
-                    // this lane dropped its own guard when `build_block_circuit`
-                    // returned above. Nothing reads those two circuits again:
-                    // the light pipeline uses the light pair, and the final
-                    // block proof uses only `block_data`, the three finished
-                    // proofs and the block. Retire their preprocessed
-                    // extensions here — 438 MiB of Metal shared buffers whose
-                    // release returns the pages to the OS immediately — instead
-                    // of holding them across the whole light phase.
-                    circuits.release_heavy_circuit_extensions();
                     pending
                         .feed(
                             BlockCircuit::witness_inputs_heavy_chain(
