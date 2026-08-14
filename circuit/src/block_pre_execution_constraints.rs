@@ -175,6 +175,7 @@ impl Circuit<C, F, D> for BlockPreExecutionCircuit {
             &circuit.common,
             partition_witness,
             &mut timing,
+            None,
         )?;
         // Recursive parents validate this proof in release builds; keep the eager check for tests.
         #[cfg(debug_assertions)]

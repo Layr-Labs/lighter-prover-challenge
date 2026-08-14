@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
@@ -263,6 +263,85 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             MerkleTree::new_columns(lde_values, cap_height)
         );
 
+        Self {
+            polynomials,
+            merkle_tree,
+            degree_log: log2_strict(degree),
+            rate_bits,
+            blinding,
+        }
+    }
+
+    pub fn from_coeffs_with_ready_ldes(
+        polynomials: Vec<PolynomialCoeffs<F>>,
+        ready_ldes: Vec<Option<Vec<F>>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+    ) -> Self {
+        if blinding || ready_ldes.iter().all(Option::is_none) {
+            return Self::from_coeffs(
+                polynomials,
+                rate_bits,
+                blinding,
+                cap_height,
+                timing,
+                fft_root_table,
+            );
+        }
+        let degree = polynomials[0].len();
+        let lde_len = degree << rate_bits;
+        if let Some(mut columns) = C::Hasher::try_allocate_merkle_tree_columns(
+            polynomials.len(),
+            lde_len,
+            cap_height,
+        ) {
+            if let Some(destinations) = columns.columns_mut() {
+                let coset_powers =
+                    crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+                destinations.into_par_iter().enumerate().for_each(|(j, destination)| {
+                    if let Some(lde) = ready_ldes.get(j).and_then(|c| c.as_ref()) {
+                        destination.copy_from_slice(lde);
+                        return;
+                    }
+                    let polynomial = &polynomials[j];
+                    batch_multiply_into(
+                        &mut destination[..degree],
+                        &polynomial.coeffs,
+                        &coset_powers,
+                    );
+                    if rate_bits == 0 || degree < 2 {
+                        destination[degree..].fill(F::ZERO);
+                    }
+                    fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                });
+                let merkle_tree = timed!(
+                    timing,
+                    "build Merkle tree",
+                    MerkleTree::new_column_store(columns, cap_height)
+                );
+                return Self {
+                    polynomials,
+                    merkle_tree,
+                    degree_log: log2_strict(degree),
+                    rate_bits,
+                    blinding,
+                };
+            }
+        }
+        let mut lde_values = Self::lde_values(&polynomials, rate_bits, blinding, fft_root_table);
+        for (j, ready) in ready_ldes.into_iter().enumerate() {
+            if let Some(lde) = ready {
+                lde_values[j] = lde;
+            }
+        }
+        let merkle_tree = timed!(
+            timing,
+            "build Merkle tree",
+            MerkleTree::new_columns(lde_values, cap_height)
+        );
         Self {
             polynomials,
             merkle_tree,
@@ -684,9 +763,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail(
+            // Marker: fri-cached-coset-1786705000. The openings-final
+            // coset shift is always the base generator lifted `(g, 0)`.
+            // `(g, 0)^i = (g^i, 0)` and `ext * (g^i, 0)` is `scalar_mul(g^i)`.
+            // `g^i` is the process-cached table every LDE already built.
+            // Same FFT input words as `coset_fft_zero_tail(..., g.into())`;
+            // a mismatch is a FRI polynomial the verifier rejects.
+            coset_fft_zero_tail_cached_base::<F, D>(
                 &lde_final_poly,
-                F::coset_shift().into(),
                 live_coeffs,
                 Some(fri_params.config.rate_bits),
                 None,
@@ -750,6 +834,50 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         unsafe { scaled.set_len(len) };
     } else {
         scaled.resize(len, F::ZERO);
+    }
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
+    } else {
+        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
+}
+
+/// `coset_fft_zero_tail` when the shift is the base coset generator
+/// lifted into the extension (`F::coset_shift().into()` = `(g, 0)`).
+/// Uses the process-cached base `g^i` table and `scalar_mul` instead of
+/// a serial extension `powers()` chain. Value-identical: `(g, 0)^i =
+/// (g^i, 0)` and `c * (g^i, 0) = c.scalar_mul(g^i)`.
+pub(crate) fn coset_fft_zero_tail_cached_base<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    coeffs: &PolynomialCoeffs<F::Extension>,
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F::Extension>>,
+) -> PolynomialValues<F::Extension> {
+    let len = coeffs.len();
+    debug_assert!(live <= len);
+    let zero_tail_is_unread =
+        matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
+    debug_assert!(
+        zero_tail_is_unread || coeffs.coeffs[live..].iter().all(F::Extension::is_zero)
+    );
+    let powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(live);
+    debug_assert!(powers.len() >= live);
+    let mut scaled = Vec::with_capacity(len);
+    scaled.extend(
+        powers[..live]
+            .iter()
+            .zip(&coeffs.coeffs[..live])
+            .map(|(&g_i, &c)| c.scalar_mul(g_i)),
+    );
+    if zero_tail_is_unread {
+        // SAFETY: same unread-tail contract as `coset_fft_zero_tail`.
+        unsafe { scaled.set_len(len) };
+    } else {
+        scaled.resize(len, F::Extension::ZERO);
     }
     if crate::hash::poseidon2::is_exclusive_gpu_phase() {
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
@@ -1024,6 +1152,45 @@ mod tests {
 
         check::<GoldilocksField>();
         check::<<GoldilocksField as Extendable<2>>::Extension>();
+    }
+
+    /// Cached-base scale must match `coset_fft_zero_tail` with the lifted
+    /// base coset generator, raw limbs included.
+    #[test]
+    fn coset_fft_zero_tail_cached_base_matches_lifted_shift() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::PrimeField64;
+
+        type GF = GoldilocksField;
+        type Q2 = <GF as Extendable<2>>::Extension;
+
+        fn raw(values: &[Q2]) -> Vec<u64> {
+            values
+                .iter()
+                .flat_map(|v| FieldExtension::<2>::to_basefield_array(v))
+                .map(|c: GF| c.to_noncanonical_u64())
+                .collect()
+        }
+
+        for lg_n in [2usize, 4, 6, 8] {
+            let n = 1usize << lg_n;
+            for rate_bits in 1..=3usize.min(lg_n) {
+                let live = n >> rate_bits;
+                let mut coeffs = Q2::rand_vec(live);
+                coeffs.resize(n, Q2::ZERO);
+                let poly = PolynomialCoeffs::new(coeffs);
+                let expected = coset_fft_zero_tail(
+                    &poly,
+                    GF::coset_shift().into(),
+                    live,
+                    Some(rate_bits),
+                    None,
+                );
+                let actual =
+                    coset_fft_zero_tail_cached_base::<GF, 2>(&poly, live, Some(rate_bits), None);
+                assert_eq!(raw(&actual.values), raw(&expected.values));
+            }
+        }
     }
 
     /// The fused quotient accumulation must be bit-identical (raw u64
