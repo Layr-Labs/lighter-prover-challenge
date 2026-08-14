@@ -376,6 +376,36 @@ fn fft_classic_simd_with<P, M>(
     let packed_n = packed_values.len();
     debug_assert!(packed_n == 1 << (lg_n - lg_packed_width));
 
+    // The ordinary base-field IFFT enters at layer zero. For four-wide
+    // Goldilocks packing, its first layer has four unity twiddles and its
+    // second has two unity/fourth-root pairs. Fuse those two layers while the
+    // two packs are still live: unity products become raw copies and only the
+    // two fourth-root lanes use the existing paired multiply/reduction.
+    #[cfg(target_arch = "aarch64")]
+    let r = if r == 0
+        && lg_n >= 2
+        && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
+    {
+        let scalars = unsafe {
+            core::slice::from_raw_parts_mut(
+                packed_values
+                    .as_mut_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                packed_values.len() * P::WIDTH,
+            )
+        };
+        let root4 = unsafe {
+            *root_table[1]
+                .as_ptr()
+                .add(1)
+                .cast::<crate::goldilocks_field::GoldilocksField>()
+        };
+        fft_classic_simd_first_two_layers_neon(scalars, root4);
+        2
+    } else {
+        r
+    };
+
     // Want the below for loop to unroll, hence the need for a literal.
     // This loop will not run when P is a scalar.
     assert!(lg_packed_width <= 4);
@@ -428,6 +458,31 @@ fn fft_classic_simd_with_parallel<P, M>(
     let packed_n = packed_values.len();
     debug_assert!(packed_n == 1 << (lg_n - lg_packed_width));
 
+    #[cfg(target_arch = "aarch64")]
+    let r = if r == 0
+        && lg_n >= 2
+        && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
+    {
+        let scalars = unsafe {
+            core::slice::from_raw_parts_mut(
+                packed_values
+                    .as_mut_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                packed_values.len() * P::WIDTH,
+            )
+        };
+        let root4 = unsafe {
+            *root_table[1]
+                .as_ptr()
+                .add(1)
+                .cast::<crate::goldilocks_field::GoldilocksField>()
+        };
+        fft_classic_simd_first_two_layers_neon(scalars, root4);
+        2
+    } else {
+        r
+    };
+
     assert!(lg_packed_width <= 4);
     for lg_half_m in 0..4 {
         if (r..min(lg_n, lg_packed_width)).contains(&lg_half_m) {
@@ -463,6 +518,46 @@ fn fft_classic_simd<P: PackedField>(
         fft_classic_simd_with::<P, GeneralTwiddle>(values, r, lg_n, root_table);
     } else {
         fft_classic_simd_with::<P, BaseSubfieldTwiddle>(values, r, lg_n, root_table);
+    }
+}
+
+/// Fused first two layers of an ordinary base-field transform.
+///
+/// In the four-wide packed schedule, layer zero multiplies every lane by one;
+/// layer one multiplies lanes `[0, 2]` by one and lanes `[1, 3]` by the fourth
+/// root. This kernel performs the same interleaves and add/sub reductions, but
+/// copies the six unity lanes raw and sends only the two fourth-root lanes
+/// through the established paired Goldilocks multiplier. Keeping both layers
+/// in one loop also removes the intermediate store/load of the two packs.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_first_two_layers_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    root4: crate::goldilocks_field::GoldilocksField,
+) {
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    debug_assert_eq!(values.len() % 8, 0);
+    let packed = WideGoldilocksField::pack_slice_mut(values);
+    let roots = NeonGoldilocksField([root4, root4]);
+
+    for pair in packed.chunks_exact_mut(2) {
+        // Layer zero. `t = 1 * v` is the raw value itself.
+        let (u0, v0) = pair[0].interleave(pair[1], 1);
+        let (stage0_lo, stage0_hi) = (u0 + v0).interleave(u0 - v0, 1);
+
+        // Layer one. Its packed twiddle is `[1, root4, 1, root4]`.
+        let (u1, v1) = stage0_lo.interleave(stage0_hi, 2);
+        let lanes = v1.as_slice();
+        let products = roots * NeonGoldilocksField([lanes[1], lanes[3]]);
+        let mut t = WideGoldilocksField::default();
+        let t_lanes = t.as_slice_mut();
+        t_lanes[0] = lanes[0];
+        t_lanes[1] = products.0[0];
+        t_lanes[2] = lanes[2];
+        t_lanes[3] = products.0[1];
+
+        (pair[0], pair[1]) = (u1 + t).interleave(u1 - t, 2);
     }
 }
 
@@ -525,6 +620,30 @@ fn fft_classic_simd_single_layer_neon(
     lg_half_m: usize,
     omega_row: &[crate::goldilocks_field::GoldilocksField],
 ) {
+    use crate::types::Field;
+
+    // Cache-blocked production FFTs use standard root rows, whose first
+    // twiddle is exactly one. Multiplication by raw one preserves every u64
+    // representative, so the first lane of each block can bypass the widening
+    // multiply and reduction. Keep arbitrary/nonstandard rows on the general
+    // kernel so this private primitive remains useful to differential tests.
+    if values.len() < (1 << 14)
+        && lg_half_m >= 2
+        && omega_row.first().map(|w| w.0)
+            == Some(crate::goldilocks_field::GoldilocksField::ONE.0)
+    {
+        return fft_classic_simd_single_layer_neon_unity(values, lg_half_m, omega_row);
+    }
+    fft_classic_simd_single_layer_neon_general(values, lg_half_m, omega_row);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_general(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
     use core::arch::aarch64::*;
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 
@@ -571,6 +690,86 @@ fn fft_classic_simd_single_layer_neon(
                 values[k + j] = u + t;
                 values[k + half + j] = u - t;
                 j += 1;
+            }
+            k += m;
+        }
+    }
+}
+
+/// Cache-blocked base-field layer with the unity twiddle removed from every
+/// block. Lane zero is copied raw; lane one uses the same nine-instruction
+/// reduction as one lane of `NeonGoldilocksField`.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_single_layer_neon_unity(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    #[inline(always)]
+    fn mul_reduce_single(a: u64, b: u64) -> u64 {
+        use core::arch::asm;
+
+        let mut result = a;
+        let scratch = b;
+        unsafe {
+            asm!(
+                "umulh {hi}, {result}, {scratch}",
+                "mul   {result}, {result}, {scratch}",
+                "umull {scratch}, {hi:w}, {epsilon:w}",
+                "subs  {result}, {result}, {hi}, lsr #32",
+                "csetm {hi:w}, cc",
+                "sub   {result}, {result}, {hi}",
+                "adds  {result}, {result}, {scratch}",
+                "csetm {scratch:w}, cs",
+                "add   {result}, {result}, {scratch}",
+                result = inout(reg) result,
+                scratch = inout(reg) scratch => _,
+                hi = out(reg) _,
+                epsilon = in(reg) ((1u64 << 32) - 1),
+                options(pure, nomem, nostack),
+            );
+        }
+        result
+    }
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    let m = half << 1;
+    debug_assert!(lg_half_m >= 2);
+    debug_assert_eq!(omega_row[0].0, 1);
+    let base = values.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut k = 0;
+        while k + m <= values.len() {
+            let v0 = values.get_unchecked(k + half).0;
+            let v1 = values.get_unchecked(k + half + 1).0;
+            let t1 = mul_reduce_single(omega_row.get_unchecked(1).0, v1);
+            let tv = vcombine_u64(vcreate_u64(v0), vcreate_u64(t1));
+            let u = vld1q_u64(base.add(k));
+            vst1q_u64(base.add(k), gl_add_neon(u, tv, eps));
+            vst1q_u64(base.add(k + half), gl_sub_neon(u, tv, eps));
+
+            let mut j = 2;
+            while j + 2 <= half {
+                let v = NeonGoldilocksField([
+                    *values.get_unchecked(k + half + j),
+                    *values.get_unchecked(k + half + j + 1),
+                ]);
+                let w = NeonGoldilocksField([
+                    *omega_row.get_unchecked(j),
+                    *omega_row.get_unchecked(j + 1),
+                ]);
+                let t = w * v;
+                let tv = vcombine_u64(vcreate_u64(t.0[0].0), vcreate_u64(t.0[1].0));
+                let u = vld1q_u64(base.add(k + j));
+                vst1q_u64(base.add(k + j), gl_add_neon(u, tv, eps));
+                vst1q_u64(base.add(k + half + j), gl_sub_neon(u, tv, eps));
+                j += 2;
             }
             k += m;
         }
@@ -3452,6 +3651,90 @@ mod tests {
                 len,
                 &mut |d| fft_classic_simd_single_layer_neon(d, lg_half_m, &w1),
                 &mut |d| fft_classic_simd_single_layer_neon_w4(d, lg_half_m, &w1),
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn unity_twiddle_kernel_matches_general_raw_words() {
+        use super::{
+            fft_classic_simd_single_layer_neon_general,
+            fft_classic_simd_single_layer_neon_unity,
+        };
+
+        let roots = fft_root_table::<GoldilocksField>(1 << 13);
+        for lg_half_m in 4usize..13 {
+            let input: Vec<_> = (0..1usize << 13)
+                .map(|i| {
+                    GoldilocksField(
+                        0xffff_ffff_0000_0000u64.wrapping_add(
+                            0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1),
+                        ),
+                    )
+                })
+                .collect();
+            let mut general = input.clone();
+            let mut unity = input;
+            fft_classic_simd_single_layer_neon_general(
+                &mut general,
+                lg_half_m,
+                &roots[lg_half_m],
+            );
+            fft_classic_simd_single_layer_neon_unity(
+                &mut unity,
+                lg_half_m,
+                &roots[lg_half_m],
+            );
+            assert_eq!(
+                general.iter().map(|x| x.0).collect::<Vec<_>>(),
+                unity.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "raw mismatch at lg_half_m={lg_half_m}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn fused_first_two_layers_match_general_raw_words() {
+        use super::fft_classic_simd_first_two_layers_neon;
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+
+        fn general(values: &mut [GoldilocksField], roots: &FftRootTable<GoldilocksField>) {
+            let packed = WideGoldilocksField::pack_slice_mut(values);
+            for lg_half_m in 0..2 {
+                let half_m = 1usize << lg_half_m;
+                let mut omega = WideGoldilocksField::default();
+                for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
+                    *omega_j = roots[lg_half_m][j % half_m];
+                }
+                for k in (0..packed.len()).step_by(2) {
+                    let (u, v) = packed[k].interleave(packed[k + 1], half_m);
+                    let t = omega * v;
+                    (packed[k], packed[k + 1]) = (u + t).interleave(u - t, half_m);
+                }
+            }
+        }
+
+        for lg_n in [3usize, 8, 14, 16, 18] {
+            let roots = fft_root_table::<GoldilocksField>(1 << lg_n);
+            let input: Vec<_> = (0..1usize << lg_n)
+                .map(|i| {
+                    GoldilocksField(
+                        0xffff_ffff_0000_0000u64.wrapping_add(
+                            0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1),
+                        ),
+                    )
+                })
+                .collect();
+            let mut expected = input.clone();
+            let mut actual = input;
+            general(&mut expected, &roots);
+            fft_classic_simd_first_two_layers_neon(&mut actual, roots[1][1]);
+            assert_eq!(
+                expected.iter().map(|x| x.0).collect::<Vec<_>>(),
+                actual.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "raw mismatch at lg_n={lg_n}",
             );
         }
     }

@@ -609,8 +609,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
-        let alpha = challenger.get_extension_challenge::<D>();
-        let mut alpha = ReducingFactor::new(alpha);
+        let fri_alpha = challenger.get_extension_challenge::<D>();
+        let mut alpha = ReducingFactor::new(fri_alpha);
 
         // Final low-degree polynomial that goes into FRI.
         let mut final_poly = PolynomialCoeffs::empty();
@@ -623,6 +623,22 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
         for FriBatchInfo { point, polynomials } in &instance.batches {
+            // Production's shifted-Z batch has exactly two base-field
+            // polynomials. Feed their [1, alpha] combination directly into
+            // synthetic division, avoiding a degree-sized temporary and its
+            // subsequent reread. Wider batches retain the generic reducer.
+            if let [p0, p1] = polynomials.as_slice() {
+                let p0 = &oracles[p0.oracle_index].polynomials[p0.polynomial_index];
+                let p1 = &oracles[p1.oracle_index].polynomials[p1.polynomial_index];
+                accumulate_two_base_polys_linear_quotient(
+                    &mut final_poly,
+                    p0,
+                    p1,
+                    fri_alpha,
+                    *point,
+                );
+                continue;
+            }
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -644,9 +660,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // (where the in-place division runs the classic `divide_by_linear`
             // Horner recurrence and leaves its top slot as the power-of-two
             // pad), writing straight into `final_poly`'s reusable buffer
-            // instead of a division pass + shift pass + add pass.
+            // instead of a division pass + shift pass + add pass. On the first
+            // nonempty batch, `final_poly` has no prior value to shift or add,
+            // so donate `composition_poly`'s allocation directly to the
+            // in-place quotient instead of allocating and zero-filling a
+            // second full-degree buffer.
             let shift = alpha.shift_factor();
-            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            if final_poly.coeffs.is_empty() {
+                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
+            } else {
+                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+            }
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -773,6 +797,44 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// only dropped work is the recurrence's final step (the remainder `p(z)`,
 /// which the division discards) and the reference's `+ ZERO` on the pad
 /// slot / `ZERO * shift` on fresh slots, all of which leave values unchanged.
+/// Fuse the two-polynomial base-field composition producer with its immediately
+/// consuming extension-field synthetic division. Coefficient zero is omitted
+/// because the quotient recurrence consumes only coefficients `1..d`.
+fn accumulate_two_base_polys_linear_quotient<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    final_poly: &mut PolynomialCoeffs<F::Extension>,
+    p0: &PolynomialCoeffs<F>,
+    p1: &PolynomialCoeffs<F>,
+    alpha: F::Extension,
+    z: F::Extension,
+) {
+    assert_eq!(p0.len(), p1.len());
+    let d = p0.len();
+    let shift = alpha.exp_u64(2);
+    let buf = &mut final_poly.coeffs;
+    for limb in buf.iter_mut().skip(d) {
+        *limb *= shift;
+    }
+    if buf.len() < d {
+        buf.resize(d, F::Extension::ZERO);
+    }
+    if d == 0 {
+        return;
+    }
+    buf[d - 1] *= shift;
+
+    let powers = [F::Extension::ONE, alpha];
+    let mut acc = F::Extension::ZERO;
+    for i in (0..d - 1).rev() {
+        let scalars = [p0.coeffs[i + 1], p1.coeffs[i + 1]];
+        let composition = F::extension_base_dot_product(&powers, &scalars);
+        acc = acc * z + composition;
+        buf[i] = buf[i] * shift + acc;
+    }
+}
+
 fn accumulate_linear_quotient<F: Field>(
     final_poly: &mut PolynomialCoeffs<F>,
     composition_poly: &PolynomialCoeffs<F>,
@@ -809,6 +871,54 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn fused_two_poly_linear_quotient_matches_materialized_raw_words() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::PrimeField64;
+
+        type FE = <GoldilocksField as Extendable<2>>::Extension;
+
+        let raw = |values: &[FE]| {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .collect::<Vec<_>>()
+        };
+
+        for &(old_len, degree) in &[
+            (0usize, 0usize),
+            (0, 1),
+            (1, 1),
+            (4, 8),
+            (8, 4),
+            (257, 257),
+        ] {
+            let p0 = PolynomialCoeffs::new(GoldilocksField::rand_vec(degree));
+            let p1 = PolynomialCoeffs::new(GoldilocksField::rand_vec(degree));
+            let initial = PolynomialCoeffs::new(FE::rand_vec(old_len));
+            let alpha = FE::rand();
+            let z = FE::rand();
+
+            let mut reducing = ReducingFactor::new(alpha);
+            let composition =
+                reducing.reduce_polys_base::<GoldilocksField, 2>([&p0, &p1]);
+            let shift = reducing.shift_factor();
+            let mut expected = initial.clone();
+            accumulate_linear_quotient(&mut expected, &composition, z, shift);
+
+            let mut actual = initial;
+            accumulate_two_base_polys_linear_quotient::<GoldilocksField, 2>(
+                &mut actual,
+                &p0,
+                &p1,
+                alpha,
+                z,
+            );
+            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
+        }
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
