@@ -354,9 +354,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RangeCheckGate
         let num_aux = self.aux_limbs_per_input();
         let base = F::from_canonical_usize(Self::BASE);
         let three = F::from_canonical_usize(3);
-        // Quotient evaluation uses batches of at most 32 points.
-        let mut stack_scratch = [F::ZERO; 32];
-        let scratch = &mut stack_scratch[..n];
+        // Keep the quotient batch scratch on the stack through the prover's
+        // 64-point batch size, with a defensive heap fallback for direct
+        // callers using a larger batch.
+        let mut stack_scratch = [F::ZERO; 64];
+        let mut heap_scratch;
+        let scratch: &mut [F] = if n <= stack_scratch.len() {
+            &mut stack_scratch[..n]
+        } else {
+            heap_scratch = vec![F::ZERO; n];
+            &mut heap_scratch
+        };
         let mut constraint_index = 0;
 
         for i in 0..self.num_ops {
@@ -655,33 +663,34 @@ mod tests {
     #[test]
     fn direct_filtered_accumulation_matches_materialized_batch() {
         const D: usize = 2;
-        const N: usize = 11;
         type F = GoldilocksField;
 
         let gate = RangeCheckGate::<F, D>::new_from_config(
             &CircuitConfig::standard_recursion_config(),
             47,
         );
-        let wires = (0..gate.num_wires() * N)
-            .map(|i| F::from_canonical_usize(3 * i + 5))
-            .collect::<Vec<_>>();
-        let constants = Vec::new();
-        let hash = HashOut::ZERO;
-        let vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
-        let filters = (0..N)
-            .map(|i| F::from_canonical_usize(2 * i + 1))
-            .collect::<Vec<_>>();
-        let mut expected = vec![F::ZERO; gate.num_constraints() * N];
-        let materialized = gate.eval_unfiltered_base_batch(vars);
-        for (acc, constraints) in expected
-            .chunks_exact_mut(N)
-            .zip(materialized.chunks_exact(N))
-        {
-            batch_multiply_add_inplace(acc, constraints, &filters);
+        for n in [11, 64] {
+            let wires = (0..gate.num_wires() * n)
+                .map(|i| F::from_canonical_usize(3 * i + 5))
+                .collect::<Vec<_>>();
+            let constants = Vec::new();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+            let filters = (0..n)
+                .map(|i| F::from_canonical_usize(2 * i + 1))
+                .collect::<Vec<_>>();
+            let mut expected = vec![F::ZERO; gate.num_constraints() * n];
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            for (acc, constraints) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+            let mut actual = vec![F::ZERO; expected.len()];
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            assert_eq!(actual, expected, "batch size {n}");
         }
-        let mut actual = vec![F::ZERO; expected.len()];
-        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-        assert_eq!(actual, expected);
     }
 
     /// End-to-end seam check for the retained-column guards, multi-gate CPU

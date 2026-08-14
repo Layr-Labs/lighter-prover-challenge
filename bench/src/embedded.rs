@@ -17,13 +17,15 @@
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
-use circuit::embed::deserialize_embedded;
+use circuit::embed::{deserialize_embedded, deserialize_embedded_with_commitment};
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
 use crate::api::{Circuits, Proof};
 
 static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
+const PRE_COMMITMENT_CACHE_PATH: &str =
+    concat!(env!("OUT_DIR"), "/pre.commitment-cache");
 static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
@@ -80,12 +82,40 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
+fn load_pre_cached() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
+    anyhow::ensure!(
+        !PRE_BLOB.is_empty(),
+        "embedded circuit blob pre is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
+    );
+    let cache = std::fs::read(PRE_COMMITMENT_CACHE_PATH).map_err(|error| {
+        anyhow::Error::from(error).context("reading pre-execution commitment cache")
+    })?;
+    anyhow::ensure!(
+        !cache.is_empty(),
+        "pre-execution commitment cache is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
+    );
+    deserialize_embedded_with_commitment::<BlockPreExecutionTarget>(PRE_BLOB, &cache)
+        .map_err(|error| error.context("loading cached pre-execution commitment"))
+}
+
 impl Circuits {
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
     /// behind the remaining circuit loads.
     pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
-        load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+        if std::env::var_os("LIGHTER_PRE_COMMITMENT_CACHE").is_some_and(|value| value == "0") {
+            return load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB);
+        }
+
+        match load_pre_cached() {
+            Ok(pre) => Ok(pre),
+            Err(error) => {
+                log::warn!(
+                    "pre-execution commitment cache unavailable ({error:#}); using compact loader"
+                );
+                load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+            }
+        }
     }
 
     /// Loads every embedded circuit except pre-execution. This is public to
@@ -159,6 +189,7 @@ impl Circuits {
 mod tests {
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
+    use plonky2::hash::merkle_tree::MerkleLeaves;
     use plonky2::util::serialization::Write as _;
 
     use super::*;
@@ -271,6 +302,146 @@ mod tests {
         );
     }
 
+    fn assert_pre_cache_identical(
+        compact: &(BlockPreExecutionTarget, CircuitData<F, C, D>),
+        cached: &(BlockPreExecutionTarget, CircuitData<F, C, D>),
+    ) {
+        let (compact_target, compact_data) = compact;
+        let (cached_target, cached_data) = cached;
+        assert_eq!(
+            bincode::serialize(compact_target).unwrap(),
+            bincode::serialize(cached_target).unwrap(),
+            "pre target diverges"
+        );
+        assert_eq!(compact_data.common, cached_data.common, "pre common data");
+        assert_eq!(
+            compact_data.verifier_only, cached_data.verifier_only,
+            "pre verifier data"
+        );
+
+        let compact_prover = &compact_data.prover_only;
+        let cached_prover = &cached_data.prover_only;
+        assert_eq!(
+            generator_stream_bytes(compact_data),
+            generator_stream_bytes(cached_data),
+            "pre generator stream"
+        );
+        assert_eq!(
+            compact_prover.generator_indices_by_watches,
+            cached_prover.generator_indices_by_watches,
+            "pre generator watch index"
+        );
+        assert_eq!(
+            compact_prover.generator_watch_counts, cached_prover.generator_watch_counts,
+            "pre generator watch counts"
+        );
+        assert_eq!(compact_prover.sigmas, cached_prover.sigmas, "pre sigmas");
+        assert_eq!(compact_prover.subgroup, cached_prover.subgroup, "pre subgroup");
+        assert_eq!(
+            compact_prover.public_inputs, cached_prover.public_inputs,
+            "pre public inputs"
+        );
+        assert_eq!(
+            compact_prover.representative_map, cached_prover.representative_map,
+            "pre representative map"
+        );
+        assert_eq!(
+            compact_prover.fixed_routed_wires, cached_prover.fixed_routed_wires,
+            "pre fixed routed wires"
+        );
+        assert_eq!(
+            compact_prover.fft_root_table, cached_prover.fft_root_table,
+            "pre FFT roots"
+        );
+        assert_eq!(
+            compact_prover.circuit_digest, cached_prover.circuit_digest,
+            "pre circuit digest"
+        );
+        assert_eq!(compact_prover.lookup_rows, cached_prover.lookup_rows, "pre lookups");
+        assert_eq!(
+            compact_prover.lut_to_lookups, cached_prover.lut_to_lookups,
+            "pre lookup tables"
+        );
+        assert_eq!(
+            compact_prover.constants_sigmas_quotient_cache,
+            cached_prover.constants_sigmas_quotient_cache,
+            "pre quotient cache"
+        );
+        assert_eq!(
+            compact_prover.constants_sigmas_quotient_step,
+            cached_prover.constants_sigmas_quotient_step,
+            "pre quotient stride"
+        );
+        assert_eq!(
+            compact_prover.constants_sigmas_quotient_domain,
+            cached_prover.constants_sigmas_quotient_domain,
+            "pre quotient domain"
+        );
+
+        let compact_commitment = &compact_prover.constants_sigmas_commitment;
+        let cached_commitment = &cached_prover.constants_sigmas_commitment;
+        assert_eq!(compact_commitment.degree_log, cached_commitment.degree_log);
+        assert_eq!(compact_commitment.rate_bits, cached_commitment.rate_bits);
+        assert_eq!(compact_commitment.blinding, cached_commitment.blinding);
+        assert_eq!(
+            compact_commitment.polynomials.len(),
+            cached_commitment.polynomials.len()
+        );
+        for (compact_poly, cached_poly) in compact_commitment
+            .polynomials
+            .iter()
+            .zip(&cached_commitment.polynomials)
+        {
+            assert_eq!(compact_poly.coeffs.len(), cached_poly.coeffs.len());
+            for (&compact_value, &cached_value) in
+                compact_poly.coeffs.iter().zip(&cached_poly.coeffs)
+            {
+                assert_eq!(compact_value.0, cached_value.0, "raw coefficient diverges");
+            }
+        }
+
+        let compact_tree = &compact_commitment.merkle_tree;
+        let cached_tree = &cached_commitment.merkle_tree;
+        assert_eq!(compact_tree.num_leaves, cached_tree.num_leaves);
+        assert_eq!(compact_tree.cap, cached_tree.cap);
+        match (&compact_tree.leaves, &cached_tree.leaves) {
+            (
+                MerkleLeaves::Columns {
+                    columns: compact_columns,
+                    log_rows: compact_log_rows,
+                },
+                MerkleLeaves::Columns {
+                    columns: cached_columns,
+                    log_rows: cached_log_rows,
+                },
+            ) => {
+                assert_eq!(compact_log_rows, cached_log_rows);
+                assert_eq!(compact_columns.num_cols(), cached_columns.num_cols());
+                assert_eq!(compact_columns.num_rows(), cached_columns.num_rows());
+                for column in 0..compact_columns.num_cols() {
+                    for (&compact_value, &cached_value) in compact_columns
+                        .col(column)
+                        .iter()
+                        .zip(cached_columns.col(column))
+                    {
+                        assert_eq!(compact_value.0, cached_value.0, "raw LDE value diverges");
+                    }
+                }
+            }
+            (MerkleLeaves::Rows { data: compact, width: compact_width }, MerkleLeaves::Rows { data: cached, width: cached_width }) => {
+                assert_eq!(compact_width, cached_width);
+                for (&compact_value, &cached_value) in compact.iter().zip(cached) {
+                    assert_eq!(compact_value.0, cached_value.0, "raw row value diverges");
+                }
+            }
+            _ => panic!("pre commitment leaf layout diverges"),
+        }
+        for index in [0, compact_tree.num_leaves / 3, compact_tree.num_leaves - 1] {
+            assert_eq!(compact_tree.leaf_vec(index), cached_tree.leaf_vec(index));
+            assert_eq!(compact_tree.prove(index), cached_tree.prove(index));
+        }
+    }
+
     /// Determinism oracle for the embed mechanism: builds all five circuits
     /// from scratch AND loads the embedded set, then asserts value identity.
     /// This is the gate for `Circuits::from_embedded` — if it fails, the
@@ -346,6 +517,62 @@ mod tests {
             assert!(!bytes.is_empty());
 
             println!("embedded_matches_rebuilt: all five circuits are value-identical");
+        });
+    }
+
+    /// Exact differential for the external pre commitment cache, including
+    /// raw Goldilocks representations for every coefficient and LDE value.
+    #[test]
+    fn pre_commitment_cache_matches_compact() {
+        on_big_stack(|| {
+            let compact = load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+                .expect("compact pre circuit must load");
+            let cached = load_pre_cached().expect("cached pre circuit must load");
+            assert_pre_cache_identical(&compact, &cached);
+        });
+    }
+
+    /// Isolated station harness. Each arm performs its production input path:
+    /// compact reads linked bytes, while cache reads the external OUT_DIR file.
+    #[test]
+    #[ignore = "manual 7-sample-per-arm pre loader station"]
+    fn pre_commitment_cache_load_timing() {
+        use std::time::Instant;
+
+        on_big_stack(|| {
+            for round in 0..7 {
+                let run = |arm: &str| {
+                    let start = Instant::now();
+                    let loaded = if arm == "compact" {
+                        load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+                    } else {
+                        load_pre_cached()
+                    }
+                    .expect("pre loader timing arm must succeed");
+                    let elapsed = start.elapsed();
+                    assert_eq!(
+                        loaded.1.verifier_only.constants_sigmas_cap,
+                        loaded
+                            .1
+                            .prover_only
+                            .constants_sigmas_commitment
+                            .merkle_tree
+                            .cap
+                    );
+                    println!(
+                        "pre_commitment_cache_load round={round} arm={arm} ns={}",
+                        elapsed.as_nanos()
+                    );
+                    drop(loaded);
+                };
+                if round % 2 == 0 {
+                    run("compact");
+                    run("cached");
+                } else {
+                    run("cached");
+                    run("compact");
+                }
+            }
         });
     }
 
@@ -430,5 +657,10 @@ mod tests {
                 "embedded circuit blob {name} is an empty stub"
             );
         }
+        assert!(
+            std::fs::metadata(PRE_COMMITMENT_CACHE_PATH)
+                .is_ok_and(|metadata| metadata.len() > 0),
+            "pre-execution commitment cache is missing or empty"
+        );
     }
 }
