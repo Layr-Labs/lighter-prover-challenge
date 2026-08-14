@@ -42,6 +42,11 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
 // Keep the promoted writer path while exercising a second submission from that baseline.
+// Redraw the verified eight-chain stack after rejecting an unsafe research successor.
+// Preserve that verified behavior for a fresh draw after the prior run failed before scoring.
+// Retain the verified fused quotient merge while sampling another ranked runner draw.
+// Keep the same fused path available for a second independent ranked sample.
+// Preserve the identical verified path for one further independent runner sample.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {

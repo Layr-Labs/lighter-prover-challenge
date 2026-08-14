@@ -1018,7 +1018,10 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+const QUOTIENT_BATCH_SIZE: usize = 64;
+const DEGREE_14_QUOTIENT_BATCH_SIZE: usize = 256;
+const DEGREE_16_QUOTIENT_BATCH_SIZE: usize = 256;
+const DEGREE_18_QUOTIENT_BATCH_SIZE: usize = 256;
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
@@ -2001,8 +2004,18 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    // Every production degree cohort shows a repeatable, separated
+    // gather+evaluation win at 256 points. Their exact gate differentials
+    // include the heap-fallback paths used beyond 64-point stack scratches;
+    // degree 18 additionally covers the fused Interleave/Uninterleave pair.
+    let batch_size = match common_data.degree_bits() {
+        14 => DEGREE_14_QUOTIENT_BATCH_SIZE,
+        16 => DEGREE_16_QUOTIENT_BATCH_SIZE,
+        18 => DEGREE_18_QUOTIENT_BATCH_SIZE,
+        _ => QUOTIENT_BATCH_SIZE,
+    };
+    let points_batches = points.par_chunks(batch_size);
+    let num_batches = points.len().div_ceil(batch_size);
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
@@ -2085,13 +2098,13 @@ fn compute_quotient_polys<
     // promoted zero-tail fast path in `fri/oracle.rs`.
     unsafe { quotient_values.set_len(quotient_len) };
     quotient_values
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
+        .par_chunks_mut(batch_size * num_challenges)
         .zip(points_batches)
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
-                indices: Vec::with_capacity(BATCH_SIZE),
-                indices_next: Vec::with_capacity(BATCH_SIZE),
+                indices: Vec::with_capacity(batch_size),
+                indices_next: Vec::with_capacity(batch_size),
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
@@ -2102,21 +2115,21 @@ fn compute_quotient_polys<
             |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
+                    xs_batch.len() == batch_size
+                        || (batch_i == num_batches - 1 && xs_batch.len() <= batch_size)
                 );
 
                 let n = xs_batch.len();
                 scratch.indices.clear();
                 scratch
                     .indices
-                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
+                    .extend(batch_size * batch_i..batch_size * batch_i + n);
                 scratch.indices_next.clear();
                 scratch
                     .indices_next
                     .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
 
-                let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
+                let shifted_xs_batch = &shifted_points[batch_size * batch_i..][..n];
                 debug_assert!(
                     shifted_xs_batch
                         .iter()
@@ -2128,7 +2141,7 @@ fn compute_quotient_polys<
                 // quotient-domain values were extracted once at circuit build
                 // time; copy them per batch instead of re-walking the strided
                 // LDE (which amplifies cache-line traffic 8x at step 8).
-                let cache_start = BATCH_SIZE * batch_i;
+                let cache_start = batch_size * batch_i;
                 // The cache is column-major (`PolyMajor`); the per-point
                 // (`PointMajor`) path with lookups keeps the original gathers.
                 let constants_cache = if col_major_perm {
@@ -2347,7 +2360,7 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2380,20 +2393,13 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        Some(gpu_values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
         let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -2429,20 +2435,13 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        Some(gpu_values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
         let gpu_values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
@@ -2466,26 +2465,28 @@ fn compute_quotient_polys<
             }
         };
         debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        Some(gpu_values)
+    } else {
+        None
+    };
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_value_sources = [
+        gpu_poseidon_values.as_deref(),
+        gpu_range_values.as_deref(),
+        gpu_permutation_values.as_deref(),
+    ];
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let gpu_value_sources: [Option<&[F]>; 0] = [];
+    let has_gpu_values = gpu_value_sources.iter().any(Option::is_some);
+
+    // Scatter the interleaved CPU values into per-challenge columns while
+    // merging every successful GPU quotient source in its historical order.
+    // Previously each GPU result made a full parallel read-modify-write pass
+    // over `quotient_values`, followed by this scatter as a fourth full pass.
+    // Each chunk below owns a disjoint point range, so the merged value can go
+    // directly to its final column without any intermediate writeback.
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
@@ -2505,14 +2506,26 @@ fn compute_quotient_polys<
         .collect();
     let column_ptrs = &column_ptrs;
     quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
+        .par_chunks(batch_size * num_challenges)
         .enumerate()
         .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
+            let base = batch_size * chunk_i;
             for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
+                let point_index = base + k;
+                let denominator_inv =
+                    has_gpu_values.then(|| z_h_on_coset.eval_inverse(point_index));
+                for (challenge, (column, &cpu_value)) in
+                    column_ptrs.iter().zip(point_values).enumerate()
+                {
+                    let mut value = cpu_value;
+                    if let Some(denominator_inv) = denominator_inv {
+                        for gpu_values in gpu_value_sources.iter().flatten() {
+                            value += gpu_values[point_index * num_challenges + challenge]
+                                * denominator_inv;
+                        }
+                    }
                     // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
+                    unsafe { *column.0.add(point_index) = value };
                 }
             }
         });
