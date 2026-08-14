@@ -6,6 +6,7 @@
 pub mod circuit_builder;
 pub mod circuit_data;
 pub mod config;
+pub mod early_wire_lde;
 pub(crate) mod copy_constraint;
 mod get_challenges;
 pub mod permutation_argument;
