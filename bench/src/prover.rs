@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
-use circuit::block_constraints::{BlockCircuit, Circuit as _};
+use circuit::block_constraints::BlockCircuit;
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
@@ -15,8 +15,6 @@ use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
-#[cfg(test)]
-use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
@@ -677,6 +675,32 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // The final block's three streamed Merkle commitments each
+                // consume a one-off ~128 MiB digest output (exceeding the
+                // digest pool cap), the first also allocates the ~192 MiB
+                // streamed sponge state, and the three GPU quotient jobs each
+                // allocate a one-off ~32 MiB output (exceeding the quotient
+                // pool cap). All of those are fresh kernel-zeroed buffers in
+                // the run's most serial window; pre-fault them here while the
+                // light pipeline still runs.
+                const FINAL_LDE_ROWS: u64 = 1 << 21;
+                const FINAL_DIGEST_BYTES: u64 = (2 * FINAL_LDE_ROWS - (1 << 4)) * 32;
+                const FINAL_STREAMED_STATE_BYTES: u64 = FINAL_LDE_ROWS * 12 * 8;
+                const FINAL_QUOTIENT_BYTES: u64 = FINAL_LDE_ROWS * 2 * 8;
+                // Four buffers cover the three streamed builds' initial
+                // outputs plus the final replacement: the first build takes
+                // one from the stash as its initial output, each build swaps
+                // in the next as its replacement, and the third build's
+                // replacement is the fourth.
+                for _ in 0..4 {
+                    plonky2::hash::poseidon2::prewarm_final_digest_output(FINAL_DIGEST_BYTES);
+                }
+                plonky2::hash::poseidon2::prewarm_final_streamed_state(
+                    FINAL_STREAMED_STATE_BYTES,
+                );
+                for _ in 0..3 {
+                    plonky2::hash::poseidon2::prewarm_final_quotient_output(FINAL_QUOTIENT_BYTES);
+                }
             })
             .ok();
     }
@@ -791,9 +815,10 @@ pub(crate) fn prove_block_after_pre(
         let circuits = &circuits;
         let active_paths = &active_paths;
         std::thread::scope(|scope| {
-            // The final block circuit depends only on already-built circuit data
-            // and is not needed until the final proof, so it builds concurrently
-            // with the entire transaction/chain proving pipeline.
+            // The final block circuit depends only on static circuit data and
+            // is not needed until the final proof. The release path loads its
+            // compile-time embedding here (with runtime construction retained
+            // as a fallback), concurrently with the transaction/chain pipeline.
             // Two-phase final-block witness (H13): this lane also runs the
             // EARLY witness phase (block data + pre-proof generators) after the
             // build, then joins the heavy path — which finishes ~30 s before
@@ -827,7 +852,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -852,7 +876,7 @@ pub(crate) fn prove_block_after_pre(
                     let early = BlockCircuit::witness_inputs_early(
                         &block_target,
                         block_ref,
-                        pre_proof_ref,
+                        &pre_proof,
                     )
                     .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
@@ -861,6 +885,8 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
+                    // Every remaining stage consumes `pre_output`, not this proof.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
