@@ -174,6 +174,17 @@ const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 
+/// Shared staging buffers are populated once by the CPU and consumed only by
+/// the GPU. Write-combined caching avoids pulling those streaming stores into
+/// the CPU cache while retaining the shared-storage visibility Metal requires.
+///
+/// Do not use this for digest outputs, coefficient readback, or retained LDE
+/// columns: all of those are read by the CPU after GPU completion.
+#[inline]
+fn write_only_staging_options() -> MTLResourceOptions {
+    MTLResourceOptions::StorageModeShared | MTLResourceOptions::CPUCacheModeWriteCombined
+}
+
 struct MetalShared {
     device: Device,
     queue: CommandQueue,
@@ -3127,7 +3138,7 @@ impl MetalShared {
             {
                 set.input = Some(autoreleasepool(|| {
                     self.device
-                        .new_buffer(value_bytes as u64, MTLResourceOptions::StorageModeShared)
+                        .new_buffer(value_bytes as u64, write_only_staging_options())
                 }));
             }
             let input_buffer = set.input.as_ref().unwrap();
@@ -3434,7 +3445,7 @@ impl MetalShared {
         {
             set.input = Some(autoreleasepool(|| {
                 self.device
-                    .new_buffer(coeff_bytes as u64, MTLResourceOptions::StorageModeShared)
+                    .new_buffer(coeff_bytes as u64, write_only_staging_options())
             }));
         }
         let input_buffer = set.input.as_ref().unwrap();
@@ -3643,7 +3654,7 @@ impl MetalShared {
             set.input = Some(autoreleasepool(|| {
                 self.device.new_buffer(
                     input_bytes.max(size_of::<u64>()) as u64,
-                    MTLResourceOptions::StorageModeShared,
+                    write_only_staging_options(),
                 )
             }));
         }
@@ -3951,6 +3962,22 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn staging_buffers_are_shared_and_write_combined() {
+        let options = write_only_staging_options();
+        assert!(options.contains(MTLResourceOptions::CPUCacheModeWriteCombined));
+
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = autoreleasepool(|| device.new_buffer(64, options));
+        assert_eq!(buffer.storage_mode(), metal::MTLStorageMode::Shared);
+        assert_eq!(
+            buffer.cpu_cache_mode(),
+            metal::MTLCPUCacheMode::WriteCombined
+        );
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
