@@ -622,7 +622,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for FriBatchInfo { point, polynomials } in &instance.batches {
+        for (batch_index, FriBatchInfo { point, polynomials }) in
+            instance.batches.iter().enumerate()
+        {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -637,6 +639,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 "reduce batch of polynomials",
                 alpha.reduce_polys_base(polys_coeff)
             );
+            // The first batch has no previous accumulator to shift or add to.
+            // Reuse the composition polynomial's allocation for its quotient
+            // instead of zero-filling a second full-degree buffer and copying
+            // the quotient into it. Resetting the reducing-factor count is all
+            // the empty-accumulator path needs; computing base^count would only
+            // multiply an empty polynomial.
+            if batch_index == 0 {
+                alpha.reset();
+                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
+                continue;
+            }
             // Fused (value-exact) form of:
             //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
             //   alpha.shift_poly(&mut final_poly);
@@ -1083,6 +1096,36 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+        }
+    }
+
+    #[test]
+    fn first_batch_in_place_quotient_matches_empty_accumulator_raw_limbs() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::PrimeField64;
+
+        type F = <GoldilocksField as Extendable<2>>::Extension;
+
+        fn raw(values: &[F]) -> Vec<u64> {
+            values
+                .iter()
+                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
+                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .collect()
+        }
+
+        for &d in &[1usize, 2, 8, 127, 128, 129, 256] {
+            let composition_poly = PolynomialCoeffs::new(F::rand_vec(d));
+            let z = F::rand();
+
+            let mut expected = PolynomialCoeffs::empty();
+            accumulate_linear_quotient(&mut expected, &composition_poly, z, F::rand());
+
+            let original_buffer = composition_poly.coeffs.as_ptr();
+            let actual = composition_poly.divide_by_linear_padded_in_place(z);
+
+            assert_eq!(actual.coeffs.as_ptr(), original_buffer, "buffer moved at d={d}");
+            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs), "d={d}");
         }
     }
 
