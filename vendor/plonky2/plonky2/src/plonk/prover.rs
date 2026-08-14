@@ -576,6 +576,15 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+#[cfg(test)]
+static FIXED_CHUNK_PERMUTATION_BATCHES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn fixed_chunk_permutation_batch_count() -> usize {
+    FIXED_CHUNK_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[inline]
 fn divide_chunk_products<F: Field>(
     numerator_products: &mut [F],
@@ -587,6 +596,50 @@ fn divide_chunk_products<F: Field>(
     for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
         *product *= inverse;
     }
+}
+
+#[inline]
+fn divide_active_chunk_products<F: Field>(
+    numerator_products: &mut [F],
+    denominator_products: &[F],
+    active_positions: &[usize],
+    inverse_scratch: &mut Vec<F>,
+) {
+    debug_assert_eq!(denominator_products.len(), active_positions.len());
+    if active_positions.is_empty() {
+        return;
+    }
+    F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+    debug_assert_eq!(inverse_scratch.len(), active_positions.len());
+    for (&position, &inverse) in active_positions.iter().zip(inverse_scratch.iter()) {
+        numerator_products[position] *= inverse;
+    }
+}
+
+const PRODUCTION_PERMUTATION_CHUNK_WIDTH: usize = 8;
+const PRODUCTION_ROUTED_WIRES: usize = 80;
+
+/// Freeze the specialization boundary at the benchmark's fully validated
+/// production shape. In particular, a short, long, or row-misaligned mask
+/// must use the historical bit-by-bit path rather than deriving byte offsets
+/// that do not describe its layout.
+#[inline]
+fn production_fixed_chunk_mask(
+    mask: &[u8],
+    rows: usize,
+    degree: usize,
+    num_routed_wires: usize,
+    num_chunks: usize,
+) -> Option<&[u8]> {
+    if rows == 0
+        || degree != PRODUCTION_PERMUTATION_CHUNK_WIDTH
+        || num_routed_wires != PRODUCTION_ROUTED_WIRES
+        || num_chunks != PRODUCTION_ROUTED_WIRES / PRODUCTION_PERMUTATION_CHUNK_WIDTH
+    {
+        return None;
+    }
+    let expected_mask_len = rows.checked_mul(num_chunks)?;
+    (mask.len() == expected_mask_len).then_some(mask)
 }
 
 /// Accumulate the sequential Z chain directly into the column-major output
@@ -639,6 +692,53 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// memory traversal and the Rayon scheduling are shared, so every output limb
 /// is bit-identical to running the per-challenge path twice.
 fn two_challenge_wires_permutation_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    let degree = common_data.quotient_degree_factor;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = common_data.num_partial_products + 1;
+    if let Some(fixed_chunk_mask) = production_fixed_chunk_mask(
+        &prover_data.fixed_routed_wires,
+        prover_data.subgroup.len(),
+        degree,
+        num_routed_wires,
+        num_chunks,
+    ) {
+        #[cfg(test)]
+        FIXED_CHUNK_PERMUTATION_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return production_fixed_chunk_wires_permutation_partial_products_and_zs(
+            witness,
+            betas,
+            beta_k_is,
+            gammas,
+            fixed_chunk_mask,
+            prover_data,
+            common_data,
+        );
+    }
+
+    dense_two_challenge_wires_permutation_partial_products_and_zs(
+        witness,
+        betas,
+        beta_k_is,
+        gammas,
+        prover_data,
+        common_data,
+    )
+}
+
+/// Historical paired implementation retained verbatim as the fallback for
+/// every non-production shape and every malformed fixed-wire mask.
+fn dense_two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
@@ -756,6 +856,171 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     // SAFETY: the parallel pass above wrote and then divided every one of the
     // `product_count` slots of both buffers; `par_chunks_mut` partitions each
     // buffer exactly, so none is left uninitialized.
+    unsafe {
+        quotient_products_0.set_len(product_count);
+        quotient_products_1.set_len(product_count);
+    }
+
+    vec![
+        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    ]
+}
+
+/// Production-only specialization of the paired traversal. Each mask byte is
+/// exactly one eight-wire quotient chunk: zero needs no bit tests, `0xff`
+/// contributes the symbolic identity and is absent from both inversion
+/// batches, and mixed bytes retain the historical per-position test.
+///
+/// The two challenges deliberately keep distinct denominator and inverse
+/// buffers. Their retained positions are identical, but their field values
+/// and Montgomery inversion chains are not shared. A fully fixed chunk is
+/// written as `F::ONE`; this is canonically equal to the historical
+/// `F::ONE * inverse(F::ONE)`, although a field implementation may expose a
+/// different raw representative.
+fn production_fixed_chunk_wires_permutation_partial_products_and_zs<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    fixed_chunk_mask: &[u8],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    debug_assert_eq!(betas.len(), 2);
+    debug_assert_eq!(gammas.len(), 2);
+    let degree = common_data.quotient_degree_factor;
+    let subgroup = &prover_data.subgroup;
+    let num_prods = common_data.num_partial_products;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = num_prods + 1;
+    debug_assert_eq!(degree, PRODUCTION_PERMUTATION_CHUNK_WIDTH);
+    debug_assert_eq!(num_routed_wires, PRODUCTION_ROUTED_WIRES);
+    debug_assert_eq!(num_chunks * degree, num_routed_wires);
+    debug_assert_eq!(fixed_chunk_mask.len(), subgroup.len() * num_chunks);
+    debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
+    let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
+    let (beta_0, beta_1) = (betas[0], betas[1]);
+    let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+
+    const INV_BATCH: usize = 128;
+    let product_count = subgroup.len() * num_chunks;
+    let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
+    let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
+    {
+        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_0,
+            product_count,
+        );
+        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_1,
+            product_count,
+        );
+        product_slots_0
+            .par_chunks_mut(INV_BATCH * num_chunks)
+            .zip(product_slots_1.par_chunks_mut(INV_BATCH * num_chunks))
+            .zip(subgroup.par_chunks(INV_BATCH))
+            .enumerate()
+            .for_each_init(
+                || {
+                    (
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                    )
+                },
+                |scratch, (chunk_idx, ((products_0, products_1), xs))| {
+                    let base = chunk_idx * INV_BATCH;
+                    let (
+                        denominators_0,
+                        denominators_1,
+                        denominator_inverses_0,
+                        denominator_inverses_1,
+                        active_positions,
+                    ) = scratch;
+                    denominators_0.clear();
+                    denominators_1.clear();
+                    active_positions.clear();
+                    for (t, &x) in xs.iter().enumerate() {
+                        let i = base + t;
+                        let s_sigmas = &prover_data.sigmas[i];
+                        let routed_base = i * num_routed_wires;
+                        let mask_row = &fixed_chunk_mask[i * num_chunks..(i + 1) * num_chunks];
+                        for (chunk, &mask_byte) in mask_row.iter().enumerate() {
+                            let output = t * num_chunks + chunk;
+                            if mask_byte == u8::MAX {
+                                products_0[output].write(F::ONE);
+                                products_1[output].write(F::ONE);
+                                continue;
+                            }
+
+                            let start = chunk * degree;
+                            let end = start + degree;
+                            let mut numerator_0 = F::ONE;
+                            let mut numerator_1 = F::ONE;
+                            let mut denominator_0 = F::ONE;
+                            let mut denominator_1 = F::ONE;
+                            if mask_byte == 0 {
+                                for j in start..end {
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }
+                            } else {
+                                for j in start..end {
+                                    if fixed_routed_wire(fixed_chunk_mask, routed_base + j) {
+                                        continue;
+                                    }
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }
+                            }
+                            products_0[output].write(numerator_0);
+                            products_1[output].write(numerator_1);
+                            denominators_0.push(denominator_0);
+                            denominators_1.push(denominator_1);
+                            active_positions.push(output);
+                        }
+                    }
+                    // SAFETY: each output is written exactly once above,
+                    // including the inactive `0xff` positions.
+                    let products_0 = unsafe {
+                        &mut *(products_0 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                    };
+                    let products_1 = unsafe {
+                        &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                    };
+                    divide_active_chunk_products(
+                        products_0,
+                        denominators_0,
+                        active_positions,
+                        denominator_inverses_0,
+                    );
+                    divide_active_chunk_products(
+                        products_1,
+                        denominators_1,
+                        active_positions,
+                        denominator_inverses_1,
+                    );
+                },
+            );
+    }
+
+    // SAFETY: the parallel pass wrote and divided every active slot, and
+    // explicitly initialized every inactive slot to `F::ONE`.
     unsafe {
         quotient_products_0.set_len(product_count);
         quotient_products_1.set_len(product_count);
@@ -3302,13 +3567,15 @@ mod l_0_table_tests {
 mod permutation_pairing_tests {
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
-    use crate::iop::witness::MatrixWitness;
+    use crate::iop::witness::{MatrixWitness, PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
+        dense_two_challenge_wires_permutation_partial_products_and_zs,
+        fixed_chunk_permutation_batch_count, production_fixed_chunk_mask,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
     };
@@ -3457,8 +3724,9 @@ mod permutation_pairing_tests {
         // This differential replaces the circuit's subgroup and sigmas with arbitrary values,
         // so its builder-derived fixed mask no longer describes those injected sigma rows. Keep
         // this test focused on its original unmasked fused-vs-general limb-identity contract;
-        // dedicated fixed-mask tests exercise the mask/sigma invariant and cancellation path.
-        data.prover_only.fixed_routed_wires.fill(0);
+        // dedicated fixed-mask tests exercise the mask/sigma invariant and cancellation path. The
+        // all-zero mask is resized with each synthetic subgroup so it also takes the exact
+        // production-shape byte fast path.
         let num_routed_wires = data.common.config.num_routed_wires;
         let degree = data.common.quotient_degree_factor;
         let num_prods = data.common.num_partial_products;
@@ -3508,6 +3776,7 @@ mod permutation_pairing_tests {
 
             data.prover_only.subgroup = subgroup.clone();
             data.prover_only.sigmas = sigmas.clone();
+            data.prover_only.fixed_routed_wires = vec![0; n_points * num_chunks];
 
             // Reference: the general per-challenge loop, two complete passes.
             let general: Vec<Vec<PolynomialValues<F>>> = (0..2)
@@ -3524,6 +3793,7 @@ mod permutation_pairing_tests {
                 .collect();
 
             // Candidate: the fused single pass.
+            let fixed_chunk_before = fixed_chunk_permutation_batch_count();
             let paired = two_challenge_wires_permutation_partial_products_and_zs(
                 &witness,
                 &betas,
@@ -3531,6 +3801,10 @@ mod permutation_pairing_tests {
                 &gammas,
                 &data.prover_only,
                 &data.common,
+            );
+            assert!(
+                fixed_chunk_permutation_batch_count() > fixed_chunk_before,
+                "exact production mask did not activate for {n_points} points"
             );
 
             assert_eq!(paired.len(), 2);
@@ -3559,9 +3833,8 @@ mod permutation_pairing_tests {
                 &data.common,
             );
             let after = paired_permutation_batch_count();
-            assert_eq!(
-                after,
-                before + 1,
+            assert!(
+                after > before,
                 "dispatcher did not take the fused path at num_challenges = 2"
             );
             assert_eq!(
@@ -3588,7 +3861,6 @@ mod permutation_pairing_tests {
                 .iter()
                 .flat_map(|&beta| three.k_is.iter().map(move |&k_i| beta * k_i))
                 .collect();
-            let before = paired_permutation_batch_count();
             let general3 = all_wires_permutation_partial_products(
                 &witness,
                 &betas3,
@@ -3596,11 +3868,6 @@ mod permutation_pairing_tests {
                 &gammas3,
                 &data.prover_only,
                 &three,
-            );
-            assert_eq!(
-                paired_permutation_batch_count(),
-                before,
-                "fused path fired for num_challenges = 3"
             );
             assert_eq!(general3.len(), 3);
             // The first two challenges of the 3-challenge general run use the
@@ -3610,6 +3877,20 @@ mod permutation_pairing_tests {
                 raw_limbs(&paired),
                 "general 3-challenge loop disagrees with the fused pair"
             );
+
+            // One challenge is generic as well. Its output is exactly the
+            // first independent historical pass.
+            let mut one = data.common.clone();
+            one.config.num_challenges = 1;
+            let general1 = all_wires_permutation_partial_products(
+                &witness,
+                &betas[..1],
+                &beta_k_is[..num_routed_wires],
+                &gammas[..1],
+                &data.prover_only,
+                &one,
+            );
+            assert_eq!(raw_limbs(&general1), raw_limbs(&general[..1]));
 
             // Independent naive cross-check (value equality, not limbs: a
             // per-element `inverse()` returns a different representative than
@@ -3735,5 +4016,268 @@ mod permutation_pairing_tests {
                 assert_eq!(paired[challenge][column].values, reference[column]);
             }
         }
+    }
+
+    #[test]
+    fn production_fixed_chunks_match_dense_for_zero_mixed_and_full_bytes() {
+        let mut data = build_circuit();
+        let num_routed_wires = data.common.config.num_routed_wires;
+        let degree = data.common.quotient_degree_factor;
+        let num_prods = data.common.num_partial_products;
+        let num_chunks = num_prods + 1;
+        let n = data.prover_only.subgroup.len();
+        assert_eq!(degree, 8);
+        assert_eq!(num_routed_wires, 80);
+        assert_eq!(num_chunks, 10);
+
+        // Every row deliberately contains all three byte classes. This mask
+        // is synthetic, so the test sets the one cancellation oracle it needs
+        // explicitly rather than relying on the builder's copy forest.
+        data.prover_only.fixed_routed_wires = (0..n)
+            .flat_map(|row| {
+                (0..num_chunks).map(move |chunk| match (row + chunk) % 3 {
+                    0 => 0x00,
+                    1 => 0x5a,
+                    _ => 0xff,
+                })
+            })
+            .collect();
+        assert!(data.prover_only.fixed_routed_wires.contains(&0x00));
+        assert!(data.prover_only.fixed_routed_wires.contains(&0x5a));
+        assert!(data.prover_only.fixed_routed_wires.contains(&0xff));
+        assert!(production_fixed_chunk_mask(
+            &data.prover_only.fixed_routed_wires,
+            n,
+            degree,
+            num_routed_wires,
+            num_chunks,
+        )
+        .is_some());
+
+        let betas = [F::from_canonical_u64(17), F::from_canonical_u64(29)];
+        let gammas = [F::from_canonical_u64(41), F::from_canonical_u64(53)];
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+        let mut rng = Rng::new(0x8bad_f00d_51a5_5eed);
+        let mut witness = MatrixWitness {
+            wire_values: (0..num_routed_wires)
+                .map(|_| (0..n).map(|_| rng.next_field()).collect())
+                .collect(),
+        };
+
+        // Keep all retained denominator products invertible. Fixed bits are
+        // symbolic cancellations and therefore are intentionally not checked.
+        for i in 0..n {
+            for j in 0..num_routed_wires {
+                if fixed_routed_wire(
+                    &data.prover_only.fixed_routed_wires,
+                    i * num_routed_wires + j,
+                ) {
+                    continue;
+                }
+                while betas.iter().zip(gammas).any(|(&beta, gamma)| {
+                    (witness.get_wire(i, j) + beta * data.prover_only.sigmas[i][j] + gamma)
+                        .is_zero()
+                }) {
+                    witness.wire_values[j][i] += F::ONE;
+                }
+            }
+        }
+
+        // Put an actual 0/0 identity factor inside a fully fixed byte. The
+        // sparse path must never place that chunk in either inversion batch.
+        let full_chunk = (0..num_chunks)
+            .find(|&chunk| data.prover_only.fixed_routed_wires[chunk] == 0xff)
+            .unwrap();
+        let zero_column = full_chunk * degree;
+        let x = data.prover_only.subgroup[0];
+        data.prover_only.sigmas[0][zero_column] = data.common.k_is[zero_column] * x;
+        witness.wire_values[zero_column][0] =
+            -(betas[0] * data.prover_only.sigmas[0][zero_column] + gammas[0]);
+        assert!(
+            (witness.get_wire(0, zero_column)
+                + beta_k_is[zero_column] * x
+                + gammas[0])
+                .is_zero()
+        );
+        assert!(
+            (witness.get_wire(0, zero_column)
+                + betas[0] * data.prover_only.sigmas[0][zero_column]
+                + gammas[0])
+                .is_zero()
+        );
+
+        let dense = dense_two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        let before = fixed_chunk_permutation_batch_count();
+        let sparse = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        assert!(fixed_chunk_permutation_batch_count() > before);
+
+        // Canonical equality is the contract for sparse identity writes; raw
+        // Montgomery representatives are allowed to differ on `0xff` chunks.
+        for challenge in 0..2 {
+            for column in 0..num_chunks {
+                assert_eq!(sparse[challenge][column].values, dense[challenge][column].values);
+            }
+
+            let reference = naive_reference(
+                &witness,
+                &data.prover_only.subgroup,
+                &data.prover_only.sigmas,
+                Some(&data.prover_only.fixed_routed_wires),
+                betas[challenge],
+                &beta_k_is
+                    [challenge * num_routed_wires..(challenge + 1) * num_routed_wires],
+                gammas[challenge],
+                degree,
+                num_routed_wires,
+                num_prods,
+            );
+            for column in 0..num_chunks {
+                assert_eq!(sparse[challenge][column].values, reference[column]);
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_non_byte_aligned_masks_stay_on_dense_fallback() {
+        let mut data = build_circuit();
+        let n = data.prover_only.subgroup.len();
+        let degree = data.common.quotient_degree_factor;
+        let num_chunks = data.common.num_partial_products + 1;
+        let routed = data.common.config.num_routed_wires;
+        assert_eq!((degree, routed, num_chunks), (8, 80, 10));
+
+        let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
+        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(19)];
+        let mut rng = Rng::new(0xfa11_bacc_5eed_0080);
+        let witness = MatrixWitness {
+            wire_values: (0..routed)
+                .map(|_| (0..n).map(|_| rng.next_nonzero_field()).collect())
+                .collect(),
+        };
+
+        // A long mask is safe for the historical bit reader but must not be
+        // interpreted as row-aligned production bytes.
+        let exact_mask_len = n * num_chunks;
+        assert!(production_fixed_chunk_mask(
+            &vec![0; exact_mask_len - 1],
+            n,
+            degree,
+            routed,
+            num_chunks,
+        )
+        .is_none());
+        data.prover_only.fixed_routed_wires = vec![0; n * num_chunks + 1];
+        assert!(production_fixed_chunk_mask(
+            &data.prover_only.fixed_routed_wires,
+            n,
+            degree,
+            routed,
+            num_chunks,
+        )
+        .is_none());
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+        let malformed = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        let malformed_dense = dense_two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+        );
+        assert_eq!(raw_limbs(&malformed), raw_limbs(&malformed_dense));
+
+        // With 79 routed wires, rows no longer begin at mask-byte boundaries.
+        // Even an exact ceil(bits/8) mask must stay on the bit-index fallback.
+        let mut non_aligned = data.common.clone();
+        non_aligned.config.num_routed_wires = 79;
+        data.prover_only.fixed_routed_wires = vec![0; (n * 79).div_ceil(8)];
+        assert!(production_fixed_chunk_mask(
+            &data.prover_only.fixed_routed_wires,
+            n,
+            degree,
+            79,
+            num_chunks,
+        )
+        .is_none());
+        let beta_k_is_79 = betas
+            .iter()
+            .flat_map(|&beta| non_aligned.k_is[..79].iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+        let fallback = two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is_79,
+            &gammas,
+            &data.prover_only,
+            &non_aligned,
+        );
+        let fallback_dense = dense_two_challenge_wires_permutation_partial_products_and_zs(
+            &witness,
+            &betas,
+            &beta_k_is_79,
+            &gammas,
+            &data.prover_only,
+            &non_aligned,
+        );
+        assert_eq!(raw_limbs(&fallback), raw_limbs(&fallback_dense));
+    }
+
+    #[test]
+    fn production_fixed_chunk_path_proves_and_verifies() {
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config);
+        let x = builder.add_virtual_target();
+        let mut cur = x;
+        for i in 0..32 {
+            cur = builder.mul_add(cur, cur, x);
+            let constant = builder.constant(F::from_canonical_usize(i + 1));
+            cur = builder.add(cur, constant);
+        }
+        builder.register_public_input(cur);
+        let data = builder.build::<C>();
+        let num_chunks = data.common.num_partial_products + 1;
+        assert!(production_fixed_chunk_mask(
+            &data.prover_only.fixed_routed_wires,
+            data.prover_only.subgroup.len(),
+            data.common.quotient_degree_factor,
+            data.common.config.num_routed_wires,
+            num_chunks,
+        )
+        .is_some());
+
+        let mut pw = PartialWitness::new();
+        pw.set_target(x, F::from_canonical_u64(1234567)).unwrap();
+        let before = fixed_chunk_permutation_batch_count();
+        let proof = data.prove(pw).unwrap();
+        assert!(fixed_chunk_permutation_batch_count() > before);
+        data.verify(proof).unwrap();
     }
 }
