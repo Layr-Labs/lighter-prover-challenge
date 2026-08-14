@@ -5,6 +5,8 @@ use plonky2_field::ops::Square;
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField as F;
+#[cfg(target_arch = "aarch64")]
+use crate::field::goldilocks_field::mul_reduce_pair;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
 use crate::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS, RichField};
@@ -603,7 +605,23 @@ impl Poseidon2 for F {
         d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
     }
 
+    /// x^7 for the single lane the partial rounds touch.
+    ///
+    /// `a^4 = a^2 * a^2` and `a^3 = a * a^2` are independent, so on AArch64 the
+    /// two products share one `mul_reduce_pair` block -- the same
+    /// nine-instruction multiply-reduce kernel the packed field uses, computing
+    /// bit-for-bit the same intermediates as the `reduce128` chain behind `Mul`,
+    /// so the raw `u64` representative is unchanged.
     #[inline]
+    #[cfg(target_arch = "aarch64")]
+    fn sbox_p(a: &Self) -> Self {
+        let a2 = a.square();
+        let (a4, a3) = mul_reduce_pair(a2.0, a2.0, a.0, a2.0);
+        Self(a3) * Self(a4)
+    }
+
+    #[inline]
+    #[cfg(not(target_arch = "aarch64"))]
     fn sbox_p(a: &Self) -> Self {
         let a2 = a.square();
         let a4 = a2.square();
