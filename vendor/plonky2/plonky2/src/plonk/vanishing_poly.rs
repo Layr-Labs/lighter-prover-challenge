@@ -280,23 +280,29 @@ pub(crate) fn interleave_pair_plan<F: RichField + Extendable<D>, const D: usize>
         })
 }
 
-/// Computes one selector filter column in the same factor order as
-/// `Gate::eval_filtered_base_batch` without consuming the constants prefix.
-fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-    vars_batch: EvaluationVarsBaseBatch<F>,
+/// Computes every live CPU gate's selector filter group-wise.
+///
+/// The default filtered-gate path evaluates, for every gate `i`,
+/// `product_{j != i} (j - selector)`. Repeating that independently for all
+/// gates in a selector group costs quadratic field work. Here the forward
+/// pass stores each gate's prefix product and the reverse pass carries the
+/// suffix product, so the complete group is linear in its size. Filters for
+/// gates replaced by a GPU quotient backend are not finalized, although their
+/// factors remain in the prefix/suffix products required by neighboring CPU
+/// gates.
+///
+/// `gate_filters` is gate-major; `suffix` is one reusable batch-sized scratch
+/// column.
+fn fill_single_gate_filter<F: RichField>(
+    selector_col: &[F],
     gate_index: usize,
+    group: core::ops::Range<usize>,
+    include_unused: bool,
     output: &mut [F],
 ) {
-    let batch_size = vars_batch.len();
-    debug_assert_eq!(output.len(), batch_size);
-    let selector_index = common_data.selectors_info.selector_indices[gate_index];
-    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-    let mut factors = common_data.selectors_info.groups[selector_index]
-        .clone()
+    let mut factors = group
         .filter(|&index| index != gate_index)
-        .chain((common_data.selectors_info.num_selectors() > 1).then_some(UNUSED_SELECTOR));
-
+        .chain(include_unused.then_some(UNUSED_SELECTOR));
     if let Some(index) = factors.next() {
         let constant = F::from_canonical_usize(index);
         for (filter, &selector) in output.iter_mut().zip(selector_col) {
@@ -309,6 +315,127 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
         let constant = F::from_canonical_usize(index);
         for (filter, &selector) in output.iter_mut().zip(selector_col) {
             *filter *= constant - selector;
+        }
+    }
+}
+
+fn fill_selector_group_filters<F: RichField>(
+    selector_col: &[F],
+    group: core::ops::Range<usize>,
+    include_unused: bool,
+    active_gate_indices: &[usize],
+    gate_filters: &mut [F],
+    suffix: &mut [F],
+) {
+    let batch_size = selector_col.len();
+    debug_assert!(!group.is_empty());
+    debug_assert_eq!(suffix.len(), batch_size);
+    debug_assert!(gate_filters.len() >= group.end * batch_size);
+    debug_assert!(active_gate_indices.windows(2).all(|pair| pair[0] < pair[1]));
+    debug_assert!(
+        active_gate_indices
+            .iter()
+            .all(|&index| group.contains(&index))
+    );
+
+    // Prefix for the first gate is the empty product. Later prefixes are
+    // built from the preceding prefix and preceding gate factor.
+    gate_filters[group.start * batch_size..(group.start + 1) * batch_size].fill(F::ONE);
+    for gate_index in group.start + 1..group.end {
+        let split = gate_index * batch_size;
+        let (before, after) = gate_filters.split_at_mut(split);
+        let previous_prefix = &before[(gate_index - 1) * batch_size..][..batch_size];
+        let current_prefix = &mut after[..batch_size];
+        let factor_constant = F::from_canonical_usize(gate_index - 1);
+        for point in 0..batch_size {
+            current_prefix[point] =
+                previous_prefix[point] * (factor_constant - selector_col[point]);
+        }
+    }
+
+    if include_unused {
+        let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+        for point in 0..batch_size {
+            suffix[point] = unused - selector_col[point];
+        }
+    } else {
+        suffix.fill(F::ONE);
+    }
+
+    // Both inputs are ordered, so one reverse cursor replaces a linear
+    // membership search for every gate in this hot loop.
+    let mut active_cursor = active_gate_indices.len();
+    for gate_index in group.clone().rev() {
+        if active_cursor != 0 && active_gate_indices[active_cursor - 1] == gate_index {
+            active_cursor -= 1;
+            let output =
+                &mut gate_filters[gate_index * batch_size..(gate_index + 1) * batch_size];
+            if gate_index == group.start {
+                // The prefix is the empty product, so copying also avoids an
+                // unnecessary multiply by one for single-gate groups.
+                output.copy_from_slice(suffix);
+            } else if include_unused || gate_index + 1 != group.end {
+                for point in 0..batch_size {
+                    output[point] *= suffix[point];
+                }
+            }
+        }
+
+        // No earlier gate needs the first factor once its output has been
+        // finalized.
+        if gate_index != group.start {
+            let factor_constant = F::from_canonical_usize(gate_index);
+            for point in 0..batch_size {
+                suffix[point] *= factor_constant - selector_col[point];
+            }
+        }
+    }
+    debug_assert_eq!(active_cursor, 0);
+}
+
+fn fill_all_gate_filters_base_batch<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    cpu_gate_indices: &[usize],
+    filters: &mut Vec<F>,
+) {
+    let batch_size = vars_batch.len();
+    let num_gates = common_data.gates.len();
+    // `QuotientScratch` retains this allocation across batches. `resize`
+    // therefore initializes storage only on the first or a larger batch;
+    // every live filter and the suffix workspace are overwritten below.
+    filters.resize((num_gates + 1) * batch_size, F::ZERO);
+    let (gate_filters, suffix) = filters.split_at_mut(num_gates * batch_size);
+    let include_unused = common_data.selectors_info.num_selectors() > 1;
+    debug_assert!(cpu_gate_indices.windows(2).all(|pair| pair[0] < pair[1]));
+
+    for (selector_index, group) in common_data.selectors_info.groups.iter().enumerate() {
+        let selector_col =
+            &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+        let active_start = cpu_gate_indices.partition_point(|&index| index < group.start);
+        let active_end = cpu_gate_indices.partition_point(|&index| index < group.end);
+        let active_gate_indices = &cpu_gate_indices[active_start..active_end];
+        if active_gate_indices.len() >= 3 {
+            fill_selector_group_filters(
+                selector_col,
+                group.clone(),
+                include_unused,
+                active_gate_indices,
+                gate_filters,
+                suffix,
+            );
+        } else {
+            for &gate_index in active_gate_indices {
+                let output = &mut gate_filters
+                    [gate_index * batch_size..(gate_index + 1) * batch_size];
+                fill_single_gate_filter(
+                    selector_col,
+                    gate_index,
+                    group.clone(),
+                    include_unused,
+                    output,
+                );
+            }
         }
     }
 }
@@ -1467,31 +1594,24 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
     constraints_batch.clear();
     constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
+    fill_all_gate_filters_base_batch(common_data, vars_batch, cpu_gate_indices, filters);
+    let num_gates = common_data.gates.len();
+    let batch_size = vars_batch.len();
+    let (gate_filters, filter_workspace) = filters.split_at_mut(num_gates * batch_size);
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
-                filters.clear();
-                filters.resize(3 * vars_batch.len(), F::ZERO);
-                let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
-                let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.interleave_index,
-                    interleave_filter,
-                );
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.uninterleave_index,
-                    uninterleave_filter,
-                );
-                for point in 0..vars_batch.len() {
+                let interleave_filter = &gate_filters
+                    [plan.interleave_index * batch_size..(plan.interleave_index + 1) * batch_size];
+                let uninterleave_filter = &gate_filters[plan.uninterleave_index * batch_size
+                    ..(plan.uninterleave_index + 1) * batch_size];
+                let summed_filter = &mut filter_workspace[..batch_size];
+                for point in 0..batch_size {
                     summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
                 }
                 eval_interleave_pair_dense_fused(
                     vars_batch.local_wires,
-                    vars_batch.len(),
+                    batch_size,
                     interleave_filter,
                     uninterleave_filter,
                     summed_filter,
@@ -1504,15 +1624,14 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
             }
         }
         let gate = &common_data.gates[i];
-        let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
-            vars_batch,
-            i,
-            selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
-            common_data.selectors_info.num_selectors(),
-            common_data.num_lookup_selectors,
-            filters,
+        let gate_filter = &gate_filters[i * batch_size..(i + 1) * batch_size];
+        let mut unfiltered_vars = vars_batch;
+        unfiltered_vars.remove_prefix(
+            common_data.selectors_info.num_selectors() + common_data.num_lookup_selectors,
+        );
+        gate.0.eval_unfiltered_base_batch_accumulate(
+            unfiltered_vars,
+            gate_filter,
             constraints_batch,
         );
     }
@@ -1730,6 +1849,108 @@ mod tests {
     use plonky2_field::types::PrimeField64;
 
     use super::*;
+
+    fn reference_selector_filter(
+        selector: GoldilocksField,
+        gate_index: usize,
+        group: core::ops::Range<usize>,
+        include_unused: bool,
+    ) -> GoldilocksField {
+        let mut factors = group
+            .filter(|&index| index != gate_index)
+            .chain(include_unused.then_some(UNUSED_SELECTOR));
+        let Some(first) = factors.next() else {
+            return GoldilocksField::ONE;
+        };
+        let mut filter = GoldilocksField::from_canonical_usize(first) - selector;
+        for index in factors {
+            filter *= GoldilocksField::from_canonical_usize(index) - selector;
+        }
+        filter
+    }
+
+    #[test]
+    fn groupwise_selector_filters_match_independent_gate_filters() {
+        type F = GoldilocksField;
+        const BATCH_SIZE: usize = 32;
+        const NUM_GATES: usize = 11;
+
+        let groups = [0..1, 1..4, 4..NUM_GATES];
+        let active = [0usize, 2, 4, 5, 7, 10];
+        let mut state = 0x6a09_e667_f3bc_c909u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            GoldilocksField(state)
+        };
+        let selector_columns = (0..groups.len() * BATCH_SIZE)
+            .map(|_| next())
+            .collect::<Vec<_>>();
+        let mut filters = vec![F::ZERO; NUM_GATES * BATCH_SIZE];
+        let mut suffix = vec![F::ZERO; BATCH_SIZE];
+
+        for (selector_index, group) in groups.iter().enumerate() {
+            let selector_col =
+                &selector_columns[selector_index * BATCH_SIZE..][..BATCH_SIZE];
+            let active_in_group = active
+                .iter()
+                .copied()
+                .filter(|index| group.contains(index))
+                .collect::<Vec<_>>();
+            fill_selector_group_filters(
+                selector_col,
+                group.clone(),
+                true,
+                &active_in_group,
+                &mut filters,
+                &mut suffix,
+            );
+            for gate_index in group.clone().filter(|index| active.contains(index)) {
+                for point in 0..BATCH_SIZE {
+                    let expected = reference_selector_filter(
+                        selector_col[point],
+                        gate_index,
+                        group.clone(),
+                        true,
+                    );
+                    assert_eq!(
+                        filters[gate_index * BATCH_SIZE + point].to_canonical_u64(),
+                        expected.to_canonical_u64(),
+                        "multi-selector mismatch for gate {gate_index}, point {point}"
+                    );
+                }
+            }
+        }
+
+        // The single-selector branch has no inactive sentinel factor and must
+        // still produce the empty product for a one-gate group.
+        let selector_col = &selector_columns[..BATCH_SIZE];
+        let all_active = (0..NUM_GATES).collect::<Vec<_>>();
+        fill_selector_group_filters(
+            selector_col,
+            0..NUM_GATES,
+            false,
+            &all_active,
+            &mut filters,
+            &mut suffix,
+        );
+        for gate_index in 0..NUM_GATES {
+            for point in 0..BATCH_SIZE {
+                let expected = reference_selector_filter(
+                    selector_col[point],
+                    gate_index,
+                    0..NUM_GATES,
+                    false,
+                );
+                assert_eq!(
+                    filters[gate_index * BATCH_SIZE + point].to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "single-selector mismatch for gate {gate_index}, point {point}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
