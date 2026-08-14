@@ -410,6 +410,86 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     pub fn full_witness(self) -> MatrixWitness<F> {
+        // The six production circuits all use 136 wires and one of these three
+        // degrees. Keep every other shape, including the zero-sized edge case,
+        // on the established row-chunk traversal.
+        if self.num_wires == 136 && matches!(self.degree, 16_384 | 65_536 | 262_144) {
+            self.full_witness_column_tiles()
+        } else {
+            self.full_witness_row_chunks()
+        }
+    }
+
+    /// Materialize the production witness in complete, disjoint column tiles.
+    ///
+    /// The prior row-chunk traversal gives every worker a row range spanning all
+    /// 136 output columns, so each core interleaves stores across 136 allocation
+    /// streams. Here each Rayon task owns at most sixteen complete columns. For
+    /// every row it reads the corresponding contiguous sixteen-entry slice of
+    /// the row-major representative map, then advances the same bounded set of
+    /// column streams. The last tile owns exactly eight columns.
+    fn full_witness_column_tiles(self) -> MatrixWitness<F> {
+        const TILE_COLUMNS: usize = 16;
+
+        let num_wires = self.num_wires;
+        let degree = self.degree;
+        debug_assert_eq!(num_wires, 136);
+        debug_assert!(cfg!(test) || matches!(degree, 16_384 | 65_536 | 262_144));
+
+        let mut wire_values: Vec<Vec<F>> = (0..num_wires)
+            .map(|_| Vec::with_capacity(degree))
+            .collect();
+
+        use plonky2_maybe_rayon::*;
+        wire_values
+            .par_chunks_mut(TILE_COLUMNS)
+            .enumerate()
+            .for_each(|(tile_index, tile)| {
+                let tile_start = tile_index * TILE_COLUMNS;
+                debug_assert_eq!(tile.len(), TILE_COLUMNS.min(num_wires - tile_start));
+
+                // Each span covers the complete spare-capacity prefix of one
+                // output column. The tile owns these Vecs exclusively.
+                let mut columns: Vec<&mut [core::mem::MaybeUninit<F>]> = tile
+                    .iter_mut()
+                    .map(|column| {
+                        crate::hash::merkle_tree::capacity_up_to_mut(column, degree)
+                    })
+                    .collect();
+
+                for row in 0..degree {
+                    let row_start = row * num_wires + tile_start;
+                    for (j, column) in columns.iter_mut().enumerate() {
+                        let rep = self.representative_map[row_start + j] as usize;
+                        // Identical bitmap-zero semantics to the row-chunk path:
+                        // unset representatives must never read their uninitialized
+                        // value slot and materialize as F::ZERO.
+                        let value = if self.is_set_by_rep_index(rep) {
+                            self.values[rep]
+                        } else {
+                            F::ZERO
+                        };
+                        column[row].write(value);
+                    }
+                }
+
+                // No Vec length changes until every cell of every column in this
+                // tile is initialized. If this fill unwinds, all lengths in
+                // this tile remain zero and its uninitialized spare capacity
+                // is never dropped. Previously completed tiles remain valid.
+                drop(columns);
+                for column in tile.iter_mut() {
+                    // SAFETY: the nested row/column loops above initialized each
+                    // of this column's `degree` slots exactly once. This tile is
+                    // the sole owner of the column, and set_len cannot unwind.
+                    unsafe { column.set_len(degree) };
+                }
+            });
+
+        MatrixWitness { wire_values }
+    }
+
+    fn full_witness_row_chunks(self) -> MatrixWitness<F> {
         // Single fused pass, parallel over row chunks. Cell (column j, row i)
         // is `values[representative_map[i * num_wires + j]]` (unset slots hold
         // `F::ZERO` in the dense `values` vector), with `Target::index`'s
@@ -512,5 +592,108 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod ev_column_tile_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field64;
+    use crate::hash::merkle_tree::MerkleTree;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = GoldilocksField;
+
+    /// Exact raw-field differential for the traversal seam. The synthetic
+    /// representative map intentionally aliases slots, and its bitmap leaves a
+    /// deterministic subset unset even though every backing `values` slot has a
+    /// nonzero poison value. This proves that both traversals preserve raw field
+    /// values, aliases and the bitmap-zero rule. A complete column-store Merkle
+    /// cap then checks the first downstream consumer's view of every matrix cell.
+    #[test]
+    #[ignore = "focused EV raw-field/alias/unset/downstream-cap oracle"]
+    fn ev_column_tiles_match_row_chunks_and_downstream_cap() {
+        const NUM_WIRES: usize = 136;
+        const DEGREE: usize = 64;
+        const TILE_COLUMNS: usize = 16;
+
+        let len = NUM_WIRES * DEGREE;
+        let representative_map = (0..len)
+            .map(|i| ((i * 17 + i / 7) % (len / 3)) as u32)
+            .collect::<Vec<_>>();
+        let raw_value = |i: usize| match i % 8 {
+            0 => F::ORDER,
+            1 => F::ORDER + 1,
+            2 => u64::MAX,
+            _ => (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+        };
+        let values = (0..len)
+            .map(|i| F::from_noncanonical_u64(raw_value(i)))
+            .collect::<Vec<_>>();
+        let mut set_bitmap = vec![0u64; len.div_ceil(64)];
+        for rep in 0..len {
+            if rep % 5 != 0 {
+                set_bitmap[rep >> 6] |= 1u64 << (rep & 63);
+            }
+        }
+
+        let witness = PartitionWitness {
+            values,
+            set_bitmap,
+            representative_map: &representative_map,
+            num_wires: NUM_WIRES,
+            degree: DEGREE,
+        };
+        let row_chunks = witness.clone().full_witness_row_chunks();
+        let column_tiles = witness.full_witness_column_tiles();
+
+        assert_eq!(row_chunks.wire_values, column_tiles.wire_values);
+        assert_eq!(column_tiles.wire_values.len(), NUM_WIRES);
+        assert_eq!(NUM_WIRES / TILE_COLUMNS, 8);
+        assert_eq!(NUM_WIRES % TILE_COLUMNS, 8);
+        assert!(column_tiles
+            .wire_values
+            .iter()
+            .all(|column| column.len() == DEGREE));
+        assert!(row_chunks
+            .wire_values
+            .iter()
+            .zip(&column_tiles.wire_values)
+            .all(|(reference, tiled)| reference.capacity() == tiled.capacity()));
+
+        for row in 0..DEGREE {
+            for column in 0..NUM_WIRES {
+                let rep = representative_map[row * NUM_WIRES + column] as usize;
+                let (expected, expected_raw) = if rep % 5 == 0 {
+                    (F::ZERO, 0)
+                } else {
+                    let raw = raw_value(rep);
+                    (F::from_noncanonical_u64(raw), raw)
+                };
+                assert_eq!(column_tiles.wire_values[column][row], expected);
+                assert_eq!(row_chunks.wire_values[column][row].0, expected_raw);
+                assert_eq!(column_tiles.wire_values[column][row].0, expected_raw);
+                assert_eq!(
+                    row_chunks.wire_values[column][row].0,
+                    column_tiles.wire_values[column][row].0
+                );
+            }
+        }
+
+        let row_tree = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_columns(
+            row_chunks.wire_values,
+            2,
+        );
+        let tiled_tree = MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new_columns(
+            column_tiles.wire_values,
+            2,
+        );
+        assert_eq!(row_tree.cap, tiled_tree.cap);
+        println!(
+            "EV_COLUMN_TILE_ORACLE_PASS wires={NUM_WIRES} degree={DEGREE} full_tiles=8 final_tile=8"
+        );
     }
 }
