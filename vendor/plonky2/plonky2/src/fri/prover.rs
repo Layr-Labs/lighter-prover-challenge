@@ -15,7 +15,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::GenericConfig;
+use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -256,6 +256,57 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     (trees, coeffs)
 }
 
+const POW_LANES: usize = 4;
+const POW_QUAD_DISABLE_ENV: &str = "LIGHTER_DISABLE_POW_QUAD";
+
+/// The four-lane path is the delivery default. Only the exact diagnostic value
+/// `LIGHTER_DISABLE_POW_QUAD=1` selects the scalar control; missing, empty,
+/// non-Unicode, and all other values keep the candidate enabled.
+#[cfg(feature = "std")]
+#[inline]
+fn pow_quad_enabled_from_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn pow_quad_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        pow_quad_enabled_from_env_value(std::env::var_os(POW_QUAD_DISABLE_ENV).as_deref())
+    })
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+const fn pow_quad_enabled() -> bool {
+    true
+}
+
+/// Returns the candidates in one four-lane PoW group and the number of active
+/// lanes. Inactive tail lanes repeat `start` and are never considered valid.
+///
+/// The caller ranges `quad_index` only through `max_candidate / POW_LANES`, so
+/// `start` and each active addition are bounded by `max_candidate`. This avoids
+/// forming `max_candidate + 1`, which would overflow when the inclusive upper
+/// bound is `u64::MAX`.
+#[inline]
+fn pow_candidate_quad(quad_index: u64, max_candidate: u64) -> ([u64; POW_LANES], usize) {
+    debug_assert!(quad_index <= max_candidate / POW_LANES as u64);
+    let start = quad_index * POW_LANES as u64;
+    let remaining = max_candidate - start;
+    if remaining >= (POW_LANES - 1) as u64 {
+        ([start, start + 1, start + 2, start + 3], POW_LANES)
+    } else {
+        let active_lanes = remaining as usize + 1;
+        let mut candidates = [start; POW_LANES];
+        for (lane, candidate) in candidates.iter_mut().enumerate().take(active_lanes).skip(1) {
+            *candidate = start + lane as u64;
+        }
+        (candidates, active_lanes)
+    }
+}
+
 /// Performs the proof-of-work (a.k.a. grinding) step of the FRI protocol. Returns the PoW witness.
 pub(crate) fn fri_proof_of_work<
     F: RichField + Extendable<D>,
@@ -287,9 +338,28 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
-        .into_par_iter()
-        .find_any(|&candidate| {
+    let max_candidate = F::NEG_ONE.to_canonical_u64();
+    let pow_witness = if pow_quad_enabled() {
+        (0..=max_candidate / POW_LANES as u64)
+            .into_par_iter()
+            .map(|quad_index| {
+                let (candidates, active_lanes) = pow_candidate_quad(quad_index, max_candidate);
+                let mut duplex_states = [duplex_intermediate_state; POW_LANES];
+                for (duplex_state, candidate) in duplex_states.iter_mut().zip(candidates) {
+                    duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                }
+                <C::Hasher as Hasher<F>>::Permutation::permute_quad(&mut duplex_states);
+
+                (0..active_lanes).find_map(|lane| {
+                    let pow_response = duplex_states[lane].squeeze().iter().last().unwrap();
+                    let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                    (leading_zeros >= min_leading_zeros).then_some(candidates[lane])
+                })
+            })
+            .find_any(Option::is_some)
+            .flatten()
+    } else {
+        (0..=max_candidate).into_par_iter().find_any(|&candidate| {
             let mut duplex_state = duplex_intermediate_state;
             duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
             duplex_state.permute();
@@ -297,8 +367,9 @@ pub(crate) fn fri_proof_of_work<
             let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
             leading_zeros >= min_leading_zeros
         })
-        .map(F::from_canonical_u64)
-        .expect("Proof of work failed. This is highly unlikely!");
+    }
+    .map(F::from_canonical_u64)
+    .expect("Proof of work failed. This is highly unlikely!");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);
@@ -370,6 +441,9 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, PrimeField64};
+    use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::plonk::config::Poseidon2GoldilocksConfig;
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
@@ -398,5 +472,77 @@ mod tests {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
             }
         }
+    }
+
+    #[test]
+    fn pow_candidate_quad_covers_tails_and_u64_boundaries() {
+        for max_candidate in 0_u64..=10 {
+            let actual = (0..=max_candidate / POW_LANES as u64)
+                .flat_map(|quad_index| {
+                    let (candidates, active_lanes) = pow_candidate_quad(quad_index, max_candidate);
+                    candidates.into_iter().take(active_lanes)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, (0..=max_candidate).collect::<Vec<_>>());
+        }
+
+        // These final groups exercise 1, 2, 3, and 4 active lanes immediately
+        // below the largest u64, including the inclusive u64::MAX endpoint.
+        for max_candidate in (u64::MAX - 3)..=u64::MAX {
+            let quad_index = max_candidate / POW_LANES as u64;
+            let (candidates, active_lanes) = pow_candidate_quad(quad_index, max_candidate);
+            let start = quad_index * POW_LANES as u64;
+            assert_eq!(active_lanes, (max_candidate - start) as usize + 1);
+            assert_eq!(candidates[0], start);
+            assert_eq!(candidates[active_lanes - 1], max_candidate);
+            assert!(candidates[..active_lanes]
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1));
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pow_quad_is_default_on_and_only_exact_one_disables() {
+        use std::ffi::OsStr;
+
+        assert!(pow_quad_enabled_from_env_value(None));
+        assert!(!pow_quad_enabled_from_env_value(Some(OsStr::new("1"))));
+        for value in ["", "0", "01", "true", " 1", "1 "] {
+            assert!(
+                pow_quad_enabled_from_env_value(Some(OsStr::new(value))),
+                "unexpectedly disabled by {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fri_pow_quad_witness_replays_through_challenger() {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let config = FriConfig {
+            rate_bits: 3,
+            cap_height: 4,
+            proof_of_work_bits: 8,
+            reduction_strategy: FriReductionStrategy::ConstantArityBits(4, 5),
+            num_query_rounds: 28,
+        };
+        let mut challenger = Challenger::<F, H>::new();
+        challenger.observe_elements(&[
+            F::from_canonical_u64(7),
+            F::from_canonical_u64(11),
+            F::from_canonical_u64(13),
+        ]);
+        let mut replay = challenger.clone();
+
+        let witness = fri_proof_of_work::<F, C, D>(&mut challenger, &config);
+        replay.observe_element(witness);
+        let response = replay.get_challenge();
+        let min_leading_zeros = config.proof_of_work_bits + (64 - F::order().bits()) as u32;
+        assert!(response.to_canonical_u64().leading_zeros() >= min_leading_zeros);
+        assert_eq!(challenger.get_n_challenges(16), replay.get_n_challenges(16));
     }
 }
