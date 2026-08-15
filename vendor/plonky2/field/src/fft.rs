@@ -272,6 +272,10 @@ pub fn ifft_with_options<F: Field>(
     ifft_with_options_and_postscale(poly, zero_factor, root_table, None)
 }
 
+/// `postscale` carries the caller's per-coefficient factors with the `1/n`
+/// IFFT normalization already folded in, i.e. `scales[i]` must equal
+/// `caller_scale_i / n`. Callers build that table once per domain size, so the
+/// separate `n_inv` multiply per coefficient disappears from this loop.
 pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     poly: PolynomialValues<F>,
     zero_factor: Option<usize>,
@@ -279,13 +283,12 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     postscale: Option<&[F]>,
 ) -> PolynomialCoeffs<F> {
     let n = poly.len();
-    let lg_n = log2_strict(n);
-    let n_inv = F::inverse_2exp(lg_n);
     let PolynomialValues { values: mut buffer } = poly;
     fft_dispatch(&mut buffer, zero_factor, root_table);
 
     match postscale {
         None => {
+            let n_inv = F::inverse_2exp(log2_strict(n));
             // We reverse all values except the first, and divide each by n.
             buffer[0] *= n_inv;
             buffer[n / 2] *= n_inv;
@@ -299,20 +302,16 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
         }
         Some(scales) => {
             assert_eq!(scales.len(), n);
-            // Fuse the caller's coefficient scaling into the same writes as
-            // IFFT reversal and normalization, preserving multiplication order.
-            buffer[0] *= n_inv;
-            buffer[n / 2] *= n_inv;
+            // `scales` already carries the `1/n` normalization, so reversal and
+            // the caller's scaling collapse into one multiply per coefficient.
             buffer[0] *= scales[0];
             if n > 1 {
                 buffer[n / 2] *= scales[n / 2];
             }
             for i in 1..(n / 2) {
                 let j = n - i;
-                let mut coeffs_i = buffer[j] * n_inv;
-                let mut coeffs_j = buffer[i] * n_inv;
-                coeffs_i *= scales[i];
-                coeffs_j *= scales[j];
+                let coeffs_i = buffer[j] * scales[i];
+                let coeffs_j = buffer[i] * scales[j];
                 buffer[i] = coeffs_i;
                 buffer[j] = coeffs_j;
             }
