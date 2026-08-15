@@ -587,18 +587,26 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    // Publish AFTER the walk completes. Publishing before the walk — as this
+    // code previously did — let a final block arriving mid-walk take the
+    // buffer, write live LDE column values into it, and then have the walk's
+    // remaining zero writes clobber them one byte per page: the corrupted
+    // wires commitment produced proofs that fail the verifier's vanishing
+    // identity intermittently (concurrency-correlated; reproduced on the
+    // unmodified promoted binary by multiple solvers). After this change a
+    // consumer receives either a fully walked buffer or — if it arrives
+    // before the publish — the ordinary fresh-allocation fallback, which
+    // only zero-faults under the fill (slower for that one block, never
+    // wrong). No value computed by any proof changes in either case.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
