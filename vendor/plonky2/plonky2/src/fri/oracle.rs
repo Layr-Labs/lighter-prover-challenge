@@ -798,8 +798,8 @@ fn accumulate_linear_quotient<F: Field>(
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
     let mut acc = F::ZERO;
     for i in (0..d - 1).rev() {
-        acc = acc * z + coeffs[i + 1];
-        buf[i] = buf[i] * shift + acc;
+        acc = coeffs[i + 1].multiply_accumulate(acc, z);
+        buf[i] = acc.multiply_accumulate(buf[i], shift);
     }
 }
 
@@ -1026,12 +1026,18 @@ mod tests {
         check::<<GoldilocksField as Extendable<2>>::Extension>();
     }
 
-    /// The fused quotient accumulation must be bit-identical (raw u64
-    /// representation) to the pre-fusion op sequences it replaces: both the
-    /// classic reference (`divide_by_linear` + explicit zero pad +
-    /// `shift_poly` + add) and this tree's in-place variant
+    /// The fused quotient accumulation must equal the pre-fusion op sequences
+    /// it replaces: both the classic reference (`divide_by_linear` + explicit
+    /// zero pad + `shift_poly` + add) and this tree's in-place variant
     /// (`divide_by_linear_padded_in_place` + `shift_poly` + add), including
     /// the empty-accumulator first batch and mismatched lengths.
+    ///
+    /// Agreement is asserted on canonical values rather than raw `u64`
+    /// representatives: the loop's `multiply_accumulate` folds each addend
+    /// into the quadratic product's own 160-bit reduction, which is contracted
+    /// to equal `*self + x * y` as a field value and may land on a different
+    /// congruent representative (the same latitude
+    /// `ext2_extension_base_dot_product_matches_generic_at_boundaries` takes).
     #[test]
     fn fused_quotient_accumulation_matches_reference() {
         use crate::field::extension::FieldExtension;
@@ -1039,11 +1045,11 @@ mod tests {
 
         type F = <GoldilocksField as Extendable<2>>::Extension;
 
-        fn raw(values: &[F]) -> Vec<u64> {
+        fn limbs(values: &[F]) -> Vec<u64> {
             values
                 .iter()
                 .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
-                .map(|c: GoldilocksField| c.to_noncanonical_u64())
+                .map(|c: GoldilocksField| c.to_canonical_u64())
                 .collect()
         }
 
@@ -1081,8 +1087,8 @@ mod tests {
             let mut actual = initial;
             accumulate_linear_quotient(&mut actual, &composition_poly, z, shift);
 
-            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
-            assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
+            assert_eq!(limbs(&actual.coeffs), limbs(&expected.coeffs));
+            assert_eq!(limbs(&actual.coeffs), limbs(&expected_in_place.coeffs));
         }
     }
 
