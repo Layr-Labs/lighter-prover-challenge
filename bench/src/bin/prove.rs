@@ -214,11 +214,27 @@ fn main() {
     drop(file);
     #[cfg(feature = "diagnostic_profile")]
     {
-        drop(_output_span);
-        drop(profile_process);
-        if let Some(path) = std::env::var_os("LIGHTER_PROFILE_PATH") {
-            plonky2::util::profile::write_chrome_trace(path)
-                .expect("cannot write diagnostic profile trace");
+        // The trusted verifier `env_clear()`s the worker, so an env-var trace
+        // path never reaches a sandboxed run (and stdout/stderr are null'ed,
+        // hiding eprintln diagnostics). Scratch is exposed as TMPDIR, which
+        // is the one writable location under Seatbelt: fall back to a
+        // fixed-name trace there when the env var is absent. Diagnostics-only;
+        // never compiled into the scored (non-diagnostic_profile) binary.
+        let path = std::env::var_os("LIGHTER_PROFILE_PATH").or_else(|| {
+            std::env::var_os("TMPDIR").map(|dir| {
+                let mut path = std::path::PathBuf::from(dir);
+                path.push("lighter-worker-trace.json");
+                path.into_os_string()
+            })
+        });
+        if let Some(path) = path {
+            if let Err(error) = plonky2::util::profile::write_chrome_trace(&path) {
+                // Best-effort diagnostics: a failed trace write must never
+                // take down a scored run. (Stderr is null'ed by the verifier,
+                // so there is nowhere to report this; the trace's absence in
+                // the scratch dir is the observable signal.)
+                let _ = error;
+            }
         }
     }
 
@@ -255,3 +271,5 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+
+// glm-paired-abba-confirmed-13of16-1786806000

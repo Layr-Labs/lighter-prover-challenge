@@ -195,6 +195,25 @@ enum ChainState<'scope> {
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
 }
 
+/// Writes a self-check failure marker into TMPDIR (scratch) and aborts.
+/// Diagnostic builds only: the trusted verifier nulls stderr and clears the
+/// environment, and `panic = "abort"` would discard both the message and the
+/// Chrome trace; a file is the only channel that survives to the hunter.
+#[cfg(feature = "diagnostic_profile")]
+fn diagnostic_selfcheck_failure(message: &str) -> ! {
+    use std::io::Write as _;
+    let mut path = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+    path.push("lighter-selfcheck-failed.txt");
+    if let Ok(mut file) = std::fs::File::create(&path) {
+        let _ = writeln!(file, "{message}");
+    }
+    // Abort rather than panic: the diagnostic binary uses `panic = "abort"`,
+    // and either way the run must fail loudly so the hunter keeps artifacts.
+    std::process::abort();
+}
+
 impl ChainState<'_> {
     fn wait(self) -> Proof {
         #[cfg(feature = "diagnostic_profile")]
@@ -259,6 +278,17 @@ fn chain_step_proof(
         })?;
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
+    // Diagnostic-only self-check (see prove_tx_witness): localizes the first
+    // corrupt proof to its pipeline stage via a TMPDIR marker; never in the
+    // scored binary.
+    #[cfg(feature = "diagnostic_profile")]
+    if let Ok(proof) = result.as_ref() {
+        if let Err(error) = chain_data.verify(proof.clone()) {
+            diagnostic_selfcheck_failure(&format!(
+                "chain step proof {path:?} step {chain_step}: {error:?}"
+            ));
+        }
+    }
     // This step is no longer part of the runnable backlog (see the matching
     // spine_backlog_add(1) at all spawn sites).
     plonky2::hash::poseidon2::spine_backlog_add(-1);
@@ -352,10 +382,21 @@ fn prove_tx_witness(
     .unwrap_or_else(|error| {
         panic!("{path:?} block transaction chunk #{chunk_index} proof failed: {error:?}")
     });
-    #[cfg(debug_assertions)]
-    tx_data
-        .verify(proof.clone())
-        .expect("transaction proof self-check failed");
+    // Diagnostic builds self-verify every tx proof: the verifier-side
+    // vanishing-identity failure mode traced to an upstream corruption, so
+    // catching the FIRST corrupt proof localizes the fault to one pipeline
+    // stage (and its trace window) instead of the whole worker. Writes a
+    // marker into TMPDIR (the verifier nulls stderr and panic=abort loses
+    // both message and trace) and aborts; never in the scored binary.
+    #[cfg(any(debug_assertions, feature = "diagnostic_profile"))]
+    if let Err(error) = tx_data.verify(proof.clone()) {
+        #[cfg(feature = "diagnostic_profile")]
+        diagnostic_selfcheck_failure(&format!(
+            "tx proof chunk {chunk_index} path {path:?}: {error:?}"
+        ));
+        #[cfg(not(feature = "diagnostic_profile"))]
+        panic!("transaction proof self-check failed");
+    }
     proof
 }
 
@@ -845,7 +886,28 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        // The recursive-verifier construction inside
+                        // `build_block_circuit` is ~2/3 of the worker's total
+                        // CPU samples (samply, symbolicated) and it floods the
+                        // GLOBAL rayon pool that the CPU-gated light pipeline
+                        // also needs — starving chain steps during exactly the
+                        // block-lane window. Run it on a dedicated bounded
+                        // pool (half the CPUs, at least 6) so the build keeps
+                        // P-cores and still finishes by the light-path drain
+                        // (its deadline), while the pipeline keeps the rest.
+                        // Scheduling-only: identical computation, identical
+                        // circuit bytes; host-adaptive by construction.
+                        let build_threads = (std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(8)
+                            / 2)
+                            .max(6);
+                        let build_pool = rayon::ThreadPoolBuilder::new()
+                            .num_threads(build_threads)
+                            .stack_size(PROVER_THREAD_STACK_BYTES)
+                            .build()
+                            .expect("block-circuit build pool must start");
+                        build_pool.install(|| circuits.build_block_circuit())
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
