@@ -251,6 +251,25 @@ impl Circuits {
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        // Embedded first: `build.rs` serializes this during the untimed compile
+        // job, so the scored worker deserializes instead of running `define` +
+        // `build`. Falls back to building on any error, so an unreadable or
+        // stubbed blob costs performance and never correctness.
+        // `LIGHTER_BUILD_CIRCUITS=1` forces the build path for A/B.
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_none() {
+            match Self::load_block() {
+                Ok(loaded) => return loaded,
+                Err(error) => {
+                    log::warn!("embedded block circuit unavailable, building: {error:#}");
+                }
+            }
+        }
+        self.build_block_circuit_from_scratch()
+    }
+
+    /// The original runtime construction: fallback path and the oracle that
+    /// `embedded_block_matches_rebuilt` compares against.
+    pub fn build_block_circuit_from_scratch(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is

@@ -20,11 +20,13 @@
 
 use std::path::{Path, PathBuf};
 
+use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution_constraints::{BlockPreExecutionCircuit, Circuit as _};
 use circuit::block_tx_chain_constraints::{BlockTxChainCircuit, Circuit as _};
 use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _};
 use circuit::embed::serialize_embedded;
-use circuit::types::config::{C, CIRCUIT_CONFIG};
+use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
+use plonky2::plonk::circuit_data::CircuitData;
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 
 // Mirrors of the `src/api.rs` constants (a build script cannot import from
@@ -36,12 +38,13 @@ const LIGHT_TX_PER_PROOF: usize = 10;
 const ON_CHAIN_OPERATIONS_LIMIT: usize = 1;
 const PROVER_THREAD_STACK_BYTES: usize = 64 * 1024 * 1024;
 
-const BLOB_NAMES: [&str; 5] = [
+const BLOB_NAMES: [&str; 6] = [
     "pre.embed",
     "heavy_tx.embed",
     "heavy_chain.embed",
     "light_tx.embed",
     "light_chain.embed",
+    "block.embed",
 ];
 
 fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
@@ -55,7 +58,10 @@ fn write_blob(out_dir: &Path, name: &str, bytes: &[u8]) {
     );
 }
 
-fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
+fn build_path_blobs(
+    tx_per_proof: usize,
+    tx_mode: u8,
+) -> (Vec<u8>, Vec<u8>, CircuitData<F, C, D>) {
     // Same construction as `PathCircuits::new`.
     let tx = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
     let tx_target: BlockTxTarget = tx.target;
@@ -69,7 +75,10 @@ fn build_path_blobs(tx_per_proof: usize, tx_mode: u8) -> (Vec<u8>, Vec<u8>) {
         .expect("serializing block transaction circuit for embedding");
     let chain_blob = serialize_embedded(&chain_target, &chain_data)
         .expect("serializing block transaction chain circuit for embedding");
-    (tx_blob, chain_blob)
+    // Returned so the final block circuit can be defined from it here, at
+    // compile time: `BlockCircuit::define` reads only `common` and
+    // `verifier_only` of its inputs, both fully determined by this build.
+    (tx_blob, chain_blob, chain_data)
 }
 
 fn main() {
@@ -103,13 +112,14 @@ fn main() {
         .spawn(move || {
             // Same layout as `Circuits::new`: pre-execution circuit in
             // parallel with the heavy and light transaction paths.
-            let (pre_blob, (heavy_blobs, light_blobs)) = rayon::join(
+            let ((pre_blob, pre_data), (heavy_blobs, light_blobs)) = rayon::join(
                 || {
                     let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
                     let pre_target = pre.target;
                     let pre_data = pre.builder.build::<C>();
-                    serialize_embedded(&pre_target, &pre_data)
-                        .expect("serializing block pre-execution circuit for embedding")
+                    let pre_blob = serialize_embedded(&pre_target, &pre_data)
+                        .expect("serializing block pre-execution circuit for embedding");
+                    (pre_blob, pre_data)
                 },
                 || {
                     rayon::join(
@@ -119,11 +129,27 @@ fn main() {
                 },
             );
 
+            // Sixth blob: the final block circuit, the one startup circuit still
+            // constructed inside every scored worker (measured 5.20 s, 4.14 s of
+            // it in `preprocess`) on a lane that overlaps transaction proving.
+            let block = BlockCircuit::define(
+                CIRCUIT_CONFIG,
+                &pre_data,
+                &light_blobs.2,
+                &heavy_blobs.2,
+                ON_CHAIN_OPERATIONS_LIMIT,
+            );
+            let block_target = block.target;
+            let block_data = block.builder.build::<C>();
+            let block_blob = serialize_embedded(&block_target, &block_data)
+                .expect("serializing final block circuit for embedding");
+
             write_blob(&out_dir, "pre.embed", &pre_blob);
             write_blob(&out_dir, "heavy_tx.embed", &heavy_blobs.0);
             write_blob(&out_dir, "heavy_chain.embed", &heavy_blobs.1);
             write_blob(&out_dir, "light_tx.embed", &light_blobs.0);
             write_blob(&out_dir, "light_chain.embed", &light_blobs.1);
+            write_blob(&out_dir, "block.embed", &block_blob);
         })
         .expect("circuit build thread must start")
         .join()

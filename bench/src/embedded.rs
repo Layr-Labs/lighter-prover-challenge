@@ -16,6 +16,7 @@
 
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
+use circuit::block_constraints::BlockTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
 use circuit::embed::deserialize_embedded;
 use circuit::types::config::{C, D, F};
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -86,6 +88,13 @@ impl Circuits {
     /// behind the remaining circuit loads.
     pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
+    /// Loads the final block circuit from its embedded blob. It depends only on
+    /// `common`/`verifier_only` of three circuits that are themselves fixed at
+    /// compile time, so it is exactly as precomputable as the other five.
+    pub fn load_block() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockTarget>("block", BLOCK_BLOB)
     }
 
     /// Loads every embedded circuit except pre-execution. This is public to
@@ -276,6 +285,24 @@ mod tests {
     /// This is the gate for `Circuits::from_embedded` — if it fails, the
     /// mechanism is wrong. Run:
     /// `cargo test --release -p bench --bin prove -- --ignored embedded_matches_rebuilt --nocapture`
+    /// Equality oracle for the sixth blob: the embedded block circuit must be
+    /// value-identical to the runtime-built one.
+    #[test]
+    #[ignore = "multi-second circuit rebuild; run explicitly"]
+    fn embedded_block_matches_rebuilt() {
+        on_big_stack(|| {
+            let circuits = Circuits::load();
+            let (rebuilt_target, rebuilt_data) = circuits.build_block_circuit_from_scratch();
+            let (embedded_target, embedded_data) =
+                Circuits::load_block().expect("embedded block circuit must load");
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_target, &rebuilt_data),
+                (&embedded_target, &embedded_data),
+            );
+        });
+    }
+
     #[test]
     #[ignore = "multi-second circuit rebuild; run explicitly"]
     fn embedded_matches_rebuilt() {
