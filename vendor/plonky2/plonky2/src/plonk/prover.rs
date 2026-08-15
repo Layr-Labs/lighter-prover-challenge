@@ -1801,6 +1801,97 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+fn sum_scale_and_scatter_quotient_numerators<F: RichField>(
+    cpu_quotient_numerators: &[F],
+    gpu_quotient_numerators: &[&[F]],
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Vec<Vec<F>> {
+    match gpu_quotient_numerators {
+        [] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        &[first] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [first],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        &[first, second] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [first, second],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        &[first, second, third] => sum_scale_and_scatter_quotient_numerators_inner(
+            cpu_quotient_numerators,
+            [first, second, third],
+            num_challenges,
+            z_h_on_coset,
+        ),
+        _ => unreachable!("at most three Metal quotient families exist"),
+    }
+}
+
+fn sum_scale_and_scatter_quotient_numerators_inner<F: RichField, const N: usize>(
+    cpu_quotient_numerators: &[F],
+    gpu_quotient_numerators: [&[F]; N],
+    num_challenges: usize,
+    z_h_on_coset: &ZeroPolyOnCoset<F>,
+) -> Vec<Vec<F>> {
+    assert!(num_challenges > 0);
+    assert_eq!(cpu_quotient_numerators.len() % num_challenges, 0);
+    assert!(gpu_quotient_numerators
+        .iter()
+        .all(|values| values.len() == cpu_quotient_numerators.len()));
+    let num_points = cpu_quotient_numerators.len() / num_challenges;
+
+    struct ColPtr<T>(*mut T);
+    unsafe impl<T> Send for ColPtr<T> {}
+    unsafe impl<T> Sync for ColPtr<T> {}
+
+    // Keep each vector's logical length at zero while Rayon writes into its
+    // allocated capacity. This keeps unwinding safe if a worker panics.
+    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
+        .map(|_| Vec::with_capacity(num_points))
+        .collect();
+    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
+        .iter_mut()
+        .map(|column| ColPtr(column.as_mut_ptr()))
+        .collect();
+    let column_ptrs = &column_ptrs;
+    cpu_quotient_numerators
+        .par_chunks(BATCH_SIZE * num_challenges)
+        .enumerate()
+        .for_each(|(chunk_i, chunk)| {
+            let base = BATCH_SIZE * chunk_i;
+            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                let point = base + k;
+                let element_base = point * num_challenges;
+                let denominator_inv = z_h_on_coset.eval_inverse(point);
+                for (challenge, (column, &cpu_numerator)) in
+                    column_ptrs.iter().zip(point_values).enumerate()
+                {
+                    let mut numerator = cpu_numerator;
+                    for gpu_numerators in gpu_quotient_numerators {
+                        numerator += gpu_numerators[element_base + challenge];
+                    }
+                    // SAFETY: `point` lies in this chunk's disjoint range.
+                    unsafe { *column.0.add(point) = numerator * denominator_inv };
+                }
+            }
+        });
+    for column in &mut challenge_columns {
+        // SAFETY: the completed parallel traversal initialized every point in
+        // every challenge column exactly once.
+        unsafe { column.set_len(num_points) };
+    }
+    challenge_columns
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2333,22 +2424,12 @@ fn compute_quotient_polys<
                     &mut scratch.vanishing,
                     quotient_values_batch,
                 );
-
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
-                }
             },
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_poseidon {
-        let gpu_values = match job.finish() {
+    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
+        let values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2379,22 +2460,15 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some((_, job)) = &gpu_range {
-        let gpu_values = match job.finish() {
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        let values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2428,22 +2502,15 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    if let Some(job) = &gpu_permutation {
-        let gpu_values = match job.finish() {
+    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
+        let values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2465,57 +2532,42 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(gpu_values.len(), quotient_values.len());
-        quotient_values
-            .par_chunks_exact_mut(num_challenges)
-            .zip(gpu_values.par_chunks_exact(num_challenges))
-            .enumerate()
-            .for_each(|(i, (cpu_values, gpu_values))| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
-                    *cpu += gpu * denominator_inv;
-                }
-            });
-    }
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
+    } else {
+        None
+    };
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let (gpu_quotient_numerators, num_gpu_quotient_numerators) = {
+        let mut numerators: [&[F]; 3] = [&[]; 3];
+        let mut len = 0;
+        for values in [
+            gpu_poseidon_values.as_deref(),
+            gpu_range_values.as_deref(),
+            gpu_permutation_values.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            numerators[len] = values;
+            len += 1;
+        }
+        (numerators, len)
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let (gpu_quotient_numerators, num_gpu_quotient_numerators): ([&[F]; 0], usize) = ([], 0);
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
-    // Parallel scatter of the interleaved point-major buffer into the
-    // per-challenge columns. The former single streaming pass was serial:
-    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
-    // walked by one thread between the parallel quotient evaluation and the
-    // parallel IFFT while every other core sat idle. Each parallel chunk
-    // below owns a disjoint point range, and column position `i` is written
-    // exactly once with the identical value the serial pass stored there.
-    struct ColPtr<T>(*mut T);
-    unsafe impl<T> Send for ColPtr<T> {}
-    unsafe impl<T> Sync for ColPtr<T> {}
-    let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
-        .collect();
-    let column_ptrs: Vec<ColPtr<F>> = challenge_columns
-        .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
-        .collect();
-    let column_ptrs = &column_ptrs;
-    quotient_values
-        .par_chunks(BATCH_SIZE * num_challenges)
-        .enumerate()
-        .for_each(|(chunk_i, chunk)| {
-            let base = BATCH_SIZE * chunk_i;
-            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                for (column, &value) in column_ptrs.iter().zip(point_values) {
-                    // SAFETY: `base + k` lies in this chunk's disjoint range.
-                    unsafe { *column.0.add(base + k) = value };
-                }
-            }
-        });
+    // Sum CPU + Metal numerators first, then apply the shared Z_H inverse once
+    // while scattering into per-challenge columns. Field-equivalent to scaling each
+    // family separately; focused tests cover canonical boundaries and fixed-seed raw words.
+    let challenge_columns = sum_scale_and_scatter_quotient_numerators(
+        &quotient_values,
+        &gpu_quotient_numerators[..num_gpu_quotient_numerators],
+        num_challenges,
+        &z_h_on_coset,
+    );
     let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
     challenge_columns
         .into_par_iter()
@@ -2650,6 +2702,140 @@ pub(crate) mod precomputed {
         coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
         two_adic_subgroup,
     };
+}
+
+#[cfg(test)]
+mod quotient_denominator_tests {
+    use super::{sum_scale_and_scatter_quotient_numerators, BATCH_SIZE};
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+
+    type F = GoldilocksField;
+
+    fn values(len: usize, seed: u64) -> Vec<F> {
+        (0..len)
+            .map(|i| {
+                GoldilocksField(u64::MAX.wrapping_sub(
+                    seed.wrapping_mul(97).wrapping_add(131 * i as u64),
+                ))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_quotient_denominator_matches_per_contribution_scaling() {
+        let num_points = BATCH_SIZE + 3;
+        let z_h_on_coset = ZeroPolyOnCoset::<F>::new(4, 3);
+
+        for num_challenges in 1..=3 {
+            let len = num_points * num_challenges;
+            let cpu_numerators = values(len, 1);
+            let gpu_numerators = [values(len, 2), values(len, 3), values(len, 4)];
+
+            for contribution_count in 0..=gpu_numerators.len() {
+                let mut expected = vec![vec![F::ZERO; num_points]; num_challenges];
+                for point in 0..num_points {
+                    let denominator_inv = z_h_on_coset.eval_inverse(point);
+                    for challenge in 0..num_challenges {
+                        let i = point * num_challenges + challenge;
+                        let mut value = cpu_numerators[i] * denominator_inv;
+                        for contribution in gpu_numerators.iter().take(contribution_count) {
+                            value += contribution[i] * denominator_inv;
+                        }
+                        expected[challenge][point] = value;
+                    }
+                }
+
+                let gpu_contributions = gpu_numerators[..contribution_count]
+                    .iter()
+                    .map(Vec::as_slice)
+                    .collect::<Vec<_>>();
+                let actual = sum_scale_and_scatter_quotient_numerators(
+                    &cpu_numerators,
+                    &gpu_contributions,
+                    num_challenges,
+                    &z_h_on_coset,
+                );
+
+                for (challenge, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    // Intentional tightening for these fixed seeds: preserve the same raw words.
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| value.to_noncanonical_u64())
+                            .collect::<Vec<_>>(),
+                        "challenge={challenge}, contributions={contribution_count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_quotient_denominator_is_field_equal_on_raw_boundary_cross_product() {
+        let words = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            u64::MAX,
+        ];
+        let denominator_count = 8;
+        let num_points = words.len().pow(4) * denominator_count;
+        let z_h_on_coset = ZeroPolyOnCoset::<F>::new(12, 3);
+        let mut cpu_numerators = Vec::with_capacity(num_points);
+        let mut gpu_0 = Vec::with_capacity(num_points);
+        let mut gpu_1 = Vec::with_capacity(num_points);
+        let mut gpu_2 = Vec::with_capacity(num_points);
+        for &a in &words {
+            for &b in &words {
+                for &c in &words {
+                    for &d in &words {
+                        // `eval_inverse` is periodic over all `1 << rate_bits` values.
+                        // Repeat each numerator tuple across every real denominator.
+                        for _ in 0..denominator_count {
+                            cpu_numerators.push(GoldilocksField(a));
+                            gpu_0.push(GoldilocksField(b));
+                            gpu_1.push(GoldilocksField(c));
+                            gpu_2.push(GoldilocksField(d));
+                        }
+                    }
+                }
+            }
+        }
+
+        let actual = sum_scale_and_scatter_quotient_numerators(
+            &cpu_numerators,
+            &[&gpu_0, &gpu_1, &gpu_2],
+            1,
+            &z_h_on_coset,
+        );
+        let expected = (0..num_points)
+            .map(|i| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                let mut value = cpu_numerators[i] * denominator_inv;
+                value += gpu_0[i] * denominator_inv;
+                value += gpu_1[i] * denominator_inv;
+                value += gpu_2[i] * denominator_inv;
+                value.to_canonical_u64()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual[0]
+                .iter()
+                .map(|value| value.to_canonical_u64())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 }
 
 #[cfg(test)]
