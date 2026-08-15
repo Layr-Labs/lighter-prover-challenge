@@ -3,17 +3,21 @@
 
 //! Embedded startup circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
-//! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
-//! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
-//! exact `Circuits` value `Circuits::new` builds, several times faster than
-//! rebuilding, moving that work out of the scored worker lifetime.
+//! `build.rs` constructs the five startup circuits and the final block circuit
+//! during the untimed compile job and serializes them (see `circuit::embed`)
+//! into OUT_DIR blobs that are compiled into this binary. The same shrunken
+//! format deliberately omits the large constants/sigmas LDE and Merkle state;
+//! [`Circuits::from_embedded`] and [`Circuits::load_block_embedded`]
+//! reconstitute exact `CircuitData` values through the checked loader.
 //!
-//! [`Circuits::load`] is the production entry point: embedded first, build
-//! fallback on any error, `LIGHTER_BUILD_CIRCUITS=1` to force the build path
-//! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
-//! value-equality oracle between the two paths.
+//! [`Circuits::load`] is the startup entry point: embedded first, build
+//! fallback on any error, `LIGHTER_BUILD_CIRCUITS=1` to force the build path.
+//! `LIGHTER_BUILD_BLOCK_CIRCUIT=1` independently forces the legacy final-block
+//! build for a controlled worker A/B. The `embedded_matches_rebuilt` ignored
+//! test is the full value-equality oracle between all six embedded circuits
+//! and freshly built data.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +32,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -86,6 +91,13 @@ impl Circuits {
     /// behind the remaining circuit loads.
     pub fn load_pre() -> anyhow::Result<(BlockPreExecutionTarget, CircuitData<F, C, D>)> {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
+    }
+
+    /// Loads the final block circuit from the same checked shrunken format as
+    /// the startup circuits. It remains a separate blob/load because the block
+    /// lane does not need it until transaction proving has begun.
+    pub(crate) fn load_block_embedded() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+        load_blob::<BlockTarget>("block", BLOCK_BLOB)
     }
 
     /// Loads every embedded circuit except pre-execution. This is public to
@@ -262,19 +274,164 @@ mod tests {
             "{name}: common circuit data diverges"
         );
 
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
+        // Prover-only: full value equality with field-specific failures
+        // (generator payloads were compared byte-for-byte above; generator
+        // references themselves compare by registered id).
+        let rebuilt = &rebuilt_data.prover_only;
+        let embedded = &embedded_data.prover_only;
+        assert_eq!(rebuilt.generators, embedded.generators, "{name}: generators diverge");
+        assert_eq!(
+            rebuilt.generator_indices_by_watches,
+            embedded.generator_indices_by_watches,
+            "{name}: generator watch index diverges"
+        );
+        assert_eq!(
+            rebuilt.generator_watch_counts,
+            embedded.generator_watch_counts,
+            "{name}: generator watch counts diverge"
+        );
+        let rebuilt_commitment = &rebuilt.constants_sigmas_commitment;
+        let embedded_commitment = &embedded.constants_sigmas_commitment;
         assert!(
-            rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
+            rebuilt_commitment.polynomials == embedded_commitment.polynomials,
+            "{name}: constants/sigmas commitment polynomials diverge"
+        );
+        let rebuilt_tree = &rebuilt_commitment.merkle_tree;
+        let embedded_tree = &embedded_commitment.merkle_tree;
+        assert_eq!(
+            rebuilt_tree.num_leaves,
+            embedded_tree.num_leaves,
+            "{name}: constants/sigmas Merkle leaf count diverges"
+        );
+        assert_eq!(
+            rebuilt_tree.leaf_width(),
+            embedded_tree.leaf_width(),
+            "{name}: constants/sigmas Merkle leaf width diverges"
+        );
+        match (&rebuilt_tree.leaves, &embedded_tree.leaves) {
+            (
+                plonky2::hash::merkle_tree::MerkleLeaves::Rows {
+                    data: rebuilt,
+                    width: rebuilt_width,
+                },
+                plonky2::hash::merkle_tree::MerkleLeaves::Rows {
+                    data: embedded,
+                    width: embedded_width,
+                },
+            ) => {
+                assert_eq!(rebuilt_width, embedded_width, "{name}: row leaf width diverges");
+                assert_eq!(rebuilt, embedded, "{name}: row leaf values diverge");
+            }
+            (
+                plonky2::hash::merkle_tree::MerkleLeaves::Columns {
+                    columns: rebuilt,
+                    log_rows: rebuilt_log_rows,
+                },
+                plonky2::hash::merkle_tree::MerkleLeaves::Columns {
+                    columns: embedded,
+                    log_rows: embedded_log_rows,
+                },
+            ) => {
+                assert_eq!(
+                    rebuilt_log_rows, embedded_log_rows,
+                    "{name}: column leaf row count diverges"
+                );
+                assert_eq!(rebuilt.num_cols(), embedded.num_cols());
+                assert_eq!(rebuilt.num_rows(), embedded.num_rows());
+                for column in 0..rebuilt.num_cols() {
+                    assert_eq!(
+                        rebuilt.col(column),
+                        embedded.col(column),
+                        "{name}: column-major leaf column {column} diverges"
+                    );
+                }
+            }
+            _ => panic!("{name}: Merkle leaf storage layout diverges"),
+        }
+        // GPU occupancy may select interleaved CPU storage for one build and
+        // level-order Metal storage for the other. Compare every logical path,
+        // not that routing-only backing representation.
+        for leaf in 0..rebuilt_tree.num_leaves {
+            assert_eq!(
+                rebuilt_tree.prove(leaf),
+                embedded_tree.prove(leaf),
+                "{name}: constants/sigmas Merkle path {leaf} diverges"
+            );
+        }
+        assert_eq!(
+            rebuilt_tree.cap,
+            embedded_tree.cap,
+            "{name}: constants/sigmas Merkle cap diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.degree_log,
+            embedded_commitment.degree_log,
+            "{name}: constants/sigmas commitment degree diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.rate_bits,
+            embedded_commitment.rate_bits,
+            "{name}: constants/sigmas commitment rate diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.blinding,
+            embedded_commitment.blinding,
+            "{name}: constants/sigmas commitment blinding diverges"
+        );
+        assert_eq!(rebuilt.sigmas, embedded.sigmas, "{name}: sigmas diverge");
+        assert_eq!(rebuilt.subgroup, embedded.subgroup, "{name}: subgroup diverges");
+        assert_eq!(
+            rebuilt.public_inputs,
+            embedded.public_inputs,
+            "{name}: public inputs diverge"
+        );
+        assert_eq!(
+            rebuilt.representative_map,
+            embedded.representative_map,
+            "{name}: representative map diverges"
+        );
+        assert_eq!(
+            rebuilt.fixed_routed_wires,
+            embedded.fixed_routed_wires,
+            "{name}: fixed routed-wire mask diverges"
+        );
+        assert_eq!(
+            rebuilt.fft_root_table,
+            embedded.fft_root_table,
+            "{name}: FFT root table diverges"
+        );
+        assert_eq!(
+            rebuilt.lookup_rows,
+            embedded.lookup_rows,
+            "{name}: lookup rows diverge"
+        );
+        assert_eq!(
+            rebuilt.lut_to_lookups,
+            embedded.lut_to_lookups,
+            "{name}: lookup tables diverge"
+        );
+        assert_eq!(
+            rebuilt.constants_sigmas_quotient_cache,
+            embedded.constants_sigmas_quotient_cache,
+            "{name}: constants/sigmas quotient cache diverges"
+        );
+        assert_eq!(
+            rebuilt.constants_sigmas_quotient_step,
+            embedded.constants_sigmas_quotient_step,
+            "{name}: constants/sigmas quotient step diverges"
+        );
+        assert_eq!(
+            rebuilt.constants_sigmas_quotient_domain,
+            embedded.constants_sigmas_quotient_domain,
+            "{name}: constants/sigmas quotient domain diverges"
         );
     }
 
-    /// Determinism oracle for the embed mechanism: builds all five circuits
-    /// from scratch AND loads the embedded set, then asserts value identity.
-    /// This is the gate for `Circuits::from_embedded` — if it fails, the
-    /// mechanism is wrong. Run:
+    /// Determinism oracle for the embed mechanism: builds all six circuits
+    /// from scratch AND loads the embedded set, then asserts full value
+    /// identity, including the final block's target, common/verifier data,
+    /// generators, representative map, constants/sigmas commitment and Merkle
+    /// tree. If this fails, the mechanism is wrong. Run:
     /// `cargo test --release -p bench --bin prove -- --ignored embedded_matches_rebuilt --nocapture`
     #[test]
     #[ignore = "multi-second circuit rebuild; run explicitly"]
@@ -345,7 +502,22 @@ mod tests {
                 .expect("common data must serialize");
             assert!(!bytes.is_empty());
 
-            println!("embedded_matches_rebuilt: all five circuits are value-identical");
+            // The final block blob uses the identical serializer/loader, but
+            // is loaded later by the block lane rather than `from_embedded`.
+            // Drop the independently loaded startup set before materializing
+            // two degree-2^18 block commitments for this exhaustive oracle.
+            drop(embedded);
+            let rebuilt_block = rebuilt.rebuild_block_circuit();
+            drop(rebuilt);
+            let embedded_block = Circuits::load_block_embedded()
+                .expect("embedded final block circuit must load");
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_block.0, &rebuilt_block.1),
+                (&embedded_block.0, &embedded_block.1),
+            );
+
+            println!("embedded_matches_rebuilt: all six circuits are value-identical");
         });
     }
 
@@ -414,6 +586,41 @@ mod tests {
         });
     }
 
+    /// Manual timing harness for the final block lane. Both arms rebuild the
+    /// omitted LDE/Merkle state; the comparison isolates compact decode from
+    /// the legacy circuit definition/preprocessing work it replaces. Run this
+    /// test by name in a fresh process for a cold loader measurement.
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn embedded_block_load_timing() {
+        use std::time::Instant;
+
+        on_big_stack(|| {
+            let t = Instant::now();
+            let embedded_cold = Circuits::load_block_embedded()
+                .expect("embedded final block circuit must load");
+            let t_embedded_cold = t.elapsed();
+            drop(embedded_cold);
+
+            let inputs = Circuits::from_embedded().expect("embedded startup circuits must load");
+            let t = Instant::now();
+            let rebuilt = inputs.rebuild_block_circuit();
+            let t_rebuilt = t.elapsed();
+            drop(rebuilt);
+            drop(inputs);
+
+            let t = Instant::now();
+            let embedded_warm = Circuits::load_block_embedded()
+                .expect("embedded final block circuit must reload");
+            let t_embedded_warm = t.elapsed();
+            drop(embedded_warm);
+
+            println!("block embedded (process-cold): {t_embedded_cold:>10.1?}");
+            println!("block rebuild  (warm inputs):  {t_rebuilt:>10.1?}");
+            println!("block embedded (warm):         {t_embedded_warm:>10.1?}");
+        });
+    }
+
     /// The embedded blobs must be present and non-empty in a normal compile
     /// (guards against LIGHTER_SKIP_EMBED stubs sneaking into a submission).
     #[test]
@@ -424,6 +631,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),
