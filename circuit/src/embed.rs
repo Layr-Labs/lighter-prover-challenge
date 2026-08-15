@@ -260,6 +260,7 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     let mut buf = Vec::with_capacity(4 * watchers.len() + 8);
     write_uvarint(&mut buf, watchers.len() as u64);
     for &watcher in watchers {
+        let watcher = u32::try_from(watcher).context("generator index exceeds u32")?;
         buf.extend_from_slice(&watcher.to_le_bytes());
     }
     write_compressed_section(&mut out, &buf);
@@ -418,15 +419,15 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     );
     let mut watchers = Vec::with_capacity(watchers_len);
     for chunk in section[vpos..].chunks_exact(4) {
-        let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
-        ensure!((watcher as usize) < generator_count, "watcher index out of range");
+        let watcher = u32::from_le_bytes(chunk.try_into().unwrap()) as usize;
+        ensure!(watcher < generator_count, "watcher index out of range");
         watchers.push(watcher);
     }
     // Watch counts are a pure function of the (deduplicated) watcher lists;
     // this mirrors `read_prover_only_circuit_data`'s reconstruction.
     let mut generator_watch_counts = vec![0usize; generator_count];
     for &watcher in &watchers {
-        generator_watch_counts[watcher as usize] += 1;
+        generator_watch_counts[watcher] += 1;
     }
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
@@ -575,15 +576,6 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         }
     };
 
-    // Runtime-only, like `generator_watch_counts`: a pure function of `generators`. Every
-    // generator this loader produces comes from `read_generator_impl!`, which wraps each
-    // deserialized `SimpleGenerator` in a `SimpleGeneratorAdapter`, so this scan is expected
-    // to return `true`; it is computed rather than assumed so a custom serializer that yields
-    // some other `WitnessGenerator` still gets the conservative behavior.
-    let generators_defer_until_ready = generators
-        .iter()
-        .all(|generator| generator.0.defers_until_ready());
-
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
         constants_sigmas_quotient_cache,
         constants_sigmas_quotient_step,
@@ -591,7 +583,6 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         generators,
         generator_indices_by_watches,
         generator_watch_counts,
-        generators_defer_until_ready,
         constants_sigmas_commitment,
         sigmas,
         subgroup,
