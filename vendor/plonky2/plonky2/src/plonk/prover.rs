@@ -1743,6 +1743,123 @@ fn start_gpu_range_check_gate_quotient<
     Some((gate_indices, job))
 }
 
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn start_gpu_extension_arith_gate_quotient<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    wires_commitment: &PolynomialBatch<F, C, D>,
+    quotient_rows: usize,
+    step: usize,
+    alphas: &[F],
+) -> Option<(
+    Vec<usize>,
+    crate::hash::poseidon2::metal::ExtensionArithGateQuotientJob<F>,
+)> {
+    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
+    use crate::hash::poseidon2::metal::{ExtArithQuotientKind, ExtArithQuotientSpec};
+
+    // Copy of the Range lookup ban (prover.rs:1304-1318). These gates read
+    // gate-local constants at the selector-prefix width; lookup selectors
+    // would shift that prefix.
+    if common_data.num_lookup_polys != 0
+        || common_data.num_lookup_selectors != 0
+        || common_data.config.num_challenges != 2
+    {
+        return None;
+    }
+    // Kernel schoolbook is D=2 / W=7 only (same as Reducing kind 9).
+    if D != 2 {
+        return None;
+    }
+
+    let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
+    let raw_constant_base = common_data
+        .selectors_info
+        .num_selectors()
+        .checked_add(common_data.num_lookup_selectors)?;
+    if raw_constant_base > common_data.num_constants {
+        return None;
+    }
+
+    let mut gate_indices = Vec::new();
+    let mut specs = Vec::new();
+    for (gate_index, gate) in common_data.gates.iter().enumerate() {
+        let admitted = if let Some(arith) =
+            gate.0.as_any().downcast_ref::<ArithmeticExtensionGate<D>>()
+        {
+            let expected_wires = arith.num_ops.checked_mul(4 * D)?;
+            let expected_constraints = arith.num_ops.checked_mul(D)?;
+            if arith.num_ops == 0
+                || gate.0.num_wires() != expected_wires
+                || gate.0.num_constraints() != expected_constraints
+                || raw_constant_base.checked_add(2)? > common_data.num_constants
+            {
+                // Fail closed: a layout-mismatched ArithExt rejects the
+                // whole Cut B job (same as Range). The gate stays on CPU
+                // because we return None *before* any exclusion.
+                return None;
+            }
+            Some((
+                ExtArithQuotientKind::ArithmeticExtension,
+                arith.num_ops,
+            ))
+        } else if let Some(mul) = gate.0.as_any().downcast_ref::<MulExtensionGate<D>>() {
+            let expected_wires = mul.num_ops.checked_mul(3 * D)?;
+            let expected_constraints = mul.num_ops.checked_mul(D)?;
+            if mul.num_ops == 0
+                || gate.0.num_wires() != expected_wires
+                || gate.0.num_constraints() != expected_constraints
+                || raw_constant_base.checked_add(1)? > common_data.num_constants
+            {
+                return None;
+            }
+            Some((ExtArithQuotientKind::MulExtension, mul.num_ops))
+        } else {
+            None
+        };
+        if let Some((kind, num_ops)) = admitted {
+            let selector_column = common_data.selectors_info.selector_indices[gate_index];
+            specs.push(ExtArithQuotientSpec {
+                selector_column,
+                gate_index,
+                group: common_data.selectors_info.groups[selector_column].clone(),
+                include_unused_selector,
+                num_ops,
+                kind,
+                constant_base: raw_constant_base,
+            });
+            gate_indices.push(gate_index);
+        }
+    }
+    if specs.is_empty() {
+        return None;
+    }
+
+    let wires = wires_commitment.merkle_tree.shared_columns()?;
+    let constants = prover_data
+        .constants_sigmas_commitment
+        .merkle_tree
+        .shared_columns()?;
+    // Same alpha prefix as every other gate family.
+    let alpha_offset = common_data.config.num_challenges * (common_data.num_partial_products + 2);
+    let job = crate::hash::poseidon2::metal::start_extension_arith_gate_quotient(
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        &specs,
+        alphas,
+        alpha_offset,
+    )?;
+    Some((gate_indices, job))
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_permutation_quotient<
     F: RichField + Extendable<D>,
@@ -1899,6 +2016,19 @@ fn compute_quotient_polys<
         })
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_ext_arith = allow_gpu_poseidon
+        .then(|| {
+            start_gpu_extension_arith_gate_quotient(
+                common_data,
+                prover_data,
+                wires_commitment,
+                lde_size,
+                step,
+                alphas,
+            )
+        })
+        .flatten();
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_permutation = (allow_gpu_poseidon && col_major_perm)
         .then(|| {
             start_gpu_permutation_quotient(
@@ -1945,7 +2075,14 @@ fn compute_quotient_polys<
                 .into_iter()
                 .flatten(),
         )
-        .collect::<Vec<_>>();
+                .chain(
+            gpu_ext_arith
+                .as_ref()
+                .map(|(gate_indices, _)| gate_indices.iter().copied())
+                .into_iter()
+                .flatten(),
+        )
+.collect::<Vec<_>>();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let excluded_gate_indices = {
         let _ = allow_gpu_poseidon;
@@ -2441,7 +2578,44 @@ fn compute_quotient_polys<
             });
     }
 
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if let Some((_, job)) = &gpu_ext_arith {
+        let gpu_values = match job.finish() {
+            Ok(values) => values,
+            Err(error) => {
+                log::warn!(
+                    "Metal extension-arith gate quotient failed; recomputing quotient on CPU: {error}"
+                );
+                return compute_quotient_polys(
+                    common_data,
+                    prover_data,
+                    public_inputs_hash,
+                    wires_commitment,
+                    zs_partial_products_and_lookup_commitment,
+                    betas,
+                    gammas,
+                    beta_k_is,
+                    deltas,
+                    alphas,
+                    col_major_perm,
+                    false,
+                );
+            }
+        };
+        debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(gpu_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (cpu_values, gpu_values))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                    *cpu += gpu * denominator_inv;
+                }
+            });
+    }
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if let Some(job) = &gpu_permutation {
         let gpu_values = match job.finish() {
             Ok(values) => values,

@@ -1602,6 +1602,154 @@ kernel void range_check_gate_quotient(
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
 }
 
+// Quadratic Goldilocks extension F[x]/(x^2 - 7). Copied from
+// range_check_gate_quotient kind 9 (Reducing) at poseidon2.metal:1468-1494.
+// Do not invent a second schoolbook.
+inline void ext2_mul_w7(
+    ulong a0, ulong a1, ulong b0, ulong b1,
+    thread ulong& p0, thread ulong& p1) {
+    p0 = gl_add(gl_mul(a0, b0), gl_mul(7, gl_mul(a1, b1)));
+    p1 = gl_add(gl_mul(a0, b1), gl_mul(a1, b0));
+}
+
+// Dedicated command for ArithmeticExtensionGate (D=2, stride 4*D) and
+// MulExtensionGate (D=2, stride 3*D). One metadata record per gate, ten
+// uints, same stride as the Range/U32 union:
+//   selector column, gate index, group start/end, include UNUSED selector,
+//   kind (0=ArithExt, 1=MulExt), num_ops, raw constant-column base,
+//   then two unused words.
+//
+// Union contract (copy of range_check_gate_quotient):
+//   filter = ∏(i - selector) over the group except gate_index
+//          * (UNUSED - selector) if include_unused_selector
+//   local-reduce constraints with the shared alpha powers, then * filter
+//   gl_canonicalize the two output words
+//   op-major, c0 then c1
+//   W = 7
+//
+// Constants sit at raw_constant_base in the constants/sigmas commitment
+// (selector prefix + lookup selectors). MulExt reads c0 only; ArithExt
+// reads c0 and c1.
+kernel void extension_arith_gate_quotient(
+    const device ulong* wires [[buffer(0)]],
+    const device ulong* constants [[buffer(1)]],
+    device ulong* output [[buffer(2)]],
+    constant ulong* alpha_powers [[buffer(3)]],
+    constant uint* metadata [[buffer(4)]],
+    constant uint& lde_rows [[buffer(5)]],
+    constant uint& quotient_rows [[buffer(6)]],
+    constant uint& step [[buffer(7)]],
+    constant uint& alpha_stride [[buffer(8)]],
+    constant uint& spec_count [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= quotient_rows) {
+        return;
+    }
+
+    uint source_row = gid * step;
+    ulong total[2] = { 0, 0 };
+    for (uint spec_index = 0; spec_index < spec_count; ++spec_index) {
+        constant uint* spec = metadata + spec_index * 10u;
+        uint selector_column = spec[0];
+        uint gate_index = spec[1];
+        uint group_start = spec[2];
+        uint group_end = spec[3];
+        uint include_unused_selector = spec[4];
+        uint kind = spec[5];
+        uint num_ops = spec[6];
+        uint constant_base = spec[7];
+
+        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
+        ulong filter = 1;
+        for (uint i = group_start; i < group_end; ++i) {
+            if (i != gate_index) {
+                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+            }
+        }
+        if (include_unused_selector != 0u) {
+            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+        }
+
+        alpha_acc_t gate_accumulators[2] = {
+            { { 0, 0 }, { 0, 0 } },
+            { { 0, 0 }, { 0, 0 } },
+        };
+        uint constraint_index = 0;
+        ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
+
+        if (kind == 0u) {
+            // ArithmeticExtensionGate D=2: 8 wires/op
+            //   m0[2] | m1[2] | addend[2] | out[2]
+            // computed = c0 * (m0 * m1) + c1 * addend
+            // emit (out - computed) limbs, c0 then c1, op-major
+            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 8u;
+                ulong a0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong a1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong b0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong b1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong z0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong z1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong out0 = wires[(wire_base + 6u) * lde_rows + source_row];
+                ulong out1 = wires[(wire_base + 7u) * lde_rows + source_row];
+                ulong p0, p1;
+                ext2_mul_w7(a0, a1, b0, b1, p0, p1);
+                ulong computed0 = gl_add(gl_mul(p0, const_0), gl_mul(z0, const_1));
+                ulong computed1 = gl_add(gl_mul(p1, const_0), gl_mul(z1, const_1));
+                range_check_gate_emit(
+                    gl_sub(out0, computed0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(out1, computed1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else if (kind == 1u) {
+            // MulExtensionGate D=2: 6 wires/op
+            //   m0[2] | m1[2] | out[2]
+            // computed = c0 * (m0 * m1)   // c0 only
+            // emit (out - computed) limbs, c0 then c1, op-major
+            for (uint op = 0; op < num_ops; ++op) {
+                ulong wire_base = (ulong)op * 6u;
+                ulong a0 = wires[(wire_base + 0u) * lde_rows + source_row];
+                ulong a1 = wires[(wire_base + 1u) * lde_rows + source_row];
+                ulong b0 = wires[(wire_base + 2u) * lde_rows + source_row];
+                ulong b1 = wires[(wire_base + 3u) * lde_rows + source_row];
+                ulong out0 = wires[(wire_base + 4u) * lde_rows + source_row];
+                ulong out1 = wires[(wire_base + 5u) * lde_rows + source_row];
+                ulong p0, p1;
+                ext2_mul_w7(a0, a1, b0, b1, p0, p1);
+                ulong computed0 = gl_mul(p0, const_0);
+                ulong computed1 = gl_mul(p1, const_0);
+                range_check_gate_emit(
+                    gl_sub(out0, computed0),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+                range_check_gate_emit(
+                    gl_sub(out1, computed1),
+                    alpha_powers, alpha_stride, gate_accumulators,
+                    constraint_index++);
+            }
+        } else {
+            // Encoder rejects unknown kinds; a malformed record must not
+            // silently contribute zero (that would be a missing quotient).
+            range_check_gate_emit(
+                1, alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index++);
+        }
+
+        total[0] = gl_mul_add(
+            filter, alpha_acc_materialize(gate_accumulators[0]), total[0]);
+        total[1] = gl_mul_add(
+            filter, alpha_acc_materialize(gate_accumulators[1]), total[1]);
+    }
+
+    output[(ulong)gid * 2] = gl_canonicalize(total[0]);
+    output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
+}
+
 kernel void poseidon2_hash_leaves(
     const device ulong* leaves [[buffer(0)]],
     device ulong* hashes [[buffer(1)]],

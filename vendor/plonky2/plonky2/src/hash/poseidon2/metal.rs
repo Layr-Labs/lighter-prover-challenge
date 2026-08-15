@@ -109,13 +109,13 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "9e8ccaff7c0583513f5237c648f8160332648a0bf1f3909700de12b54209eff7";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -126,6 +126,7 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
     "permutation_quotient",
+    "extension_arith_gate_quotient",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -245,6 +246,45 @@ pub(crate) struct PermutationQuotientJob<F> {
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
+}
+
+/// An asynchronously submitted ArithmeticExtension + MulExtension evaluation.
+/// Layout matches [`PoseidonGateQuotientJob`]: two challenge values per
+/// quotient-domain point. Own type so Cut B cannot share Range's finish
+/// observer or drop path.
+pub(crate) struct ExtensionArithGateQuotientJob<F> {
+    command_buffer: CommandBuffer,
+    output: Option<Buffer>,
+    output_pool: Arc<Mutex<QuotientOutputPool>>,
+    len: usize,
+    _job: GpuJobGuard,
+    _phantom: PhantomData<F>,
+}
+
+impl<F: RichField> ExtensionArithGateQuotientJob<F> {
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.command_buffer.wait_until_completed();
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "extension-arith gate quotient command buffer ended with status {:?}",
+                self.command_buffer.status()
+            ));
+        }
+        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
+        // and the completed kernel canonicalized every output word.
+        let output = self.output.as_ref().expect("quotient output present");
+        Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+    }
+}
+
+impl<F> Drop for ExtensionArithGateQuotientJob<F> {
+    fn drop(&mut self) {
+        recycle_completed_quotient_output(
+            &self.command_buffer,
+            &mut self.output,
+            &self.output_pool,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -506,6 +546,29 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
+}
+
+/// Kind tag for the dedicated extension-arithmetic kernel. Not a
+/// [`U32QuotientKind`] — these gates must never enter the Range/U32 job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExtArithQuotientKind {
+    /// `ArithmeticExtensionGate` at `D == 2`: 4*D wires/op, 2 constants.
+    ArithmeticExtension,
+    /// `MulExtensionGate` at `D == 2`: 3*D wires/op, 1 constant (c0 only).
+    MulExtension,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ExtArithQuotientSpec {
+    pub selector_column: usize,
+    pub gate_index: usize,
+    pub group: core::ops::Range<usize>,
+    pub include_unused_selector: bool,
+    pub num_ops: usize,
+    pub kind: ExtArithQuotientKind,
+    /// Column of local constant 0 in the constants/sigmas commitment
+    /// (`num_selectors + num_lookup_selectors`).
+    pub constant_base: usize,
 }
 
 /// Bounded exact-size cache of shared column-store buffers.
@@ -1088,6 +1151,7 @@ impl LazyPipeline {
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1100,6 +1164,10 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
 
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     PERMUTATION_QUOTIENT_PIPELINE.get()
+}
+
+fn extension_arith_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE.get()
 }
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1124,6 +1192,10 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
         ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        (
+            "extension_arith_gate_quotient",
+            &EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE,
+        ),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -1987,6 +2059,126 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_extension_arith_gate_quotient<F: RichField>(
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    specs: &[ExtArithQuotientSpec],
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<ExtensionArithGateQuotientJob<F>> {
+    const SPEC_WORDS: usize = 10;
+    const MAX_INLINE_BYTES: usize = 4096;
+
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || alphas.len() != 2
+        || specs.is_empty()
+        || specs
+            .len()
+            .checked_mul(SPEC_WORDS * size_of::<u32>())
+            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
+        || wires.rows == 0
+        || wires.rows != constants.rows
+        || quotient_rows == 0
+        || step == 0
+        || quotient_rows.checked_mul(step) != Some(wires.rows)
+        || wires.rows > u32::MAX as usize
+        || quotient_rows > u32::MAX as usize
+        || step > u32::MAX as usize
+    {
+        return None;
+    }
+
+    let mut alpha_stride = 0usize;
+    let mut metadata = Vec::with_capacity(specs.len() * SPEC_WORDS);
+    for spec in specs {
+        if spec.num_ops == 0 {
+            return None;
+        }
+        let (kind, wire_count, num_constraints, constants_needed) = match spec.kind {
+            ExtArithQuotientKind::ArithmeticExtension => (
+                0usize,
+                spec.num_ops.checked_mul(8)?, // 4 * D, D=2
+                spec.num_ops.checked_mul(2)?,
+                2usize,
+            ),
+            ExtArithQuotientKind::MulExtension => (
+                1usize,
+                spec.num_ops.checked_mul(6)?, // 3 * D, D=2
+                spec.num_ops.checked_mul(2)?,
+                1usize,
+            ),
+        };
+        if wire_count > wires.cols
+            || spec.selector_column >= constants.cols
+            || spec.constant_base.checked_add(constants_needed)? > constants.cols
+            || spec.group.start > spec.gate_index
+            || spec.gate_index >= spec.group.end
+            || spec.selector_column > u32::MAX as usize
+            || spec.gate_index > u32::MAX as usize
+            || spec.group.end > u32::MAX as usize
+            || spec.num_ops > u32::MAX as usize
+            || spec.constant_base > u32::MAX as usize
+        {
+            return None;
+        }
+        alpha_stride = alpha_stride.max(num_constraints);
+        metadata.extend([
+            spec.selector_column as u32,
+            spec.gate_index as u32,
+            spec.group.start as u32,
+            spec.group.end as u32,
+            spec.include_unused_selector as u32,
+            kind as u32,
+            spec.num_ops as u32,
+            spec.constant_base as u32,
+            0,
+            0,
+        ]);
+    }
+    if alpha_stride == 0
+        || alpha_stride > u32::MAX as usize
+        || alpha_stride
+            .checked_mul(2 * size_of::<u64>())
+            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
+    {
+        return None;
+    }
+
+    // Host powers are residue-canonical. Same as Poseidon/Range.
+    let mut alpha_powers = Vec::with_capacity(2 * alpha_stride);
+    for &alpha in alphas {
+        let mut power = alpha.exp_u64(alpha_offset as u64);
+        for _ in 0..alpha_stride {
+            alpha_powers.push(power.to_canonical_u64());
+            power *= alpha;
+        }
+    }
+
+    let context = shared_context()?;
+    match context.start_extension_arith_gate_quotient(
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        &metadata,
+        specs.len(),
+        &alpha_powers,
+        alpha_stride,
+    ) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            log::warn!(
+                "Metal extension-arith gate quotient unavailable; using CPU path: {error}"
+            );
+            None
+        }
+    }
+}
+
 /// Allocates the final retained column store before the CPU LDE is computed,
 /// so the same shared buffer can be bound directly as the Metal leaf input.
 pub(crate) fn allocate_columns<F: RichField>(
@@ -2725,6 +2917,68 @@ impl MetalShared {
             len,
             #[cfg(test)]
             failure_observer,
+            _job: job_guard,
+            _phantom: PhantomData,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_extension_arith_gate_quotient<F: RichField>(
+        &self,
+        wires: &MetalColumns<F>,
+        constants: &MetalColumns<F>,
+        quotient_rows: usize,
+        step: usize,
+        metadata: &[u32],
+        spec_count: usize,
+        alpha_powers: &[u64],
+        alpha_stride: usize,
+    ) -> Result<ExtensionArithGateQuotientJob<F>, String> {
+        let pipeline = extension_arith_gate_quotient_pipeline()
+            .ok_or("extension-arith gate quotient pipeline unavailable")?;
+        if metadata.len() != spec_count * 10 || alpha_powers.len() != alpha_stride * 2 {
+            return Err("invalid extension-arith quotient metadata".to_string());
+        }
+        let len = quotient_rows
+            .checked_mul(2)
+            .ok_or("extension-arith gate quotient output length overflow")?;
+        let bytes = len
+            .checked_mul(size_of::<u64>())
+            .ok_or("extension-arith gate quotient output size overflow")?;
+        let output = self.acquire_quotient_output(bytes as u64);
+        let job_guard = GpuJobGuard::begin();
+        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(&wires.buffer), 0);
+            encoder.set_buffer(1, Some(&constants.buffer), 0);
+            encoder.set_buffer(2, Some(&output), 0);
+            encoder.set_bytes(
+                3,
+                size_of_val(alpha_powers) as NSUInteger,
+                alpha_powers.as_ptr().cast::<c_void>(),
+            );
+            encoder.set_bytes(
+                4,
+                size_of_val(metadata) as NSUInteger,
+                metadata.as_ptr().cast::<c_void>(),
+            );
+            set_u32(encoder, 5, wires.rows as u32);
+            set_u32(encoder, 6, quotient_rows as u32);
+            set_u32(encoder, 7, step as u32);
+            set_u32(encoder, 8, alpha_stride as u32);
+            set_u32(encoder, 9, spec_count as u32);
+            dispatch(encoder, pipeline, quotient_rows);
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.to_owned()
+        });
+        Ok(ExtensionArithGateQuotientJob {
+            command_buffer,
+            output: Some(output),
+            output_pool: Arc::clone(&self.quotient_output_pool),
+            len,
             _job: job_guard,
             _phantom: PhantomData,
         })
@@ -4099,6 +4353,8 @@ mod tests {
         assert_eq!(reused.contents(), completed_output_ptr);
         assert!(pool.lock().unwrap().free.is_empty());
     }
+    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
     use crate::gates::selectors::UNUSED_SELECTOR;
     use crate::hash::hash_types::HashOut;
     use crate::hash::merkle_tree::{capacity_up_to_mut, fill_digests_buf, merkle_tree_prove};
@@ -5579,6 +5835,213 @@ mod tests {
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "byte/quintic gate quotient mismatch at word {i}, step {step}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_extension_arith_gate_quotient_matches_cpu() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+        const WIRE_COLUMNS: usize = 136;
+        const QUOTIENT_ROWS: usize = 64;
+        const ALPHA_OFFSET: usize = 13;
+        const ARITH_OPS: usize = 10; // production 80 / (4*D)
+        const MUL_OPS: usize = 13;   // production 80 / (3*D)
+        const RAW_CONSTANT_BASE: usize = 2; // two selector columns, no lookups
+
+        let context = shared_context().expect("Metal context must initialize");
+        let arith_gate = ArithmeticExtensionGate::<D> { num_ops: ARITH_OPS };
+        let mul_gate = MulExtensionGate::<D> { num_ops: MUL_OPS };
+        assert_eq!(Gate::<F, D>::num_wires(&arith_gate), ARITH_OPS * 4 * D);
+        assert_eq!(Gate::<F, D>::num_constraints(&arith_gate), ARITH_OPS * D);
+        assert_eq!(Gate::<F, D>::num_wires(&mul_gate), MUL_OPS * 3 * D);
+        assert_eq!(Gate::<F, D>::num_constraints(&mul_gate), MUL_OPS * D);
+
+        let alphas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        let specs = [
+            ExtArithQuotientSpec {
+                selector_column: 0,
+                gate_index: 2,
+                group: 1..4,
+                include_unused_selector: true,
+                num_ops: ARITH_OPS,
+                kind: ExtArithQuotientKind::ArithmeticExtension,
+                constant_base: RAW_CONSTANT_BASE,
+            },
+            ExtArithQuotientSpec {
+                selector_column: 1,
+                gate_index: 5,
+                group: 4..7,
+                include_unused_selector: true,
+                num_ops: MUL_OPS,
+                kind: ExtArithQuotientKind::MulExtension,
+                constant_base: RAW_CONSTANT_BASE,
+            },
+        ];
+
+        // Same boundary set as metal_byte_and_quintic_gate_quotient_matches_cpu
+        // (metal.rs:5099-5112): canonical edges plus noncanonical encodings
+        // at and above the order, including p, p+1, u64::MAX.
+        let boundary = [
+            0u64,
+            1,
+            2,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u32::MAX as u64,
+            1 << 32,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+            9_087_029_921_428_221_768,
+            2_441_288_194_761_790_662,
+        ];
+
+        for step in [1, 2, 4, 8] {
+            let full_rows = QUOTIENT_ROWS * step;
+            let mut wires = context
+                .allocate_columns::<F>(full_rows, WIRE_COLUMNS)
+                .expect("wire columns must allocate");
+            let mut constants = context
+                .allocate_columns::<F>(full_rows, RAW_CONSTANT_BASE + 2)
+                .expect("constant columns must allocate");
+            let mut rng = StdRng::seed_from_u64(0x0e27_0000 + step as u64);
+            for (column_index, column) in wires
+                .columns_mut()
+                .expect("unique wire columns")
+                .into_iter()
+                .enumerate()
+            {
+                for (row, value) in column.iter_mut().enumerate() {
+                    *value = if (row + column_index) % 5 == 0 {
+                        GoldilocksField(boundary[(row + 7 * column_index) % boundary.len()])
+                    } else {
+                        F::from_canonical_u64(rng.next_u64() % F::ORDER)
+                    };
+                }
+            }
+            for (column_index, column) in constants
+                .columns_mut()
+                .expect("unique constant columns")
+                .into_iter()
+                .enumerate()
+            {
+                for (row, value) in column.iter_mut().enumerate() {
+                    *value = if (row + 3 * column_index) % 7 == 0 {
+                        GoldilocksField(boundary[(row + 5 * column_index) % boundary.len()])
+                    } else {
+                        F::from_canonical_u64(rng.next_u64() % F::ORDER)
+                    };
+                }
+            }
+            {
+                let mut selector_columns =
+                    constants.columns_mut().expect("unique selector columns");
+                for spec in &specs {
+                    let other_gate = spec
+                        .group
+                        .clone()
+                        .find(|&gate| gate != spec.gate_index)
+                        .unwrap();
+                    let column = &mut selector_columns[spec.selector_column];
+                    for row in 0..full_rows {
+                        column[row] = match (row / step) & 3 {
+                            0 => F::from_canonical_usize(spec.gate_index),
+                            1 => F::from_canonical_usize(other_gate),
+                            2 => F::from_canonical_usize(UNUSED_SELECTOR),
+                            _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
+                        };
+                    }
+                }
+            }
+
+            let gather = |columns: &MetalColumns<F>, start: usize, count: usize| {
+                let mut out = Vec::with_capacity(count * QUOTIENT_ROWS);
+                for column in start..start + count {
+                    out.extend((0..QUOTIENT_ROWS).map(|row| columns.col(column)[row * step]));
+                }
+                out
+            };
+            let filter_for = |spec: &ExtArithQuotientSpec| {
+                (0..QUOTIENT_ROWS)
+                    .map(|row| {
+                        let selector = constants.col(spec.selector_column)[row * step];
+                        spec.group
+                            .clone()
+                            .filter(|&i| i != spec.gate_index)
+                            .chain(core::iter::once(UNUSED_SELECTOR))
+                            .fold(F::ONE, |filter, i| {
+                                filter * (F::from_canonical_usize(i) - selector)
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            let mut expected = vec![F::ZERO; 2 * QUOTIENT_ROWS];
+            let reduce = |filtered: &[F], n_constraints: usize, expected: &mut [F]| {
+                for row in 0..QUOTIENT_ROWS {
+                    for (challenge, &alpha) in alphas.iter().enumerate() {
+                        let mut power = alpha.exp_u64(ALPHA_OFFSET as u64);
+                        let mut sum = F::ZERO;
+                        for constraint in 0..n_constraints {
+                            sum += filtered[constraint * QUOTIENT_ROWS + row] * power;
+                            power *= alpha;
+                        }
+                        expected[row * 2 + challenge] += sum;
+                    }
+                }
+            };
+
+            // ArithExt: local constants are c0 then c1 (raw columns).
+            {
+                let gathered_wires = gather(&wires, 0, Gate::<F, D>::num_wires(&arith_gate));
+                let gathered_constants = gather(&constants, RAW_CONSTANT_BASE, 2);
+                let filters = filter_for(&specs[0]);
+                let vars = EvaluationVarsBaseBatch::new(
+                    QUOTIENT_ROWS,
+                    &gathered_constants,
+                    &gathered_wires,
+                    &HashOut::ZERO,
+                );
+                let mut filtered = vec![F::ZERO; Gate::<F, D>::num_constraints(&arith_gate) * QUOTIENT_ROWS];
+                Gate::<F, D>::eval_unfiltered_base_batch_accumulate(&arith_gate, vars, &filters, &mut filtered);
+                reduce(&filtered, Gate::<F, D>::num_constraints(&arith_gate), &mut expected);
+            }
+            // MulExt: local constants are c0 only.
+            {
+                let gathered_wires = gather(&wires, 0, Gate::<F, D>::num_wires(&mul_gate));
+                let gathered_constants = gather(&constants, RAW_CONSTANT_BASE, 1);
+                let filters = filter_for(&specs[1]);
+                let vars = EvaluationVarsBaseBatch::new(
+                    QUOTIENT_ROWS,
+                    &gathered_constants,
+                    &gathered_wires,
+                    &HashOut::ZERO,
+                );
+                let mut filtered = vec![F::ZERO; Gate::<F, D>::num_constraints(&mul_gate) * QUOTIENT_ROWS];
+                Gate::<F, D>::eval_unfiltered_base_batch_accumulate(&mul_gate, vars, &filters, &mut filtered);
+                reduce(&filtered, Gate::<F, D>::num_constraints(&mul_gate), &mut expected);
+            }
+
+            let job = start_extension_arith_gate_quotient(
+                &wires,
+                &constants,
+                QUOTIENT_ROWS,
+                step,
+                &specs,
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("Metal extension-arith job must start");
+            let actual = job.finish().expect("Metal extension-arith job must finish");
+            assert_eq!(actual.len(), expected.len());
+            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "extension-arith gate quotient mismatch at word {i}, step {step}"
                 );
             }
         }
