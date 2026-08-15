@@ -179,9 +179,11 @@ pub fn flatten<F, const D: usize>(l: &[F::Extension]) -> Vec<F>
 where
     F: Field + Extendable<D>,
 {
-    l.iter()
-        .flat_map(|x| x.to_basefield_array().to_vec())
-        .collect()
+    let mut flattened = Vec::with_capacity(l.len() * D);
+    for x in l {
+        flattened.extend_from_slice(&x.to_basefield_array());
+    }
+    flattened
 }
 
 /// Batch every D-sized chunks into extension field elements.
