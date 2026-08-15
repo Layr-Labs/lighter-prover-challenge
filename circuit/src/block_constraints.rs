@@ -257,11 +257,6 @@ impl BlockCircuit {
     }
 
     /// The light-chain witness inputs, fed once the light transaction chain proof is available.
-    ///
-    /// Retained as the map-transport oracle for the seeded feed in
-    /// `bench/src/prover.rs`; the production path writes the same single
-    /// proof target directly through a `PartitionFeeder`.
-    #[allow(dead_code)]
     pub fn witness_inputs_light_chain(
         target: &BlockTarget,
         light_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
@@ -272,11 +267,6 @@ impl BlockCircuit {
     }
 
     /// The heavy-chain witness inputs, fed once the heavy transaction chain proof is available.
-    ///
-    /// Retained as the map-transport oracle for the seeded feed in
-    /// `bench/src/prover.rs`; the production path writes the same single
-    /// proof target directly through a `PartitionFeeder`.
-    #[allow(dead_code)]
     pub fn witness_inputs_heavy_chain(
         target: &BlockTarget,
         heavy_tx_chain_proof: &ProofWithPublicInputs<F, C, D>,
