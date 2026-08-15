@@ -213,8 +213,83 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Z columns only (`zs_range`), gathered at the "next" indices.
         zs_next_cols: &'a [F],
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
-        s_sigmas_cols: &'a [F],
+        ///
+        /// Unlike the proof-local Z buffers, these may remain in the
+        /// circuit-wide quotient cache. `ColumnBatch` keeps the batch window
+        /// as a borrowed strided view, so each proof reads the cached columns
+        /// directly instead of copying every routed-wire sigma into a worker
+        /// scratch buffer first.
+        s_sigmas_cols: ColumnBatch<'a, F>,
     },
+}
+
+/// A point window over column-major values without repacking the columns.
+///
+/// Column `c` occupies `data[c * column_stride + offset..][..batch_len]`.
+/// The ordinary proof-local gather uses `column_stride == batch_len` and
+/// `offset == 0`; a circuit-wide cache uses the full quotient-domain stride
+/// and a per-batch offset. Both expose the same contiguous per-column slice to
+/// the permutation evaluator.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnBatch<'a, F> {
+    data: &'a [F],
+    columns: usize,
+    column_stride: usize,
+    offset: usize,
+    batch_len: usize,
+}
+
+impl<'a, F> ColumnBatch<'a, F> {
+    pub(crate) fn new(
+        data: &'a [F],
+        columns: usize,
+        column_stride: usize,
+        offset: usize,
+        batch_len: usize,
+    ) -> Self {
+        if columns == 0 {
+            assert!(data.is_empty());
+        } else {
+            assert!(offset + batch_len <= column_stride);
+            assert!(
+                (columns - 1) * column_stride + offset + batch_len <= data.len(),
+                "column batch exceeds its backing store"
+            );
+        }
+        Self {
+            data,
+            columns,
+            column_stride,
+            offset,
+            batch_len,
+        }
+    }
+
+    pub(crate) fn contiguous(data: &'a [F], columns: usize, batch_len: usize) -> Self {
+        assert_eq!(data.len(), columns * batch_len);
+        Self::new(data, columns, batch_len, 0, batch_len)
+    }
+
+    pub(crate) fn empty(batch_len: usize) -> Self {
+        Self {
+            data: &[],
+            columns: 0,
+            column_stride: 0,
+            offset: 0,
+            batch_len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.columns * self.batch_len
+    }
+
+    #[inline]
+    fn col(&self, column: usize) -> &'a [F] {
+        assert!(column < self.columns);
+        let start = column * self.column_stride + self.offset;
+        &self.data[start..start + self.batch_len]
+    }
 }
 
 const INTERLEAVE_PAIR_WIRES: usize = 136;
@@ -291,7 +366,7 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
     let batch_size = vars_batch.len();
     debug_assert_eq!(output.len(), batch_size);
     let selector_index = common_data.selectors_info.selector_indices[gate_index];
-    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+    let selector_col = vars_batch.local_constants_col(selector_index);
     let mut factors = common_data.selectors_info.groups[selector_index]
         .clone()
         .filter(|&index| index != gate_index)
@@ -745,7 +820,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 den_prod_second.clear();
                 {
                     let wire_col = &wires[j_start * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                    let sigma_col = s_sigmas_cols.col(j_start);
                     let beta_k_0 = beta_k_is[j_start];
                     let beta_k_1 = beta_k_is[num_routed_wires + j_start];
                     for k in 0..n {
@@ -760,7 +835,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 }
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j * n..][..n];
+                    let sigma_col = s_sigmas_cols.col(j);
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
                     for k in 0..n {
@@ -804,7 +879,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     den_prod.clear();
                     {
                         let wire_col = &wires[j_start * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                        let sigma_col = s_sigmas_cols.col(j_start);
                         let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                         for k in 0..n {
                             num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
@@ -813,7 +888,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                     for j in j_start + 1..j_end {
                         let wire_col = &wires[j * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j * n..][..n];
+                        let sigma_col = s_sigmas_cols.col(j);
                         let beta_k_i = beta_k_is[i * num_routed_wires + j];
                         for k in 0..n {
                             num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;

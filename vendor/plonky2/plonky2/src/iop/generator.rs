@@ -124,7 +124,7 @@ fn run_generator_worklist<
     unresolved_watches: &mut [usize],
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
-    mut pending_generator_indices: Vec<usize>,
+    mut pending_generator_indices: Vec<u32>,
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
@@ -141,7 +141,8 @@ fn run_generator_worklist<
     // generation, and there is one witness generation per transaction chunk and
     // per chain step. Swapping keeps both buffers at their high-water capacity,
     // so after the first few rounds a round costs no allocation and no growth
-    // copies at all. `clear()` only resets the length (`usize` has no `Drop`),
+    // copies at all. The compact u32 indices halve queue capacity and copy bandwidth
+    // on 64-bit hosts; `clear()` only resets the length (`u32` has no `Drop`),
     // so each round still observes an empty queue and pushes exactly the same
     // indices in exactly the same order.
     let mut next_pending_generator_indices = Vec::new();
@@ -170,7 +171,7 @@ fn run_generator_worklist<
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
+                Vec<(Target, F, Option<&[u32]>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -178,6 +179,7 @@ fn run_generator_worklist<
                     let mut annotated_values = Vec::new();
                     let mut round_buffer = GeneratedValues::empty();
                     for &generator_idx in chunk {
+                        let generator_idx = generator_idx as usize;
                         if round_generator_is_expired[generator_idx] {
                             continue;
                         }
@@ -221,9 +223,10 @@ fn run_generator_worklist<
                         }
                         if let Some(watchers) = watchers {
                             for &watching_generator_idx in watchers {
-                                if !generator_is_expired[watching_generator_idx] {
-                                    debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                    unresolved_watches[watching_generator_idx] -= 1;
+                                let watching_generator = watching_generator_idx as usize;
+                                if !generator_is_expired[watching_generator] {
+                                    debug_assert_ne!(unresolved_watches[watching_generator], 0);
+                                    unresolved_watches[watching_generator] -= 1;
                                     next_pending_generator_indices.push(watching_generator_idx);
                                 }
                             }
@@ -240,6 +243,7 @@ fn run_generator_worklist<
         }
 
         for &generator_idx in &pending_generator_indices {
+            let generator_idx = generator_idx as usize;
             if generator_is_expired[generator_idx] {
                 continue;
             }
@@ -265,9 +269,10 @@ fn run_generator_worklist<
                 if let Some(watch) = witness.set_target_returning_rep(t, v)? {
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
-                            if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
+                            let watching_generator = watching_generator_idx as usize;
+                            if !generator_is_expired[watching_generator] {
+                                debug_assert_ne!(unresolved_watches[watching_generator], 0);
+                                unresolved_watches[watching_generator] -= 1;
                                 next_pending_generator_indices.push(watching_generator_idx);
                             }
                         }
@@ -310,6 +315,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
         if let Some(watch) = witness.set_target_returning_rep(t, v)? {
             if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     debug_assert_ne!(unresolved_watches[generator_idx], 0);
                     unresolved_watches[generator_idx] -= 1;
                 }
@@ -344,6 +350,7 @@ impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
                     self.unresolved_watches[generator_idx] -= 1;
                 }
@@ -368,7 +375,7 @@ pub struct PartitionFeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
     unresolved_watches: &'b mut [usize],
     generator_is_expired: &'b [bool],
-    pending_generator_indices: &'b mut Vec<usize>,
+    pending_generator_indices: &'b mut Vec<u32>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
 }
 
@@ -383,9 +390,10 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &watching_generator_idx in watchers {
-                    if !self.generator_is_expired[watching_generator_idx] {
-                        debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                        self.unresolved_watches[watching_generator_idx] -= 1;
+                    let watching_generator = watching_generator_idx as usize;
+                    if !self.generator_is_expired[watching_generator] {
+                        debug_assert_ne!(self.unresolved_watches[watching_generator], 0);
+                        self.unresolved_watches[watching_generator] -= 1;
                         self.pending_generator_indices.push(watching_generator_idx);
                     }
                 }
@@ -474,6 +482,8 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let generator_count =
+            u32::try_from(generators.len()).expect("generator count exceeds compact worklist");
 
         // Initially, all generators are queued.
         run_generator_worklist(
@@ -482,7 +492,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            (0..generator_count).collect(),
             parallel_threshold,
         )?;
 
@@ -523,6 +533,8 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let generator_count =
+            u32::try_from(generators.len()).expect("generator count exceeds compact worklist");
 
         // Initially, all generators are queued.
         run_generator_worklist(
@@ -531,7 +543,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            (0..generator_count).collect(),
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
@@ -556,9 +568,10 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
                 if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                     for &watching_generator_idx in watchers {
-                        if !self.generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                            self.unresolved_watches[watching_generator_idx] -= 1;
+                        let watching_generator = watching_generator_idx as usize;
+                        if !self.generator_is_expired[watching_generator] {
+                            debug_assert_ne!(self.unresolved_watches[watching_generator], 0);
+                            self.unresolved_watches[watching_generator] -= 1;
                             pending_generator_indices.push(watching_generator_idx);
                         }
                     }
@@ -1216,6 +1229,7 @@ mod tests {
         for (watch, watchers) in prover_data.generator_indices_by_watches.iter() {
             if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     unresolved_watches[generator_idx] += 1;
                 }
             }
@@ -1236,6 +1250,7 @@ mod tests {
         let mut occurrences = vec![0usize; prover_data.generators.len()];
         for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
             for &generator_idx in watchers {
+                let generator_idx = generator_idx as usize;
                 occurrences[generator_idx] += 1;
             }
         }
