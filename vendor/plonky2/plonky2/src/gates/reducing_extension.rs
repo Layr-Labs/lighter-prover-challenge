@@ -5,6 +5,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -159,7 +160,33 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
             .map(|p| ext(Self::wires_old_acc().start, p))
             .collect();
 
-        let mut scratch = vec![F::ZERO; D * n];
+        // One `D x n` constraint block, reused across the `num_coeffs` reduction
+        // steps. Every slot is assigned by the point loop below before the
+        // `batch_multiply_add_inplace` read, so the block never needs a zero-fill
+        // or a heap allocation when it fits on the stack. This accumulate impl
+        // runs once per 32-point quotient batch for a CPU-quotient gate of every
+        // proof, i.e. `quotient_domain / 32` times per proof; the previous
+        // `vec![F::ZERO; D * n]` paid a malloc, a free and a `D * n` memset per
+        // call for a block it immediately overwrote.
+        const STACK_SCRATCH: usize = 128;
+        let scratch_len = D * n;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
+            // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`,
+            // and every element of `[..scratch_len]` is written by the point loop
+            // below before any is read. Same idiom as `ArithmeticExtensionGate`'s
+            // stack-or-heap scratch.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
+                    scratch_len,
+                )
+            }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
         for i in 0..self.num_coeffs {
             let coeff_start = Self::wires_coeff(i).start;
             let acc_start = self.wires_accs(i).start;

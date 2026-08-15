@@ -248,6 +248,34 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
         // parallelism without changing constraint emission order.
         let base_minus_one = base - P::ONES;
         let mut i = 0;
+        // Unroll four independent transitions per iteration to deepen ILP on
+        // top of the two-wide rewrite; constraint emission order is unchanged.
+        while i + 3 < self.num_power_bits {
+            let prev_0 = if i == 0 {
+                P::ONES
+            } else {
+                intermediate_values[i - 1].square()
+            };
+            let prev_1 = intermediate_values[i].square();
+            let prev_2 = intermediate_values[i + 1].square();
+            let prev_3 = intermediate_values[i + 2].square();
+
+            // power_bits is in LE order, but we accumulate in BE order.
+            let bit_0 = power_bits[self.num_power_bits - i - 1];
+            let bit_1 = power_bits[self.num_power_bits - i - 2];
+            let bit_2 = power_bits[self.num_power_bits - i - 3];
+            let bit_3 = power_bits[self.num_power_bits - i - 4];
+            let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
+            let mul_by_1 = P::ONES.multiply_accumulate(bit_1, base_minus_one);
+            let mul_by_2 = P::ONES.multiply_accumulate(bit_2, base_minus_one);
+            let mul_by_3 = P::ONES.multiply_accumulate(bit_3, base_minus_one);
+
+            yield_constr.one(prev_0 * mul_by_0 - intermediate_values[i]);
+            yield_constr.one(prev_1 * mul_by_1 - intermediate_values[i + 1]);
+            yield_constr.one(prev_2 * mul_by_2 - intermediate_values[i + 2]);
+            yield_constr.one(prev_3 * mul_by_3 - intermediate_values[i + 3]);
+            i += 4;
+        }
         while i + 1 < self.num_power_bits {
             let prev_0 = if i == 0 {
                 P::ONES
@@ -256,7 +284,6 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
             };
             let prev_1 = intermediate_values[i].square();
 
-            // power_bits is in LE order, but we accumulate in BE order.
             let bit_0 = power_bits[self.num_power_bits - i - 1];
             let bit_1 = power_bits[self.num_power_bits - i - 2];
             let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
