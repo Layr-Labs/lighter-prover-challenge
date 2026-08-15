@@ -1293,6 +1293,37 @@ pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Count of in-flight chain `prove_prepared` calls. Unlike exclusive phase,
+/// hideable tx proofs may still be running; this flag only changes routing
+/// for the 2^17 serial-critical shapes (see [`gpu_worthwhile`]).
+static CHAIN_CRITICAL_GPU: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// RAII: while held, 2^17 width-≤64 chain trees (Z/partial-product and
+/// quotient) take the GPU path even if another Merkle job is in flight, and
+/// those 2^17 shapes jump the single buffer-set wait queue. Nested holds
+/// from overlapping heavy/light chain proofs are counted. Proof bytes are
+/// unchanged: either backend hashes the identical tree.
+#[derive(Debug)]
+pub struct ChainCriticalGpuGuard;
+
+impl ChainCriticalGpuGuard {
+    pub fn new() -> Self {
+        CHAIN_CRITICAL_GPU.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        ChainCriticalGpuGuard
+    }
+}
+
+impl Drop for ChainCriticalGpuGuard {
+    fn drop(&mut self) {
+        CHAIN_CRITICAL_GPU.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn chain_critical_gpu() -> bool {
+    CHAIN_CRITICAL_GPU.load(core::sync::atomic::Ordering::Relaxed) > 0
+}
+
 /// Runnable-but-unproven chain steps: incremented by the orchestrator when a
 /// chain step's transaction proof is ready (the step could prove right now),
 /// decremented when its proof completes. While this backlog is at or above
@@ -1369,7 +1400,13 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // wait and measurably starves the fold's pure-CPU phases.
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
+        // Width > 64 (wires) already GPU. Width ≤ 64 (Z/PP, quotient) used to
+        // stay on CPU whenever a chunk tree occupied the stream, because FIFO
+        // wait was 200–320 ms vs ~15 ms CPU. During chain `prove_prepared` the
+        // spine is the scored path and those trees jump the buffer waiters, so
+        // admit them to the GPU even if a hideable chunk job is in flight.
         return exclusive
+            || chain_critical_gpu()
             || leaf_width > 64
             || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
@@ -3601,7 +3638,9 @@ impl MetalShared {
         // Spine trees (the 2^17 serial-critical shapes, same predicate as
         // gpu_worthwhile) jump queued chunk-tree waiters for the single set —
         // but only while the chain is actually the laggard (see SPINE_BACKLOG).
-        let spine = leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent();
+        let spine = leaf_count == 1 << 17
+            && leaf_width > 4
+            && (spine_urgent() || chain_critical_gpu());
         let mut set = self.acquire_set_priority(spine)?;
         let result = self.build_with_set(
             &mut set,

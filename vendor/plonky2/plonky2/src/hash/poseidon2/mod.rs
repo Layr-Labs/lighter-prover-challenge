@@ -7,7 +7,7 @@ pub(crate) mod metal;
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 pub use metal::{
     is_exclusive_gpu_phase, prewarm as prewarm_gpu, prewarm_large_column_store,
-    set_exclusive_gpu_phase, spine_backlog_add,
+    set_exclusive_gpu_phase, spine_backlog_add, ChainCriticalGpuGuard,
 };
 
 /// No-op fallback so callers can toggle the exclusive-phase GPU routing hint
@@ -30,6 +30,18 @@ pub fn prewarm_gpu() {}
 /// without the Metal backend.
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
 pub fn spine_backlog_add(_delta: isize) {}
+
+/// No-op stand-in for [`ChainCriticalGpuGuard`] on non-Metal platforms.
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+#[derive(Debug)]
+pub struct ChainCriticalGpuGuard;
+
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+impl ChainCriticalGpuGuard {
+    pub fn new() -> Self {
+        ChainCriticalGpuGuard
+    }
+}
 
 /// No-op fallback for the large-store prewarm on platforms without the
 /// Metal backend.
