@@ -99,6 +99,26 @@ pub trait Extendable<const D: usize>: Field + Sized {
             .sum()
     }
 
+    /// Compute four dot products against one shared extension-value table.
+    ///
+    /// This has the same per-lane zip semantics as calling
+    /// [`Self::extension_base_dot_product`] four times. A base field can
+    /// specialize the full-width case to retain its reduction strategy while
+    /// loading the shared table only once.
+    #[doc(hidden)]
+    #[inline]
+    fn extension_base_dot_product_four(
+        extension_values: &[Self::Extension],
+        base_scalars: [&[Self]; 4],
+    ) -> [Self::Extension; 4] {
+        [
+            Self::extension_base_dot_product(extension_values, base_scalars[0]),
+            Self::extension_base_dot_product(extension_values, base_scalars[1]),
+            Self::extension_base_dot_product(extension_values, base_scalars[2]),
+            Self::extension_base_dot_product(extension_values, base_scalars[3]),
+        ]
+    }
+
     /// Internal FFT hook. The default preserves general extension
     /// multiplication; a base field may explicitly specialize multiplication
     /// by its own embedded twiddles without overlapping trait impls.

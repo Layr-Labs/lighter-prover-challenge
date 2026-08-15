@@ -4,6 +4,8 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use circuit::block::PostPreBlock;
+#[cfg(test)]
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
 use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
@@ -746,20 +748,20 @@ pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
         &BlockPreExec::from_block(&block),
     );
     plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
-    prove_block_after_pre(block, circuits, pre_proof)
+    prove_block_after_pre(block.into_post_pre(), circuits, pre_proof)
 }
 
 /// The pipeline after the pre-execution proof. The startup-overlap path calls
 /// this once both the pre-execution proof and the remaining circuit loads have
 /// completed.
 pub(crate) fn prove_block_after_pre(
-    mut block: Block<F>,
+    mut block: PostPreBlock<F>,
     mut circuits: Circuits,
     pre_proof: Proof,
 ) -> Proof {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
-        plonky2::util::profile::enter_context("block_pipeline", block.block_number, &[]);
+        plonky2::util::profile::enter_context("block_pipeline", block.block_witness.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_block_after_pre");
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
@@ -817,9 +819,9 @@ pub(crate) fn prove_block_after_pre(
                         TxPath::Heavy,
                         heavy_chunks,
                         circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
+                        block.block_witness.block_number,
+                        block.block_witness.created_at,
+                        block.block_witness.old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
                         active_paths,
@@ -835,7 +837,7 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
                         "final_block_build",
-                        block_ref.block_number,
+                        block_ref.block_witness.block_number,
                         &[],
                     );
                     #[cfg(feature = "diagnostic_profile")]
@@ -849,9 +851,10 @@ pub(crate) fn prove_block_after_pre(
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
+                    let early = BlockCircuit::witness_inputs_early_from_block_witness(
                         &block_target,
-                        block_ref,
+                        &block_ref.block_witness,
+                        &block_ref.tx_chunks,
                         pre_proof_ref,
                     )
                     .expect("final block early witness inputs failed");
@@ -900,9 +903,9 @@ pub(crate) fn prove_block_after_pre(
                         TxPath::Light,
                         light_chunks,
                         circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
+                        block.block_witness.block_number,
+                        block.block_witness.created_at,
+                        block.block_witness.old_account_delta_tree_root,
                         &pre_output,
                         state_metadata_hash,
                         active_paths,
@@ -951,7 +954,7 @@ pub(crate) fn prove_block_after_pre(
 
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context =
-        plonky2::util::profile::enter_context("final_block", block.block_number, &[]);
+        plonky2::util::profile::enter_context("final_block", block.block_witness.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "final_block_tail");
     let (light_chain_input, heavy_chain_input) =
@@ -1035,6 +1038,32 @@ mod tests {
             .expect("orchestration test thread must start")
             .join()
             .expect("orchestration test thread must finish");
+    }
+
+    #[test]
+    fn post_pre_block_preserves_final_witness_and_moves_transaction_chunks() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let block = Block::<F>::from_json_with_empty_txs(
+                    include_bytes!("../bench_test.json"),
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("public fixture must parse");
+                let expected_witness = circuit::block::BlockWitness::from_block(&block, 1);
+                let first_tx = Arc::clone(&block.tx_chunks[0][0]);
+                let post_pre = block.into_post_pre();
+
+                assert_eq!(post_pre.block_witness, expected_witness);
+                assert!(!post_pre.tx_chunks.is_empty());
+                assert!(Arc::ptr_eq(&post_pre.tx_chunks[0][0], &first_tx));
+            })
+            .expect("post-pre ownership test thread must start")
+            .join()
+            .expect("post-pre ownership test thread must finish");
     }
 
     #[test]
