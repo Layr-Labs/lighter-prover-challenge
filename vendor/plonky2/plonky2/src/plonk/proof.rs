@@ -312,6 +312,31 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+
+/// `z^0 .. z^{n-1}` via two independent multiply chains on `z^2`.
+/// Field-equal to `z.powers().take(n)`: the field is exact.
+fn ext_powers_two_chain<FE: Field>(z: FE, n: usize) -> Vec<FE> {
+    let mut out = Vec::with_capacity(n);
+    if n == 0 {
+        return out;
+    }
+    let z2 = z * z;
+    let mut even = FE::ONE;
+    let mut odd = z;
+    let pairs = n / 2;
+    for _ in 0..pairs {
+        out.push(even);
+        out.push(odd);
+        even = even * z2;
+        odd = odd * z2;
+    }
+    if n % 2 == 1 {
+        out.push(even);
+    }
+    debug_assert_eq!(out.len(), n);
+    out
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -338,7 +363,10 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // identical field element and the transcript is unchanged.
         let degree = common_data.degree();
         let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
-        let zeta_pows = table(zeta);
+        // Serial 2-chain fill of `ζ^i`: even `ζ^{2k}=(ζ^2)^k`, odd `ζ^{2k+1}=ζ·(ζ^2)^k`.
+        // Field-equal to `powers()` (exact field). Not rayon (not e6804e3), not
+        // ext2-dot-ilp, not pepe width-2, not cached-scale.
+        let zeta_pows = ext_powers_two_chain(zeta, degree);
         // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
         // the process-cached natural-order two-adic subgroup, and
         // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
