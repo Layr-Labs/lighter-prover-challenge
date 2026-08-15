@@ -481,7 +481,7 @@ where
             common_data
         )
     );
-    challenger.observe_openings(&openings.to_fri_openings());
+    openings.observe(&mut challenger);
     let instance = common_data.get_fri_instance(zeta);
 
     let opening_proof = timed!(
@@ -2611,6 +2611,113 @@ pub(crate) mod precomputed {
                 F::coset_shift().inverse().powers().take(degree).collect()
             })
         }
+
+        pub(crate) struct FriLayout {
+            pub oracles: Arc<Vec<crate::fri::structure::FriOracleInfo>>,
+            pub all_polys: Arc<Vec<crate::fri::structure::FriPolynomialInfo>>,
+            pub next_batch_polys: Arc<Vec<crate::fri::structure::FriPolynomialInfo>>,
+        }
+
+        static FRI_LAYOUTS: OnceLock<
+            RwLock<HashMap<(usize, usize, usize, usize, usize, usize), Arc<FriLayout>>>
+        > = OnceLock::new();
+
+        pub(crate) fn fri_layout(
+            num_preprocessed_polys: usize,
+            num_wires: usize,
+            num_zs_partial_products_polys: usize,
+            num_all_lookup_polys: usize,
+            num_quotient_polys: usize,
+            num_challenges: usize,
+        ) -> Arc<FriLayout> {
+            let key = (
+                num_preprocessed_polys,
+                num_wires,
+                num_zs_partial_products_polys,
+                num_all_lookup_polys,
+                num_quotient_polys,
+                num_challenges,
+            );
+            let map = FRI_LAYOUTS.get_or_init(|| RwLock::new(HashMap::new()));
+            if let Some(hit) = map.read().unwrap().get(&key) {
+                return Arc::clone(hit);
+            }
+
+            use crate::fri::structure::{FriOracleInfo, FriPolynomialInfo};
+            use crate::plonk::plonk_common::PlonkOracle;
+
+            let oracles = Arc::new(vec![
+                FriOracleInfo {
+                    num_polys: num_preprocessed_polys,
+                    blinding: PlonkOracle::CONSTANTS_SIGMAS.blinding,
+                },
+                FriOracleInfo {
+                    num_polys: num_wires,
+                    blinding: PlonkOracle::WIRES.blinding,
+                },
+                FriOracleInfo {
+                    num_polys: num_zs_partial_products_polys + num_all_lookup_polys,
+                    blinding: PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+                },
+                FriOracleInfo {
+                    num_polys: num_quotient_polys,
+                    blinding: PlonkOracle::QUOTIENT.blinding,
+                },
+            ]);
+
+            let mut all_polys_vec = Vec::with_capacity(
+                num_preprocessed_polys
+                    + num_wires
+                    + num_zs_partial_products_polys
+                    + num_all_lookup_polys
+                    + num_quotient_polys,
+            );
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::CONSTANTS_SIGMAS.index,
+                0..num_preprocessed_polys,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::WIRES.index,
+                0..num_wires,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                0..num_zs_partial_products_polys,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                num_zs_partial_products_polys
+                    ..num_zs_partial_products_polys + num_all_lookup_polys,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::QUOTIENT.index,
+                0..num_quotient_polys,
+            ));
+            let all_polys = Arc::new(all_polys_vec);
+
+            let mut next_batch_polys_vec =
+                Vec::with_capacity(num_challenges + num_all_lookup_polys);
+            next_batch_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                0..num_challenges,
+            ));
+            next_batch_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                num_zs_partial_products_polys
+                    ..num_zs_partial_products_polys + num_all_lookup_polys,
+            ));
+            let next_batch_polys = Arc::new(next_batch_polys_vec);
+
+            let computed = Arc::new(FriLayout {
+                oracles,
+                all_polys,
+                next_batch_polys,
+            });
+
+            let mut map = map.write().unwrap();
+            let entry = map.entry(key).or_insert_with(|| Arc::clone(&computed));
+            Arc::clone(entry)
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -2644,11 +2751,96 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
+
+        pub(crate) struct FriLayout {
+            pub oracles: Arc<Vec<crate::fri::structure::FriOracleInfo>>,
+            pub all_polys: Arc<Vec<crate::fri::structure::FriPolynomialInfo>>,
+            pub next_batch_polys: Arc<Vec<crate::fri::structure::FriPolynomialInfo>>,
+        }
+
+        pub(crate) fn fri_layout(
+            num_preprocessed_polys: usize,
+            num_wires: usize,
+            num_zs_partial_products_polys: usize,
+            num_all_lookup_polys: usize,
+            num_quotient_polys: usize,
+            num_challenges: usize,
+        ) -> Arc<FriLayout> {
+            use alloc::vec;
+            use crate::fri::structure::{FriOracleInfo, FriPolynomialInfo};
+            use crate::plonk::plonk_common::PlonkOracle;
+
+            let oracles = Arc::new(vec![
+                FriOracleInfo {
+                    num_polys: num_preprocessed_polys,
+                    blinding: PlonkOracle::CONSTANTS_SIGMAS.blinding,
+                },
+                FriOracleInfo {
+                    num_polys: num_wires,
+                    blinding: PlonkOracle::WIRES.blinding,
+                },
+                FriOracleInfo {
+                    num_polys: num_zs_partial_products_polys + num_all_lookup_polys,
+                    blinding: PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
+                },
+                FriOracleInfo {
+                    num_polys: num_quotient_polys,
+                    blinding: PlonkOracle::QUOTIENT.blinding,
+                },
+            ]);
+
+            let mut all_polys_vec = Vec::with_capacity(
+                num_preprocessed_polys
+                    + num_wires
+                    + num_zs_partial_products_polys
+                    + num_all_lookup_polys
+                    + num_quotient_polys,
+            );
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::CONSTANTS_SIGMAS.index,
+                0..num_preprocessed_polys,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::WIRES.index,
+                0..num_wires,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                0..num_zs_partial_products_polys,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                num_zs_partial_products_polys
+                    ..num_zs_partial_products_polys + num_all_lookup_polys,
+            ));
+            all_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::QUOTIENT.index,
+                0..num_quotient_polys,
+            ));
+
+            let mut next_batch_polys_vec =
+                Vec::with_capacity(num_challenges + num_all_lookup_polys);
+            next_batch_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                0..num_challenges,
+            ));
+            next_batch_polys_vec.extend(FriPolynomialInfo::from_range(
+                PlonkOracle::ZS_PARTIAL_PRODUCTS.index,
+                num_zs_partial_products_polys
+                    ..num_zs_partial_products_polys + num_all_lookup_polys,
+            ));
+
+            Arc::new(FriLayout {
+                oracles,
+                all_polys: Arc::new(all_polys_vec),
+                next_batch_polys: Arc::new(next_batch_polys_vec),
+            })
+        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
-        two_adic_subgroup,
+        coset_shift_powers, fri_layout, inverse_coset_shift_powers,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 

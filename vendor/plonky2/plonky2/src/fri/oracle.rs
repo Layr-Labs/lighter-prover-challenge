@@ -782,6 +782,18 @@ fn accumulate_linear_quotient<F: Field>(
     let d = composition_poly.len();
     let coeffs = &composition_poly.coeffs;
     let buf = &mut final_poly.coeffs;
+    if buf.is_empty() {
+        if d == 0 {
+            return;
+        }
+        buf.resize(d, F::ZERO);
+        let mut acc = F::ZERO;
+        for i in (0..d - 1).rev() {
+            acc = acc * z + coeffs[i + 1];
+            buf[i] = acc;
+        }
+        return;
+    }
     // Entries past the padded quotient's length only see the shift.
     for l in buf.iter_mut().skip(d) {
         *l *= shift;
