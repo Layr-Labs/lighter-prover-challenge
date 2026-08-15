@@ -1373,6 +1373,19 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
             || leaf_width > 64
             || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
+
+    // Mid-size FRI fold trees are below the normal GPU cutoff, so they
+    // normally run on the CPU. When the Metal queue is otherwise idle their
+    // data-parallel hashing can finish sooner; when it is busy, submitting
+    // them creates a FIFO wait on a dependency-sensitive fold path. Keep the
+    // established cutoff under contention and use Metal only in the idle case.
+    let idle_fold_tree = (17..=64).contains(&leaf_width)
+        && ((1 << 14)..=(1 << 17)).contains(&leaf_count)
+        && leaf_permutations + parent_permutations < MIN_GPU_PERMUTATIONS;
+    if idle_fold_tree {
+        return exclusive || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    }
+
     leaf_permutations + parent_permutations >= min_permutations
 }
 
