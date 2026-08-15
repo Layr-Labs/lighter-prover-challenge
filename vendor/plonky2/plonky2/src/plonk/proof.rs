@@ -24,6 +24,7 @@ use crate::fri::structure::{
 use crate::fri::FriParams;
 use crate::hash::hash_types::{MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
+use crate::iop::challenger::Challenger;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
 use crate::plonk::circuit_data::{CommonCircuitData, VerifierOnlyCircuitData};
@@ -450,6 +451,25 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         };
         FriOpenings {
             batches: vec![zeta_batch, zeta_next_batch],
+        }
+    }
+
+    /// Feeds opening values directly into the Fiat-Shamir challenger's sponge
+    /// state, preserving the exact element sequence of [`Self::to_fri_openings`]
+    /// while deleting both large `concat()` allocations and the wrapper types.
+    pub(crate) fn observe<H: Hasher<F>>(&self, challenger: &mut Challenger<F, H>) {
+        challenger.observe_extension_elements(&self.constants);
+        challenger.observe_extension_elements(&self.plonk_sigmas);
+        challenger.observe_extension_elements(&self.wires);
+        challenger.observe_extension_elements(&self.plonk_zs);
+        challenger.observe_extension_elements(&self.partial_products);
+        challenger.observe_extension_elements(&self.quotient_polys);
+        if !self.lookup_zs.is_empty() {
+            challenger.observe_extension_elements(&self.lookup_zs);
+        }
+        challenger.observe_extension_elements(&self.plonk_zs_next);
+        if !self.lookup_zs_next.is_empty() {
+            challenger.observe_extension_elements(&self.lookup_zs_next);
         }
     }
 }

@@ -792,10 +792,19 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
     }
 
     pub(crate) fn get_fri_instance(&self, zeta: F::Extension) -> FriInstanceInfo<F, D> {
+        let layout = crate::plonk::prover::precomputed::fri_layout(
+            self.num_preprocessed_polys(),
+            self.config.num_wires,
+            self.num_zs_partial_products_polys(),
+            self.num_all_lookup_polys(),
+            self.num_quotient_polys(),
+            self.config.num_challenges,
+        );
+
         // All polynomials are opened at zeta.
         let zeta_batch = FriBatchInfo {
             point: zeta,
-            polynomials: self.fri_all_polys(),
+            polynomials: (*layout.all_polys).clone(),
         };
 
         // The Z polynomials are also opened at g * zeta.
@@ -803,12 +812,12 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         let zeta_next = g * zeta;
         let zeta_next_batch = FriBatchInfo {
             point: zeta_next,
-            polynomials: self.fri_next_batch_polys(),
+            polynomials: (*layout.next_batch_polys).clone(),
         };
 
         let openings = vec![zeta_batch, zeta_next_batch];
         FriInstanceInfo {
-            oracles: self.fri_oracles(),
+            oracles: (*layout.oracles).clone(),
             batches: openings,
         }
     }
