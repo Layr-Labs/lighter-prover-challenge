@@ -53,6 +53,15 @@ impl Extendable<2> for GoldilocksField {
     ) -> QuadraticExtension<Self> {
         ext2_dot_product_arity16(terms, beta_powers)
     }
+
+    #[inline(always)]
+    fn mul_acc_quadratic(acc: [Self; 2], a: [Self; 2], b: [Self; 2]) -> [Self; 2] {
+        ext2_mul_acc(
+            [acc[0].0, acc[1].0],
+            [a[0].0, a[1].0],
+            [b[0].0, b[1].0],
+        )
+    }
 }
 
 impl Mul for QuadraticExtension<GoldilocksField> {
@@ -396,12 +405,11 @@ pub fn ext2_base_scalar_dot_slots(
  */
 
 #[inline(always)]
-fn ext2_add_prods0(a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
-    // Computes a0 * b0 + W * a1 * b1;
+fn ext2_add_prods0(acc: u64, a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
+    // Computes acc + a0 * b0 + W * a1 * b1;
+    let mut cy;
     let [a0, a1] = *a;
     let [b0, b1] = *b;
-
-    let cy;
 
     // W * a1 * b1
     let (mut cumul_lo, mut cumul_hi) = u160_times_7((a1 as u128) * (b1 as u128), 0u32);
@@ -410,23 +418,33 @@ fn ext2_add_prods0(a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
     (cumul_lo, cy) = cumul_lo.overflowing_add((a0 as u128) * (b0 as u128));
     cumul_hi += cy as u32;
 
+    // acc, folded into the same accumulator instead of being added to the
+    // reduced product. The bound stays comfortable: raw Goldilocks limbs are
+    // at most 2^64 - 1, so this is at most 8 * (2^64 - 1)^2 + (2^64 - 1) <
+    // 2^131, well inside `reduce160`'s x < 2^160 - 2^128 + 2^96 precondition.
+    (cumul_lo, cy) = cumul_lo.overflowing_add(acc as u128);
+    cumul_hi += cy as u32;
+
     unsafe { reduce160(cumul_lo, cumul_hi) }
 }
 
 #[inline(always)]
-fn ext2_add_prods1(a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
-    // Computes a0 * b1 + a1 * b0;
+fn ext2_add_prods1(acc: u64, a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
+    // Computes acc + a0 * b1 + a1 * b0;
+    let mut cy;
     let [a0, a1] = *a;
     let [b0, b1] = *b;
-
-    let cy;
 
     // a0 * b1
     let mut cumul_lo = (a0 as u128) * (b1 as u128);
 
     // a1 * b0
     (cumul_lo, cy) = cumul_lo.overflowing_add((a1 as u128) * (b0 as u128));
-    let cumul_hi = cy as u32;
+    let mut cumul_hi = cy as u32;
+
+    // acc; see `ext2_add_prods0`. At most 2 * (2^64 - 1)^2 + (2^64 - 1).
+    (cumul_lo, cy) = cumul_lo.overflowing_add(acc as u128);
+    cumul_hi += cy as u32;
 
     unsafe { reduce160(cumul_lo, cumul_hi) }
 }
@@ -434,12 +452,22 @@ fn ext2_add_prods1(a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
 /// Multiply a and b considered as elements of GF(p^2).
 #[inline(always)]
 pub(crate) fn ext2_mul(a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
+    ext2_mul_acc([0u64; 2], a, b)
+}
+
+/// Compute `acc + a * b` for a, b, acc in GF(p^2).
+///
+/// Each coordinate's addend joins the 160-bit accumulator the product is
+/// already reduced from, so the fused form costs one carry-propagating 128-bit
+/// add per coordinate instead of a full Goldilocks add on the reduced product.
+#[inline(always)]
+pub(crate) fn ext2_mul_acc(acc: [u64; 2], a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
     // The code in ext2_add_prods[01] assumes the quadratic extension
     // generator is 7.
     const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
 
-    let c0 = ext2_add_prods0(&a, &b);
-    let c1 = ext2_add_prods1(&a, &b);
+    let c0 = ext2_add_prods0(acc[0], &a, &b);
+    let c1 = ext2_add_prods1(acc[1], &a, &b);
     [c0, c1]
 }
 
@@ -884,6 +912,75 @@ mod tests {
         // Raw representatives are deliberately not part of the assertion:
         // delayed and per-term reduction are required to agree as field
         // values, including when every input can occupy the full u64 range.
+    }
+
+    /// The `Extendable<2>` multiply-accumulate hook folds the addend into the
+    /// same 160-bit accumulator the product is reduced from, so it is checked
+    /// against the `Mul` + `Add` pair it replaces over raw limbs that include
+    /// non-canonical representatives and the reduction's borrow boundaries.
+    ///
+    /// As with `extension_base_dot_product`, the agreement asserted is as
+    /// field values: moving the addend to the near side of the reduction can
+    /// land on a different — still congruent — `u64` representative.
+    #[test]
+    fn ext2_mul_acc_matches_mul_then_add() {
+        fn check(acc: Q2, x: Q2, y: Q2) {
+            let fused = acc.multiply_accumulate(x, y);
+            let reference = acc + x * y;
+            for limb in 0..2 {
+                assert_eq!(
+                    fused.0[limb].to_canonical_u64(),
+                    reference.0[limb].to_canonical_u64(),
+                    "limb {limb} mismatch for {acc:?} + {x:?} * {y:?}"
+                );
+            }
+        }
+
+        let p = GF::ORDER;
+        let raw_specials = [0u64, 1, 2, p - 1, p, p + 1, u64::MAX, 1 << 32, u32::MAX as u64];
+        for &s0 in &raw_specials {
+            for &s1 in &raw_specials {
+                for &s2 in &raw_specials {
+                    for &s3 in &raw_specials {
+                        check(
+                            QuadraticExtension([GoldilocksField(s3), GoldilocksField(s0)]),
+                            QuadraticExtension([GoldilocksField(s0), GoldilocksField(s1)]),
+                            QuadraticExtension([GoldilocksField(s2), GoldilocksField(s3)]),
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut state = 0xA076_1D64_78BD_642Fu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            check(
+                QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]),
+                QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]),
+                QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]),
+            );
+        }
+    }
+
+    /// `ext2_add_prods*` now also absorbs a raw `u64` addend, so the worst-case
+    /// accumulator grows by one limb beyond `8 * (2^64 - 1)^2`.
+    #[test]
+    fn ext2_mul_acc_reduce160_bound() {
+        use num::BigUint;
+
+        let one = BigUint::from(1u8);
+        let max_limb = (&one << 64usize) - &one;
+        let max_product = &max_limb * &max_limb;
+        let reduce160_limit = (&one << 160usize) - (&one << 128usize) + (&one << 96usize);
+        // c0 is the larger side: W * a1 * b1 + a0 * b0 + acc0, with W == 7.
+        let worst_case = BigUint::from(8u8) * &max_product + &max_limb;
+        assert!(worst_case < reduce160_limit);
     }
 
     #[test]
