@@ -11,6 +11,7 @@ use anyhow::Result;
 
 use crate::field::extension::Extendable;
 use crate::field::ops::Square;
+use crate::field::packable::Packable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
@@ -144,6 +145,81 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        // The production exponentiation gate has 67 transition rows and is
+        // evaluated on a 32-point batch. The generic packed implementation
+        // walks a packed point group and touches all 68 accumulator rows,
+        // then repeats that scan for the next group. Stream one constraint
+        // row at a time instead: each 32-element row is contiguous in the
+        // quotient accumulator, and the eight packed base-minus-one values
+        // can be retained across all transition rows. Constraint values and
+        // multiply-accumulate order within every output slot are unchanged.
+        if self.num_power_bits == 67 && vars_base.len() == 32 {
+            type P<F> = <F as Packable>::Packing;
+
+            let n = vars_base.len();
+            let width = <P<F> as PackedField>::WIDTH;
+            let (packed_iter, leftovers_iter) = vars_base.pack::<P<F>>();
+            debug_assert_eq!(leftovers_iter.len(), 0);
+            let packed_vars: Vec<_> = packed_iter.collect();
+            debug_assert_eq!(packed_vars.len() * width, n);
+
+            let packed_filters: Vec<_> = filters
+                .chunks_exact(width)
+                .map(|filter| {
+                    let mut packed = P::<F>::ZEROS;
+                    packed.as_slice_mut().copy_from_slice(filter);
+                    packed
+                })
+                .collect();
+            debug_assert_eq!(packed_filters.len(), packed_vars.len());
+            let base_minus_one: Vec<_> = packed_vars
+                .iter()
+                .map(|vars| vars.local_wires[self.wire_base()] - P::<F>::ONES)
+                .collect();
+
+            let mut accumulate_row = |row: usize, packed_index: usize, constraint: P<F>| {
+                let offset = packed_index * width;
+                let destination = &mut combined_gate_constraints
+                    [row * n + offset..row * n + offset + width];
+                let mut current = P::<F>::ZEROS;
+                current.as_slice_mut().copy_from_slice(destination);
+                destination.copy_from_slice(
+                    current
+                        .multiply_accumulate(constraint, packed_filters[packed_index])
+                        .as_slice(),
+                );
+            };
+
+            for row in 0..self.num_power_bits {
+                for (packed_index, vars) in packed_vars.iter().enumerate() {
+                    let previous = if row == 0 {
+                        P::<F>::ONES
+                    } else {
+                        vars.local_wires[self.wire_intermediate_value(row - 1)].square()
+                    };
+                    // Power bits are stored little-endian but accumulated
+                    // from most to least significant, as in the generic path.
+                    let bit = vars.local_wires[self.wire_power_bit(self.num_power_bits - row - 1)];
+                    let multiplied_by = P::<F>::ONES
+                        .multiply_accumulate(bit, base_minus_one[packed_index]);
+                    let constraint = previous * multiplied_by
+                        - vars.local_wires[self.wire_intermediate_value(row)];
+                    accumulate_row(row, packed_index, constraint);
+                }
+            }
+
+            let output_row = self.num_power_bits;
+            for (packed_index, vars) in packed_vars.iter().enumerate() {
+                accumulate_row(
+                    output_row,
+                    packed_index,
+                    vars.local_wires[self.wire_output()]
+                        - vars.local_wires[self.wire_intermediate_value(self.num_power_bits - 1)],
+                );
+            }
+            return;
+        }
+
         self.eval_unfiltered_base_batch_accumulate_packed(
             vars_base,
             filters,
@@ -363,7 +439,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -484,6 +560,51 @@ mod tests {
             gate.eval_unfiltered(vars).iter().all(|x| x.is_zero()),
             "Gate constraints are not satisfied."
         );
+    }
+
+    /// The production 67-bit gate takes the specialized constraint-major
+    /// direct-accumulation path at 32 points. Compare its raw stored words to
+    /// the independent materialize-then-accumulate reference, including
+    /// neighboring batch sizes that exercise the generic fallback.
+    #[test]
+    fn production_accumulate_matches_materialized_raw_words() {
+        use crate::field::batch_util::batch_multiply_add_inplace;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = ExponentiationGate::<F, D>::new_from_config(&CircuitConfig {
+            num_wires: 136,
+            num_routed_wires: 80,
+            ..CircuitConfig::standard_recursion_config()
+        });
+        let constants = Vec::new();
+        let hash = HashOut::ZERO;
+
+        for n in [31, 32, 33] {
+            let wires = F::rand_vec(gate.num_wires() * n);
+            let filters = F::rand_vec(n);
+            let initial = F::rand_vec(gate.num_constraints() * n);
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            let mut expected = initial.clone();
+            for (destination, constraints) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(destination, constraints, &filters);
+            }
+
+            let mut actual = initial;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+                assert_eq!(
+                    actual.to_noncanonical_u64(),
+                    expected.to_noncanonical_u64(),
+                    "batch size {n}, accumulator index {index}"
+                );
+            }
+        }
     }
 
     /// Manual timing harness comparing the packed-fused accumulate against the
