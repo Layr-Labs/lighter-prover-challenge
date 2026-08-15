@@ -1801,6 +1801,26 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Same-binary measurement switch for the isolated quotient-IFFT change.
+/// The ranked environment is cleared, so the one-multiply path is the default;
+/// setting `LIGHTER_QUOTIENT_PRESCALED_IFFT=0` restores the promoted
+/// two-multiply post-pass. The environment is read once per process and the
+/// resulting branch runs once per proof, outside every coefficient loop.
+#[cfg(feature = "std")]
+fn quotient_prescaled_ifft_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_QUOTIENT_PRESCALED_IFFT")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+#[cfg(not(feature = "std"))]
+const fn quotient_prescaled_ifft_enabled() -> bool {
+    true
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2516,17 +2536,34 @@ fn compute_quotient_polys<
                 }
             }
         });
-    let inverse_coset_shift_powers = precomputed::inverse_coset_shift_powers::<F>(points.len());
-    challenge_columns
-        .into_par_iter()
-        .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain.
-            PolynomialValues::new(column)
-                .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
-        })
-        .collect()
+    if quotient_prescaled_ifft_enabled() {
+        let prescaled_inverse_coset_shift_powers =
+            precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
+        challenge_columns
+            .into_par_iter()
+            .map(|column| {
+                // The cached chain already carries the IFFT's `1/n`
+                // normalization, so each coefficient receives exactly one
+                // multiply in the post-pass instead of a `1/n` multiply
+                // followed by the shift-power multiply. The FFT dispatch and
+                // every butterfly are unchanged.
+                PolynomialValues::new(column).coset_ifft_with_prescaled_powers(
+                    prescaled_inverse_coset_shift_powers.as_slice(),
+                )
+            })
+            .collect()
+    } else {
+        // Same-binary control arm: byte-for-byte promoted post-pass.
+        let inverse_coset_shift_powers =
+            precomputed::inverse_coset_shift_powers::<F>(points.len());
+        challenge_columns
+            .into_par_iter()
+            .map(|column| {
+                PolynomialValues::new(column)
+                    .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+            })
+            .collect()
+    }
 }
 
 /// Process-global caches for deterministic per-degree precomputations that
@@ -2544,6 +2581,8 @@ pub(crate) mod precomputed {
         use std::collections::HashMap;
         use std::sync::{Arc, OnceLock, RwLock};
 
+        use plonky2_util::log2_strict;
+
         use crate::field::types::Field;
 
         type Map = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
@@ -2552,6 +2591,7 @@ pub(crate) mod precomputed {
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
+        static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2611,6 +2651,27 @@ pub(crate) mod precomputed {
                 F::coset_shift().inverse().powers().take(degree).collect()
             })
         }
+
+        /// Cached `n_inv * F::coset_shift().inverse().powers().take(degree)`.
+        /// The quotient columns' coset IFFT post-scaling multiplies every
+        /// coefficient by both `1/n` and the inverse shift power, so the two
+        /// canonical factors are folded into one per-slot multiply. The
+        /// value for each slot is the product of the same two factors the
+        /// two-multiply form uses; field multiplication is commutative, so
+        /// every coefficient is field-identical.
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            get_or_compute(&INVERSE_COSET_POWERS_SCALED, degree, || {
+                let n_inv = F::inverse_2exp(log2_strict(degree));
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect()
+            })
+        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -2644,11 +2705,25 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
+
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
+            Arc::new(
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .map(|power| n_inv * power)
+                    .collect::<Vec<F>>(),
+            )
+        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers, shifted_two_adic_subgroup,
-        two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_powers, inverse_coset_shift_powers_scaled,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 
@@ -2662,7 +2737,7 @@ mod quotient_layout_tests {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2679,6 +2754,30 @@ mod quotient_layout_tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn prescaled_inverse_coset_cache_matches_promoted_factors() {
+        for degree_bits in 0usize..=12 {
+            let degree = 1usize << degree_bits;
+            let promoted = precomputed::inverse_coset_shift_powers::<F>(degree);
+            let prescaled = precomputed::inverse_coset_shift_powers_scaled::<F>(degree);
+            let prescaled_again = precomputed::inverse_coset_shift_powers_scaled::<F>(degree);
+            assert!(std::sync::Arc::ptr_eq(&prescaled, &prescaled_again));
+            assert_eq!(promoted.len(), degree);
+            assert_eq!(prescaled.len(), degree);
+
+            let n_inv = F::inverse_2exp(degree_bits);
+            for (i, (&old_factor, &new_factor)) in
+                promoted.iter().zip(prescaled.iter()).enumerate()
+            {
+                assert_eq!(
+                    new_factor.to_canonical_u64(),
+                    (n_inv * old_factor).to_canonical_u64(),
+                    "prescaled cache mismatch at degree 2^{degree_bits}, slot {i}",
+                );
+            }
+        }
+    }
 
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
