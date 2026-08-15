@@ -232,7 +232,8 @@ fn chain_step_proof(
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
+        // per-path template clone, and no target/value replay through a PartialWitness. Compact
+        // unresolved counters replay only first-populated representative indices after seeding.
         let mut pending = PendingPartitionWitness::start_seeded(
             &chain_data.prover_only,
             &chain_data.common,
