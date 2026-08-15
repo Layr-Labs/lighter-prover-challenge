@@ -1367,13 +1367,29 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // The width-135 wires tree stays on the GPU unconditionally: its CPU
     // build (~17 permutations per leaf) costs about as much as the queue
     // wait and measurably starves the fold's pure-CPU phases.
+    let idle = GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
-        return exclusive
-            || leaf_width > 64
-            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+        return exclusive || leaf_width > 64 || idle;
     }
-    leaf_permutations + parent_permutations >= min_permutations
+    // FRI fold trees (chunk circuits fold at 2^16 and below) sit under
+    // MIN_GPU_PERMUTATIONS, so they hashed on the CPU even when the stream
+    // was empty. Occupancy-gate them the same way as the 2^17 serial trees:
+    // GPU only while exclusive or idle, never behind a 2^19 chunk tree.
+    //
+    // Idle break-even is the measured 2^16 width-8 shape (131,056 perms,
+    // GPU/CPU 0.88). 2^15 width-8 (≈65k, GPU/CPU 1.37) stays on the CPU.
+    // 2^16 width>4 is at or above that break-even; 2^14/2^15 need enough
+    // width that leaf+parent permutations reach it.
+    let perms = leaf_permutations + parent_permutations;
+    const IDLE_FOLD_MIN_PERMUTATIONS: usize = 131_056;
+    let fri_fold_shape = leaf_width > 4
+        && leaf_count.is_power_of_two()
+        && (1 << 14..=1 << 16).contains(&leaf_count);
+    if fri_fold_shape && perms >= IDLE_FOLD_MIN_PERMUTATIONS && (exclusive || idle) {
+        return true;
+    }
+    perms >= min_permutations
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -3939,6 +3955,7 @@ fn tree_from_levels<F: RichField>(
 #[cfg(test)]
 mod tests {
     use core::mem::MaybeUninit;
+    use core::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use objc::runtime::Sel;
@@ -3951,6 +3968,35 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn gpu_worthwhile_admits_idle_fri_folds_above_break_even() {
+        let was_exclusive = EXCLUSIVE_GPU_PHASE.swap(false, Ordering::Relaxed);
+        let jobs = GPU_JOBS_IN_FLIGHT.swap(0, Ordering::Relaxed);
+        assert!(
+            gpu_worthwhile(8, 1 << 16, 4),
+            "2^16 width-8 idle is the measured 0.88 GPU win"
+        );
+        assert!(
+            !gpu_worthwhile(8, 1 << 15, 4),
+            "2^15 width-8 idle stays CPU (measured 1.37)"
+        );
+        assert!(
+            gpu_worthwhile(32, 1 << 15, 4),
+            "2^15 width-32 idle is above the 131k break-even"
+        );
+        GPU_JOBS_IN_FLIGHT.store(1, Ordering::Relaxed);
+        assert!(
+            !gpu_worthwhile(8, 1 << 16, 4),
+            "2^16 width-8 behind a chunk tree stays CPU"
+        );
+        assert!(
+            gpu_worthwhile(8, 1 << 19, 4),
+            "2^19 stays above MIN_GPU_PERMUTATIONS when busy"
+        );
+        GPU_JOBS_IN_FLIGHT.store(jobs, Ordering::Relaxed);
+        EXCLUSIVE_GPU_PHASE.store(was_exclusive, Ordering::Relaxed);
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
