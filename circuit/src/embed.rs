@@ -260,7 +260,6 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     let mut buf = Vec::with_capacity(4 * watchers.len() + 8);
     write_uvarint(&mut buf, watchers.len() as u64);
     for &watcher in watchers {
-        let watcher = u32::try_from(watcher).context("generator index exceeds u32")?;
         buf.extend_from_slice(&watcher.to_le_bytes());
     }
     write_compressed_section(&mut out, &buf);
@@ -407,29 +406,44 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let mut offsets = Vec::with_capacity(offsets_len);
     let mut running = 0u64;
     for _ in 0..offsets_len {
-        running += read_uvarint(&section, &mut vpos)?;
+        running = running
+            .checked_add(read_uvarint(&section, &mut vpos)?)
+            .context("watch index offset overflow")?;
         offsets.push(u32::try_from(running).context("watch index offset exceeds u32")?);
     }
+    ensure!(
+        vpos == section.len(),
+        "trailing bytes in watch index offset section"
+    );
     let section = read_compressed_section(bytes, &mut pos)?;
     let mut vpos = 0usize;
     let watchers_len = read_uvarint(&section, &mut vpos)? as usize;
+    let watcher_bytes = watchers_len
+        .checked_mul(4)
+        .and_then(|length| vpos.checked_add(length))
+        .context("watch index watcher section length overflow")?;
     ensure!(
-        section.len() == vpos + 4 * watchers_len,
+        section.len() == watcher_bytes,
         "watch index watcher section length mismatch"
     );
     let mut watchers = Vec::with_capacity(watchers_len);
     for chunk in section[vpos..].chunks_exact(4) {
-        let watcher = u32::from_le_bytes(chunk.try_into().unwrap()) as usize;
-        ensure!(watcher < generator_count, "watcher index out of range");
+        let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
+        ensure!(
+            (watcher as usize) < generator_count,
+            "watcher index out of range"
+        );
         watchers.push(watcher);
     }
     // Watch counts are a pure function of the (deduplicated) watcher lists;
     // this mirrors `read_prover_only_circuit_data`'s reconstruction.
     let mut generator_watch_counts = vec![0usize; generator_count];
     for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
+        generator_watch_counts[watcher as usize] += 1;
     }
-    let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
+    let generator_indices_by_watches =
+        GeneratorWatchIndex::from_parts(offsets, watchers, generator_count)
+            .context("invalid watch index CSR")?;
 
     // constant polynomial values
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -655,5 +669,31 @@ mod tests {
         let decoded = read_compressed_section(&framed, &mut pos).unwrap();
         assert_eq!(decoded, input);
         assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn embedded_watch_index_round_trips_u32_csr() {
+        use plonky2::plonk::circuit_builder::CircuitBuilder;
+        use plonky2::plonk::circuit_data::CircuitConfig;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let input = builder.add_virtual_target();
+        let squared = builder.square(input);
+        builder.register_public_input(squared);
+        let circuit = builder.build::<C>();
+        assert!(!circuit.prover_only.generator_indices_by_watches.watchers().is_empty());
+
+        let blob = serialize_embedded(&0x54u32, &circuit).unwrap();
+        let (tag, decoded) = deserialize_embedded::<u32>(&blob).unwrap();
+        assert_eq!(tag, 0x54);
+        assert_eq!(
+            decoded.prover_only.generator_indices_by_watches,
+            circuit.prover_only.generator_indices_by_watches
+        );
+        assert_eq!(
+            decoded.prover_only.generator_watch_counts,
+            circuit.prover_only.generator_watch_counts
+        );
+        assert_eq!(decoded.prover_only.generators.len(), circuit.prover_only.generators.len());
     }
 }
