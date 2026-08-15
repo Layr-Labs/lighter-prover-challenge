@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "ab6be2f936de3b1a832f08e3bca48e0427b917f0fe1e6b6ee71ae34357f6a91f";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -4349,16 +4349,40 @@ mod tests {
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
         let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        // Keep one gamma near the top of the canonical range so adding it to
+        // the raw representatives below crosses the u64 carry boundary. The
+        // other covers the Goldilocks epsilon boundary directly.
+        let gammas = [
+            F::from_canonical_u64(F::ORDER - 1),
+            F::from_canonical_u64(1 << 32),
+        ];
         let beta_k_is = (0..2 * ROUTED)
             .map(|i| F::from_canonical_usize(19 + i * 2))
             .collect::<Vec<_>>();
+        // Canonical edges, noncanonical encodings, both 2^32 limb boundaries,
+        // and arbitrary heavy representatives. `MetalColumns` retains these
+        // exact u64 words, so the shader's factor arithmetic is checked on raw
+        // inputs rather than only on values already reduced below the order.
+        let boundary = [
+            0u64,
+            1,
+            2,
+            u32::MAX as u64,
+            1 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+            9_087_029_921_428_221_768,
+            2_441_288_194_761_790_662,
+        ];
         let shifted_points = F::two_adic_subgroup(QUOTIENT_ROWS.ilog2() as usize)
             .into_iter()
             .map(|x| F::coset_shift() * x)
             .collect::<Vec<_>>();
 
-        for step in [1, 4] {
+        for step in [1, 2, 4, 8] {
             let full_rows = QUOTIENT_ROWS * step;
             let mut wires = context
                 .allocate_columns::<F>(full_rows, ROUTED)
@@ -4370,10 +4394,25 @@ mod tests {
                 .allocate_columns::<F>(full_rows, 2 + 2 * NUM_PARTIALS)
                 .expect("Z/partial columns");
             let mut rng = StdRng::seed_from_u64(0xcafe_5000 + step as u64);
-            for columns in [&mut wires, &mut constants, &mut zs] {
-                for column in columns.columns_mut().expect("unique columns") {
-                    for value in column {
-                        *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            for (set_index, columns) in [&mut wires, &mut constants, &mut zs]
+                .into_iter()
+                .enumerate()
+            {
+                for (column_index, column) in columns
+                    .columns_mut()
+                    .expect("unique columns")
+                    .into_iter()
+                    .enumerate()
+                {
+                    for (row, value) in column.iter_mut().enumerate() {
+                        *value = if (row + 3 * column_index + set_index) % 4 == 0 {
+                            GoldilocksField(
+                                boundary[(row + 5 * column_index + 7 * set_index)
+                                    % boundary.len()],
+                            )
+                        } else {
+                            F::from_canonical_u64(rng.next_u64() % F::ORDER)
+                        };
                     }
                 }
             }
