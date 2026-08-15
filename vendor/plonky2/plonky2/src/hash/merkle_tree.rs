@@ -349,6 +349,61 @@ pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
     );
 }
 
+/// Writes the 30-slot interleaved region one 16-leaf unroll stores in
+/// `left_digests_buf (14) || left_digest_mem || right_digest_mem ||
+/// right_digests_buf (14)`.
+///
+/// Each 14-slot half is the keep-point 16-unroll store
+/// `h0,h1,n0,n1,h2,h3,m0,m1,h4,h5,n2,n3,h6,h7`; the two 8-leaf roots
+/// sit in the middle. `merkle_tree_prove` indexes this interleave
+/// (729–740). A 32-frame is this layout twice, into the already-split
+/// 30-slot halves — not a flattened 32-slot concatenation.
+fn write_16_unroll_layout<T: Copy>(
+    digests_buf: &mut [MaybeUninit<T>],
+    h: &[T],
+    n_a: &[T],
+    n_b: &[T],
+    m: &[T],
+    left_8_root: T,
+    right_8_root: T,
+) {
+    debug_assert_eq!(digests_buf.len(), 30);
+    debug_assert_eq!(h.len(), 16);
+    debug_assert_eq!(n_a.len(), 4);
+    debug_assert_eq!(n_b.len(), 4);
+    debug_assert_eq!(m.len(), 4);
+    // Same split the 16-unroll uses on a 30-slot `digests_buf`.
+    let (left_digests_buf, right_digests_buf) = digests_buf.split_at_mut(digests_buf.len() / 2);
+    let (left_digest_mem, left_digests_buf) = left_digests_buf.split_last_mut().unwrap();
+    let (right_digest_mem, right_digests_buf) = right_digests_buf.split_first_mut().unwrap();
+    for half in 0..2 {
+        let buf: &mut [MaybeUninit<T>] = if half == 0 {
+            left_digests_buf
+        } else {
+            right_digests_buf
+        };
+        let h = &h[8 * half..8 * (half + 1)];
+        let n = if half == 0 { n_a } else { n_b };
+        let m = &m[2 * half..2 * (half + 1)];
+        buf[0].write(h[0]);
+        buf[1].write(h[1]);
+        buf[2].write(n[0]);
+        buf[3].write(n[1]);
+        buf[4].write(h[2]);
+        buf[5].write(h[3]);
+        buf[6].write(m[0]);
+        buf[7].write(m[1]);
+        buf[8].write(h[4]);
+        buf[9].write(h[5]);
+        buf[10].write(n[2]);
+        buf[11].write(n[3]);
+        buf[12].write(h[6]);
+        buf[13].write(h[7]);
+    }
+    left_digest_mem.write(left_8_root);
+    right_digest_mem.write(right_8_root);
+}
+
 pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
     digests_buf: &mut [MaybeUninit<H::Hash>],
     leaves: &[F],
@@ -484,6 +539,102 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
                 buf[12].write(h[6]);
                 buf[13].write(h[7]);
             }
+            left_digest_mem.write(left_digest);
+            right_digest_mem.write(right_digest);
+            return H::two_to_one(left_digest, right_digest);
+        }
+
+        // Whole synchronous 32-leaf subtree: the two 16-unrolls' same
+        // sibling-pair parent compresses share one `two_to_one_quad`.
+        // Each 16 already does `two_to_one_pair(m0, m1, m2, m3)` to get
+        // its two 8-leaf roots. Fuse those two pair compresses:
+        //   [(m0, m1), (m2, m3), (m0′, m1′), (m2′, m3′)]
+        // Never (m0, m0′) — that crosses the 16-boundary. The four
+        // 8-leaf roots are four *values* (only two sibling pairs) and
+        // must not enter one quad as inputs; they go through
+        // `two_to_one_pair` then a scalar `two_to_one`, same binary
+        // parents as today's 16+16+scalar. Digest layout is the
+        // recursive 16-layout written twice into the already-split
+        // 30-slot halves.
+        if num_leaves == 32 {
+            debug_assert_eq!(left_digests_buf.len(), 30);
+            debug_assert_eq!(right_digests_buf.len(), 30);
+
+            let mut leaf_digests = [core::mem::MaybeUninit::<H::Hash>::uninit(); 32];
+            // Two copies of the 16-unroll's four leaf quads.
+            for side in 0..2 {
+                let side_leaves = if side == 0 { left_leaves } else { right_leaves };
+                for q in 0..4 {
+                    let base = q * 4 * leaf_width;
+                    let (leaf_a, rest) =
+                        side_leaves[base..base + 4 * leaf_width].split_at(leaf_width);
+                    let (leaf_b, rest2) = rest.split_at(leaf_width);
+                    let (leaf_c, leaf_d) = rest2.split_at(leaf_width);
+                    let (ha, hb, hc, hd) = H::hash_or_noop_quad(leaf_a, leaf_b, leaf_c, leaf_d);
+                    let o = 16 * side + 4 * q;
+                    leaf_digests[o].write(ha);
+                    leaf_digests[o + 1].write(hb);
+                    leaf_digests[o + 2].write(hc);
+                    leaf_digests[o + 3].write(hd);
+                }
+            }
+            // SAFETY: all 32 entries were initialized above.
+            let h: [H::Hash; 32] = unsafe { core::mem::transmute_copy(&leaf_digests) };
+
+            // Per-16 n-level (level-1), same pairing as the 16-unroll's n_a / n_b.
+            let n_a =
+                H::two_to_one_quad([(h[0], h[1]), (h[2], h[3]), (h[4], h[5]), (h[6], h[7])]);
+            let n_b = H::two_to_one_quad([
+                (h[8], h[9]),
+                (h[10], h[11]),
+                (h[12], h[13]),
+                (h[14], h[15]),
+            ]);
+            let n_a_r = H::two_to_one_quad([
+                (h[16], h[17]),
+                (h[18], h[19]),
+                (h[20], h[21]),
+                (h[22], h[23]),
+            ]);
+            let n_b_r = H::two_to_one_quad([
+                (h[24], h[25]),
+                (h[26], h[27]),
+                (h[28], h[29]),
+                (h[30], h[31]),
+            ]);
+
+            // Per-16 m-level (4-leaf roots), same pairing as the 16-unroll's m.
+            let m = H::two_to_one_quad([
+                (n_a[0], n_a[1]),
+                (n_a[2], n_a[3]),
+                (n_b[0], n_b[1]),
+                (n_b[2], n_b[3]),
+            ]);
+            let m_r = H::two_to_one_quad([
+                (n_a_r[0], n_a_r[1]),
+                (n_a_r[2], n_a_r[3]),
+                (n_b_r[0], n_b_r[1]),
+                (n_b_r[2], n_b_r[3]),
+            ]);
+
+            // THE FUSE: each 16-unroll does
+            //   (r0, r1) = H::two_to_one_pair(m[0], m[1], m[2], m[3])
+            // Overlap those two same-sibling pair compresses. Inputs are
+            // four *pairs of 4-leaf roots*, not four 8-leaf roots.
+            let [r0, r1, r2, r3] = H::two_to_one_quad([
+                (m[0], m[1]),
+                (m[2], m[3]),
+                (m_r[0], m_r[1]),
+                (m_r[2], m_r[3]),
+            ]);
+
+            // Each 16 then did scalar two_to_one(r0, r1). The four 8-roots
+            // are values — two sibling pairs (r0, r1) and (r2, r3) — so
+            // they enter a pair, never a quad.
+            let (left_digest, right_digest) = H::two_to_one_pair(r0, r1, r2, r3);
+
+            write_16_unroll_layout(left_digests_buf, &h[..16], &n_a, &n_b, &m, r0, r1);
+            write_16_unroll_layout(right_digests_buf, &h[16..], &n_a_r, &n_b_r, &m_r, r2, r3);
             left_digest_mem.write(left_digest);
             right_digest_mem.write(right_digest);
             return H::two_to_one(left_digest, right_digest);
