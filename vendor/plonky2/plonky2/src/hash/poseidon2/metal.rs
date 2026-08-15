@@ -29,6 +29,82 @@ use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MAT
 static PROFILE_COMMAND_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Local-only startup probe. Records first-wins named timestamps (micros
+/// since the process's first probe event) and prints them on report(). Pure
+/// observability: reads/writes no prover state and changes no computed value.
+/// Ranked harness nulls worker stdout/stderr, so this is a local/diagnostic
+/// channel only.
+pub mod startup_probe {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    struct Rec {
+        name: &'static str,
+        us: u64,
+    }
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    static EVENTS: Mutex<Vec<Rec>> = Mutex::new(Vec::new());
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    fn names() -> [&'static str; 5] {
+        ["start", "prewarm_start", "ctx_build_start", "ctx_ready", "first_commit"]
+    }
+
+    /// Record the first event named `name`. When the tracked set becomes
+    /// complete it prints the report immediately so a local run can be captured
+    /// right after the first GPU dispatch without finishing a full proof.
+    pub fn mark(name: &'static str) {
+        let t0 = *START.get_or_init(Instant::now);
+        let us = t0.elapsed().as_micros() as u64;
+        let mut ev = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
+        if !ev.iter().any(|r| r.name == name) {
+            ev.push(Rec { name, us });
+            let complete = names().iter().all(|n| ev.iter().any(|r| r.name == *n));
+            drop(ev);
+            if complete {
+                emit();
+            }
+        }
+    }
+
+    fn get(name: &str) -> Option<u64> {
+        let ev = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
+        ev.iter().find(|r| r.name == name).map(|r| r.us)
+    }
+
+    fn emit() {
+        eprintln!("[startup_probe]");
+        for n in names() {
+            if let Some(us) = get(n) {
+                eprintln!("  {n}: {:>9.1} ms", us as f64 / 1000.0);
+            }
+        }
+        match (get("ctx_ready"), get("first_commit")) {
+            (Some(a), Some(b)) => {
+                let d = b as i64 - a as i64;
+                eprintln!(
+                    "  SIGNED first_commit - ctx_ready = {:>8.1} ms  (positive = compile hidden before first GPU dispatch)",
+                    d as f64 / 1000.0
+                );
+            }
+            _ => {
+                eprintln!("  SIGNED measure unavailable");
+            }
+        }
+    }
+
+    pub fn report() {
+        if REPORTED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        emit();
+    }
+}
+
+pub use startup_probe::{mark as startup_mark, report as startup_report};
+
 #[cfg(feature = "diagnostic_profile")]
 fn profile_command_buffer(
     command_buffer: &CommandBufferRef,
@@ -1245,6 +1321,7 @@ pub fn prewarm() {
     std::thread::Builder::new()
         .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
+            startup_probe::mark("prewarm_start");
             // The shader compile and AIR->ISA lowering run in
             // MTLCompilerService, an XPC service that inherits the requesting
             // thread's QoS through XPC boost propagation. Under the benchmark
@@ -2145,6 +2222,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2187,7 +2265,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         }
         #[cfg(feature = "diagnostic_profile")]
         profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
-        command_buffer.commit();
+        startup_probe::mark("first_commit");
+            command_buffer.commit();
         command_buffer.to_owned()
     });
 
@@ -2368,6 +2447,7 @@ enum LeafSource<'a, F> {
 impl MetalShared {
     fn new() -> Result<Self, String> {
         autoreleasepool(|| {
+            startup_probe::mark("ctx_build_start");
             let device = Device::system_default().ok_or("no Metal device")?;
             let options = CompileOptions::new();
             // Prefer the prebuilt AIR library over compiling the MSL source.
@@ -2523,6 +2603,7 @@ impl MetalShared {
                 MTLResourceOptions::StorageModeShared,
             );
 
+            startup_probe::mark("ctx_ready");
             Ok(Self {
                 queue: device.new_command_queue(),
                 device,
@@ -2633,6 +2714,7 @@ impl MetalShared {
                 "poseidon_quotient",
                 (quotient_rows * (group.end - group.start)) as u64,
             );
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2705,6 +2787,7 @@ impl MetalShared {
                 "range_u32_quotient",
                 (quotient_rows * (range_count + u32_count)) as u64,
             );
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -2802,6 +2885,7 @@ impl MetalShared {
                 "permutation_quotient",
                 (quotient_rows * num_routed_wires * 2) as u64,
             );
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3289,7 +3373,8 @@ impl MetalShared {
                     "values_ntt_merkle",
                     (lde_size * cols) as u64,
                 );
-                command_buffer.commit();
+                startup_probe::mark("first_commit");
+            command_buffer.commit();
                 command_buffer.to_owned()
             });
 
@@ -3553,6 +3638,7 @@ impl MetalShared {
                 "coeff_ntt_merkle",
                 (lde_size * cols) as u64,
             );
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3782,6 +3868,7 @@ impl MetalShared {
                 "merkle_tree",
                 (leaf_count * leaf_width) as u64,
             );
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -4051,6 +4138,7 @@ mod tests {
 
         let completed = autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.wait_until_completed();
             assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
@@ -4076,6 +4164,7 @@ mod tests {
 
         let completed = autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
+            startup_probe::mark("first_commit");
             command_buffer.commit();
             command_buffer.wait_until_completed();
             command_buffer.to_owned()
@@ -5721,7 +5810,8 @@ kernel void goldilocks_mul_bench_native(
                 set_u32(encoder, 2, count as u32);
                 dispatch(encoder, pipeline, count);
                 encoder.end_encoding();
-                command_buffer.commit();
+                startup_probe::mark("first_commit");
+            command_buffer.commit();
                 command_buffer.to_owned()
             });
             command_buffer.wait_until_completed();
@@ -5811,7 +5901,8 @@ kernel void goldilocks_mul_bench_native(
                 set_u32(encoder, 3, count as u32);
                 dispatch(encoder, pipeline, count);
                 encoder.end_encoding();
-                command_buffer.commit();
+                startup_probe::mark("first_commit");
+            command_buffer.commit();
                 command_buffer.to_owned()
             });
             command_buffer.wait_until_completed();
@@ -5873,7 +5964,8 @@ kernel void goldilocks_mul_bench_native(
                     child_count = parent_count;
                 }
 
-                command_buffer.commit();
+                startup_probe::mark("first_commit");
+            command_buffer.commit();
                 command_buffer.to_owned()
             });
             command_buffer.wait_until_completed();
