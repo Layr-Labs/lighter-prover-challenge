@@ -677,6 +677,32 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // The final block's three streamed Merkle commitments each
+                // consume a one-off ~128 MiB digest output (exceeding the
+                // digest pool cap), the first also allocates the ~192 MiB
+                // streamed sponge state, and the three GPU quotient jobs each
+                // allocate a one-off ~32 MiB output (exceeding the quotient
+                // pool cap). All of those are fresh kernel-zeroed buffers in
+                // the run's most serial window; pre-fault them here while the
+                // light pipeline still runs.
+                const FINAL_LDE_ROWS: u64 = 1 << 21;
+                const FINAL_DIGEST_BYTES: u64 = (2 * FINAL_LDE_ROWS - (1 << 4)) * 32;
+                const FINAL_STREAMED_STATE_BYTES: u64 = FINAL_LDE_ROWS * 12 * 8;
+                const FINAL_QUOTIENT_BYTES: u64 = FINAL_LDE_ROWS * 2 * 8;
+                // Four buffers cover the three streamed builds' initial
+                // outputs plus the final replacement: the first build takes
+                // one from the stash as its initial output, each build swaps
+                // in the next as its replacement, and the third build's
+                // replacement is the fourth.
+                for _ in 0..4 {
+                    plonky2::hash::poseidon2::prewarm_final_digest_output(FINAL_DIGEST_BYTES);
+                }
+                plonky2::hash::poseidon2::prewarm_final_streamed_state(
+                    FINAL_STREAMED_STATE_BYTES,
+                );
+                for _ in 0..3 {
+                    plonky2::hash::poseidon2::prewarm_final_quotient_output(FINAL_QUOTIENT_BYTES);
+                }
             })
             .ok();
     }
