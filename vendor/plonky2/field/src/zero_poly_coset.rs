@@ -65,6 +65,12 @@ impl<F: Field> ZeroPolyOnCoset<F> {
         self.inverses[i & self.rate_mask]
     }
 
+    /// The power-of-two periodic inverse row consumed by whole-domain quotient
+    /// backends. Point `i` uses `periodic_inverses()[i & (len - 1)]`.
+    pub fn periodic_inverses(&self) -> &[F] {
+        &self.inverses
+    }
+
     /// Like `eval_inverse`, but for a range of indices starting with `i_start`.
     pub fn eval_inverse_packed<P: PackedField<Scalar = F>>(&self, i_start: usize) -> P {
         let mut packed = P::ZEROS;

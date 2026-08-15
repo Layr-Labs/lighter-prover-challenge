@@ -109,13 +109,13 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "f5e53593491489763a93e7420c20f28146577ddd4c591ca4d6f29cd179669501";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -126,6 +126,7 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
     "permutation_quotient",
+    "merge_quotient_contributions",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -244,6 +245,25 @@ pub(crate) struct PermutationQuotientJob<F> {
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
     _job: GpuJobGuard,
+    _phantom: PhantomData<F>,
+}
+
+/// A fourth command buffer enqueued after two or three independent quotient
+/// producers. It owns their output buffers after admission, so an unwind or an
+/// early fallback cannot recycle storage while the downstream reduction still
+/// references it. The selected last-present buffer is updated in place.
+pub(crate) struct MergedQuotientJob<F> {
+    command_buffer: CommandBuffer,
+    source_command_buffers: [Option<CommandBuffer>; 3],
+    outputs: [Option<Buffer>; 3],
+    output_pool: Arc<Mutex<QuotientOutputPool>>,
+    output_slot: usize,
+    admission_mask: u8,
+    len: usize,
+    #[cfg(test)]
+    range_failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
+    #[cfg(test)]
+    forced_source_failure_mask: u8,
     _phantom: PhantomData<F>,
 }
 
@@ -376,6 +396,53 @@ impl<F: RichField> PermutationQuotientJob<F> {
     }
 }
 
+impl<F: RichField> MergedQuotientJob<F> {
+    /// Waits only for the already-enqueued downstream reduction. Since all four
+    /// command buffers use the same queue, its completion also orders every
+    /// producer write before the in-place merged output readback.
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.command_buffer.wait_until_completed();
+        const NAMES: [&str; 3] = ["Poseidon2 gate", "Range/U32 gate", "permutation"];
+        for (slot, command_buffer) in self.source_command_buffers.iter().enumerate() {
+            if let Some(command_buffer) = command_buffer {
+                if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                    return Err(format!(
+                        "{} quotient command buffer ended with status {:?}",
+                        NAMES[slot],
+                        command_buffer.status()
+                    ));
+                }
+            }
+        }
+        #[cfg(test)]
+        if let Some(slot) = (0..3).find(|&slot| {
+            self.forced_source_failure_mask & self.admission_mask & (1 << slot) != 0
+        }) {
+            return Err(format!("forced {} quotient completion failure", NAMES[slot]));
+        }
+        #[cfg(test)]
+        if let Some(observer) = &self.range_failure_observer {
+            observer
+                .forced
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+            return Err("forced RangeCheck quotient completion failure".to_string());
+        }
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "merged quotient command buffer ended with status {:?}",
+                self.command_buffer.status()
+            ));
+        }
+        debug_assert!(self.admission_mask.count_ones() >= 2);
+        // SAFETY: construction is restricted to an 8-byte Goldilocks field,
+        // and the completed merge kernel canonicalized every output word.
+        let output = self.outputs[self.output_slot]
+            .as_ref()
+            .expect("merged quotient output present");
+        Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+    }
+}
+
 fn recycle_completed_quotient_output(
     command_buffer: &CommandBuffer,
     output: &mut Option<Buffer>,
@@ -424,6 +491,32 @@ impl<F> Drop for PermutationQuotientJob<F> {
             &mut self.output,
             &self.output_pool,
         );
+    }
+}
+
+impl<F> Drop for MergedQuotientJob<F> {
+    fn drop(&mut self) {
+        // Dropping an in-flight merged job must never expose any producer
+        // output to the pool. Default retained command-buffer references keep
+        // all buffers alive until Metal itself is done with them.
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed
+            || self
+                .source_command_buffers
+                .iter()
+                .flatten()
+                .any(|command_buffer| {
+                    command_buffer.status() != MTLCommandBufferStatus::Completed
+                })
+        {
+            return;
+        }
+        if let Ok(mut pool) = self.output_pool.try_lock() {
+            for output in &mut self.outputs {
+                if let Some(output) = output.take() {
+                    pool.recycle(output);
+                }
+            }
+        }
     }
 }
 
@@ -1088,6 +1181,7 @@ impl LazyPipeline {
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static MERGE_QUOTIENT_CONTRIBUTIONS_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1100,6 +1194,10 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
 
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     PERMUTATION_QUOTIENT_PIPELINE.get()
+}
+
+fn merge_quotient_contributions_pipeline() -> Option<&'static ComputePipelineState> {
+    MERGE_QUOTIENT_CONTRIBUTIONS_PIPELINE.get()
 }
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1123,6 +1221,10 @@ fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
             &RANGE_CHECK_GATE_QUOTIENT_PIPELINE,
         ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
+        (
+            "merge_quotient_contributions",
+            &MERGE_QUOTIENT_CONTRIBUTIONS_PIPELINE,
+        ),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
         let device = device.clone();
@@ -1658,6 +1760,38 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!("Metal permutation quotient unavailable; using CPU path: {error}");
+            None
+        }
+    }
+}
+
+/// Enqueues a pointwise reduction after all admitted quotient producers without
+/// waiting for any of them on the CPU. At least two jobs are required; a lone
+/// output keeps the existing direct finish path and avoids an extra dispatch.
+/// Output ownership moves into the returned job only after command encoding has
+/// succeeded, preventing premature pool reuse on unwind or fallback.
+pub(crate) fn start_merged_quotient_job<F: RichField>(
+    poseidon: Option<&mut PoseidonGateQuotientJob<F>>,
+    range_u32: Option<&mut RangeCheckGateQuotientJob<F>>,
+    permutation: Option<&mut PermutationQuotientJob<F>>,
+    denominator_inverses: &[F],
+) -> Option<MergedQuotientJob<F>> {
+    let admission_count = usize::from(poseidon.is_some())
+        + usize::from(range_u32.is_some())
+        + usize::from(permutation.is_some());
+    if admission_count < 2 {
+        return None;
+    }
+    let context = shared_context()?;
+    match context.start_merged_quotient_job(
+        poseidon,
+        range_u32,
+        permutation,
+        denominator_inverses,
+    ) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            log::warn!("Metal quotient contribution merge unavailable: {error}");
             None
         }
     }
@@ -2811,6 +2945,157 @@ impl MetalShared {
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
             _job: job_guard,
+            _phantom: PhantomData,
+        })
+    }
+
+    fn start_merged_quotient_job<F: RichField>(
+        &self,
+        mut poseidon: Option<&mut PoseidonGateQuotientJob<F>>,
+        mut range_u32: Option<&mut RangeCheckGateQuotientJob<F>>,
+        mut permutation: Option<&mut PermutationQuotientJob<F>>,
+        denominator_inverses: &[F],
+    ) -> Result<MergedQuotientJob<F>, String> {
+        if F::ORDER != 0xffff_ffff_0000_0001 || size_of::<F>() != size_of::<u64>() {
+            return Err("merged quotient requires the 8-byte Goldilocks field".to_string());
+        }
+        let admission_mask = u8::from(poseidon.is_some())
+            | (u8::from(range_u32.is_some()) << 1)
+            | (u8::from(permutation.is_some()) << 2);
+        if admission_mask.count_ones() < 2 {
+            return Err("merged quotient requires at least two producers".to_string());
+        }
+        let pipeline = merge_quotient_contributions_pipeline()
+            .ok_or("merged quotient pipeline unavailable")?;
+
+        let len = poseidon
+            .as_ref()
+            .map(|job| job.len)
+            .or_else(|| range_u32.as_ref().map(|job| job.len))
+            .or_else(|| permutation.as_ref().map(|job| job.len))
+            .ok_or("merged quotient has no producer")?;
+        if len == 0 || len > u32::MAX as usize || len & 1 != 0 {
+            return Err("merged quotient output length is invalid".to_string());
+        }
+        if denominator_inverses.is_empty()
+            || !denominator_inverses.len().is_power_of_two()
+            || denominator_inverses.len() > u32::MAX as usize
+            || size_of_val(denominator_inverses) > 4096
+        {
+            return Err("merged quotient denominator inverse row is invalid".to_string());
+        }
+        for producer_len in [
+            poseidon.as_ref().map(|job| job.len),
+            range_u32.as_ref().map(|job| job.len),
+            permutation.as_ref().map(|job| job.len),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if producer_len != len {
+                return Err("merged quotient producer lengths differ".to_string());
+            }
+        }
+
+        let poseidon_output = poseidon.as_ref().and_then(|job| job.output.as_ref());
+        let range_output = range_u32.as_ref().and_then(|job| job.output.as_ref());
+        let permutation_output = permutation.as_ref().and_then(|job| job.output.as_ref());
+        if (poseidon.is_some() && poseidon_output.is_none())
+            || (range_u32.is_some() && range_output.is_none())
+            || (permutation.is_some() && permutation_output.is_none())
+        {
+            return Err("merged quotient producer output was already consumed".to_string());
+        }
+        let output_slot = if permutation_output.is_some() {
+            2
+        } else if range_output.is_some() {
+            1
+        } else {
+            0
+        };
+        let output = [poseidon_output, range_output, permutation_output][output_slot]
+            .expect("last admitted quotient output present");
+        let bytes = len * size_of::<u64>();
+        for producer in [poseidon_output, range_output, permutation_output]
+            .into_iter()
+            .flatten()
+        {
+            if producer.length() < bytes as u64 {
+                return Err("merged quotient producer buffer is too short".to_string());
+            }
+        }
+
+        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+            let command_buffer = self.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_buffer(0, Some(poseidon_output.unwrap_or(output)), 0);
+            encoder.set_buffer(1, Some(range_output.unwrap_or(output)), 0);
+            encoder.set_buffer(2, Some(permutation_output.unwrap_or(output)), 0);
+            encoder.set_buffer(3, Some(output), 0);
+            set_u32(encoder, 4, len as u32);
+            set_u32(encoder, 5, admission_mask as u32);
+            encoder.set_bytes(
+                6,
+                size_of_val(denominator_inverses) as NSUInteger,
+                denominator_inverses.as_ptr().cast::<c_void>(),
+            );
+            set_u32(encoder, 7, (denominator_inverses.len() - 1) as u32);
+            dispatch(encoder, pipeline, len / 2);
+            encoder.end_encoding();
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(
+                command_buffer,
+                "merge_quotient_contributions",
+                (len * admission_mask.count_ones() as usize) as u64,
+            );
+            let owned = command_buffer.to_owned();
+            command_buffer.commit();
+            owned
+        });
+
+        // Transfer ownership immediately after the downstream command has
+        // retained all bindings and been committed. The original jobs' Drop
+        // implementations now see `None` and cannot recycle these buffers
+        // while the merge still references them.
+        let outputs = [
+            poseidon.as_deref_mut().and_then(|job| job.output.take()),
+            range_u32
+                .as_deref_mut()
+                .and_then(|job| job.output.take()),
+            permutation
+                .as_deref_mut()
+                .and_then(|job| job.output.take()),
+        ];
+        debug_assert!(outputs[output_slot].is_some());
+
+        let source_command_buffers = [
+            poseidon
+                .as_ref()
+                .map(|job| job.command_buffer.to_owned()),
+            range_u32
+                .as_ref()
+                .map(|job| job.command_buffer.to_owned()),
+            permutation
+                .as_ref()
+                .map(|job| job.command_buffer.to_owned()),
+        ];
+        #[cfg(test)]
+        let range_failure_observer = range_u32
+            .as_ref()
+            .and_then(|job| job.failure_observer.as_ref().map(Arc::clone));
+        Ok(MergedQuotientJob {
+            command_buffer,
+            source_command_buffers,
+            outputs,
+            output_pool: Arc::clone(&self.quotient_output_pool),
+            output_slot,
+            admission_mask,
+            len,
+            #[cfg(test)]
+            range_failure_observer,
+            #[cfg(test)]
+            forced_source_failure_mask: 0,
             _phantom: PhantomData,
         })
     }
@@ -3995,6 +4280,316 @@ mod tests {
         }
     }
 
+    /// Actual-kernel differential for every subset of the three optional
+    /// producers. Two- and three-job masks must transfer buffer ownership into
+    /// one downstream job and produce the canonical pointwise sum in the fixed
+    /// Poseidon -> Range/U32 -> permutation order. Zero/one-job masks must leave
+    /// the original direct-finish ownership untouched.
+    #[test]
+    fn metal_merged_quotient_matches_cpu_for_all_admission_masks() {
+        type F = GoldilocksField;
+        const LEN: usize = 1 << 10;
+        let context = shared_context().expect("Metal context must initialize");
+        let source_values = core::array::from_fn::<_, 3, _>(|slot| {
+            (0..LEN)
+                .map(|i| {
+                    let raw = match i & 7 {
+                        0 => 0,
+                        1 => 1,
+                        2 => F::ORDER - 1,
+                        3 => F::ORDER,
+                        4 => F::ORDER + 1,
+                        5 => u64::MAX,
+                        _ => (i as u64)
+                            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                            .wrapping_add((slot as u64 + 1) * 0x85eb_ca6b),
+                    };
+                    GoldilocksField(raw)
+                })
+                .collect::<Vec<_>>()
+        });
+        let denominator_inverses = core::array::from_fn::<_, 8, _>(|i| {
+            F::from_canonical_u64((i as u64 + 2).pow(3))
+        });
+        let completed_command_buffer = || {
+            autoreleasepool(|| {
+                let command_buffer = context.queue.new_command_buffer();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+                command_buffer.to_owned()
+            })
+        };
+        let output = |values: &[F]| {
+            autoreleasepool(|| {
+                context.device.new_buffer_with_data(
+                    values.as_ptr().cast::<c_void>(),
+                    size_of_val(values) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+        };
+
+        for admission_mask in 0u8..8 {
+            let mut poseidon: Option<PoseidonGateQuotientJob<F>> =
+                (admission_mask & 1 != 0).then(|| PoseidonGateQuotientJob {
+                command_buffer: completed_command_buffer(),
+                output: Some(output(&source_values[0])),
+                output_pool: Arc::clone(&context.quotient_output_pool),
+                len: LEN,
+                _job: GpuJobGuard::begin(),
+                _phantom: PhantomData,
+            });
+            let mut range_u32: Option<RangeCheckGateQuotientJob<F>> =
+                (admission_mask & 2 != 0).then(|| RangeCheckGateQuotientJob {
+                    command_buffer: completed_command_buffer(),
+                    output: Some(output(&source_values[1])),
+                    output_pool: Arc::clone(&context.quotient_output_pool),
+                    len: LEN,
+                    failure_observer: None,
+                    _job: GpuJobGuard::begin(),
+                    _phantom: PhantomData,
+                });
+            let mut permutation: Option<PermutationQuotientJob<F>> =
+                (admission_mask & 4 != 0).then(|| PermutationQuotientJob {
+                    command_buffer: completed_command_buffer(),
+                    output: Some(output(&source_values[2])),
+                    output_pool: Arc::clone(&context.quotient_output_pool),
+                    len: LEN,
+                    _job: GpuJobGuard::begin(),
+                    _phantom: PhantomData,
+                });
+
+            let merged = start_merged_quotient_job(
+                poseidon.as_mut(),
+                range_u32.as_mut(),
+                permutation.as_mut(),
+                &denominator_inverses,
+            );
+            if admission_mask.count_ones() < 2 {
+                assert!(merged.is_none(), "admission mask {admission_mask:03b}");
+                assert_eq!(poseidon.as_ref().and_then(|job| job.output.as_ref()).is_some(), admission_mask & 1 != 0);
+                assert_eq!(range_u32.as_ref().and_then(|job| job.output.as_ref()).is_some(), admission_mask & 2 != 0);
+                assert_eq!(permutation.as_ref().and_then(|job| job.output.as_ref()).is_some(), admission_mask & 4 != 0);
+                continue;
+            }
+
+            assert!(poseidon.as_ref().and_then(|job| job.output.as_ref()).is_none());
+            assert!(range_u32.as_ref().and_then(|job| job.output.as_ref()).is_none());
+            assert!(permutation.as_ref().and_then(|job| job.output.as_ref()).is_none());
+            let mut merged = merged.expect("multi-job admission must enqueue the merge");
+            {
+                let actual = merged.finish().expect("merged quotient must finish");
+                for i in 0..LEN {
+                    let mut expected = F::ZERO;
+                    for slot in 0..3 {
+                        if admission_mask & (1 << slot) != 0 {
+                            expected += source_values[slot][i];
+                        }
+                    }
+                    expected *= denominator_inverses[(i >> 1) & (denominator_inverses.len() - 1)];
+                    assert_eq!(
+                        actual[i].to_canonical_u64(),
+                        expected.to_canonical_u64(),
+                        "admission mask {admission_mask:03b}, cell {i}"
+                    );
+                }
+            }
+            // Every producer-failure subset, including bits for jobs that were
+            // not admitted: only the intersection may force fallback.
+            for failure_mask in 0u8..8 {
+                merged.forced_source_failure_mask = failure_mask;
+                assert_eq!(
+                    merged.finish().is_err(),
+                    admission_mask & failure_mask != 0,
+                    "admission={admission_mask:03b}, failure={failure_mask:03b}"
+                );
+            }
+            merged.forced_source_failure_mask = 0;
+        }
+    }
+
+    /// Manual exact-production-shape A/B. The candidate timing includes the
+    /// downstream Metal reduction even though production enqueues it under the
+    /// much longer CPU quotient evaluation, so this is deliberately conservative.
+    #[test]
+    #[ignore = "manual exact-shape Metal/CPU quotient merge benchmark"]
+    fn benchmark_merged_quotient_d14_d16_d18() {
+        type F = GoldilocksField;
+        use crate::field::zero_poly_coset::ZeroPolyOnCoset;
+
+        let context = shared_context().expect("Metal context must initialize");
+        let completed_command_buffer = || {
+            autoreleasepool(|| {
+                let command_buffer = context.queue.new_command_buffer();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                command_buffer.to_owned()
+            })
+        };
+        let output = |values: &[F]| {
+            autoreleasepool(|| {
+                context.device.new_buffer_with_data(
+                    values.as_ptr().cast::<c_void>(),
+                    size_of_val(values) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            })
+        };
+        let buffer_slice = |buffer: &Buffer, len: usize| {
+            // SAFETY: every benchmark buffer was copied from `len` Goldilocks words.
+            unsafe { slice::from_raw_parts(buffer.contents().cast::<F>(), len) }
+        };
+
+        for (circuit_bits, domain_bits, samples) in
+            [(14usize, 17usize, 15usize), (16, 19, 11), (18, 21, 7)]
+        {
+            let points = 1usize << domain_bits;
+            let len = points * 2;
+            let z_h = ZeroPolyOnCoset::<F>::new(circuit_bits, domain_bits - circuit_bits);
+            let initial = (0..len)
+                .map(|i| F::from_noncanonical_u64(
+                    (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(11),
+                ))
+                .collect::<Vec<_>>();
+            let sources = core::array::from_fn::<_, 3, _>(|slot| {
+                (0..len)
+                    .map(|i| F::from_noncanonical_u64(
+                        (i as u64)
+                            .wrapping_mul(0xd6e8_feb8_6659_fd93 ^ slot as u64)
+                            .wrapping_add(13 + slot as u64 * 2),
+                    ))
+                    .collect::<Vec<_>>()
+            });
+            let control_buffers = sources.each_ref().map(|values| output(values));
+            let control_sources = control_buffers
+                .each_ref()
+                .map(|buffer| buffer_slice(buffer, len));
+            let mut control_times = Vec::with_capacity(samples);
+            let mut candidate_times = Vec::with_capacity(samples);
+            let mut candidate_cpu_times = Vec::with_capacity(samples);
+            let mut candidate_gpu_times = Vec::with_capacity(samples);
+
+            for sample in 0..samples {
+                let run_control = || {
+                    let mut accumulated = initial.clone();
+                    let started = Instant::now();
+                    for contribution in &control_sources {
+                        accumulated
+                            .par_chunks_exact_mut(2)
+                            .zip(contribution.par_chunks_exact(2))
+                            .enumerate()
+                            .for_each(|(i, (accumulated, contribution))| {
+                                let inverse = z_h.eval_inverse(i);
+                                accumulated[0] += contribution[0] * inverse;
+                                accumulated[1] += contribution[1] * inverse;
+                            });
+                    }
+                    let columns: (Vec<F>, Vec<F>) = accumulated
+                        .par_chunks_exact(2)
+                        .map(|point| (point[0], point[1]))
+                        .unzip();
+                    (started.elapsed(), columns)
+                };
+                let run_candidate = || {
+                    let mut poseidon: Option<PoseidonGateQuotientJob<F>> =
+                        Some(PoseidonGateQuotientJob {
+                            command_buffer: completed_command_buffer(),
+                            output: Some(output(&sources[0])),
+                            output_pool: Arc::clone(&context.quotient_output_pool),
+                            len,
+                            _job: GpuJobGuard::begin(),
+                            _phantom: PhantomData,
+                        });
+                    let mut range_u32: Option<RangeCheckGateQuotientJob<F>> =
+                        Some(RangeCheckGateQuotientJob {
+                            command_buffer: completed_command_buffer(),
+                            output: Some(output(&sources[1])),
+                            output_pool: Arc::clone(&context.quotient_output_pool),
+                            len,
+                            failure_observer: None,
+                            _job: GpuJobGuard::begin(),
+                            _phantom: PhantomData,
+                        });
+                    let mut permutation: Option<PermutationQuotientJob<F>> =
+                        Some(PermutationQuotientJob {
+                            command_buffer: completed_command_buffer(),
+                            output: Some(output(&sources[2])),
+                            output_pool: Arc::clone(&context.quotient_output_pool),
+                            len,
+                            _job: GpuJobGuard::begin(),
+                            _phantom: PhantomData,
+                        });
+                    let started = Instant::now();
+                    let merged = start_merged_quotient_job(
+                        poseidon.as_mut(),
+                        range_u32.as_mut(),
+                        permutation.as_mut(),
+                        z_h.periodic_inverses(),
+                    )
+                    .expect("three-way merge must start");
+                    let finish_started = Instant::now();
+                    let contribution = merged.finish().expect("three-way merge must finish");
+                    let finish_wall = finish_started.elapsed();
+                    let gpu_elapsed = gpu_duration(&merged.command_buffer, finish_wall);
+                    let cpu_started = Instant::now();
+                    let columns: (Vec<F>, Vec<F>) = initial
+                        .par_chunks_exact(2)
+                        .zip(contribution.par_chunks_exact(2))
+                        .map(|(cpu, gpu)| (cpu[0] + gpu[0], cpu[1] + gpu[1]))
+                        .unzip();
+                    let cpu_elapsed = cpu_started.elapsed();
+                    (started.elapsed(), cpu_elapsed, gpu_elapsed, columns)
+                };
+
+                let (
+                    (control_elapsed, control),
+                    (candidate_elapsed, candidate_cpu, candidate_gpu, candidate),
+                ) = if sample & 1 == 0 {
+                    let control = run_control();
+                    let candidate = run_candidate();
+                    (control, candidate)
+                } else {
+                    let candidate = run_candidate();
+                    let control = run_control();
+                    (control, candidate)
+                };
+                for challenge in 0..2 {
+                    let actual = if challenge == 0 { &candidate.0 } else { &candidate.1 };
+                    let expected = if challenge == 0 { &control.0 } else { &control.1 };
+                    for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                        assert_eq!(
+                            actual.to_canonical_u64(),
+                            expected.to_canonical_u64(),
+                            "d{circuit_bits} challenge {challenge} cell {i}"
+                        );
+                    }
+                }
+
+                control_times.push(control_elapsed.as_secs_f64() * 1e3);
+                candidate_times.push(candidate_elapsed.as_secs_f64() * 1e3);
+                candidate_cpu_times.push(candidate_cpu.as_secs_f64() * 1e3);
+                candidate_gpu_times.push(candidate_gpu.as_secs_f64() * 1e3);
+            }
+            control_times.sort_by(f64::total_cmp);
+            candidate_times.sort_by(f64::total_cmp);
+            candidate_cpu_times.sort_by(f64::total_cmp);
+            candidate_gpu_times.sort_by(f64::total_cmp);
+            let control_median = control_times[samples / 2];
+            let candidate_median = candidate_times[samples / 2];
+            let candidate_cpu_median = candidate_cpu_times[samples / 2];
+            let candidate_gpu_median = candidate_gpu_times[samples / 2];
+            println!(
+                "quotient-merge d{circuit_bits} domain=2^{domain_bits} samples={samples} control_ms={control_median:.6} candidate_tail_ms={candidate_median:.6} hidden_candidate_cpu_ms={candidate_cpu_median:.6} merge_gpu_ms={candidate_gpu_median:.6} hidden_speedup={:.3}%",
+                (control_median / candidate_cpu_median - 1.0) * 100.0
+            );
+            println!("  control={control_times:?}");
+            println!("  candidate_tail={candidate_times:?}");
+            println!("  candidate_cpu={candidate_cpu_times:?}");
+            println!("  merge_gpu={candidate_gpu_times:?}");
+        }
+    }
+
     #[test]
     fn quotient_output_pool_is_bounded_and_best_fit() {
         let Some(device) = Device::system_default() else {
@@ -4349,16 +4944,40 @@ mod tests {
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
         let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        // Keep one gamma near the top of the canonical range so adding it to
+        // the raw representatives below crosses the u64 carry boundary. The
+        // other covers the Goldilocks epsilon boundary directly.
+        let gammas = [
+            F::from_canonical_u64(F::ORDER - 1),
+            F::from_canonical_u64(1 << 32),
+        ];
         let beta_k_is = (0..2 * ROUTED)
             .map(|i| F::from_canonical_usize(19 + i * 2))
             .collect::<Vec<_>>();
+        // Canonical edges, noncanonical encodings, both 2^32 limb boundaries,
+        // and arbitrary heavy representatives. `MetalColumns` retains these
+        // exact u64 words, so the shader's factor arithmetic is checked on raw
+        // inputs rather than only on values already reduced below the order.
+        let boundary = [
+            0u64,
+            1,
+            2,
+            u32::MAX as u64,
+            1 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+            9_087_029_921_428_221_768,
+            2_441_288_194_761_790_662,
+        ];
         let shifted_points = F::two_adic_subgroup(QUOTIENT_ROWS.ilog2() as usize)
             .into_iter()
             .map(|x| F::coset_shift() * x)
             .collect::<Vec<_>>();
 
-        for step in [1, 4] {
+        for step in [1, 2, 4, 8] {
             let full_rows = QUOTIENT_ROWS * step;
             let mut wires = context
                 .allocate_columns::<F>(full_rows, ROUTED)
@@ -4370,10 +4989,25 @@ mod tests {
                 .allocate_columns::<F>(full_rows, 2 + 2 * NUM_PARTIALS)
                 .expect("Z/partial columns");
             let mut rng = StdRng::seed_from_u64(0xcafe_5000 + step as u64);
-            for columns in [&mut wires, &mut constants, &mut zs] {
-                for column in columns.columns_mut().expect("unique columns") {
-                    for value in column {
-                        *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            for (set_index, columns) in [&mut wires, &mut constants, &mut zs]
+                .into_iter()
+                .enumerate()
+            {
+                for (column_index, column) in columns
+                    .columns_mut()
+                    .expect("unique columns")
+                    .into_iter()
+                    .enumerate()
+                {
+                    for (row, value) in column.iter_mut().enumerate() {
+                        *value = if (row + 3 * column_index + set_index) % 4 == 0 {
+                            GoldilocksField(
+                                boundary[(row + 5 * column_index + 7 * set_index)
+                                    % boundary.len()],
+                            )
+                        } else {
+                            F::from_canonical_u64(rng.next_u64() % F::ORDER)
+                        };
                     }
                 }
             }

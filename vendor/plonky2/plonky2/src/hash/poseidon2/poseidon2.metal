@@ -621,26 +621,37 @@ kernel void permutation_quotient(
         ulong wire = wires[(ulong)j_start * lde_rows + source_row];
         ulong sigma = constants_sigmas[
             (ulong)(sigma_start + j_start) * lde_rows + source_row];
-        ulong beta_k0 = challenges[4u + j_start];
-        ulong beta_k1 = challenges[4u + num_routed_wires + j_start];
-        ulong numerator0 = gl_add(gl_mul_add(beta_k0, x, wire), gamma0);
-        ulong denominator0 = gl_add(gl_mul_add(beta0, sigma, wire), gamma0);
-        ulong numerator1 = gl_add(gl_mul_add(beta_k1, x, wire), gamma1);
-        ulong denominator1 = gl_add(gl_mul_add(beta1, sigma, wire), gamma1);
+
+        // Both factors for one challenge contain `wire + gamma`. Form that
+        // shared addend once, then finish the numerator and denominator with
+        // `gl_mul_add`. Reuse the temporary for challenge one before moving to
+        // the next wire so both shared addends and beta-k values are never live
+        // together in this register-heavy quotient kernel.
+        ulong wire_gamma = gl_add(wire, gamma0);
+        ulong numerator0 = gl_mul_add(challenges[4u + j_start], x, wire_gamma);
+        ulong denominator0 = gl_mul_add(beta0, sigma, wire_gamma);
+        wire_gamma = gl_add(wire, gamma1);
+        ulong numerator1 = gl_mul_add(
+            challenges[4u + num_routed_wires + j_start], x, wire_gamma);
+        ulong denominator1 = gl_mul_add(beta1, sigma, wire_gamma);
         for (uint j = j_start + 1u; j < j_end; ++j) {
             wire = wires[(ulong)j * lde_rows + source_row];
             sigma = constants_sigmas[
                 (ulong)(sigma_start + j) * lde_rows + source_row];
-            beta_k0 = challenges[4u + j];
-            beta_k1 = challenges[4u + num_routed_wires + j];
+
+            wire_gamma = gl_add(wire, gamma0);
             numerator0 = gl_mul(
-                numerator0, gl_add(gl_mul_add(beta_k0, x, wire), gamma0));
+                numerator0, gl_mul_add(challenges[4u + j], x, wire_gamma));
             denominator0 = gl_mul(
-                denominator0, gl_add(gl_mul_add(beta0, sigma, wire), gamma0));
+                denominator0, gl_mul_add(beta0, sigma, wire_gamma));
+
+            wire_gamma = gl_add(wire, gamma1);
             numerator1 = gl_mul(
-                numerator1, gl_add(gl_mul_add(beta_k1, x, wire), gamma1));
+                numerator1,
+                gl_mul_add(
+                    challenges[4u + num_routed_wires + j], x, wire_gamma));
             denominator1 = gl_mul(
-                denominator1, gl_add(gl_mul_add(beta1, sigma, wire), gamma1));
+                denominator1, gl_mul_add(beta1, sigma, wire_gamma));
         }
 
         uint previous_column0 = chunk == 0u ? 0u : 1u + chunk;
@@ -681,6 +692,45 @@ kernel void permutation_quotient(
 
     output[(ulong)gid * 2u] = gl_canonicalize(totals[0]);
     output[(ulong)gid * 2u + 1u] = gl_canonicalize(totals[1]);
+}
+
+// Reduces and Z_H-normalizes the already-dispatched optional quotient
+// contributions to one shared buffer while the CPU evaluates its survivor
+// constraints. The three producer
+// command buffers remain independent; this command is enqueued after all of
+// them and therefore observes their completed writes without any CPU wait.
+// `output` may alias any present input: each thread reads each challenge cell
+// before overwriting that cell, and no thread accesses another thread's pair.
+kernel void merge_quotient_contributions(
+    const device ulong* poseidon [[buffer(0)]],
+    const device ulong* range_u32 [[buffer(1)]],
+    const device ulong* permutation [[buffer(2)]],
+    device ulong* output [[buffer(3)]],
+    constant uint& len [[buffer(4)]],
+    constant uint& admission_mask [[buffer(5)]],
+    constant ulong* denominator_inverses [[buffer(6)]],
+    constant uint& inverse_mask [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint base = gid << 1u;
+    if (base >= len) {
+        return;
+    }
+
+    ulong inverse = denominator_inverses[gid & inverse_mask];
+    for (uint challenge = 0; challenge < 2u; ++challenge) {
+        uint cell = base + challenge;
+        ulong sum = 0;
+        if ((admission_mask & 1u) != 0u) {
+            sum = poseidon[cell];
+        }
+        if ((admission_mask & 2u) != 0u) {
+            sum = gl_add(sum, range_u32[cell]);
+        }
+        if ((admission_mask & 4u) != 0u) {
+            sum = gl_add(sum, permutation[cell]);
+        }
+        output[cell] = gl_canonicalize(gl_mul(sum, inverse));
+    }
 }
 
 // Deferred-reduction accumulator for one alpha-weighted constraint sum.
