@@ -219,6 +219,16 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     *hi += carry as u32;
 }
 
+/// Add two little-endian 160-bit accumulators whose exact combined value
+/// satisfies the same `reduce160` bound as either caller's original sum.
+#[inline(always)]
+fn u160_merge((lo_0, hi_0): (u128, u32), (lo_1, hi_1): (u128, u32)) -> (u128, u32) {
+    let (lo, carry) = lo_0.overflowing_add(lo_1);
+    let hi = u64::from(hi_0) + u64::from(hi_1) + u64::from(carry);
+    debug_assert!(hi <= u64::from(u32::MAX));
+    (lo, hi as u32)
+}
+
 /// Compute `sum_i extension_values[i].scalar_mul(base_scalars[i])` in
 /// GF(p^2), delaying reduction across the complete dot product.
 ///
@@ -255,14 +265,43 @@ fn ext2_base_scalar_dot_product(
                         scalars: &[GoldilocksField]| {
         debug_assert_eq!(values.len(), scalars.len());
         debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for (&QuadraticExtension([a0, a1]), &scalar) in values.iter().zip(scalars) {
-            u160_add_product(&mut lo0, &mut hi0, a0.0, scalar.0);
-            u160_add_product(&mut lo1, &mut hi1, a1.0, scalar.0);
+        let (mut even_lo0, mut even_hi0) = (0u128, 0u32);
+        let (mut even_lo1, mut even_hi1) = (0u128, 0u32);
+        let (mut odd_lo0, mut odd_hi0) = (0u128, 0u32);
+        let (mut odd_lo1, mut odd_hi1) = (0u128, 0u32);
+        let mut value_pairs = values.chunks_exact(2);
+        let mut scalar_pairs = scalars.chunks_exact(2);
+        for (value_pair, scalar_pair) in value_pairs.by_ref().zip(scalar_pairs.by_ref()) {
+            let QuadraticExtension([even_0, even_1]) = value_pair[0];
+            let even_scalar = scalar_pair[0];
+            let QuadraticExtension([odd_0, odd_1]) = value_pair[1];
+            let odd_scalar = scalar_pair[1];
+            u160_add_product(
+                &mut even_lo0,
+                &mut even_hi0,
+                even_0.0,
+                even_scalar.0,
+            );
+            u160_add_product(
+                &mut even_lo1,
+                &mut even_hi1,
+                even_1.0,
+                even_scalar.0,
+            );
+            u160_add_product(&mut odd_lo0, &mut odd_hi0, odd_0.0, odd_scalar.0);
+            u160_add_product(&mut odd_lo1, &mut odd_hi1, odd_1.0, odd_scalar.0);
         }
+        if let ([last], [scalar]) = (value_pairs.remainder(), scalar_pairs.remainder()) {
+            let QuadraticExtension([a0, a1]) = *last;
+            u160_add_product(&mut even_lo0, &mut even_hi0, a0.0, scalar.0);
+            u160_add_product(&mut even_lo1, &mut even_hi1, a1.0, scalar.0);
+        }
+        let (lo0, hi0) = u160_merge((even_lo0, even_hi0), (odd_lo0, odd_hi0));
+        let (lo1, hi1) = u160_merge((even_lo1, even_hi1), (odd_lo1, odd_hi1));
         // SAFETY: the exact worst-case bound above covers arbitrary u64
-        // representatives for every term in this chunk.
+        // representatives for every term in this chunk. Splitting the terms
+        // between two banks and exactly merging them reconstructs that same
+        // bounded integer sum.
         QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
             reduce160(lo1, hi1)
         }])
@@ -365,11 +404,52 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
-    for (i, o) in out.iter_mut().enumerate() {
+    let paired_len = out.len() & !1;
+    let (paired, remainder) = out.split_at_mut(paired_len);
+    for (pair_index, o) in paired.chunks_exact_mut(2).enumerate() {
+        let i = pair_index * 2;
+        let (mut lo00, mut hi00) = (0u128, 0u32);
+        let (mut lo01, mut hi01) = (0u128, 0u32);
+        let (mut lo10, mut hi10) = (0u128, 0u32);
+        let (mut lo11, mut hi11) = (0u128, 0u32);
+        for &(p, QuadraticExtension([b0, b1])) in &full {
+            // SAFETY: every slice in `full` has length exactly `out.len()`.
+            let c0 = unsafe { p.get_unchecked(i).0 };
+            let c1 = unsafe { p.get_unchecked(i + 1).0 };
+            u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+            u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+            u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+            u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+        }
+        for &(p, QuadraticExtension([b0, b1])) in &partial {
+            if i < p.len() {
+                let c = p[i].0;
+                u160_add_product(&mut lo00, &mut hi00, b0.0, c);
+                u160_add_product(&mut lo01, &mut hi01, b1.0, c);
+            }
+            if i + 1 < p.len() {
+                let c = p[i + 1].0;
+                u160_add_product(&mut lo10, &mut hi10, b0.0, c);
+                u160_add_product(&mut lo11, &mut hi11, b1.0, c);
+            }
+        }
+        // SAFETY: the accumulator bound documented above — below
+        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
+        // precondition.
+        o[0] = QuadraticExtension([
+            unsafe { reduce160(lo00, hi00) },
+            unsafe { reduce160(lo01, hi01) },
+        ]);
+        o[1] = QuadraticExtension([
+            unsafe { reduce160(lo10, hi10) },
+            unsafe { reduce160(lo11, hi11) },
+        ]);
+    }
+    if let [o] = remainder {
+        let i = paired_len;
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
         for &(p, QuadraticExtension([b0, b1])) in &full {
-            // SAFETY: every slice in `full` has length exactly `out.len()`.
             let c = unsafe { p.get_unchecked(i).0 };
             u160_add_product(&mut lo0, &mut hi0, b0.0, c);
             u160_add_product(&mut lo1, &mut hi1, b1.0, c);
@@ -381,9 +461,6 @@ pub fn ext2_base_scalar_dot_slots(
                 u160_add_product(&mut lo1, &mut hi1, b1.0, c);
             }
         }
-        // SAFETY: the accumulator bound documented above — below
-        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
-        // precondition.
         *o = QuadraticExtension([
             unsafe { reduce160(lo0, hi0) },
             unsafe { reduce160(lo1, hi1) },
@@ -429,6 +506,130 @@ fn ext2_add_prods1(a: &[u64; 2], b: &[u64; 2]) -> GoldilocksField {
     let cumul_hi = cy as u32;
 
     unsafe { reduce160(cumul_lo, cumul_hi) }
+}
+
+/// One barycentric `partial_interpolate` step in GF(p^2), fusing the two
+/// products that are immediately summed.
+///
+/// `CosetInterpolationGate`'s inner loop is
+///
+/// ```text
+/// term      = x - domain_i                  (second limb is x's, unchanged)
+/// next_eval = eval * term + val * prod
+/// next_prod = prod * term
+/// ```
+///
+/// Evaluating that as written costs three `ext2_mul`s -- six `reduce160`s and
+/// three `u160_times_7`s -- plus a canonicalizing extension add. Because
+/// reduction is a ring homomorphism, the two products feeding `next_eval` can
+/// share accumulators: four `reduce160`s and two `u160_times_7`s, with the add
+/// absorbed. `term`'s second limb is `x`'s second limb for every point, so it
+/// is passed as `x1` rather than rebuilt, and only the first limb is
+/// subtracted.
+///
+/// Bounds, with every raw limb below `2^64` so each product is below `2^128`:
+/// the plain part of `c0` holds two products, the `W`-weighted part holds two
+/// and is then tripled-and-quadrupled by `u160_times_7`, so `c0 < 2^129 +
+/// 7 * 2^129 = 2^132`; `c1` holds four products, so `c1 < 2^130`; `d0 <
+/// 2^128 + 7 * 2^128 = 2^131` and `d1 < 2^129`. All are far below
+/// `reduce160`'s `2^160 - 2^128 + 2^96` precondition, and the `u32` high
+/// accumulators stay in single digits.
+#[inline(always)]
+fn ext2_interpolate_step(
+    eval: [u64; 2],
+    val: [u64; 2],
+    prod: [u64; 2],
+    t0: u64,
+    x1: u64,
+) -> ([GoldilocksField; 2], [GoldilocksField; 2]) {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let [e0, e1] = eval;
+    let [v0, v1] = val;
+    let [p0, p1] = prod;
+
+    // next_eval = eval * (t0, x1) + val * (p0, p1)
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, e0, t0);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, v0, p0);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, e1, x1);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, v1, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e0, x1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e1, t0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v0, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v1, p0);
+
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+
+    // next_prod = prod * (t0, x1)
+    let (mut d0_plain_lo, mut d0_plain_hi) = (0u128, 0u32);
+    let (mut d0_w_lo, mut d0_w_hi) = (0u128, 0u32);
+    let (mut d1_lo, mut d1_hi) = (0u128, 0u32);
+    u160_add_product(&mut d0_plain_lo, &mut d0_plain_hi, p0, t0);
+    u160_add_product(&mut d0_w_lo, &mut d0_w_hi, p1, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p0, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p1, t0);
+
+    let (d0_w_lo, d0_w_hi) = u160_times_7(d0_w_lo, d0_w_hi);
+    let (d0_lo, carry) = d0_plain_lo.overflowing_add(d0_w_lo);
+    let d0_hi = d0_plain_hi + d0_w_hi + carry as u32;
+
+    // SAFETY: the bounds documented above are far below reduce160's
+    // `2^160 - 2^128 + 2^96` precondition.
+    unsafe {
+        (
+            [reduce160(c0_lo, c0_hi), reduce160(c1_lo, c1_hi)],
+            [reduce160(d0_lo, d0_hi), reduce160(d1_lo, d1_hi)],
+        )
+    }
+}
+
+/// Goldilocks specialization of `CosetInterpolationGate`'s `partial_interpolate`.
+///
+/// Value-identical to the generic fold modulo `p`, which is all the quotient
+/// pass observes; like the other delayed-reduction helpers here, the returned
+/// representative need not match reduce-per-term evaluation bit for bit.
+pub fn ext2_partial_interpolate(
+    domain: &[GoldilocksField],
+    values: &[QuadraticExtension<GoldilocksField>],
+    barycentric_weights: &[GoldilocksField],
+    x: QuadraticExtension<GoldilocksField>,
+    initial_eval: QuadraticExtension<GoldilocksField>,
+    initial_partial_prod: QuadraticExtension<GoldilocksField>,
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    debug_assert_eq!(domain.len(), values.len());
+    debug_assert_eq!(domain.len(), barycentric_weights.len());
+
+    let QuadraticExtension([x0, x1]) = x;
+    let QuadraticExtension([e0, e1]) = initial_eval;
+    let QuadraticExtension([p0, p1]) = initial_partial_prod;
+    let mut eval = [e0.0, e1.0];
+    let mut prod = [p0.0, p1.0];
+
+    for i in 0..domain.len() {
+        let QuadraticExtension([v0, v1]) = values[i];
+        let weight = barycentric_weights[i];
+        let val = [(v0 * weight).0, (v1 * weight).0];
+        // Only the first limb differs from `x`; the generic path builds a full
+        // extension element for `domain[i]` and subtracts both limbs.
+        let t0 = (x0 - domain[i]).0;
+
+        let (next_eval, next_prod) = ext2_interpolate_step(eval, val, prod, t0, x1.0);
+        eval = [next_eval[0].0, next_eval[1].0];
+        prod = [next_prod[0].0, next_prod[1].0];
+    }
+
+    (
+        QuadraticExtension([GoldilocksField(eval[0]), GoldilocksField(eval[1])]),
+        QuadraticExtension([GoldilocksField(prod[0]), GoldilocksField(prod[1])]),
+    )
 }
 
 /// Multiply a and b considered as elements of GF(p^2).

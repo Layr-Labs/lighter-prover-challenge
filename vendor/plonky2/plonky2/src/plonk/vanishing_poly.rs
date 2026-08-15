@@ -8,7 +8,8 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::types::Field;
+use crate::field::packable::Packable;
+use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
 use crate::gates::lookup::LookupGate;
@@ -222,6 +223,11 @@ const INTERLEAVE_PAIR_CONSTRAINTS: usize = 136;
 const INTERLEAVE_OPS: usize = 4;
 const UNINTERLEAVE_OPS: usize = 2;
 const INTERLEAVE_PAIR_STACK_BATCH: usize = 32;
+/// How many base-4 spread bits may share one delayed reduction. A stage seeded
+/// by a sub-`2^64` representative and running `k` steps holds at most
+/// `(2^64 - 1)(4 * 4^k - 1)/3`; 11 splits the 32-bit chain into 11/11/10.
+const BASE4_SPREAD_STAGE: usize = 11;
+const _: () = assert!(BASE4_SPREAD_STAGE <= 15 && BASE4_SPREAD_STAGE > 0);
 
 /// Proof-local recognition of the exact CPU-owned pair used by the ranked
 /// final-block circuit. The plan is evaluator-only and changes no circuit data.
@@ -321,7 +327,11 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
 /// the corresponding interleave range row, so those values use two packed
 /// MACs. The second half lands on the same row and uses one packed MAC with the
 /// pre-summed filters. No range column survives past the current bit.
-fn eval_interleave_pair_dense_fused<F: Field>(
+///
+/// The base-2 recompositions use one bounded `u128` reduction per chain; the
+/// longer base-4 spread is reduced after 11/11/10 bits so every accumulator
+/// remains below the raw-exact `2^96` Goldilocks reduction bound.
+fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     wires: &[F],
     batch_size: usize,
     interleave_filter: &[F],
@@ -348,30 +358,47 @@ fn eval_interleave_pair_dense_fused<F: Field>(
     let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
     let (parity_accumulators, rest) = rest.split_at_mut(4 * batch_size);
     let (base4_accumulator, range) = rest.split_at_mut(batch_size);
-    parity_accumulators.fill(F::ZERO);
-
-    let base2 = F::from_canonical_usize(2);
-    let base4 = F::from_canonical_usize(4);
+    const WIDE_COLS: usize = 6;
+    let wide_required = WIDE_COLS * batch_size;
+    let mut wide_stack = [0u128; WIDE_COLS * INTERLEAVE_PAIR_STACK_BATCH];
+    let mut wide_heap;
+    let wide: &mut [u128] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
+        &mut wide_stack[..wide_required]
+    } else {
+        wide_heap = vec![0u128; wide_required];
+        &mut wide_heap
+    };
+    let (wide_x, rest) = wide.split_at_mut(batch_size);
+    let (wide_spread, wide_parity) = rest.split_at_mut(batch_size);
+    wide_parity.fill(0);
 
     for operation in 0..INTERLEAVE_OPS {
         let interleave_row = operation * 34;
         let bit_offset = operation * 32;
         let x = &mut x_accumulators[operation * batch_size..(operation + 1) * batch_size];
-        x.fill(F::ZERO);
-        base4_accumulator.fill(F::ZERO);
+        wide_x.fill(0);
+        wide_spread.fill(0);
 
         for bit_index in 0..32 {
             let bit_number = bit_offset + bit_index;
             let bit_col = &wires[(8 + bit_number) * batch_size..][..batch_size];
             let parity_index = 2 * (operation / 2) + bit_index % 2;
-            let parity = &mut parity_accumulators
+            let parity = &mut wide_parity
                 [parity_index * batch_size..(parity_index + 1) * batch_size];
             for point in 0..batch_size {
                 let bit = bit_col[point];
-                x[point] = x[point] * base2 + bit;
-                base4_accumulator[point] = base4_accumulator[point] * base4 + bit;
-                parity[point] = parity[point] * base2 + bit;
+                let raw = bit.to_noncanonical_u64() as u128;
+                wide_x[point] = (wide_x[point] << 1) + raw;
+                wide_spread[point] = (wide_spread[point] << 2) + raw;
+                parity[point] = (parity[point] << 1) + raw;
                 range[point] = bit * (bit - F::ONE);
+            }
+            if bit_index % BASE4_SPREAD_STAGE == BASE4_SPREAD_STAGE - 1 {
+                for point in 0..batch_size {
+                    debug_assert!(wide_spread[point] < 1u128 << 96);
+                    wide_spread[point] = F::from_noncanonical_u128(wide_spread[point])
+                        .to_noncanonical_u64() as u128;
+                }
             }
 
             let row = interleave_row + 2 + bit_index;
@@ -389,6 +416,8 @@ fn eval_interleave_pair_dense_fused<F: Field>(
 
         let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
         for point in 0..batch_size {
+            debug_assert!(wide_x[point] < 1u128 << 96);
+            x[point] = F::from_noncanonical_u128(wide_x[point]);
             range[point] = x[point] - x_col[point];
         }
         let output = &mut combined
@@ -397,11 +426,18 @@ fn eval_interleave_pair_dense_fused<F: Field>(
 
         let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
         for point in 0..batch_size {
+            debug_assert!(wide_spread[point] < 1u128 << 96);
+            base4_accumulator[point] = F::from_noncanonical_u128(wide_spread[point]);
             range[point] = base4_accumulator[point] - spread_col[point];
         }
         let output = &mut combined
             [(interleave_row + 1) * batch_size..(interleave_row + 2) * batch_size];
         batch_multiply_add_inplace(output, range, interleave_filter);
+    }
+
+    for (accumulator, &lane) in parity_accumulators.iter_mut().zip(wide_parity.iter()) {
+        debug_assert!(lane < 1u128 << 96);
+        *accumulator = F::from_noncanonical_u128(lane);
     }
 
     let split = F::from_canonical_u64(1 << 32u64);
@@ -613,10 +649,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // partial-product traversal from the CPU without moving a transcript
         // barrier or changing an alpha exponent.
         assert_eq!(permutation_gate_scales.len(), num_challenges);
-        for k in 0..n {
-            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-            let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-            let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
+        let mut reduce_point = |k: usize, z1_0: F, z1_1: F| {
             let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
             for ((&alpha, &gate_scale), value) in alphas
                 .iter()
@@ -625,6 +658,59 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             {
                 let gate_terms = *value * gate_scale;
                 *value = z1_0 + z1_1 * alpha + gate_terms;
+            }
+        };
+        if let Some(l_0_xs) = z_h_on_coset.eval_l_0_slice(indices_batch[0], n) {
+            type Packing<F> = <F as Packable>::Packing;
+            let width = <Packing<F> as crate::field::packed::PackedField>::WIDTH;
+            let packed_len = n - n % width;
+            let (l_0_prefix, l_0_tail) = l_0_xs.split_at(packed_len);
+            let (z_0_prefix, z_0_tail) = zs_partial_products_cols[..n].split_at(packed_len);
+            let (z_1_prefix, z_1_tail) =
+                zs_partial_products_cols[n..2 * n].split_at(packed_len);
+            for (group, ((&l_0, &z_0), &z_1)) in
+                <Packing<F> as crate::field::packed::PackedField>::pack_slice(l_0_prefix)
+                .iter()
+                .zip(<Packing<F> as crate::field::packed::PackedField>::pack_slice(
+                    z_0_prefix,
+                ))
+                .zip(<Packing<F> as crate::field::packed::PackedField>::pack_slice(
+                    z_1_prefix,
+                ))
+                .enumerate()
+            {
+                let z1_0 = l_0
+                    * (z_0 - <Packing<F> as crate::field::packed::PackedField>::ONES);
+                let z1_1 = l_0
+                    * (z_1 - <Packing<F> as crate::field::packed::PackedField>::ONES);
+                for (lane, (&value_0, &value_1)) in
+                    <Packing<F> as crate::field::packed::PackedField>::as_slice(&z1_0)
+                        .iter()
+                        .zip(<Packing<F> as crate::field::packed::PackedField>::as_slice(
+                            &z1_1,
+                        ))
+                        .enumerate()
+                {
+                    reduce_point(group * width + lane, value_0, value_1);
+                }
+            }
+            for (offset, ((&l_0, &z_0), &z_1)) in
+                l_0_tail.iter().zip(z_0_tail).zip(z_1_tail).enumerate()
+            {
+                reduce_point(
+                    packed_len + offset,
+                    l_0 * z_0.sub_one(),
+                    l_0 * z_1.sub_one(),
+                );
+            }
+        } else {
+            for k in 0..n {
+                let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
+                reduce_point(
+                    k,
+                    l_0_x * zs_partial_products_cols[k].sub_one(),
+                    l_0_x * zs_partial_products_cols[n + k].sub_one(),
+                );
             }
         }
         return;
