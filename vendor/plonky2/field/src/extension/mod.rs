@@ -191,6 +191,108 @@ where
 {
     debug_assert_eq!(l.len() % D, 0);
     l.chunks_exact(D)
-        .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
+        .map(|c| {
+            let mut arr = [F::ZERO; D];
+            arr.copy_from_slice(c);
+            F::Extension::from_basefield_array(arr)
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    use super::*;
+    use crate::goldilocks_field::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    fn legacy_unflatten<const D: usize>(l: &[F]) -> Vec<<F as Extendable<D>>::Extension>
+    where
+        F: Extendable<D>,
+    {
+        debug_assert_eq!(l.len() % D, 0);
+        l.chunks_exact(D)
+            .map(|c| {
+                <F as Extendable<D>>::Extension::from_basefield_array(
+                    c.to_vec().try_into().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn raw_limbs<const D: usize>(values: &[<F as Extendable<D>>::Extension]) -> Vec<[u64; D]>
+    where
+        F: Extendable<D>,
+    {
+        values
+            .iter()
+            .map(|value| value.to_basefield_array().map(|limb| limb.0))
+            .collect()
+    }
+
+    fn assert_exact_matches_legacy<const D: usize>(input: &[F])
+    where
+        F: Extendable<D>,
+    {
+        let legacy = legacy_unflatten::<D>(input);
+        let stack = unflatten::<F, D>(input);
+        assert_eq!(raw_limbs::<D>(&stack), raw_limbs::<D>(&legacy));
+    }
+
+    fn assert_remainder_matches_legacy<const D: usize>(input: &[F])
+    where
+        F: Extendable<D>,
+    {
+        assert_ne!(input.len() % D, 0);
+        let legacy = catch_unwind(AssertUnwindSafe(|| legacy_unflatten::<D>(input)));
+        let stack = catch_unwind(AssertUnwindSafe(|| unflatten::<F, D>(input)));
+
+        #[cfg(debug_assertions)]
+        {
+            assert!(legacy.is_err());
+            assert!(stack.is_err());
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            let legacy = legacy.unwrap();
+            let stack = stack.unwrap();
+            assert_eq!(raw_limbs::<D>(&stack), raw_limbs::<D>(&legacy));
+        }
+    }
+
+    fn raw_values(len: usize) -> Vec<F> {
+        (0..len)
+            .map(|i| GoldilocksField(u64::MAX.wrapping_sub(i as u64)))
+            .collect()
+    }
+
+    #[test]
+    fn unflatten_d1_matches_legacy_for_empty_and_noncanonical_inputs() {
+        assert_exact_matches_legacy::<1>(&[]);
+        assert_exact_matches_legacy::<1>(&raw_values(3));
+    }
+
+    #[test]
+    fn unflatten_d2_matches_legacy_for_empty_noncanonical_and_remainder_inputs() {
+        assert_exact_matches_legacy::<2>(&[]);
+        assert_exact_matches_legacy::<2>(&raw_values(4));
+        assert_remainder_matches_legacy::<2>(&raw_values(3));
+    }
+
+    #[test]
+    fn unflatten_d4_matches_legacy_for_empty_noncanonical_and_remainder_inputs() {
+        assert_exact_matches_legacy::<4>(&[]);
+        assert_exact_matches_legacy::<4>(&raw_values(8));
+        assert_remainder_matches_legacy::<4>(&raw_values(6));
+    }
+
+    #[test]
+    fn unflatten_d5_matches_legacy_for_empty_noncanonical_and_remainder_inputs() {
+        assert_exact_matches_legacy::<5>(&[]);
+        assert_exact_matches_legacy::<5>(&raw_values(10));
+        assert_remainder_matches_legacy::<5>(&raw_values(7));
+    }
 }
