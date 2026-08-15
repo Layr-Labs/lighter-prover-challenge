@@ -21,10 +21,12 @@ use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
-use plonky2::iop::generator::{ParallelWitnessGuard, PendingPartitionWitness};
+use plonky2::iop::generator::{
+    ParallelWitnessGuard, PartitionSeedLayout, PendingPartitionWitness, is_seed_layout_mismatch,
+};
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
-use plonky2::iop::witness::{PartitionWitness, Witness};
+use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
@@ -297,6 +299,7 @@ fn generate_tx_witness<'a>(
     created_at: i64,
     state_metadata_hash: HashOut<F>,
     old_jump: JumpState<F>,
+    seed_layout: &mut Option<PartitionSeedLayout<'a, F, C, D>>,
 ) -> (PartitionWitness<'a, F>, JumpState<F>) {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
@@ -316,11 +319,47 @@ fn generate_tx_witness<'a>(
     // slots (array-indexed), bypassing the PartialWitness hash map and its
     // per-target hashing for the ~10^5 inputs of every transaction chunk,
     // while maintaining the same unresolved-watch counters.
-    let partition_witness = PendingPartitionWitness::start_seeded(
-        &tx_data.prover_only,
-        &tx_data.common,
-        |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
-    )
+    // The writer's target sequence is fixed for this circuit, so record it on
+    // the first chunk of the path and replay it positionally on every later
+    // chunk: the per-write `representative_map` gather and the per-write
+    // watcher-CSR traversal collapse into one positional read and one sparse
+    // aggregate pass.
+    let pending = if let Some(layout) = seed_layout.as_ref() {
+        let replay = PendingPartitionWitness::start_seeded_with_layout(
+            &tx_data.prover_only,
+            &tx_data.common,
+            layout,
+            |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
+        );
+        // Only a typed layout-applicability mismatch may retry on the generic
+        // lookup path; a writer failure or a generator/worklist failure keeps
+        // its own type and propagates without rerunning the writer.
+        match replay {
+            Err(error) if is_seed_layout_mismatch(&error) => {
+                // Retire the layout. Without this, every later chunk of the
+                // path pays a failed replay *and* a full generic re-seed, for
+                // the rest of the block.
+                *seed_layout = None;
+                PendingPartitionWitness::start_seeded(
+                    &tx_data.prover_only,
+                    &tx_data.common,
+                    |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
+                )
+            }
+            result => result,
+        }
+    } else {
+        PendingPartitionWitness::start_seeded_recording(
+            &tx_data.prover_only,
+            &tx_data.common,
+            |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
+        )
+        .map(|(pending, layout)| {
+            *seed_layout = Some(layout);
+            pending
+        })
+    };
+    let partition_witness = pending
     .and_then(PendingPartitionWitness::finish)
     .unwrap_or_else(|error| {
         panic!("{path:?} block transaction chunk #{chunk_index} witness generation failed: {error:?}")
@@ -443,6 +482,9 @@ fn prove_path(
         old_account_delta_tree_root,
     );
     let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
+    // Recorded on this path's first chunk and replayed for the rest; failing
+    // closed and retiring itself if the writer's target sequence ever changes.
+    let mut tx_seed_layout = None;
     let mut chunks = chunks.into_iter();
     let (mut current_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
@@ -455,6 +497,7 @@ fn prove_path(
         created_at,
         state_metadata_hash,
         jump,
+        &mut tx_seed_layout,
     );
     jump = next_jump;
 
@@ -517,6 +560,7 @@ fn prove_path(
                     created_at,
                     state_metadata_hash,
                     jump,
+                    &mut tx_seed_layout,
                 );
                 jump = next_jump;
                 (chunk_index, witness)
@@ -849,16 +893,21 @@ pub(crate) fn prove_block_after_pre(
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
-                    let early = BlockCircuit::witness_inputs_early(
-                        &block_target,
-                        block_ref,
-                        pre_proof_ref,
-                    )
-                    .expect("final block early witness inputs failed");
-                    let mut pending = PendingPartitionWitness::start(
-                        early,
+                    // Seed the early block inputs straight into the
+                    // partition's representative slots, as the transaction and
+                    // chain lanes already do, instead of building a
+                    // ~22k-entry `PartialWitness` map and replaying it.
+                    let mut pending = PendingPartitionWitness::start_seeded(
                         &block_data.prover_only,
                         &block_data.common,
+                        |seeder| {
+                            BlockCircuit::seed_witness_early_into(
+                                &block_target,
+                                block_ref,
+                                pre_proof_ref,
+                                seeder,
+                            )
+                        },
                     )
                     .expect("final block early witness phase failed");
                     #[cfg(feature = "diagnostic_profile")]
@@ -879,13 +928,12 @@ pub(crate) fn prove_block_after_pre(
                     // of holding them across the whole light phase.
                     circuits.release_heavy_circuit_extensions();
                     pending
-                        .feed(
-                            BlockCircuit::witness_inputs_heavy_chain(
-                                &block_target,
+                        .feed_seeded(|feeder| {
+                            feeder.set_proof_with_pis_target(
+                                &block_target.heavy_tx_chain_proof,
                                 &heavy_chain_proof,
                             )
-                            .expect("final block heavy-chain witness inputs failed"),
-                        )
+                        })
                         .expect("final block heavy-chain witness feed failed");
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
@@ -969,10 +1017,12 @@ pub(crate) fn prove_block_after_pre(
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("witness", "final_light_feed");
         block_pending
-            .feed(
-                BlockCircuit::witness_inputs_light_chain(&block_target, light_chain_input)
-                    .expect("final block light-chain witness inputs failed"),
-            )
+            .feed_seeded(|feeder| {
+                feeder.set_proof_with_pis_target(
+                    &block_target.light_tx_chain_proof,
+                    light_chain_input,
+                )
+            })
             .expect("final block light-chain witness feed failed");
     }
     let _ = heavy_chain_input;
@@ -991,8 +1041,268 @@ mod tests {
 
     use super::*;
     use crate::api::{
-        HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
+        CHAIN_ID, HEAVY_TX_MODE, HEAVY_TX_PER_PROOF, LIGHT_TX_MODE, LIGHT_TX_PER_PROOF,
+        PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
     };
+
+    /// Every set slot must hold the same value the generic seeded path
+    /// produces, except at slots the circuit itself randomizes; the set bitmaps
+    /// must be identical everywhere. `plain` and `plain_repeat` are two
+    /// independent generic runs, so a slot that differs between them is
+    /// nondeterministic by construction and is only counted, not compared.
+    fn assert_seeded_witness_matches_plain(
+        candidate: &PartitionWitness<'_, F>,
+        plain: &PartitionWitness<'_, F>,
+        plain_repeat: &PartitionWitness<'_, F>,
+        data: &CircuitData<F, C, D>,
+    ) {
+        assert_eq!(candidate.set_bitmap, plain.set_bitmap);
+        assert_eq!(plain.set_bitmap, plain_repeat.set_bitmap);
+        let random_generators = data
+            .prover_only
+            .generators
+            .iter()
+            .filter(|generator| generator.0.id() == "RandomValueGenerator")
+            .count();
+        let mut nondeterministic_positions = 0usize;
+        for representative in 0..plain.values.len() {
+            if !plain.is_set_by_rep_index(representative) {
+                continue;
+            }
+            if plain.values[representative] == plain_repeat.values[representative] {
+                assert_eq!(candidate.values[representative], plain.values[representative]);
+            } else {
+                nondeterministic_positions += 1;
+            }
+        }
+        assert!(
+            nondeterministic_positions <= random_generators,
+            "{nondeterministic_positions} unstable slots exceed {random_generators} random generators"
+        );
+        for &target in &data.prover_only.public_inputs {
+            assert_eq!(candidate.get_target(target), plain.get_target(target));
+            assert_eq!(candidate.get_target(target), plain_repeat.get_target(target));
+        }
+    }
+
+    #[test]
+    fn production_tx_seed_layout_heavy_light_census_and_differential() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(production_tx_seed_layout_heavy_light_census_and_differential_impl)
+            .expect("tx seed-layout component thread must start")
+            .join()
+            .expect("tx seed-layout component thread must finish");
+    }
+
+    fn production_tx_seed_layout_heavy_light_census_and_differential_impl() {
+        use circuit::types::config::CIRCUIT_CONFIG;
+
+        let block = Block::<F>::from_json_with_empty_txs(
+            include_bytes!("../bench_test.json"),
+            HEAVY_TX_PER_PROOF,
+            LIGHT_TX_PER_PROOF,
+            PUBLIC_HEAVY_TX_COUNT,
+            PUBLIC_LIGHT_TX_COUNT,
+        )
+        .expect("public fixture must parse");
+        let mut state_metadata = block.state_metadata.clone();
+        if block.calculate_funding {
+            state_metadata.last_funding_round_timestamp = block.created_at;
+        }
+        if block.calculate_oracle_prices {
+            state_metadata.last_oracle_price_timestamp = block.created_at;
+        }
+        if block.calculate_premium {
+            state_metadata.last_premium_timestamp = block.created_at;
+        }
+        let state_metadata_hash = state_metadata.hash();
+
+        for (path, tx_per_proof, tx_mode) in [
+            (TxPath::Heavy, HEAVY_TX_PER_PROOF, HEAVY_TX_MODE),
+            (TxPath::Light, LIGHT_TX_PER_PROOF, LIGHT_TX_MODE),
+        ] {
+            let chunks = block
+                .tx_chunks
+                .iter()
+                .filter(|txs| chunk_is_light(txs) == (path == TxPath::Light))
+                .take(2)
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(chunks.len(), 2, "fixture lacks two {path:?} chunks");
+
+            let circuit = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
+            let target = circuit.target;
+            let data = circuit.builder.build::<C>();
+            let initial_jump = JumpState::initial(
+                chunks[0][0].old_state_root,
+                chunks[0][0].old_account_delta_tree_root,
+            );
+            let first = BlockTx {
+                created_at: block.created_at,
+                state_metadata_hash,
+                old_jump: initial_jump,
+                txs: chunks[0].clone(),
+            };
+            let (recorded_pending, layout) = PendingPartitionWitness::start_seeded_recording(
+                &data.prover_only,
+                &data.common,
+                |seed| BlockTxCircuit::generate_witness_into(&first, &target, seed),
+            )
+            .expect("first production chunk must record");
+            let recorded = recorded_pending.finish().expect("recorded witness must finish");
+            let first_plain = PendingPartitionWitness::start_seeded(
+                &data.prover_only,
+                &data.common,
+                |seed| BlockTxCircuit::generate_witness_into(&first, &target, seed),
+            )
+            .and_then(PendingPartitionWitness::finish)
+            .expect("first plain witness must finish");
+            let first_plain_repeat = PendingPartitionWitness::start_seeded(
+                &data.prover_only,
+                &data.common,
+                |seed| BlockTxCircuit::generate_witness_into(&first, &target, seed),
+            )
+            .and_then(PendingPartitionWitness::finish)
+            .expect("first repeated plain witness must finish");
+            assert_seeded_witness_matches_plain(&recorded, &first_plain, &first_plain_repeat, &data);
+
+            let second_jump = jump_from_witness(&recorded, &target.new_jump);
+            let second = BlockTx {
+                created_at: block.created_at,
+                state_metadata_hash,
+                old_jump: second_jump,
+                txs: chunks[1].clone(),
+            };
+            let replayed = PendingPartitionWitness::start_seeded_with_layout(
+                &data.prover_only,
+                &data.common,
+                &layout,
+                |seed| BlockTxCircuit::generate_witness_into(&second, &target, seed),
+            )
+            .and_then(PendingPartitionWitness::finish)
+            .expect("second production chunk must replay");
+            let second_plain = PendingPartitionWitness::start_seeded(
+                &data.prover_only,
+                &data.common,
+                |seed| BlockTxCircuit::generate_witness_into(&second, &target, seed),
+            )
+            .and_then(PendingPartitionWitness::finish)
+            .expect("second plain witness must finish");
+            let second_plain_repeat = PendingPartitionWitness::start_seeded(
+                &data.prover_only,
+                &data.common,
+                |seed| BlockTxCircuit::generate_witness_into(&second, &target, seed),
+            )
+            .and_then(PendingPartitionWitness::finish)
+            .expect("second repeated plain witness must finish");
+            assert_seeded_witness_matches_plain(
+                &replayed,
+                &second_plain,
+                &second_plain_repeat,
+                &data,
+            );
+
+            // Sabotage control: a layout recorded against a *different* circuit
+            // instance must be rejected, not silently replayed.
+            let other = BlockTxCircuit::define(CIRCUIT_CONFIG, tx_per_proof, CHAIN_ID, tx_mode);
+            let other_target = other.target;
+            let other_data = other.builder.build::<C>();
+            let foreign = PendingPartitionWitness::start_seeded_with_layout(
+                &other_data.prover_only,
+                &other_data.common,
+                &layout,
+                |seed| BlockTxCircuit::generate_witness_into(&second, &other_target, seed),
+            )
+            .err()
+            .expect("a foreign circuit instance must be rejected");
+            assert!(
+                is_seed_layout_mismatch(&foreign),
+                "foreign-instance rejection must be a typed layout mismatch: {foreign:?}"
+            );
+
+            // Exercise the actual production helper for its
+            // first-record/second-replay route.
+            let mut production_layout = None;
+            let (production_first, production_second_jump) = generate_tx_witness(
+                path,
+                0,
+                chunks[0].clone(),
+                &data,
+                &target,
+                block.created_at,
+                state_metadata_hash,
+                initial_jump,
+                &mut production_layout,
+            );
+            assert!(
+                production_layout.is_some(),
+                "the first chunk must leave a recorded layout behind"
+            );
+            let (production_second, _) = generate_tx_witness(
+                path,
+                1,
+                chunks[1].clone(),
+                &data,
+                &target,
+                block.created_at,
+                state_metadata_hash,
+                production_second_jump,
+                &mut production_layout,
+            );
+            for &public_target in &data.prover_only.public_inputs {
+                assert_eq!(
+                    production_first.get_target(public_target),
+                    recorded.get_target(public_target)
+                );
+                assert_eq!(
+                    production_second.get_target(public_target),
+                    replayed.get_target(public_target)
+                );
+            }
+
+            // The fallback must RETIRE the layout. With a layout that can never
+            // apply, the first fallback clears it and every later chunk takes
+            // the generic path once instead of paying a failed replay plus a
+            // full re-seed forever.
+            let mut doomed = Some(
+                PendingPartitionWitness::start_seeded_recording(
+                    &other_data.prover_only,
+                    &other_data.common,
+                    |seed| BlockTxCircuit::generate_witness_into(&first, &other_target, seed),
+                )
+                .expect("foreign recording for the fallback control")
+                .1,
+            );
+            let (_, fallback_jump) = generate_tx_witness(
+                path,
+                0,
+                chunks[0].clone(),
+                &data,
+                &target,
+                block.created_at,
+                state_metadata_hash,
+                initial_jump,
+                &mut doomed,
+            );
+            assert!(
+                doomed.is_none(),
+                "a layout that failed to apply must be retired, not retried on every chunk"
+            );
+            let _ = fallback_jump;
+
+            println!(
+                "TX_SEED_LAYOUT_CENSUS path={path:?} target_writes={} changed_generators={} fixture_chunks={}",
+                layout.target_write_count(),
+                layout.changed_generator_count(),
+                block
+                    .tx_chunks
+                    .iter()
+                    .filter(|txs| chunk_is_light(txs) == (path == TxPath::Light))
+                    .count(),
+            );
+        }
+    }
 
     #[cfg(feature = "diagnostic_profile")]
     #[test]
@@ -1189,6 +1499,7 @@ mod tests {
             block.created_at,
             state_metadata_hash,
             jump,
+            &mut None,
         );
         let tx_prove_start = Instant::now();
         let mut tx_timing = TimingTree::new("tx-chunk-prove", log::Level::Debug);
