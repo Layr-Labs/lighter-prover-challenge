@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::extension::{Extendable, FieldExtension};
 use crate::fft::{
-    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_postscale,
+    FftRootTable, fft, fft_with_options, ifft, ifft_with_options_and_normalized_postscale,
+    ifft_with_options_and_postscale,
 };
 use crate::types::Field;
 
@@ -78,6 +79,20 @@ impl<F: Field> PolynomialValues<F> {
     /// already has the inverse powers of that coset's shift.
     pub fn coset_ifft_with_powers(self, inverse_shift_powers: &[F]) -> PolynomialCoeffs<F> {
         ifft_with_options_and_postscale(self, None, None, Some(inverse_shift_powers))
+    }
+
+    /// As `coset_ifft_with_powers`, but every supplied scale already includes
+    /// the transform's `n^-1` normalization factor.
+    pub fn coset_ifft_with_normalized_powers(
+        self,
+        normalized_inverse_shift_powers: &[F],
+    ) -> PolynomialCoeffs<F> {
+        ifft_with_options_and_normalized_postscale(
+            self,
+            None,
+            None,
+            normalized_inverse_shift_powers,
+        )
     }
 
     pub fn lde_multiple(polys: Vec<Self>, rate_bits: usize) -> Vec<Self> {
@@ -540,9 +555,16 @@ mod tests {
             );
             let shift = F::coset_shift();
             let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
+            let n_inv = F::inverse_2exp(k);
+            let normalized_inverse_powers = inverse_powers
+                .iter()
+                .map(|&scale| n_inv * scale)
+                .collect::<Vec<_>>();
 
             let expected = evals.clone().coset_ifft(shift);
-            let actual = evals.coset_ifft_with_powers(&inverse_powers);
+            let actual = evals.clone().coset_ifft_with_powers(&inverse_powers);
+            let normalized_actual =
+                evals.coset_ifft_with_normalized_powers(&normalized_inverse_powers);
 
             assert_eq!(
                 actual.coeffs.iter().map(|value| value.0).collect::<Vec<_>>(),
@@ -552,6 +574,7 @@ mod tests {
                     .map(|value| value.0)
                     .collect::<Vec<_>>()
             );
+            assert_eq!(normalized_actual, expected);
         }
     }
 
