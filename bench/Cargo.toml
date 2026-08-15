@@ -48,6 +48,10 @@ circuit = { path = "../circuit", default-features = true }
 anyhow = { workspace = true }
 rayon = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
+# Already in the graph as a normal dependency of this crate and of `circuit`;
+# the build script needs it only to name `CircuitData` when it hands the
+# compile-time chain circuits to `BlockCircuit::define`.
+plonky2 = { workspace = true }
 
 [dev-dependencies]
 flate2 = "1.0"
