@@ -576,6 +576,15 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         }
     };
 
+    // Runtime-only, like `generator_watch_counts`: a pure function of `generators`. Every
+    // generator this loader produces comes from `read_generator_impl!`, which wraps each
+    // deserialized `SimpleGenerator` in a `SimpleGeneratorAdapter`, so this scan is expected
+    // to return `true`; it is computed rather than assumed so a custom serializer that yields
+    // some other `WitnessGenerator` still gets the conservative behavior.
+    let generators_defer_until_ready = generators
+        .iter()
+        .all(|generator| generator.0.defers_until_ready());
+
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
         constants_sigmas_quotient_cache,
         constants_sigmas_quotient_step,
@@ -583,6 +592,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         generators,
         generator_indices_by_watches,
         generator_watch_counts,
+        generators_defer_until_ready,
         constants_sigmas_commitment,
         sigmas,
         subgroup,
