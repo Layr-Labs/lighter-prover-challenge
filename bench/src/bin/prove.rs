@@ -41,7 +41,18 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
-// Keep the promoted writer path while exercising a second submission from that baseline.
+//
+// narenas:4 — the worker spawns 100+ short-lived scoped threads per block
+// (one per chunk proof and chain step), each recycling the same
+// witness/coefficient allocation shapes. jemalloc's default arena count
+// (~4x CPUs) spreads successive threads across many arenas so a freed
+// extent is rarely reused by the next thread. Pinning to 4 arenas keeps
+// the same shapes within a small arena set so thread-local caches and
+// recently freed extents are reused. Placement-only: no sizes, lifetimes,
+// byte contents, or computed values change.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8] = b"narenas:4\0";
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {

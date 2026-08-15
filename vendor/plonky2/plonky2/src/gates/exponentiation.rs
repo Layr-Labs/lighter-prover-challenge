@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 
 use anyhow::Result;
 
@@ -74,6 +75,167 @@ impl<F: RichField + Extendable<D>, const D: usize> ExponentiationGate<F, D> {
     pub(crate) const fn wire_intermediate_value(&self, i: usize) -> usize {
         debug_assert!(i < self.num_power_bits);
         2 + self.num_power_bits + i
+    }
+
+    /// Row-major filtered accumulator: for each constraint row, stream all
+    /// packed point groups contiguously before moving to the next row. This
+    /// improves cache locality versus the default point-group-major
+    /// traversal, which walks all 68 constraint rows per group and then
+    /// repeats for the next group. The packed `base - 1` values are cached
+    /// once per batch instead of recomputed per group.
+    ///
+    /// Value-exact with the generic
+    /// `eval_unfiltered_base_batch_accumulate_packed`: same gate equations,
+    /// same packed field operations, same constraint order, same
+    /// `combined[j * n + p] += constraint * filters[p]` accumulation.
+    fn eval_unfiltered_base_batch_accumulate_row_major(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        use crate::field::packable::Packable;
+        use crate::field::packed::PackedField;
+
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let num_constraints = self.num_constraints();
+        assert!(combined_gate_constraints.len() >= num_constraints * n);
+
+        let width = <F as Packable>::Packing::WIDTH;
+        let wires = vars_base.local_wires;
+        let num_power_bits = self.num_power_bits;
+
+        // Wire columns are stored point-major within each wire: wire w's data
+        // occupies `wires[w * n .. (w + 1) * n]`.
+        let wire_col = |w: usize| -> &[F] { &wires[w * n..(w + 1) * n] };
+
+        let base_col = wire_col(self.wire_base());
+        let output_col = wire_col(self.wire_output());
+
+        let num_groups = n / width;
+        let leftovers_start = num_groups * width;
+
+        // Cache packed `base - 1` once per batch. The production 32-point
+        // batch has 8 packed groups (width 4); keep them on the stack.
+        // Larger generic batches use a heap fallback.
+        let mut bmo_stack: [MaybeUninit<<F as Packable>::Packing>; 8] =
+            [MaybeUninit::uninit(); 8];
+        let bmo_heap: Vec<<F as Packable>::Packing>;
+        let base_minus_one: &[<F as Packable>::Packing] = if num_groups <= bmo_stack.len() {
+            for g in 0..num_groups {
+                let mut packed = <F as Packable>::Packing::ZEROS;
+                packed
+                    .as_slice_mut()
+                    .copy_from_slice(&base_col[g * width..(g + 1) * width]);
+                bmo_stack[g].write(packed - <F as Packable>::Packing::ONES);
+            }
+            // SAFETY: the loop above wrote `num_groups` elements.
+            unsafe {
+                core::slice::from_raw_parts(
+                    bmo_stack.as_ptr().cast::<<F as Packable>::Packing>(),
+                    num_groups,
+                )
+            }
+        } else {
+            bmo_heap = (0..num_groups)
+                .map(|g| {
+                    let mut packed = <F as Packable>::Packing::ZEROS;
+                    packed
+                        .as_slice_mut()
+                        .copy_from_slice(&base_col[g * width..(g + 1) * width]);
+                    packed - <F as Packable>::Packing::ONES
+                })
+                .collect();
+            &bmo_heap
+        };
+
+        let load_packed = |col: &[F], g: usize| -> <F as Packable>::Packing {
+            let mut packed = <F as Packable>::Packing::ZEROS;
+            packed
+                .as_slice_mut()
+                .copy_from_slice(&col[g * width..(g + 1) * width]);
+            packed
+        };
+
+        let ones = <F as Packable>::Packing::ONES;
+
+        // Transition constraints: for each row i (0..num_power_bits),
+        // constraint = prev * mul_by - current_intermediate
+        // where prev = ONE (if i==0) or square(intermediate[i-1])
+        // and mul_by = 1 + bit * (base - 1)
+        // bit = power_bits[num_power_bits - i - 1] (big-endian)
+        for i in 0..num_power_bits {
+            let bit_col = wire_col(self.wire_power_bit(num_power_bits - i - 1));
+            let cur_col = wire_col(self.wire_intermediate_value(i));
+            let prev_col_opt = if i == 0 {
+                None
+            } else {
+                Some(wire_col(self.wire_intermediate_value(i - 1)))
+            };
+
+            // Packed groups
+            for g in 0..num_groups {
+                let bit = load_packed(bit_col, g);
+                let cur = load_packed(cur_col, g);
+                let mul_by = ones.multiply_accumulate(bit, base_minus_one[g]);
+                let constraint = if let Some(prev_col) = prev_col_opt {
+                    let prev = load_packed(prev_col, g);
+                    prev.square() * mul_by - cur
+                } else {
+                    ones * mul_by - cur
+                };
+
+                // Accumulate: combined[i * n + g*width..] += constraint * filter
+                let offset = g * width;
+                let mut filter = <F as Packable>::Packing::ZEROS;
+                filter
+                    .as_slice_mut()
+                    .copy_from_slice(&filters[offset..offset + width]);
+                let combined = &mut combined_gate_constraints[i * n + offset..][..width];
+                let mut acc = <F as Packable>::Packing::ZEROS;
+                acc.as_slice_mut().copy_from_slice(combined);
+                let result = acc.multiply_accumulate(constraint, filter);
+                combined.copy_from_slice(result.as_slice());
+            }
+
+            // Scalar tail
+            for p in leftovers_start..n {
+                let bit = bit_col[p];
+                let cur = cur_col[p];
+                let base = base_col[p];
+                let prev = if i == 0 {
+                    F::ONE
+                } else {
+                    prev_col_opt.unwrap()[p].square()
+                };
+                let mul_by = F::ONE.multiply_accumulate(bit, base - F::ONE);
+                let constraint = prev * mul_by - cur;
+                combined_gate_constraints[i * n + p] += constraint * filters[p];
+            }
+        }
+
+        // Final constraint: output - intermediate[num_power_bits - 1]
+        let last_col = wire_col(self.wire_intermediate_value(num_power_bits - 1));
+        for g in 0..num_groups {
+            let output = load_packed(output_col, g);
+            let last = load_packed(last_col, g);
+            let constraint = output - last;
+            let offset = g * width;
+            let mut filter = <F as Packable>::Packing::ZEROS;
+            filter
+                .as_slice_mut()
+                .copy_from_slice(&filters[offset..offset + width]);
+            let combined = &mut combined_gate_constraints[num_power_bits * n + offset..][..width];
+            let mut acc = <F as Packable>::Packing::ZEROS;
+            acc.as_slice_mut().copy_from_slice(combined);
+            let result = acc.multiply_accumulate(constraint, filter);
+            combined.copy_from_slice(result.as_slice());
+        }
+        for p in leftovers_start..n {
+            let constraint = output_col[p] - last_col[p];
+            combined_gate_constraints[num_power_bits * n + p] += constraint * filters[p];
+        }
     }
 }
 
@@ -144,7 +306,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
-        self.eval_unfiltered_base_batch_accumulate_packed(
+        self.eval_unfiltered_base_batch_accumulate_row_major(
             vars_base,
             filters,
             combined_gate_constraints,
