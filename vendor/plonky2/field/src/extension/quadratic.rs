@@ -89,6 +89,20 @@ impl<F: Extendable<2>> Field for QuadraticExtension<F> {
         ))
     }
 
+    /// Equivalent to `*self + x * y`, with the addend folded into each
+    /// coordinate's own accumulation instead of taking a separate
+    /// extension-wide add afterwards.
+    ///
+    /// Delegates to the base field's hook because that is where quadratic
+    /// multiplication is actually specialized — `Mul for
+    /// QuadraticExtension<GoldilocksField>` overrides the `default fn mul`
+    /// below — so a fused form written here in terms of `Mul`/`Add` would
+    /// silently drop that specialization.
+    #[inline(always)]
+    fn multiply_accumulate(&self, x: Self, y: Self) -> Self {
+        Self(<F as Extendable<2>>::mul_acc_quadratic(self.0, x.0, y.0))
+    }
+
     // Algorithm 11.3.4 in Handbook of Elliptic and Hyperelliptic Curve Cryptography.
     fn try_inverse(&self) -> Option<Self> {
         if self.is_zero() {
@@ -253,5 +267,42 @@ mod tests {
                 crate::goldilocks_field::GoldilocksField,
             >
         );
+    }
+
+    mod multiply_accumulate {
+        use crate::extension::quadratic::QuadraticExtension;
+        use crate::goldilocks_field::GoldilocksField;
+        use crate::types::{Field, Sample};
+
+        type Q2 = QuadraticExtension<GoldilocksField>;
+
+        /// `Field::multiply_accumulate` is contracted to equal `*self + x * y`.
+        /// The quadratic override routes through the base field's hook, which
+        /// folds the addend into the product's own reduction, so this checks
+        /// the fused result against the `Mul` + `Add` pair it replaces.
+        #[test]
+        fn matches_mul_then_add() {
+            for _ in 0..10_000 {
+                let acc = Q2::rand();
+                let x = Q2::rand();
+                let y = Q2::rand();
+                assert_eq!(acc.multiply_accumulate(x, y), acc + x * y);
+            }
+
+            // Degenerate arguments the random draws will never produce.
+            let corners: [Q2; 4] = [
+                Q2::ZERO,
+                Q2::ONE,
+                Q2::NEG_ONE,
+                QuadraticExtension([GoldilocksField::ZERO, GoldilocksField::ONE]),
+            ];
+            for &acc in &corners {
+                for &x in &corners {
+                    for &y in &corners {
+                        assert_eq!(acc.multiply_accumulate(x, y), acc + x * y);
+                    }
+                }
+            }
+        }
     }
 }
