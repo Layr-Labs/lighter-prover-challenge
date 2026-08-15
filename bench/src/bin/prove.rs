@@ -170,7 +170,7 @@ fn main() {
         (pre_handle, remaining)
     });
     // The pre circuit is owned by the startup proof until it completes; only
-    // the other four blobs are loaded above (loading all five here would
+    // the other five blobs are loaded above (loading all six here would
     // deserialize the same pre circuit twice on the scored critical path).
     // Keep the forced-build mode's established behavior unchanged.
     #[cfg(feature = "diagnostic_profile")]
@@ -193,7 +193,7 @@ fn main() {
     let proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
-        prover::prove_block_after_pre(block, circuits, pre_proof)
+        prover::prove_block_after_pre(block.into_post_pre(), circuits, pre_proof)
     };
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");

@@ -135,6 +135,16 @@ where
     pub tx_chunks: Vec<Vec<Arc<Tx<F>>>>,
 }
 
+/// The subset of a parsed block still needed after its pre-execution proof is
+/// complete. Keeping this separate lets the pre-execution-only state release
+/// before the transaction and final-block pipelines raise their working set.
+pub struct PostPreBlock<F>
+where
+    F: Field + Extendable<5> + RichField,
+{
+    pub block_witness: BlockWitness<F>,
+    pub tx_chunks: Vec<Vec<Arc<Tx<F>>>>,
+}
 impl<F> Block<F>
 where
     F: Field + Extendable<5> + RichField,
@@ -296,6 +306,20 @@ where
             chunks.push(std::mem::take(buf));
         }
         chunks
+    }
+}
+
+impl Block<F> {
+    /// Retain exactly the values used after the pre-execution proof. The
+    /// public block witness is already required by the final block circuit;
+    /// constructing it here lets all pre-execution-only arrays drop before the
+    /// concurrent transaction/chain pipeline begins.
+    pub fn into_post_pre(self) -> PostPreBlock<F> {
+        let block_witness = BlockWitness::from_block(&self, 1);
+        PostPreBlock {
+            block_witness,
+            tx_chunks: self.tx_chunks,
+        }
     }
 }
 

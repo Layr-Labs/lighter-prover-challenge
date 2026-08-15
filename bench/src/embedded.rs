@@ -3,7 +3,7 @@
 
 //! Embedded startup circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
+//! `build.rs` constructs the five startup circuits and final block circuit during the untimed compile
 //! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
 //! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
 //! exact `Circuits` value `Circuits::new` builds, several times faster than
@@ -14,6 +14,7 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,15 +29,17 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
-/// The four startup circuits that do not participate in pre-execution. Keeping
-/// this separate lets the worker start the pre-execution proof from its already
-/// decoded circuit while these independent blobs load in parallel.
+/// The circuits other than pre-execution. Keeping this separate lets the
+/// worker start the pre-execution proof from its already decoded circuit while
+/// these independent blobs load in parallel.
 pub(crate) struct RemainingEmbeddedCircuits {
     heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
     heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
     light_tx: (BlockTxTarget, CircuitData<F, C, D>),
     light_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    block: (BlockTarget, CircuitData<F, C, D>),
     dummy_heavy_proof: Proof,
     dummy_light_proof: Proof,
 }
@@ -62,6 +65,7 @@ impl RemainingEmbeddedCircuits {
             heavy_chain_data: std::sync::RwLock::new(heavy_chain_data),
             light_chain_target,
             light_chain_data: std::sync::RwLock::new(light_chain_data),
+            final_block_circuit: std::sync::Mutex::new(Some(self.block)),
             dummy_heavy_proof: self.dummy_heavy_proof,
             dummy_light_proof: self.dummy_light_proof,
         }
@@ -92,7 +96,7 @@ impl Circuits {
     /// the worker startup path only; normal callers should keep using
     /// [`Self::load`].
     pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingEmbeddedCircuits> {
-        let (heavy, light) = rayon::join(
+        let (heavy, (light, block)) = rayon::join(
             || {
                 rayon::join(
                     || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
@@ -100,14 +104,16 @@ impl Circuits {
                 )
             },
             || {
-                rayon::join(
+                let light = rayon::join(
                     || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
                     || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
-                )
+                );
+                (light, load_blob::<BlockTarget>("block", BLOCK_BLOB))
             },
         );
         let (heavy_tx, heavy_chain) = (heavy.0?, heavy.1?);
         let (light_tx, light_chain) = (light.0?, light.1?);
+        let block = block?;
 
         let dummy_heavy_proof: Proof =
             bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
@@ -121,12 +127,13 @@ impl Circuits {
             heavy_chain,
             light_tx,
             light_chain,
+            block,
             dummy_heavy_proof,
             dummy_light_proof,
         })
     }
 
-    /// Reconstructs all five startup circuits from the blobs embedded at
+    /// Reconstructs all fixed worker circuits from the blobs embedded at
     /// compile time. Value-identical to [`Circuits::new`] (oracle:
     /// `embedded_matches_rebuilt`); errors if the blobs are absent, corrupt,
     /// or fail their internal commitment-cap check.
@@ -271,7 +278,7 @@ mod tests {
         );
     }
 
-    /// Determinism oracle for the embed mechanism: builds all five circuits
+    /// Determinism oracle for the embed mechanism: builds all fixed circuits
     /// from scratch AND loads the embedded set, then asserts value identity.
     /// This is the gate for `Circuits::from_embedded` — if it fails, the
     /// mechanism is wrong. Run:
@@ -333,6 +340,13 @@ mod tests {
                     &embedded.light_chain_data.read().unwrap(),
                 ),
             );
+            let rebuilt_block = rebuilt.build_block_circuit();
+            let embedded_block = embedded.build_block_circuit();
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_block.0, &rebuilt_block.1),
+                (&embedded_block.0, &embedded_block.1),
+            );
 
             // The gate serializer round trip below also pins the common data
             // encoding used by the blobs.
@@ -345,7 +359,82 @@ mod tests {
                 .expect("common data must serialize");
             assert!(!bytes.is_empty());
 
-            println!("embedded_matches_rebuilt: all five circuits are value-identical");
+            println!("embedded_matches_rebuilt: all six circuits are value-identical");
+        });
+    }
+
+    /// Focused gate for the final-circuit blob. Its target, common data,
+    /// verifier data and circuit digest are the values that determine whether
+    /// a final proof can be constructed and accepted. Unlike the older broad
+    /// startup oracle above, this does not compare mutable prover-runtime
+    /// caches that are intentionally not part of verifier identity.
+    #[test]
+    #[ignore = "multi-second final circuit rebuild; run explicitly"]
+    fn embedded_final_block_matches_rebuilt_identity() {
+        on_big_stack(|| {
+            let rebuilt = Circuits::new();
+            let embedded = Circuits::from_embedded()
+                .expect("embedded circuits must load when blobs are compiled in");
+            let rebuilt_block = rebuilt.build_block_circuit();
+            let embedded_block = embedded.build_block_circuit();
+
+            assert_eq!(
+                bincode::serialize(&rebuilt_block.0).unwrap(),
+                bincode::serialize(&embedded_block.0).unwrap(),
+                "final block target diverges"
+            );
+            assert_eq!(
+                rebuilt_block.1.common,
+                embedded_block.1.common,
+                "final block common data diverges"
+            );
+            assert_eq!(
+                rebuilt_block.1.verifier_only,
+                embedded_block.1.verifier_only,
+                "final block verifier-only data diverges"
+            );
+            assert_eq!(
+                rebuilt_block.1.prover_only.circuit_digest,
+                embedded_block.1.prover_only.circuit_digest,
+                "final block circuit digest diverges"
+            );
+            println!("embedded_final_block_matches_rebuilt_identity: passed");
+        });
+    }
+
+    /// Edge case: the embedded final circuit is a one-worker resource. A
+    /// second request must preserve the old build-from-scratch behavior rather
+    /// than returning an empty or stale value.
+    #[test]
+    #[ignore = "multi-second final circuit rebuild; run explicitly"]
+    fn embedded_final_block_second_request_falls_back_to_rebuild() {
+        on_big_stack(|| {
+            let circuits = Circuits::from_embedded()
+                .expect("embedded circuits must load when blobs are compiled in");
+            let embedded_block = circuits.build_block_circuit();
+            let rebuilt_block = circuits.build_block_circuit();
+
+            assert_eq!(
+                bincode::serialize(&embedded_block.0).unwrap(),
+                bincode::serialize(&rebuilt_block.0).unwrap(),
+                "fallback final block target diverges"
+            );
+            assert_eq!(
+                embedded_block.1.common,
+                rebuilt_block.1.common,
+                "fallback final block common data diverges"
+            );
+            assert_eq!(
+                embedded_block.1.verifier_only,
+                rebuilt_block.1.verifier_only,
+                "fallback final block verifier-only data diverges"
+            );
+            assert_eq!(
+                embedded_block.1.prover_only.circuit_digest,
+                rebuilt_block.1.prover_only.circuit_digest,
+                "fallback final block circuit digest diverges"
+            );
+            println!("embedded_final_block_second_request_falls_back_to_rebuild: passed");
         });
     }
 

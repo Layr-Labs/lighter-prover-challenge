@@ -58,6 +58,10 @@ pub struct Circuits {
     pub light_chain_target: BlockTxChainTarget,
     /// See [`Circuits::light_tx_data`].
     pub light_chain_data: std::sync::RwLock<CircuitData<F, C, D>>,
+    /// The embedded final block circuit is used exactly once by a worker. A
+    /// mutex makes that one-time transfer explicit while retaining the fresh
+    /// build fallback for non-embedded and repeated test callers.
+    pub(crate) final_block_circuit: std::sync::Mutex<Option<(BlockTarget, CircuitData<F, C, D>)>>,
     pub dummy_heavy_proof: Proof,
     pub dummy_light_proof: Proof,
 }
@@ -128,6 +132,7 @@ impl Circuits {
             heavy_chain_data: std::sync::RwLock::new(heavy.chain_data),
             light_chain_target: light.chain_target,
             light_chain_data: std::sync::RwLock::new(light.chain_data),
+            final_block_circuit: std::sync::Mutex::new(None),
             dummy_heavy_proof: heavy.dummy_proof,
             dummy_light_proof: light.dummy_proof,
         }
@@ -251,6 +256,15 @@ impl Circuits {
     /// both chain circuits but is only needed for the final proof. Callers run
     /// this concurrently with transaction/chain proving.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if let Some(embedded) = self
+            .final_block_circuit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            return embedded;
+        }
+
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is
