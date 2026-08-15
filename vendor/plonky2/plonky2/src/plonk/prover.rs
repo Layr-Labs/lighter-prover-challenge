@@ -1274,6 +1274,31 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
     }
 }
 
+/// Routing policy for the ExponentiationGate quotient family. `Off` is the
+/// promoted baseline (CPU evaluator, shortest shared Metal command).
+/// `Exclusive` emits the GPU spec only while the process-global exclusive
+/// serial phase is active, when the GPU stream is otherwise idle. `Always`
+/// emits it unconditionally. Read once per process from `LIGHTER_EXP_GPU`
+/// (`off`/`exclusive`/`always`); unset means `Off`, so a scored environment
+/// (which clears the worker environment) reproduces the baseline exactly.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExponentiationGpuPolicy {
+    Off,
+    Exclusive,
+    Always,
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn exponentiation_gpu_policy() -> ExponentiationGpuPolicy {
+    static POLICY: std::sync::OnceLock<ExponentiationGpuPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("LIGHTER_EXP_GPU").as_deref() {
+        Ok("exclusive") => ExponentiationGpuPolicy::Exclusive,
+        Ok("always") => ExponentiationGpuPolicy::Always,
+        _ => ExponentiationGpuPolicy::Off,
+    })
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
@@ -1591,15 +1616,37 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
+        let native = if let Some(exponentiation) =
+            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
+        {
             // The transaction circuits' 67-bit exponentiation loop is the
             // most divergent native branch in the shared Range/U32 command.
-            // Leave this one family on the existing CPU quotient evaluator:
-            // it stays out of `gate_indices`, so it is not CPU-excluded and
-            // its selector/alpha contribution remains byte-for-byte the
-            // ordinary generic path. This trades a small parallel CPU span
-            // for a shorter process-shared Metal queue tail.
-            None
+            // The promoted baseline leaves this family on the CPU quotient
+            // evaluator unconditionally, trading a small parallel CPU span
+            // for a shorter process-shared Metal queue tail. That trade is
+            // phase-dependent: during the exclusive serial phases (the
+            // pre-execution proof, the solo chain drain, the final block
+            // proof) the GPU stream is otherwise idle and a longer command
+            // is free, while the CPU span sits directly on the serial tail.
+            // `LIGHTER_EXP_GPU` selects the policy for measurement:
+            // unset/"off" reproduces the baseline; "exclusive" offloads only
+            // when the exclusive phase is active at spec-build time;
+            // "always" offloads unconditionally. Routing-only: either path
+            // computes the identical filtered constraint contribution.
+            match exponentiation_gpu_policy() {
+                ExponentiationGpuPolicy::Off => None,
+                ExponentiationGpuPolicy::Exclusive
+                    if !crate::hash::poseidon2::is_exclusive_gpu_phase() =>
+                {
+                    None
+                }
+                _ => Some((
+                    U32QuotientKind::Exponentiation,
+                    exponentiation.num_power_bits,
+                    exponentiation.num_power_bits.checked_mul(2)?.checked_add(2)?,
+                    exponentiation.num_power_bits.checked_add(1)?,
+                )),
+            }
         } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
             // The gate reads its single constant (the "one" value) as local
             // constant 0, i.e. the column immediately after the selector
