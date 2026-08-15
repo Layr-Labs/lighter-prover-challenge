@@ -738,6 +738,24 @@ inline ulong alpha_acc_materialize(alpha_acc_t acc) {
     return gl_sub(lazy_materialize(positive), acc.high.lo + acc.high.hi);
 }
 
+// The range constraint one auxiliary limb owes: the final limb of a
+// range-2 gate is boolean, every other limb is base-4. Factored out of the
+// gate body so a single descending pass over `wires` can emit it beside the
+// recomposition without re-reading the limb.
+inline ulong range_check_limb_constraint(
+    ulong x,
+    uint j,
+    uint num_aux,
+    uint final_limb_range) {
+    if (j + 1u == num_aux && final_limb_range == 2u) {
+        return gl_mul(x, gl_sub(x, 1));
+    }
+    // x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3),
+    // exactly the production CPU specialization.
+    ulong y = gl_mul(x, gl_sub(x, 3));
+    return gl_mul(y, gl_add(y, 2));
+}
+
 inline void range_check_gate_emit(
     ulong constraint,
     constant ulong* alpha_powers,
@@ -876,37 +894,54 @@ kernel void range_check_gate_quotient(
         for (uint op = 0; op < num_ops; ++op) {
             ulong input = wires[(ulong)op * lde_rows + source_row];
             ulong aux_base = (ulong)num_ops + (ulong)num_aux * op;
-            ulong computed = wires[(aux_base + num_aux - 1u) * lde_rows + source_row];
-            for (uint remaining = num_aux - 1u; remaining > 0u; --remaining) {
+            // Each auxiliary limb feeds two constraints -- the base-4
+            // recomposition and its own range constraint -- which used to be
+            // two separate descending/ascending passes over the same
+            // addresses, so every limb was fetched from `wires` twice. One
+            // descending pass now serves both: the recomposition is
+            // unchanged (`computed` still absorbs limbs highest-first), and
+            // each limb's range constraint is emitted at the alpha index the
+            // ascending pass would have given it (`base + 1 + j`), so the
+            // deleted work is exactly the redundant load.
+            //
+            // Emission order changes, the accumulated value does not: both
+            // accumulators are plain sums of `constraint * alpha^i` terms
+            // over a fixed index set, and each term keeps its own index.
+            //
+            // The recomposition is a weighted sum, not a Horner chain. Written
+            // as `computed = 4 * computed + limb` it paid a strict reduction
+            // per limb -- `gl_quadruple` is two `gl_add`s, and `gl_add` carries
+            // a two-round epsilon correction -- and it serialized the whole
+            // loop on one register. `sum(limb_j * 4^j)` is the same value and
+            // is exactly the shape `alpha_acc_t` already defers for the alpha
+            // reduction: accumulate the `mul_128` limbs of each weighted term
+            // into four carry-free 64-bit sums and reduce once at the end. The
+            // per-limb accumulate is independent, so the chain disappears too.
+            //
+            // Headroom is the same argument the alpha accumulator uses: each
+            // partial limb is below 2^32, `num_aux` is at most 32 here, and the
+            // bound only needs the count.
+            uint base_index = constraint_index;
+            constraint_index += num_aux + 1u;
+
+            alpha_acc_t recomposition = { { 0, 0 }, { 0, 0 } };
+            for (uint remaining = num_aux; remaining > 0u; --remaining) {
                 uint j = remaining - 1u;
                 ulong limb = wires[(aux_base + j) * lde_rows + source_row];
-                computed = gl_add(gl_quadruple(computed), limb);
-            }
-            range_check_gate_emit(
-                gl_sub(computed, input),
-                alpha_powers,
-                alpha_stride,
-                gate_accumulators,
-                constraint_index++);
-
-            for (uint j = 0; j < num_aux; ++j) {
-                ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                ulong constraint;
-                if (j + 1u == num_aux && final_limb_range == 2u) {
-                    constraint = gl_mul(x, gl_sub(x, 1));
-                } else {
-                    // x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3),
-                    // exactly the production CPU specialization.
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    constraint = gl_mul(y, gl_add(y, 2));
-                }
+                alpha_acc_mul_add(recomposition, limb, 1UL << (2u * j));
                 range_check_gate_emit(
-                    constraint,
+                    range_check_limb_constraint(limb, j, num_aux, final_limb_range),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
-                    constraint_index++);
+                    base_index + 1u + j);
             }
+            range_check_gate_emit(
+                gl_sub(alpha_acc_materialize(recomposition), input),
+                alpha_powers,
+                alpha_stride,
+                gate_accumulators,
+                base_index);
         }
 
         total[0] = gl_mul_add(
@@ -1030,8 +1065,12 @@ kernel void range_check_gate_quotient(
                     gate_accumulators,
                     constraint_index++);
 
+                // Same deferred weighted sum as the RangeCheck families:
+                // `sum(x_j * 4^j)` instead of a strict `4 * acc + x` Horner
+                // chain. `result_limbs` is at most 24, so the top weight is
+                // 4^23 and the accumulator's count bound is untouched.
                 ulong limb_base = (ulong)num_ops * 5u + (ulong)op * result_limbs;
-                ulong recomposed = 0;
+                alpha_acc_t recomposed = { { 0, 0 }, { 0, 0 } };
                 for (uint remaining = result_limbs; remaining > 0u; --remaining) {
                     uint j = remaining - 1u;
                     ulong x = wires[(limb_base + j) * lde_rows + source_row];
@@ -1042,10 +1081,10 @@ kernel void range_check_gate_quotient(
                         alpha_stride,
                         gate_accumulators,
                         constraint_index++);
-                    recomposed = gl_add(gl_quadruple(recomposed), x);
+                    alpha_acc_mul_add(recomposed, x, 1UL << (2u * j));
                 }
                 range_check_gate_emit(
-                    gl_sub(recomposed, output_result),
+                    gl_sub(alpha_acc_materialize(recomposed), output_result),
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
@@ -1126,28 +1165,43 @@ kernel void range_check_gate_quotient(
             uint num_limbs = num_addends;
             uint routed_per_op = 1u + num_limbs;
             uint aux_per_op = 4u * num_limbs;
+            // Every wire this kind reads used to be read twice: the aux limbs
+            // once for their range product and again for the byte's base-4
+            // recomposition, and each byte word once for that recomposition
+            // and again for the base-256 sum. One descending walk over the
+            // bytes now serves all three, so each address is fetched once.
+            // Descending is what lets the sum stay a Horner chain over the
+            // byte word already in hand (`sum * 256 + byte`, seeded at zero --
+            // the old seed `byte[n-1]` is that step with `sum == 0`).
+            //
+            // Emission order changes, the accumulated value does not: each
+            // constraint keeps the alpha index the ascending passes gave it,
+            // and the deferred accumulator is four independent limb sums, so
+            // it is order-insensitive and its headroom bound depends only on
+            // the constraint count.
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * routed_per_op;
                 ulong aux_base =
                     (ulong)routed_per_op * num_ops + (ulong)op * aux_per_op;
-                for (uint j = 0; j < aux_per_op; ++j) {
-                    ulong x = wires[(aux_base + j) * lde_rows + source_row];
-                    ulong y = gl_mul(x, gl_sub(x, 3));
-                    range_check_gate_emit(
-                        gl_mul(y, gl_add(y, 2)),
-                        alpha_powers,
-                        alpha_stride,
-                        gate_accumulators,
-                        constraint_index++);
-                }
-                for (uint byte_index = 0; byte_index < num_limbs; ++byte_index) {
+                uint op_base = constraint_index;
+                constraint_index += aux_per_op + num_limbs + 1u;
+
+                ulong recomposed_sum = 0;
+                for (uint pending = num_limbs; pending > 0u; --pending) {
+                    uint byte_index = pending - 1u;
                     ulong chunk = aux_base + (ulong)byte_index * 4u;
-                    ulong recomposed = wires[(chunk + 3u) * lde_rows + source_row];
-                    for (uint remaining = 3u; remaining > 0u; --remaining) {
+                    ulong recomposed = 0;
+                    for (uint remaining = 4u; remaining > 0u; --remaining) {
                         uint k = remaining - 1u;
-                        recomposed = gl_add(
-                            gl_quadruple(recomposed),
-                            wires[(chunk + k) * lde_rows + source_row]);
+                        ulong x = wires[(chunk + k) * lde_rows + source_row];
+                        ulong y = gl_mul(x, gl_sub(x, 3));
+                        range_check_gate_emit(
+                            gl_mul(y, gl_add(y, 2)),
+                            alpha_powers,
+                            alpha_stride,
+                            gate_accumulators,
+                            op_base + byte_index * 4u + k);
+                        recomposed = gl_add(gl_quadruple(recomposed), x);
                     }
                     ulong byte_value =
                         wires[(routed_base + 1u + byte_index) * lde_rows + source_row];
@@ -1156,15 +1210,8 @@ kernel void range_check_gate_quotient(
                         alpha_powers,
                         alpha_stride,
                         gate_accumulators,
-                        constraint_index++);
-                }
-                ulong recomposed_sum =
-                    wires[(routed_base + num_limbs) * lde_rows + source_row];
-                for (uint remaining = num_limbs - 1u; remaining > 0u; --remaining) {
-                    uint k = remaining - 1u;
-                    recomposed_sum = gl_add(
-                        gl_mul(recomposed_sum, 256),
-                        wires[(routed_base + 1u + k) * lde_rows + source_row]);
+                        op_base + aux_per_op + byte_index);
+                    recomposed_sum = gl_add(gl_mul(recomposed_sum, 256), byte_value);
                 }
                 ulong expected_sum = wires[routed_base * lde_rows + source_row];
                 range_check_gate_emit(
@@ -1172,7 +1219,7 @@ kernel void range_check_gate_quotient(
                     alpha_powers,
                     alpha_stride,
                     gate_accumulators,
-                    constraint_index++);
+                    op_base + aux_per_op + num_limbs);
             }
         } else if (kind == 4u) {
             ulong strict_accumulators[2] = { 0, 0 };
@@ -1539,20 +1586,33 @@ kernel void range_check_gate_quotient(
             // range-constraint loop as well costs another 1.5 ms on d18. Both
             // arms bit-exact, so this is a scheduling/footprint effect, not an
             // arithmetic one. Keep the multiply.
+            //
+            // Loop fusion is a separate question from that base specialization
+            // and goes the other way: the descending Horner pass and the
+            // ascending range pass read the same `num_ops` limb addresses, so
+            // every limb was fetched twice -- 63 redundant loads per row on the
+            // widest family. The descending pass now emits each limb's range
+            // constraint at the alpha index the ascending pass would have given
+            // it (`1 + limb`), which deletes exactly the second load.
+            //
+            // That measurement is superseded here, and it is worth saying why
+            // rather than deleting it: the comparison was `gl_mul(acc, base)`
+            // against `gl_quadruple(acc)`, and `gl_quadruple` is two `gl_add`s
+            // with two-round epsilon corrections -- more work than the multiply
+            // it replaced, which is exactly why specializing lost. The chain
+            // itself was never the thing to keep. `sum(x_limb * base^limb)`
+            // deferred into `alpha_acc_t` removes the per-limb reduction
+            // entirely and, on the widest family, a 63-deep serial dependency
+            // with it. Both production bases are powers of two, so the weight
+            // is a shift; the top exponent is 62 for either (2^62 and 4^31).
             ulong base = num_addends;
-            ulong computed = 0;
+            uint weight_shift = base == 2u ? 1u : 2u;
+            uint range_base = constraint_index + 1u;
+            alpha_acc_t recomposed = { { 0, 0 }, { 0, 0 } };
             for (uint remaining = num_ops; remaining > 0u; --remaining) {
                 uint limb = remaining - 1u;
-                computed = gl_add(
-                    gl_mul(computed, base),
-                    wires[((ulong)1u + limb) * lde_rows + source_row]);
-            }
-            range_check_gate_emit(
-                gl_sub(computed, wires[source_row]),
-                alpha_powers, alpha_stride, gate_accumulators,
-                constraint_index++);
-            for (uint limb = 0; limb < num_ops; ++limb) {
                 ulong x = wires[((ulong)1u + limb) * lde_rows + source_row];
+                alpha_acc_mul_add(recomposed, x, 1UL << (weight_shift * limb));
                 ulong constraint;
                 if (base == 2u) {
                     constraint = gl_mul(x, gl_sub(x, 1));
@@ -1563,8 +1623,13 @@ kernel void range_check_gate_quotient(
                 range_check_gate_emit(
                     constraint,
                     alpha_powers, alpha_stride, gate_accumulators,
-                    constraint_index++);
+                    range_base + limb);
             }
+            range_check_gate_emit(
+                gl_sub(alpha_acc_materialize(recomposed), wires[source_row]),
+                alpha_powers, alpha_stride, gate_accumulators,
+                constraint_index);
+            constraint_index += num_ops + 1u;
         } else if (kind == 12u) {
             // SelectionGate: four routed wires per operation followed by one
             // temporary wire per operation.
