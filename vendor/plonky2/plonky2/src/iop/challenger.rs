@@ -54,9 +54,20 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
         self.observe_elements(&element.to_basefield_array());
     }
 
-    pub fn observe_elements(&mut self, elements: &[F]) {
-        for &element in elements {
-            self.observe_element(element);
+    pub fn observe_elements(&mut self, mut elements: &[F]) {
+        if elements.is_empty() {
+            return;
+        }
+        self.output_buffer.clear();
+        while !elements.is_empty() {
+            let space = H::Permutation::RATE - self.input_buffer.len();
+            let take = space.min(elements.len());
+            let (head, tail) = elements.split_at(take);
+            self.input_buffer.extend_from_slice(head);
+            if self.input_buffer.len() == H::Permutation::RATE {
+                self.duplexing();
+            }
+            elements = tail;
         }
     }
 
