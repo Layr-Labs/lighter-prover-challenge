@@ -181,24 +181,61 @@ fn run_generator_worklist<
                         if round_generator_is_expired[generator_idx] {
                             continue;
                         }
-                        let finished = generators[generator_idx].0.run_with_ready_hint(
+                        let run = generators[generator_idx].0.run_with_ready_hint(
                             round_witness,
                             &mut round_buffer,
                             round_unresolved_watches[generator_idx] == 0,
                         );
-                        entries.push((generator_idx, finished, round_buffer.target_values.len()));
-                        for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
-                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
-                                generator_indices_by_watches.get(&rep_index)
-                            } else {
-                                // The representative is populated in the snapshot, so the merge
-                                // cannot newly populate it and never needs watchers.
-                                None
-                            };
-                            annotated_values.push((t, v, watchers));
+                        match run {
+                            GeneratorRun::Buffered(finished) => {
+                                entries.push((
+                                    generator_idx,
+                                    finished,
+                                    round_buffer.target_values.len(),
+                                ));
+                                for (t, v) in round_buffer.target_values.drain(..) {
+                                    let rep_index = round_witness.representative_map
+                                        [round_witness.target_index(t)]
+                                        as usize;
+                                    let watchers =
+                                        if !round_witness.is_set_by_rep_index(rep_index) {
+                                            generator_indices_by_watches.get(&rep_index)
+                                        } else {
+                                            // The representative is populated in the snapshot,
+                                            // so the merge cannot newly populate it and never
+                                            // needs watchers.
+                                            None
+                                        };
+                                    annotated_values.push((t, v, watchers));
+                                }
+                            }
+                            GeneratorRun::Single { target, value } => {
+                                let rep_index = round_witness.representative_map
+                                    [round_witness.target_index(target)]
+                                    as usize;
+                                let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
+                                    generator_indices_by_watches.get(&rep_index)
+                                } else {
+                                    None
+                                };
+                                entries.push((generator_idx, true, 1));
+                                annotated_values.push((target, value, watchers));
+                            }
+                            GeneratorRun::Pair { values } => {
+                                entries.push((generator_idx, true, 2));
+                                for (target, value) in values {
+                                    let rep_index = round_witness.representative_map
+                                        [round_witness.target_index(target)]
+                                        as usize;
+                                    let watchers =
+                                        if !round_witness.is_set_by_rep_index(rep_index) {
+                                            generator_indices_by_watches.get(&rep_index)
+                                        } else {
+                                            None
+                                        };
+                                    annotated_values.push((target, value, watchers));
+                                }
+                            }
                         }
                     }
                     (entries, annotated_values)
@@ -244,31 +281,79 @@ fn run_generator_worklist<
                 continue;
             }
 
-            let finished = generators[generator_idx].0.run_with_ready_hint(
+            let run = generators[generator_idx].0.run_with_ready_hint(
                 witness,
                 &mut buffer,
                 unresolved_watches[generator_idx] == 0,
             );
-            if finished {
-                generator_is_expired[generator_idx] = true;
-                *remaining_generators -= 1;
-            }
+            match run {
+                GeneratorRun::Buffered(finished) => {
+                    if finished {
+                        generator_is_expired[generator_idx] = true;
+                        *remaining_generators -= 1;
+                    }
 
-            // Merge any generated values into our witness and, for each newly populated
-            // target's representative, immediately enqueue the unfinished generators watching
-            // it. The witness merge (`witness`) and the watcher bookkeeping
-            // (`generator_indices_by_watches`, `generator_is_expired`, `unresolved_watches`)
-            // touch disjoint state, so fusing the two passes deletes the per-run intermediate
-            // rep Vec while preserving both the `set_target_returning_rep` call order and the
-            // pending-queue push order exactly.
-            for (t, v) in buffer.target_values.drain(..) {
-                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
-                    if let Some(watchers) = generator_indices_by_watches.get(&watch) {
-                        for &watching_generator_idx in watchers {
-                            if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
+                    // Merge any generated values into our witness and, for each newly populated
+                    // target's representative, immediately enqueue the unfinished generators
+                    // watching it. The witness merge (`witness`) and watcher bookkeeping touch
+                    // disjoint state, so the passes stay fused without an intermediate rep Vec.
+                    for (t, v) in buffer.target_values.drain(..) {
+                        if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                                for &watching_generator_idx in watchers {
+                                    if !generator_is_expired[watching_generator_idx] {
+                                        debug_assert_ne!(
+                                            unresolved_watches[watching_generator_idx],
+                                            0
+                                        );
+                                        unresolved_watches[watching_generator_idx] -= 1;
+                                        next_pending_generator_indices
+                                            .push(watching_generator_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                GeneratorRun::Single { target, value } => {
+                    // Simple one-output generators always finish. Expire before notifying
+                    // watchers, matching the buffered merge's observable scheduler order.
+                    generator_is_expired[generator_idx] = true;
+                    *remaining_generators -= 1;
+                    if let Some(watch) = witness.set_target_returning_rep(target, value)? {
+                        if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                            for &watching_generator_idx in watchers {
+                                if !generator_is_expired[watching_generator_idx] {
+                                    debug_assert_ne!(
+                                        unresolved_watches[watching_generator_idx],
+                                        0
+                                    );
+                                    unresolved_watches[watching_generator_idx] -= 1;
+                                    next_pending_generator_indices.push(watching_generator_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                GeneratorRun::Pair { values } => {
+                    // Pair-output generators always finish. Expire before notifying watchers and
+                    // merge values in buffered insertion order.
+                    generator_is_expired[generator_idx] = true;
+                    *remaining_generators -= 1;
+                    for (target, value) in values {
+                        if let Some(watch) = witness.set_target_returning_rep(target, value)? {
+                            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                                for &watching_generator_idx in watchers {
+                                    if !generator_is_expired[watching_generator_idx] {
+                                        debug_assert_ne!(
+                                            unresolved_watches[watching_generator_idx],
+                                            0
+                                        );
+                                        unresolved_watches[watching_generator_idx] -= 1;
+                                        next_pending_generator_indices
+                                            .push(watching_generator_idx);
+                                    }
+                                }
                             }
                         }
                     }
@@ -645,8 +730,8 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
         _all_watches_populated: bool,
-    ) -> bool {
-        self.run(witness, out_buffer)
+    ) -> GeneratorRun<F> {
+        GeneratorRun::Buffered(self.run(witness, out_buffer))
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
@@ -680,6 +765,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Debug for WitnessGeneratorRef
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0.id())
     }
+}
+
+/// Result of running a generator from the ready worklist.
+#[derive(Debug)]
+pub enum GeneratorRun<F: Field> {
+    /// The generator used the reusable output buffer.
+    Buffered(bool),
+    /// A finished generator produced exactly one value without staging it in the buffer.
+    Single { target: Target, value: F },
+    /// A finished generator produced exactly two ordered values without staging them.
+    Pair { values: [(Target, F); 2] },
 }
 
 /// Values generated by a generator invocation.
@@ -747,6 +843,21 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
 
+    /// Optional one-output fast path used by the sequential witness worklist.
+    /// Returning `Some` must perform exactly the same computation as `run_once`.
+    fn run_once_single(&self, _witness: &PartitionWitness<F>) -> Option<Result<(Target, F)>> {
+        None
+    }
+
+    /// Optional ordered two-output fast path. Returning `Some` must perform exactly the same
+    /// computation and preserve the same insertion order as `run_once`.
+    fn run_once_pair(
+        &self,
+        _witness: &PartitionWitness<F>,
+    ) -> Option<Result<[(Target, F); 2]>> {
+        None
+    }
+
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
         Self: Sized,
@@ -798,8 +909,23 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
         all_watches_populated: bool,
-    ) -> bool {
-        all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
+    ) -> GeneratorRun<F> {
+        if !all_watches_populated {
+            return GeneratorRun::Buffered(false);
+        }
+        if let Some(result) = self.inner.run_once_single(witness) {
+            return match result {
+                Ok((target, value)) => GeneratorRun::Single { target, value },
+                Err(_) => GeneratorRun::Buffered(false),
+            };
+        }
+        if let Some(result) = self.inner.run_once_pair(witness) {
+            return match result {
+                Ok(values) => GeneratorRun::Pair { values },
+                Err(_) => GeneratorRun::Buffered(false),
+            };
+        }
+        GeneratorRun::Buffered(self.inner.run_once(witness, out_buffer).is_ok())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {

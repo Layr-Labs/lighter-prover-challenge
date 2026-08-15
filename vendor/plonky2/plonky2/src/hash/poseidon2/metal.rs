@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "3f99f8a51b5a36c69d92b6e878fd4bad8cd395b890fb2951e242e1d6be58c1c5";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1701,6 +1701,51 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         return None;
     }
 
+    // Find the selector group whose division-free Lagrange filter is rebuilt
+    // most often. The shader caches at most one group and marks its records in
+    // metadata bit 1; bit 0 remains `include_unused_selector`. This is useful
+    // for the production 12..17 group, which is shared by three RangeCheck and
+    // five promoted integer families.
+    let mut filter_groups: Vec<((usize, usize, usize, bool), usize)> = Vec::new();
+    let mut count_filter_group =
+        |selector_column: usize, group: &core::ops::Range<usize>, include_unused: bool| {
+            let key = (selector_column, group.start, group.end, include_unused);
+            if let Some((_, count)) = filter_groups.iter_mut().find(|(seen, _)| *seen == key) {
+                *count += 1;
+            } else {
+                filter_groups.push((key, 1));
+            }
+        };
+    for spec in specs {
+        count_filter_group(
+            spec.selector_column,
+            &spec.group,
+            spec.include_unused_selector,
+        );
+    }
+    for spec in u32_specs {
+        count_filter_group(
+            spec.selector_column,
+            &spec.group,
+            spec.include_unused_selector,
+        );
+    }
+    let cached_filter = filter_groups
+        .into_iter()
+        .filter(|((_, start, end, _), _)| end.saturating_sub(*start) <= 8)
+        .filter_map(|(key @ (_, start, end, include_unused), count)| {
+            let group_len = end.saturating_sub(start);
+            let multiplies_per_record = group_len
+                .saturating_sub(1)
+                .saturating_add(include_unused as usize);
+            let saved = count
+                .saturating_mul(multiplies_per_record)
+                .saturating_sub(3 * group_len);
+            (saved > 0).then_some((key, saved))
+        })
+        .max_by_key(|(_, saved)| *saved)
+        .map(|(key, _)| key);
+
     let mut alpha_stride = 0usize;
     let mut metadata = Vec::with_capacity(spec_count * SPEC_WORDS);
     for spec in specs {
@@ -1728,7 +1773,15 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             spec.gate_index as u32,
             spec.group.start as u32,
             spec.group.end as u32,
-            spec.include_unused_selector as u32,
+            spec.include_unused_selector as u32
+                | ((cached_filter
+                    == Some((
+                        spec.selector_column,
+                        spec.group.start,
+                        spec.group.end,
+                        spec.include_unused_selector,
+                    ))) as u32)
+                    << 1,
             spec.num_ops as u32,
             num_aux as u32,
             if spec.bit_size & 1 == 1 { 2 } else { 4 },
@@ -1941,7 +1994,15 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
             spec.gate_index as u32,
             spec.group.start as u32,
             spec.group.end as u32,
-            spec.include_unused_selector as u32,
+            spec.include_unused_selector as u32
+                | ((cached_filter
+                    == Some((
+                        spec.selector_column,
+                        spec.group.start,
+                        spec.group.end,
+                        spec.include_unused_selector,
+                    ))) as u32)
+                    << 1,
             kind as u32,
             spec.num_ops as u32,
             num_addends as u32,
@@ -1978,6 +2039,7 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         u32_specs.len(),
         &alpha_powers,
         alpha_stride,
+        cached_filter.unwrap_or((0, 0, 0, false)),
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -2658,6 +2720,7 @@ impl MetalShared {
         u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
+        cached_filter: (usize, usize, usize, bool),
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
@@ -2697,6 +2760,10 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
+            set_u32(encoder, 11, cached_filter.0 as u32);
+            set_u32(encoder, 12, cached_filter.1 as u32);
+            set_u32(encoder, 13, cached_filter.2 as u32);
+            set_u32(encoder, 14, cached_filter.3 as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -4349,16 +4416,40 @@ mod tests {
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
         let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        // Keep one gamma near the top of the canonical range so adding it to
+        // the raw representatives below crosses the u64 carry boundary. The
+        // other covers the Goldilocks epsilon boundary directly.
+        let gammas = [
+            F::from_canonical_u64(F::ORDER - 1),
+            F::from_canonical_u64(1 << 32),
+        ];
         let beta_k_is = (0..2 * ROUTED)
             .map(|i| F::from_canonical_usize(19 + i * 2))
             .collect::<Vec<_>>();
+        // Canonical edges, noncanonical encodings, both 2^32 limb boundaries,
+        // and arbitrary heavy representatives. `MetalColumns` retains these
+        // exact u64 words, so the shader's factor arithmetic is checked on raw
+        // inputs rather than only on values already reduced below the order.
+        let boundary = [
+            0u64,
+            1,
+            2,
+            u32::MAX as u64,
+            1 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+            9_087_029_921_428_221_768,
+            2_441_288_194_761_790_662,
+        ];
         let shifted_points = F::two_adic_subgroup(QUOTIENT_ROWS.ilog2() as usize)
             .into_iter()
             .map(|x| F::coset_shift() * x)
             .collect::<Vec<_>>();
 
-        for step in [1, 4] {
+        for step in [1, 2, 4, 8] {
             let full_rows = QUOTIENT_ROWS * step;
             let mut wires = context
                 .allocate_columns::<F>(full_rows, ROUTED)
@@ -4370,10 +4461,25 @@ mod tests {
                 .allocate_columns::<F>(full_rows, 2 + 2 * NUM_PARTIALS)
                 .expect("Z/partial columns");
             let mut rng = StdRng::seed_from_u64(0xcafe_5000 + step as u64);
-            for columns in [&mut wires, &mut constants, &mut zs] {
-                for column in columns.columns_mut().expect("unique columns") {
-                    for value in column {
-                        *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            for (set_index, columns) in [&mut wires, &mut constants, &mut zs]
+                .into_iter()
+                .enumerate()
+            {
+                for (column_index, column) in columns
+                    .columns_mut()
+                    .expect("unique columns")
+                    .into_iter()
+                    .enumerate()
+                {
+                    for (row, value) in column.iter_mut().enumerate() {
+                        *value = if (row + 3 * column_index + set_index) % 4 == 0 {
+                            GoldilocksField(
+                                boundary[(row + 5 * column_index + 7 * set_index)
+                                    % boundary.len()],
+                            )
+                        } else {
+                            F::from_canonical_u64(rng.next_u64() % F::ORDER)
+                        };
                     }
                 }
             }
