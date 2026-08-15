@@ -423,53 +423,28 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         let mut wire_values: Vec<Vec<F>> = (0..num_wires)
             .map(|_| Vec::with_capacity(degree))
             .collect();
-        let num_chunks = 16.min(degree.max(1));
-        let chunk_rows = degree.div_ceil(num_chunks);
-        {
-            let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
-                .map(|_| Vec::with_capacity(num_wires))
-                .collect();
-            for column in wire_values.iter_mut() {
-                let mut rest =
-                    crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
-                for segment_columns in segments.iter_mut() {
-                    let take = chunk_rows.min(rest.len());
-                    let (head, tail) = rest.split_at_mut(take);
-                    segment_columns.push(head);
-                    rest = tail;
+        use plonky2_maybe_rayon::*;
+        wire_values
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(j, column)| {
+                let uninit_slice = crate::hash::merkle_tree::capacity_up_to_mut(column, degree);
+                let mut wire_index = j;
+                for row in 0..degree {
+                    let rep = self.representative_map[wire_index] as usize;
+                    let value = if self.is_set_by_rep_index(rep) {
+                        self.values[rep]
+                    } else {
+                        F::ZERO
+                    };
+                    uninit_slice[row].write(value);
+                    wire_index += num_wires;
                 }
-            }
-            use plonky2_maybe_rayon::*;
-            segments
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(chunk, columns)| {
-                    let rows = columns.first().map_or(0, |column| column.len());
-                    let mut wire_index = chunk * chunk_rows * num_wires;
-                    for i in 0..rows {
-                        for column in columns.iter_mut() {
-                            let rep = self.representative_map[wire_index] as usize;
-                            // Bitmap-guarded: unset slots are uninitialized
-                            // storage and must read as F::ZERO (identical to
-                            // the dense-zero representation this replaces).
-                            let value = if self.is_set_by_rep_index(rep) {
-                                self.values[rep]
-                            } else {
-                                F::ZERO
-                            };
-                            column[i].write(value);
-                            wire_index += 1;
-                        }
-                    }
-                });
-        }
-        for column in wire_values.iter_mut() {
-            // SAFETY: every one of the `degree` slots of every column was
-            // initialized exactly once by the disjoint segment writes above.
-            unsafe {
-                column.set_len(degree);
-            }
-        }
+                // SAFETY: all `degree` slots of this column have been initialized.
+                unsafe {
+                    column.set_len(degree);
+                }
+            });
 
         MatrixWitness { wire_values }
     }

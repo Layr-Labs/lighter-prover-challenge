@@ -179,9 +179,11 @@ pub fn flatten<F, const D: usize>(l: &[F::Extension]) -> Vec<F>
 where
     F: Field + Extendable<D>,
 {
-    l.iter()
-        .flat_map(|x| x.to_basefield_array().to_vec())
-        .collect()
+    let mut out = Vec::with_capacity(l.len() * D);
+    for x in l {
+        out.extend_from_slice(&x.to_basefield_array());
+    }
+    out
 }
 
 /// Batch every D-sized chunks into extension field elements.
@@ -190,7 +192,11 @@ where
     F: Field + Extendable<D>,
 {
     debug_assert_eq!(l.len() % D, 0);
-    l.chunks_exact(D)
-        .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
-        .collect()
+    let mut out = Vec::with_capacity(l.len() / D);
+    for chunk in l.chunks_exact(D) {
+        let mut arr = [F::ZERO; D];
+        arr.copy_from_slice(chunk);
+        out.push(F::Extension::from_basefield_array(arr));
+    }
+    out
 }
