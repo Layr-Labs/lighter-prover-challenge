@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "ab6be2f936de3b1a832f08e3bca48e0427b917f0fe1e6b6ee71ae34357f6a91f";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -1315,6 +1315,18 @@ fn spine_urgent() -> bool {
     SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed) >= SPINE_URGENT_BACKLOG
 }
 
+/// Runtime kill switch for a same-binary scheduling A/B. Streaming urgent
+/// spine wires is on by default; `PLONKY2_STREAM_SPINE_WIRES=0` restores the
+/// previous admission rule without changing any tree inputs or outputs.
+fn stream_spine_wires_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PLONKY2_STREAM_SPINE_WIRES")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
@@ -2021,17 +2033,17 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// staging buffer.
 /// Retained buffers for the streamed sponge build: the inter-pass state
 /// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
+/// One streamed build runs at a time, so a single grow-on-demand pair
+/// suffices; holding the lock for the whole build serializes concurrent
+/// streamed callers.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+/// the GPU absorbs each group while the CPU fills the next. Admission is
+/// restricted to selected large commitments and urgent wide spine wires,
+/// where the overlap converts the previously serial CPU-FFT-then-GPU-hash
+/// commitment into max(FFT, hash) + one pass.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
@@ -2050,17 +2062,21 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
     // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
-    // only when the GPU stream is unoccupied at entry, the same occupancy
-    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
-    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
-    // while an already-busy stream would just queue the absorb groups behind
-    // another tree and stretch both.
+    // pipelined 2^19 commitments (tx wires/Zs/quotient) stream only when the
+    // GPU is unoccupied at entry. The one narrower exception is an urgent
+    // degree-2^14 spine wires tree: it already routes to Metal at width > 64,
+    // and streaming overlaps its CPU column fill instead of waiting to submit
+    // the whole hash after the fill. Narrow spine trees retain the classic
+    // occupancy-sensitive path.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
         leaf_count >= 1 << 20
     } else {
-        leaf_count >= 1 << 19
-            && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
+        (leaf_count >= 1 << 19
+            && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0)
+            || (leaf_count == 1 << 17
+                && leaf_width > 64
+                && spine_urgent()
+                && stream_spine_wires_enabled())
     };
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -3952,6 +3968,9 @@ mod tests {
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
+    /// Tests below toggle process-global Merkle routing state and must not race.
+    static STREAMED_ROUTING_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
     /// this pins the source bytes: edit `poseidon2.metal` without regenerating
@@ -4349,16 +4368,40 @@ mod tests {
         let context = shared_context().expect("Metal context must initialize");
         let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(5)];
         let betas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
-        let gammas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        // Keep one gamma near the top of the canonical range so adding it to
+        // the raw representatives below crosses the u64 carry boundary. The
+        // other covers the Goldilocks epsilon boundary directly.
+        let gammas = [
+            F::from_canonical_u64(F::ORDER - 1),
+            F::from_canonical_u64(1 << 32),
+        ];
         let beta_k_is = (0..2 * ROUTED)
             .map(|i| F::from_canonical_usize(19 + i * 2))
             .collect::<Vec<_>>();
+        // Canonical edges, noncanonical encodings, both 2^32 limb boundaries,
+        // and arbitrary heavy representatives. `MetalColumns` retains these
+        // exact u64 words, so the shader's factor arithmetic is checked on raw
+        // inputs rather than only on values already reduced below the order.
+        let boundary = [
+            0u64,
+            1,
+            2,
+            u32::MAX as u64,
+            1 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+            9_087_029_921_428_221_768,
+            2_441_288_194_761_790_662,
+        ];
         let shifted_points = F::two_adic_subgroup(QUOTIENT_ROWS.ilog2() as usize)
             .into_iter()
             .map(|x| F::coset_shift() * x)
             .collect::<Vec<_>>();
 
-        for step in [1, 4] {
+        for step in [1, 2, 4, 8] {
             let full_rows = QUOTIENT_ROWS * step;
             let mut wires = context
                 .allocate_columns::<F>(full_rows, ROUTED)
@@ -4370,10 +4413,25 @@ mod tests {
                 .allocate_columns::<F>(full_rows, 2 + 2 * NUM_PARTIALS)
                 .expect("Z/partial columns");
             let mut rng = StdRng::seed_from_u64(0xcafe_5000 + step as u64);
-            for columns in [&mut wires, &mut constants, &mut zs] {
-                for column in columns.columns_mut().expect("unique columns") {
-                    for value in column {
-                        *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            for (set_index, columns) in [&mut wires, &mut constants, &mut zs]
+                .into_iter()
+                .enumerate()
+            {
+                for (column_index, column) in columns
+                    .columns_mut()
+                    .expect("unique columns")
+                    .into_iter()
+                    .enumerate()
+                {
+                    for (row, value) in column.iter_mut().enumerate() {
+                        *value = if (row + 3 * column_index + set_index) % 4 == 0 {
+                            GoldilocksField(
+                                boundary[(row + 5 * column_index + 7 * set_index)
+                                    % boundary.len()],
+                            )
+                        } else {
+                            F::from_canonical_u64(rng.next_u64() % F::ORDER)
+                        };
                     }
                 }
             }
@@ -6468,6 +6526,9 @@ kernel void goldilocks_mul_bench_native(
 
     #[test]
     fn streamed_merkle_keeps_digests_resident_and_matches_classic() {
+        let _routing_lock = STREAMED_ROUTING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         type F = GoldilocksField;
         struct ExclusiveReset;
         impl Drop for ExclusiveReset {
@@ -6503,6 +6564,56 @@ kernel void goldilocks_mul_bench_native(
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
             .expect("classic tree");
         assert_eq!(streamed, classic);
+    }
+
+    #[test]
+    fn streamed_urgent_spine_wires_matches_classic_exactly() {
+        let _routing_lock = STREAMED_ROUTING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        type F = GoldilocksField;
+        struct SpineBacklogReset;
+        impl Drop for SpineBacklogReset {
+            fn drop(&mut self) {
+                spine_backlog_add(-SPINE_URGENT_BACKLOG);
+            }
+        }
+
+        let context = shared_context().expect("Metal context");
+        let rows = 1usize << 17;
+        let cols = 136;
+        let cap_height = 4;
+        assert!(!is_exclusive_gpu_phase(), "test must exercise non-exclusive admission");
+        assert!(
+            stream_spine_wires_enabled(),
+            "unset PLONKY2_STREAM_SPINE_WIRES (or set it to a nonzero value)"
+        );
+        let columns = allocate_columns::<F>(cols, rows, cap_height)
+            .expect("d14 wide wires must route to retained Metal columns");
+
+        spine_backlog_add(SPINE_URGENT_BACKLOG);
+        let _backlog_reset = SpineBacklogReset;
+        assert!(spine_urgent());
+        let streamed = build_merkle_tree_shared_streamed(
+            &columns,
+            cap_height,
+            &|group, destinations| {
+                for (index, destination) in destinations.iter_mut().enumerate() {
+                    let column = group * 8 + index;
+                    let column_seed = (column as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    for (row, value) in destination.iter_mut().enumerate() {
+                        *value = GoldilocksField(column_seed.wrapping_add(row as u64));
+                    }
+                }
+            },
+        )
+        .expect("urgent d14 wide wires must use the streamed path");
+        assert!(streamed.0.nodes.is_shared());
+
+        let classic = context
+            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+            .expect("classic tree");
+        assert_tree_raw_eq(&streamed, &classic, cols, cap_height);
     }
 
     #[test]
