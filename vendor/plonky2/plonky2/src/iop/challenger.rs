@@ -94,7 +94,24 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     }
 
     pub fn get_n_challenges(&mut self, n: usize) -> Vec<F> {
-        (0..n).map(|_| self.get_challenge()).collect()
+        // Same duplexing predicate and pop order as `n` times `get_challenge`,
+        // but drain the current squeeze in one inner loop instead of a
+        // per-element call. Transcript-identical. Not observe-batch (608ba8d).
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            if !self.input_buffer.is_empty() || self.output_buffer.is_empty() {
+                self.duplexing();
+            }
+            let take = (n - out.len()).min(self.output_buffer.len());
+            for _ in 0..take {
+                out.push(
+                    self.output_buffer
+                        .pop()
+                        .expect("Output buffer should be non-empty"),
+                );
+            }
+        }
+        out
     }
 
     pub fn get_hash(&mut self) -> HashOut<F> {
