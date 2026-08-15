@@ -370,6 +370,18 @@ pub struct GeneratorWatchIndex {
     offsets: Vec<u32>,
     watchers: Vec<usize>,
     entries: usize,
+    /// One bit per representative, set exactly when its watcher list is non-empty. The compact
+    /// bitmap answers the common miss without probing the much larger scattered offset table.
+    watched: Vec<u64>,
+}
+
+#[inline]
+fn mark_watched(watched: &mut [u64], representative: usize) {
+    watched[representative >> 6] |= 1u64 << (representative & 63);
+}
+
+fn empty_watched(offsets_len: usize) -> Vec<u64> {
+    vec![0u64; offsets_len.saturating_sub(1).div_ceil(64)]
 }
 
 impl GeneratorWatchIndex {
@@ -380,6 +392,7 @@ impl GeneratorWatchIndex {
                 offsets: vec![0],
                 watchers: Vec::new(),
                 entries: 0,
+                watched: Vec::new(),
             };
         };
 
@@ -393,6 +406,7 @@ impl GeneratorWatchIndex {
         );
 
         let mut offsets = vec![0u32; offsets_len];
+        let mut watched = empty_watched(offsets_len);
         let mut watchers = Vec::with_capacity(total_watchers);
         let mut entries_iter = map.into_iter().peekable();
         for representative in 0..=max_representative {
@@ -402,6 +416,9 @@ impl GeneratorWatchIndex {
                 .is_some_and(|(key, _)| *key == representative)
             {
                 let (_, representative_watchers) = entries_iter.next().unwrap();
+                if !representative_watchers.is_empty() {
+                    mark_watched(&mut watched, representative);
+                }
                 watchers.extend(representative_watchers);
             }
         }
@@ -412,6 +429,7 @@ impl GeneratorWatchIndex {
             offsets,
             watchers,
             entries,
+            watched,
         }
     }
 
@@ -444,6 +462,7 @@ impl GeneratorWatchIndex {
                 offsets: vec![0],
                 watchers: Vec::new(),
                 entries: 0,
+                watched: Vec::new(),
             };
         };
         let max_representative = max_representative as usize;
@@ -490,10 +509,18 @@ impl GeneratorWatchIndex {
         offsets.copy_within(2.., 1);
         *offsets.last_mut().unwrap() = total;
 
+        let mut watched = empty_watched(offsets.len());
+        for (representative, bounds) in offsets.windows(2).enumerate() {
+            if bounds[0] != bounds[1] {
+                mark_watched(&mut watched, representative);
+            }
+        }
+
         Self {
             offsets,
             watchers,
             entries,
+            watched,
         }
     }
 
@@ -522,27 +549,32 @@ impl GeneratorWatchIndex {
             "watch index offsets must cover the watcher list"
         );
         let mut entries = 0usize;
-        for bounds in offsets.windows(2) {
+        let mut watched = empty_watched(offsets.len());
+        for (representative, bounds) in offsets.windows(2).enumerate() {
             assert!(bounds[0] <= bounds[1], "watch index offsets must be sorted");
             if bounds[0] != bounds[1] {
                 entries += 1;
+                mark_watched(&mut watched, representative);
             }
         }
         Self {
             offsets,
             watchers,
             entries,
+            watched,
         }
     }
 
     #[inline]
     pub fn get(&self, representative: &usize) -> Option<&[usize]> {
-        let end_index = representative.checked_add(1)?;
-        let (&start, &end) = (
-            self.offsets.get(*representative)?,
-            self.offsets.get(end_index)?,
-        );
-        (start != end).then(|| &self.watchers[start as usize..end as usize])
+        let representative = *representative;
+        if (self.watched.get(representative >> 6)? >> (representative & 63)) & 1 == 0 {
+            return None;
+        }
+        let start = self.offsets[representative] as usize;
+        let end = self.offsets[representative + 1] as usize;
+        debug_assert!(start != end);
+        Some(&self.watchers[start..end])
     }
 
     pub const fn len(&self) -> usize {
@@ -582,6 +614,9 @@ pub struct ProverOnlyCircuitData<
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
     pub generator_watch_counts: Vec<usize>,
+    /// Whether all generators guarantee that an unready hinted dispatch is inert. This is
+    /// runtime-only and is re-derived wherever the generator vector is constructed.
+    pub generators_defer_until_ready: bool,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
