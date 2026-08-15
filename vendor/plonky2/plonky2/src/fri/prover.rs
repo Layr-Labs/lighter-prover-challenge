@@ -265,7 +265,7 @@ pub(crate) fn fri_proof_of_work<
     challenger: &mut Challenger<F, C::Hasher>,
     config: &FriConfig,
 ) -> F {
-    let min_leading_zeros = config.proof_of_work_bits + (64 - F::order().bits()) as u32;
+    let min_leading_zeros = config.proof_of_work_bits + (64 - F::BITS) as u32;
 
     // The easiest implementation would be repeatedly clone our Challenger. With each clone, we'd
     // observe an incrementing PoW witness, then get the PoW response. If it contained sufficient
