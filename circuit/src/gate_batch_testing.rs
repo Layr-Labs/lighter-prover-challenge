@@ -86,6 +86,30 @@ mod vendored_gate_tests {
     }
 
     #[test]
+    fn arithmetic_extension_accumulate_matches_materialized_n11_and_n32() {
+        use plonky2::gates::arithmetic_extension::ArithmeticExtensionGate;
+
+        // N=11 is the remainder oracle (11 = 2*4 + 3). Do not drop it.
+        // n=32 is the production quotient batch. Do not assume n==32 in the impl.
+        for num_ops in [1, 2, 10] {
+            let gate = ArithmeticExtensionGate::<2> { num_ops };
+            assert_direct_accumulation_matches_materialized_batch(&gate);
+            assert_accumulate_matches_materialized_at_batch_size(&gate, 32);
+        }
+    }
+
+    #[test]
+    fn multiplication_extension_accumulate_matches_materialized_n11_and_n32() {
+        use plonky2::gates::multiplication_extension::MulExtensionGate;
+
+        for num_ops in [1, 2, 13] {
+            let gate = MulExtensionGate::<2> { num_ops };
+            assert_direct_accumulation_matches_materialized_batch(&gate);
+            assert_accumulate_matches_materialized_at_batch_size(&gate, 32);
+        }
+    }
+
+    #[test]
     fn random_access_accumulate_matches_eval_unfiltered_across_batch() {
         use plonky2::gates::random_access::RandomAccessGate;
         use plonky2::plonk::circuit_data::CircuitConfig;

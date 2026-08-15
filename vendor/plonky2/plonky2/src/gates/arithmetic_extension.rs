@@ -11,6 +11,9 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
+use crate::field::types::Field;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -57,6 +60,86 @@ impl<const D: usize> ArithmeticExtensionGate<D> {
     }
     pub(crate) const fn wires_ith_output(i: usize) -> Range<usize> {
         4 * D * i + 3 * D..4 * D * i + 4 * D
+    }
+}
+
+/// Fill `scratch[d * n + p]` for one ArithmeticExtension op using a 4-wide
+/// packed quadratic schoolbook when `D == 2` and `Packable::Packing::WIDTH == 4`.
+/// Keeps `c0 * (m0 * m1) + c1 * z` (addend is not dropped; c0/c1 are not swapped).
+/// The `n % 4` tail stays on today's per-point `F::Extension` path. Packs
+/// points, not ops; the caller still emits op-major, limb-major.
+fn fill_arithmetic_extension_scratch<F: RichField + Extendable<D>, const D: usize>(
+    wires: &[F],
+    const_0: &[F],
+    const_1: &[F],
+    n: usize,
+    m0_start: usize,
+    m1_start: usize,
+    addend_start: usize,
+    output_start: usize,
+    scratch: &mut [F],
+) {
+    let ext = |start: usize, p: usize| {
+        let mut arr = [F::ZERO; D];
+        for (d, a) in arr.iter_mut().enumerate() {
+            *a = wires[(start + d) * n + p];
+        }
+        F::Extension::from_basefield_array(arr)
+    };
+
+    let write_point = |scratch: &mut [F], p: usize| {
+        let multiplicand_0 = ext(m0_start, p);
+        let multiplicand_1 = ext(m1_start, p);
+        let addend = ext(addend_start, p);
+        let output = ext(output_start, p);
+        let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p])
+            + addend.scalar_mul(const_1[p]);
+        let arr = (output - computed_output).to_basefield_array();
+        for (d, a) in arr.iter().enumerate() {
+            scratch[d * n + p] = *a;
+        }
+    };
+
+    // Pack 4 points only. Other Packable widths stay on the per-point path.
+    if D == 2 && <F as Packable>::Packing::WIDTH == 4 {
+        type P<T: Packable> = <T as Packable>::Packing;
+        const WIDTH: usize = 4;
+        debug_assert_eq!(P::<F>::WIDTH, WIDTH);
+        debug_assert_eq!(F::W, F::from_canonical_u64(7));
+        let w = P::<F>::from(F::W);
+        let n_packed = n - n % WIDTH;
+        let load = |start: usize, limb: usize, p: usize| -> P<F> {
+            *P::<F>::from_slice(&wires[(start + limb) * n + p..][..WIDTH])
+        };
+        for p in (0..n_packed).step_by(WIDTH) {
+            let a0 = load(m0_start, 0, p);
+            let a1 = load(m0_start, 1, p);
+            let b0 = load(m1_start, 0, p);
+            let b1 = load(m1_start, 1, p);
+            let z0 = load(addend_start, 0, p);
+            let z1 = load(addend_start, 1, p);
+            let o0 = load(output_start, 0, p);
+            let o1 = load(output_start, 1, p);
+            let c0 = *P::<F>::from_slice(&const_0[p..][..WIDTH]);
+            let c1 = *P::<F>::from_slice(&const_1[p..][..WIDTH]);
+            // (a0 + a1 X)(b0 + b1 X) = (a0 b0 + W a1 b1, a0 b1 + a1 b0)
+            let prod0 = (a0 * b0).multiply_accumulate(w, a1 * b1);
+            let prod1 = (a0 * b1).multiply_accumulate(a1, b0);
+            // c0 * (m0 * m1) + c1 * z  — do not drop the addend, do not swap c0/c1.
+            let computed0 = (prod0 * c0).multiply_accumulate(z0, c1);
+            let computed1 = (prod1 * c0).multiply_accumulate(z1, c1);
+            let arr0 = o0 - computed0;
+            let arr1 = o1 - computed1;
+            scratch[0 * n + p..][..WIDTH].copy_from_slice(arr0.as_slice());
+            scratch[1 * n + p..][..WIDTH].copy_from_slice(arr1.as_slice());
+        }
+        for p in n_packed..n {
+            write_point(scratch, p);
+        }
+    } else {
+        for p in 0..n {
+            write_point(scratch, p);
+        }
     }
 }
 
@@ -131,14 +214,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         let constants = vars_base.local_constants;
         let const_0 = &constants[..n];
         let const_1 = &constants[n..2 * n];
-        let ext = |start: usize, p: usize| {
-            let mut arr = [F::ZERO; D];
-            for (d, a) in arr.iter_mut().enumerate() {
-                *a = wires[(start + d) * n + p];
-            }
-            F::Extension::from_basefield_array(arr)
-        };
-
         // One `D x n` constraint block, reused across the `num_ops` operations.
         // Every slot is assigned by the point loop below before the
         // `batch_multiply_add_inplace` read: `to_basefield_array()` yields exactly
@@ -174,18 +249,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
             let addend_start = Self::wires_ith_addend(i).start;
             let output_start = Self::wires_ith_output(i).start;
-            for p in 0..n {
-                let multiplicand_0 = ext(m0_start, p);
-                let multiplicand_1 = ext(m1_start, p);
-                let addend = ext(addend_start, p);
-                let output = ext(output_start, p);
-                let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p])
-                    + addend.scalar_mul(const_1[p]);
-                let arr = (output - computed_output).to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
-                }
-            }
+            fill_arithmetic_extension_scratch::<F, D>(
+                wires,
+                const_0,
+                const_1,
+                n,
+                m0_start,
+                m1_start,
+                addend_start,
+                output_start,
+                scratch,
+            );
             for d in 0..D {
                 batch_multiply_add_inplace(
                     &mut combined_gate_constraints[(i * D + d) * n..][..n],
