@@ -355,12 +355,21 @@ pub fn ext2_base_scalar_dot_slots(
     // Split once so the dense inner loop over fully-covering polynomials
     // runs without per-slot bounds checks; only boundary-length polynomials
     // take the checked loop.
-    let mut full: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> =
-        Vec::with_capacity(polys.len());
+    #[derive(Copy, Clone)]
+    struct FullEntry {
+        ptr: *const GoldilocksField,
+        b0: u64,
+        b1: u64,
+    }
+    let mut full: Vec<FullEntry> = Vec::with_capacity(polys.len());
     let mut partial: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> = Vec::new();
     for (&p, &pw) in polys.iter().zip(powers) {
         if p.len() >= end {
-            full.push((&p[start..end], pw));
+            full.push(FullEntry {
+                ptr: p[start..end].as_ptr(),
+                b0: pw.0[0].0,
+                b1: pw.0[1].0,
+            });
         } else if p.len() > start {
             partial.push((&p[start..], pw));
         }
@@ -368,11 +377,10 @@ pub fn ext2_base_scalar_dot_slots(
     for (i, o) in out.iter_mut().enumerate() {
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
-            // SAFETY: every slice in `full` has length exactly `out.len()`.
-            let c = unsafe { p.get_unchecked(i).0 };
-            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+        for entry in &full {
+            let c = unsafe { (*entry.ptr.add(i)).0 };
+            u160_add_product(&mut lo0, &mut hi0, entry.b0, c);
+            u160_add_product(&mut lo1, &mut hi1, entry.b1, c);
         }
         for &(p, QuadraticExtension([b0, b1])) in &partial {
             if i < p.len() {
