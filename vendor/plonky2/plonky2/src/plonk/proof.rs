@@ -12,6 +12,7 @@ use plonky2_maybe_rayon::*;
 use serde::{Deserialize, Serialize};
 
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::polynomial::PolynomialCoeffs;
 use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
 use crate::fri::proof::{
@@ -349,177 +350,65 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // and compares every entry by raw noncanonical limbs.
         let g_subgroup =
             crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
-        // The shifted table is only materialized when something actually
-        // consumes a whole table of `(g·ζ)^i`. In the ranked lookup-free
-        // configuration the only shifted openings are the `num_challenges`
-        // `Z` polynomials, so folding `g^i` into each coefficient and reusing
-        // the `ζ` table evaluates `P(gζ) = sum_i c_i · g^i · ζ^i` directly and
-        // deletes a `degree`-long extension vector: its allocation, its
-        // zero-fault, its fill pass and its read pass. Arithmetic is a wash
-        // (one extra base multiply per term against one extension scalar-mul
-        // per table entry), the deleted memory traffic is not.
-        let use_fused_shifted = common_data.num_lookup_polys == 0
-            && common_data.zs_range().len() <= D
-            && std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_none();
-        let g_zeta_pows: Vec<F::Extension> = if use_fused_shifted {
-            Vec::new()
-        } else {
-            let g_zeta_pows: Vec<F::Extension> = zeta_pows
-                .iter()
-                .zip(g_subgroup.iter())
-                .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
-                .collect();
-            if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
-                let reference = table(g * zeta);
-                assert_eq!(reference.len(), g_zeta_pows.len());
-                for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
-                    let a_raw: Vec<u64> = a
-                        .to_basefield_array()
-                        .iter()
-                        .map(|c| c.to_noncanonical_u64())
-                        .collect();
-                    let b_raw: Vec<u64> = b
-                        .to_basefield_array()
-                        .iter()
-                        .map(|c| c.to_noncanonical_u64())
-                        .collect();
-                    assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
-                }
+        let g_zeta_pows: Vec<F::Extension> = zeta_pows
+            .iter()
+            .zip(g_subgroup.iter())
+            .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
+            .collect();
+        if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
+            let reference = table(g * zeta);
+            assert_eq!(reference.len(), g_zeta_pows.len());
+            for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
+                let a_raw: Vec<u64> = a
+                    .to_basefield_array()
+                    .iter()
+                    .map(|c| c.to_noncanonical_u64())
+                    .collect();
+                let b_raw: Vec<u64> = b
+                    .to_basefield_array()
+                    .iter()
+                    .map(|c| c.to_noncanonical_u64())
+                    .collect();
+                assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
             }
-            g_zeta_pows
+        }
+        let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
+            polynomials
+                .par_iter()
+                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
+                .collect::<Vec<_>>()
         };
-        // One task per *pair* of polynomials: both dots walk the same
-        // `pows` slice, so the shared powers table is read once instead of
-        // twice while each output keeps its own 160-bit accumulator pair.
-        // `extension_base_dot_products_2` defaults to the two single dots, and
-        // the Goldilocks specialization is raw-representative-identical to them
-        // (see its differential test).
-        //
-        // The pairs are drawn from *one* job list spanning every commitment
-        // opened in this phase, so the whole opening set is a single Rayon
-        // wave instead of one wave per commitment plus a wave for the shifted
-        // openings. Each output owns a private 160-bit accumulator that is
-        // reduced exactly once, and exact integer accumulation does not depend
-        // on which other polynomial shares the task, so every opening is the
-        // same raw word under any pairing arrangement -- including the pairs
-        // that now straddle a commitment boundary. Peak stream count and total
-        // bytes read are unchanged; only the barriers between the waves are
-        // gone.
-        //
-        // Job order is the historical evaluation order, so the slices carved
-        // out below are the very vectors the per-commitment waves produced.
-        // `true` tags a shifted (`g·ζ`) opening.
-        let constants_sigmas_polys = &constants_sigmas_commitment.polynomials;
-        let zs_partial_products_lookup_polys = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys_src = &quotient_polys_commitment.polynomials;
-        let wires_polys = &wires_commitment.polynomials;
-        let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let zs_range = common_data.zs_range();
-        let lookup_range = common_data.lookup_range();
-        let shifted_zs_polys = &shifted_polynomials[zs_range.clone()];
-        let shifted_lookup_polys = &shifted_polynomials[lookup_range.clone()];
+        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
+            eval_polynomials(pows, &c.polynomials)
+        };
+        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
 
-        let mut jobs: Vec<(&[F], bool)> = Vec::with_capacity(
-            constants_sigmas_polys.len()
-                + zs_partial_products_lookup_polys.len()
-                + quotient_polys_src.len()
-                + wires_polys.len()
-                + shifted_zs_polys.len()
-                + shifted_lookup_polys.len(),
-        );
-        for poly in constants_sigmas_polys {
-            jobs.push((poly.coeffs.as_slice(), false));
-        }
-        for poly in zs_partial_products_lookup_polys {
-            jobs.push((poly.coeffs.as_slice(), false));
-        }
-        for poly in quotient_polys_src {
-            jobs.push((poly.coeffs.as_slice(), false));
-        }
-        for poly in wires_polys {
-            jobs.push((poly.coeffs.as_slice(), false));
-        }
-        // Partial-product polynomials are opened only at `zeta`, never at
-        // `g * zeta`; only the shifted Z (and lookup Z) polynomials are
-        // consumed by the FRI next batch.
-        for poly in shifted_zs_polys {
-            jobs.push((poly.coeffs.as_slice(), true));
-        }
-        for poly in shifted_lookup_polys {
-            jobs.push((poly.coeffs.as_slice(), true));
-        }
-
-        let mut evals = vec![F::Extension::ZERO; jobs.len()];
-        {
-            let jobs = &jobs;
-            let zeta_pows = &zeta_pows;
-            let g_zeta_pows = &g_zeta_pows;
-            let g_subgroup = g_subgroup.as_slice();
-            evals
-                .par_chunks_mut(2)
-                .enumerate()
-                .for_each(|(pair, out)| {
-                    let base = pair * 2;
-                    let eval_one = |(coeffs, shifted): (&[F], bool)| {
-                        if !shifted {
-                            F::extension_base_dot_product(zeta_pows, coeffs)
-                        } else if use_fused_shifted {
-                            // Shifted opening without a materialized `(g·ζ)`
-                            // table: fold the natural-order subgroup power
-                            // into each coefficient.
-                            F::extension_base_dot_product_with_subgroup_scales(
-                                zeta_pows, coeffs, g_subgroup,
-                            )
-                        } else {
-                            F::extension_base_dot_product(g_zeta_pows, coeffs)
-                        }
-                    };
-                    // Only two unshifted openings share a powers slice, so
-                    // only they can ride the fused two-accumulator dot.
-                    if out.len() == 2 && !jobs[base].1 && !jobs[base + 1].1 {
-                        let [first, second] = F::extension_base_dot_products_2(
-                            zeta_pows,
-                            [jobs[base].0, jobs[base + 1].0],
-                        );
-                        out[0] = first;
-                        out[1] = second;
-                    } else {
-                        for (slot, &job) in out.iter_mut().zip(&jobs[base..]) {
-                            *slot = eval_one(job);
-                        }
-                    }
-                });
-        }
-
-        let constants_sigmas_len = constants_sigmas_polys.len();
-        let zs_partial_products_lookup_len = zs_partial_products_lookup_polys.len();
-        let quotient_len = quotient_polys_src.len();
-        let wires_len = wires_polys.len();
-        let constants_sigmas_at = 0;
-        let zs_partial_products_lookup_at = constants_sigmas_at + constants_sigmas_len;
-        let quotient_at = zs_partial_products_lookup_at + zs_partial_products_lookup_len;
-        let wires_at = quotient_at + quotient_len;
-        let zs_next_at = wires_at + wires_len;
-        let lookup_next_at = zs_next_at + shifted_zs_polys.len();
-
-        let constants_sigmas_eval =
-            &evals[constants_sigmas_at..constants_sigmas_at + constants_sigmas_len];
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval = &evals[zs_partial_products_lookup_at
-            ..zs_partial_products_lookup_at + zs_partial_products_lookup_len];
+        let zs_partial_products_lookup_eval =
+            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
+        let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
+        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: evals[wires_at..wires_at + wires_len].to_vec(),
+            wires: eval_commitment(&zeta_pows, wires_commitment),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
-            plonk_zs_next: evals[zs_next_at..zs_next_at + shifted_zs_polys.len()].to_vec(),
+            // Partial-product polynomials are opened only at `zeta`, never at
+            // `g * zeta`; evaluate only the shifted Z polynomials consumed by
+            // the FRI next batch.
+            plonk_zs_next: eval_polynomials(
+                &g_zeta_pows,
+                &shifted_polynomials[common_data.zs_range()],
+            ),
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
-            quotient_polys: evals[quotient_at..quotient_at + quotient_len].to_vec(),
+            quotient_polys,
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: evals[lookup_next_at..lookup_next_at + shifted_lookup_polys.len()]
-                .to_vec(),
+            lookup_zs_next: eval_polynomials(
+                &g_zeta_pows,
+                &shifted_polynomials[common_data.lookup_range()],
+            ),
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
