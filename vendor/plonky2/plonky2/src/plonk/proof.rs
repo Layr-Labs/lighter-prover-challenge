@@ -372,43 +372,79 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 assert_eq!(a_raw, b_raw, "g-zeta table representative mismatch at {i}");
             }
         }
-        let eval_polynomials = |pows: &[F::Extension], polynomials: &[PolynomialCoeffs<F>]| {
-            polynomials
-                .par_iter()
-                .map(|p| F::extension_base_dot_product(pows, &p.coeffs))
-                .collect::<Vec<_>>()
+        // Evaluate both opening points in one Rayon dispatch. Each logical
+        // plan is chunked before the parallel iterators are chained, so a
+        // width-2 task can never pair polynomials that use different powers
+        // tables. The tiny shifted-opening tail can execute beside the large
+        // zeta plan instead of waiting behind its full join barrier.
+        let eval_plans = |pows_0: &[F::Extension],
+                          polys_0: &[&PolynomialCoeffs<F>],
+                          pows_1: &[F::Extension],
+                          polys_1: &[&PolynomialCoeffs<F>]| {
+            let mut out_0 = vec![F::Extension::ZERO; polys_0.len()];
+            let mut out_1 = vec![F::Extension::ZERO; polys_1.len()];
+            out_0
+                .par_chunks_mut(2)
+                .enumerate()
+                .map(|(slot, out_chunk)| (pows_0, polys_0, slot, out_chunk))
+                .chain(
+                    out_1
+                        .par_chunks_mut(2)
+                        .enumerate()
+                        .map(|(slot, out_chunk)| (pows_1, polys_1, slot, out_chunk)),
+                )
+                .for_each(|(pows, polys, slot, out_chunk)| {
+                    let base = slot * 2;
+                    let a = polys[base];
+                    if out_chunk.len() == 2 {
+                        let b = polys[base + 1];
+                        let [ra, rb] = F::extension_base_dot_products_2(pows, [&a.coeffs, &b.coeffs]);
+                        out_chunk[0] = ra;
+                        out_chunk[1] = rb;
+                    } else {
+                        out_chunk[0] = F::extension_base_dot_product(pows, &a.coeffs);
+                    }
+                });
+            (out_0, out_1)
         };
-        let eval_commitment = |pows: &[F::Extension], c: &PolynomialBatch<F, C, D>| {
-            eval_polynomials(pows, &c.polynomials)
-        };
-        let constants_sigmas_eval = eval_commitment(&zeta_pows, constants_sigmas_commitment);
 
-        // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
-        let zs_partial_products_lookup_eval =
-            eval_commitment(&zeta_pows, zs_partial_products_lookup_commitment);
+        let mut zeta_polys: Vec<&PolynomialCoeffs<F>> = Vec::new();
+        zeta_polys.extend(constants_sigmas_commitment.polynomials.iter());
+        zeta_polys.extend(zs_partial_products_lookup_commitment.polynomials.iter());
+        zeta_polys.extend(quotient_polys_commitment.polynomials.iter());
+        zeta_polys.extend(wires_commitment.polynomials.iter());
+
+        // Partial-product polynomials are opened only at `zeta`, never at
+        // `g * zeta`; the shifted plan contains only Z and lookup polynomials
+        // in their historical output order.
         let shifted_polynomials = &zs_partial_products_lookup_commitment.polynomials;
-        let quotient_polys = eval_commitment(&zeta_pows, quotient_polys_commitment);
+        let mut g_zeta_polys: Vec<&PolynomialCoeffs<F>> = Vec::new();
+        g_zeta_polys.extend(shifted_polynomials[common_data.zs_range()].iter());
+        g_zeta_polys.extend(shifted_polynomials[common_data.lookup_range()].iter());
+
+        let (zeta_eval, g_zeta_eval) =
+            eval_plans(&zeta_pows, &zeta_polys, &g_zeta_pows, &g_zeta_polys);
+
+        let cs_len = constants_sigmas_commitment.polynomials.len();
+        let zs_pp_len = zs_partial_products_lookup_commitment.polynomials.len();
+        let quotient_len = quotient_polys_commitment.polynomials.len();
+        let constants_sigmas_eval = &zeta_eval[..cs_len];
+        let zs_partial_products_lookup_eval = &zeta_eval[cs_len..cs_len + zs_pp_len];
+        let quotient_polys = &zeta_eval[cs_len + zs_pp_len..cs_len + zs_pp_len + quotient_len];
+        let wires_eval = &zeta_eval[cs_len + zs_pp_len + quotient_len..];
+        let zs_next_len = common_data.zs_range().len();
 
         Self {
             constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
             plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
-            wires: eval_commitment(&zeta_pows, wires_commitment),
+            wires: wires_eval.to_vec(),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
-            // Partial-product polynomials are opened only at `zeta`, never at
-            // `g * zeta`; evaluate only the shifted Z polynomials consumed by
-            // the FRI next batch.
-            plonk_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.zs_range()],
-            ),
+            plonk_zs_next: g_zeta_eval[..zs_next_len].to_vec(),
             partial_products: zs_partial_products_lookup_eval[common_data.partial_products_range()]
                 .to_vec(),
-            quotient_polys,
+            quotient_polys: quotient_polys.to_vec(),
             lookup_zs: zs_partial_products_lookup_eval[common_data.lookup_range()].to_vec(),
-            lookup_zs_next: eval_polynomials(
-                &g_zeta_pows,
-                &shifted_polynomials[common_data.lookup_range()],
-            ),
+            lookup_zs_next: g_zeta_eval[zs_next_len..].to_vec(),
         }
     }
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {

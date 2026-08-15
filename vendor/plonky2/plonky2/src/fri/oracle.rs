@@ -6,7 +6,7 @@ use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
 use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
-use crate::field::extension::Extendable;
+use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
@@ -684,13 +684,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail(
-                &lde_final_poly,
-                F::coset_shift().into(),
-                live_coeffs,
-                Some(fri_params.config.rate_bits),
-                None,
-            )
+            {
+                // Commitment LDEs already cache this exact ordered power chain.
+                // Reuse its raw representatives instead of regenerating one
+                // dependent base-field multiplication per live coefficient.
+                let coset_powers = crate::plonk::prover::precomputed::
+                    coset_shift_powers::<F>(live_coeffs);
+                assert_eq!(coset_powers.len(), live_coeffs);
+                coset_fft_zero_tail_base_powers::<F, D>(
+                    &lde_final_poly,
+                    coset_powers.iter().copied(),
+                    live_coeffs,
+                    Some(fri_params.config.rate_bits),
+                    None,
+                )
+            }
         );
 
         let fri_proof = fri_proof::<F, C, D>(
@@ -757,6 +765,65 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         fft_in_place_with_options(&mut scaled, zero_factor, root_table);
     }
     PolynomialValues::new(scaled)
+}
+
+/// Extension-field zero-tail FFT whose coset shift is known to lie in the
+/// base field. Scale each extension limb directly by the base-field power,
+/// avoiding a general extension multiplication by an embedded scalar at
+/// every live coefficient.
+fn coset_fft_zero_tail_base_powers<BF: Extendable<D>, const D: usize>(
+    coeffs: &PolynomialCoeffs<BF::Extension>,
+    powers: impl Iterator<Item = BF>,
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<BF::Extension>>,
+) -> PolynomialValues<BF::Extension> {
+    let len = coeffs.len();
+    debug_assert!(live <= len);
+    let zero_tail_is_unread =
+        matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
+    debug_assert!(
+        zero_tail_is_unread || coeffs.coeffs[live..].iter().all(Field::is_zero)
+    );
+    let mut scaled = Vec::with_capacity(len);
+    scaled.extend(
+        powers
+            .zip(&coeffs.coeffs[..live])
+            .map(|(r, c)| c.scalar_mul(r)),
+    );
+    if zero_tail_is_unread {
+        // SAFETY: identical zero-tail contract to `coset_fft_zero_tail` above.
+        // The FFT reads only the initialized live prefix before overwriting
+        // every tail slot.
+        unsafe { scaled.set_len(len) };
+    } else {
+        scaled.resize(len, BF::Extension::ZERO);
+    }
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
+    } else {
+        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
+    }
+    PolynomialValues::new(scaled)
+}
+
+/// Later FRI rounds evolve `shift` and must preserve their exact local power
+/// chain. Keep their call path unchanged; only the initial coset-shift call
+/// above supplies the process-cached, identically generated iterator.
+pub(crate) fn coset_fft_zero_tail_base_shift<BF: Extendable<D>, const D: usize>(
+    coeffs: &PolynomialCoeffs<BF::Extension>,
+    shift: BF,
+    live: usize,
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<BF::Extension>>,
+) -> PolynomialValues<BF::Extension> {
+    coset_fft_zero_tail_base_powers(
+        coeffs,
+        shift.powers(),
+        live,
+        zero_factor,
+        root_table,
+    )
 }
 
 /// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
@@ -1024,6 +1091,51 @@ mod tests {
 
         check::<GoldilocksField>();
         check::<<GoldilocksField as Extendable<2>>::Extension>();
+    }
+
+    /// The base-scalar specialization is used before FFT butterflies and its
+    /// raw Goldilocks representatives therefore have to match the ordinary
+    /// extension multiplication it replaces, not merely be field-equal.
+    #[test]
+    fn base_scalar_mul_matches_embedded_extension_mul_raw_words() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::{Field64, PrimeField64};
+
+        type BF = GoldilocksField;
+        type E = <BF as Extendable<2>>::Extension;
+
+        let words = [
+            0,
+            1,
+            BF::ORDER - 1,
+            BF::ORDER,
+            BF::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+            0x9e37_79b9_7f4a_7c15,
+        ];
+        for &a0 in &words {
+            for &a1 in &words {
+                let coefficient = <E as FieldExtension<2>>::from_basefield_array([
+                    GoldilocksField(a0),
+                    GoldilocksField(a1),
+                ]);
+                for &scalar in &words {
+                    let scalar = GoldilocksField(scalar);
+                    let expected = coefficient * <E as FieldExtension<2>>::from_basefield(scalar);
+                    let actual = <E as FieldExtension<2>>::scalar_mul(&coefficient, scalar);
+                    let expected_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
+                        &expected,
+                    )
+                        .map(|x| x.to_noncanonical_u64());
+                    let actual_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
+                        &actual,
+                    )
+                        .map(|x| x.to_noncanonical_u64());
+                    assert_eq!(actual_raw, expected_raw, "a0={a0:#x}, a1={a1:#x}");
+                }
+            }
+        }
     }
 
     /// The fused quotient accumulation must be bit-identical (raw u64
