@@ -197,35 +197,39 @@ where
     let public_inputs = partition_witness.get_targets(&prover_data.public_inputs);
     let public_inputs_hash = C::InnerHasher::hash_no_pad(&public_inputs);
 
-    let mut witness = timed!(
+    // Expand only routed columns. The partition is borrowed (`&self`), not
+    // consumed: non-routed IFFTs gather from it after this expand.
+    // `full_witness(self)` is not called on the prove path.
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_wires = common_data.config.num_wires;
+    let witness = timed!(
         timing,
-        "compute full witness",
-        partition_witness.full_witness()
+        "compute routed witness",
+        partition_witness.routed_witness(num_routed_wires)
     );
 
-    // Only the routed columns are read again after this point (the
-    // permutation argument covers wires `j < num_routed_wires`; nothing else
-    // consumes the matrix). Non-routed columns are moved out and IFFT'd in
-    // place; routed columns are IFFT'd from the borrowed witness column
-    // (`ifft_borrowed` fuses the former clone with the FFT's initial
-    // bit-reversal gather), so no witness column is copied.
-    let num_routed_wires = common_data.config.num_routed_wires;
+    // Routed: `ifft_borrowed` on the expanded columns.
+    // Non-routed: bitmap-guarded bit-reversed gather from the still-live
+    // partition, then the same in-place IFFT as `ifft_borrowed`.
+    // `wires_coeffs[j]` stays wire `j`. Range is `num_routed_wires..num_wires`,
+    // not a hardcoded 80..135.
     let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
         timing,
         "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
+        (0..num_wires)
+            .into_par_iter()
+            .map(|j| {
                 if j < num_routed_wires {
-                    ifft_borrowed(column)
+                    ifft_borrowed(&witness.wire_values[j])
                 } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
+                    partition_witness.ifft_non_routed_column(j)
                 }
             })
             .collect()
     );
+
+    // Every non-routed IFFT has finished; the partition can drop.
+    drop(partition_witness);
 
     let wires_commitment = timed!(
         timing,
@@ -310,9 +314,9 @@ where
         compute_all_lookup_polys(&witness, &deltas, prover_data, common_data, has_lookup);
 
     // The permutation argument and lookup polys were the last readers of the
-    // witness matrix (non-routed columns were already moved out into
-    // `wires_values`). Free the ~80 routed columns now, before the ZS
-    // commitment, quotient evaluation, and FRI phases raise memory pressure.
+    // routed witness matrix (non-routed columns were never expanded). Free
+    // those columns now, before the ZS commitment, quotient evaluation, and
+    // FRI phases raise memory pressure.
     drop(witness);
 
     if has_lookup {

@@ -321,18 +321,16 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
     PolynomialCoeffs { coeffs: buffer }
 }
 
-/// `ifft` of a borrowed column without the caller-side copy: the initial
-/// bit-reversal permutation is applied as an out-of-place gather from
-/// `values` into the fresh buffer (the same permutation `fft_classic`'s
-/// in-place pass would apply to a clone), after which the identical
-/// butterfly layers and coefficient reversal/scaling run. Value-identical
-/// to `ifft(PolynomialValues::new(values.to_vec()))`.
-pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
-    let n = values.len();
+/// IFFT of a buffer already in the bit-reversed order that
+/// `reverse_index_bits` produces (`buffer[i] == natural[reverse_bits(i)]`,
+/// equivalently `buffer[reverse_bits(i)] == natural[i]`). Butterfly layers
+/// and coefficient reversal/scaling are identical to `ifft_borrowed` after
+/// its gather. Used by the partition-direct non-routed wire IFFT so the
+/// gather can write the bit-reversed slot in one pass.
+pub fn ifft_bitrev_buffer<F: Field>(mut buffer: Vec<F>) -> PolynomialCoeffs<F> {
+    let n = buffer.len();
     let lg_n = log2_strict(n);
     let n_inv = F::inverse_2exp(lg_n);
-
-    let mut buffer = plonky2_util::reverse_index_bits(values);
 
     #[cfg(feature = "std")]
     let root_table = root_table_cache::get::<F>(lg_n);
@@ -358,6 +356,16 @@ pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
         buffer[j] = coeffs_j;
     }
     PolynomialCoeffs { coeffs: buffer }
+}
+
+/// `ifft` of a borrowed column without the caller-side copy: the initial
+/// bit-reversal permutation is applied as an out-of-place gather from
+/// `values` into the fresh buffer (the same permutation `fft_classic`'s
+/// in-place pass would apply to a clone), after which the identical
+/// butterfly layers and coefficient reversal/scaling run. Value-identical
+/// to `ifft(PolynomialValues::new(values.to_vec()))`.
+pub fn ifft_borrowed<F: Field>(values: &[F]) -> PolynomialCoeffs<F> {
+    ifft_bitrev_buffer(plonky2_util::reverse_index_bits(values))
 }
 
 /// Generic FFT implementation that works with both scalar and packed inputs.
