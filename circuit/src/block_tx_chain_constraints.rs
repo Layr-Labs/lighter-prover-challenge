@@ -320,17 +320,12 @@ impl BlockTxChainCircuit {
         circuit_data: &CircuitData<F, C, D>,
     ) -> Result<ProofWithPublicInputs<F, C, D>> {
         let partition_witness = pending.finish()?;
-        let proof = {
-            let mut prove_timing = TimingTree::new("BlockTxChainProve", Level::Debug);
-            let proof = prove_with_partition_witness(
-                &circuit_data.prover_only,
-                &circuit_data.common,
-                partition_witness,
-                &mut prove_timing,
-            )?;
-            prove_timing.print();
-            proof
-        };
+        let proof = prove_with_partition_witness(
+            &circuit_data.prover_only,
+            &circuit_data.common,
+            partition_witness,
+            &mut TimingTree::default(),
+        )?;
         // Recursive parents validate this proof in release builds; keep the eager check for tests.
         #[cfg(debug_assertions)]
         circuit_data.verify(proof.clone())?;
