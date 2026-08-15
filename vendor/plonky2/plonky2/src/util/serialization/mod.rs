@@ -881,13 +881,18 @@ pub trait Read {
         // the watcher map just read. Each map entry's watcher list is deduplicated at build time,
         // so a generator appears once per distinct representative it watches and counting its
         // occurrences reproduces the builder-derived counts exactly.
-        let mut generator_watch_counts = vec![0usize; generators.len()];
+        let mut generator_watch_counts = vec![0u32; generators.len()];
         for watchers in generator_indices_by_watches.values() {
             for &generator_idx in watchers {
                 if generator_idx >= generators.len() {
                     return Err(IoError);
                 }
-                generator_watch_counts[generator_idx] += 1;
+                generator_watch_counts[generator_idx] = generator_watch_counts[generator_idx]
+                    .checked_add(1)
+                    .ok_or(IoError)?;
+                if generator_watch_counts[generator_idx] >= 1 << 31 {
+                    return Err(IoError);
+                }
             }
         }
         let generator_indices_by_watches =
@@ -1956,7 +1961,10 @@ pub trait Write {
         self.write_usize(generator_indices_by_watches.len())?;
         for (k, v) in generator_indices_by_watches.iter() {
             self.write_usize(k)?;
-            self.write_usize_vec(v)?;
+            self.write_usize(v.len())?;
+            for &generator_idx in v {
+                self.write_usize(generator_idx as usize)?;
+            }
         }
 
         self.write_polynomial_batch(constants_sigmas_commitment)?;

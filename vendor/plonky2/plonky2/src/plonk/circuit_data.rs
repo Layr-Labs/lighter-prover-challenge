@@ -368,7 +368,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 #[derive(Eq, PartialEq, Debug)]
 pub struct GeneratorWatchIndex {
     offsets: Vec<u32>,
-    watchers: Vec<usize>,
+    // Generator indices are bounded by the circuit's generator count. Storing the hot,
+    // sequentially-read CSR payload as u32 halves its cache footprint on 64-bit provers.
+    watchers: Vec<u32>,
     entries: usize,
 }
 
@@ -402,7 +404,9 @@ impl GeneratorWatchIndex {
                 .is_some_and(|(key, _)| *key == representative)
             {
                 let (_, representative_watchers) = entries_iter.next().unwrap();
-                watchers.extend(representative_watchers);
+                watchers.extend(representative_watchers.into_iter().map(|watcher| {
+                    u32::try_from(watcher).expect("generator watch index exceeds u32")
+                }));
             }
         }
         offsets[max_representative + 1] = watchers.len() as u32;
@@ -422,17 +426,20 @@ impl GeneratorWatchIndex {
     /// flat avoids a tree node and a separately allocated `Vec` for every watched representative.
     pub(crate) fn from_sorted_generator_representatives(
         representatives: &[u32],
-        generator_watch_counts: &[usize],
+        generator_watch_counts: &[u32],
     ) -> Self {
         debug_assert_eq!(
-            generator_watch_counts.iter().sum::<usize>(),
+            generator_watch_counts
+                .iter()
+                .map(|&count| count as usize)
+                .sum::<usize>(),
             representatives.len()
         );
         debug_assert!({
             let mut end = 0usize;
             generator_watch_counts.iter().all(|&count| {
                 let start = end;
-                end += count;
+                end += count as usize;
                 representatives[start..end]
                     .windows(2)
                     .all(|pair| pair[0] < pair[1])
@@ -453,6 +460,10 @@ impl GeneratorWatchIndex {
         assert!(
             u32::try_from(representatives.len()).is_ok(),
             "generator watch index exceeds u32 offsets"
+        );
+        assert!(
+            u32::try_from(generator_watch_counts.len()).is_ok(),
+            "generator count exceeds u32 watcher indices"
         );
 
         // First form cumulative end offsets. Counts live in slot `representative + 1`, so the
@@ -475,14 +486,14 @@ impl GeneratorWatchIndex {
         // preserves the old ascending generator order without a second cursor array. Afterwards,
         // each end cursor has become the next representative's start, so one overlapping shift
         // restores the original CSR offsets.
-        let mut watchers = vec![0usize; representatives.len()];
+        let mut watchers = vec![0u32; representatives.len()];
         let mut group_end = representatives.len();
         for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
-            let group_start = group_end - count;
+            let group_start = group_end - count as usize;
             for &representative in &representatives[group_start..group_end] {
                 let cursor = &mut offsets[representative as usize + 1];
                 *cursor -= 1;
-                watchers[*cursor as usize] = generator;
+                watchers[*cursor as usize] = generator as u32;
             }
             group_end = group_start;
         }
@@ -504,7 +515,7 @@ impl GeneratorWatchIndex {
     }
 
     /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
-    pub fn watchers(&self) -> &[usize] {
+    pub fn watchers(&self) -> &[u32] {
         &self.watchers
     }
 
@@ -513,7 +524,7 @@ impl GeneratorWatchIndex {
     /// function of the offsets and is re-derived. The offsets must be
     /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
     /// exactly as [`Self::from_map`] produces them.
-    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
+    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<u32>) -> Self {
         assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
         assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
         assert_eq!(
@@ -536,20 +547,29 @@ impl GeneratorWatchIndex {
     }
 
     #[inline]
-    pub fn get(&self, representative: &usize) -> Option<&[usize]> {
-        let end_index = representative.checked_add(1)?;
-        let (&start, &end) = (
-            self.offsets.get(*representative)?,
-            self.offsets.get(end_index)?,
-        );
+    pub fn get(&self, representative: &usize) -> Option<&[u32]> {
+        let (start, end) = self.span(representative)?;
         (start != end).then(|| &self.watchers[start as usize..end as usize])
+    }
+
+    /// Compact `[start, end)` span into [`Self::watchers`]. This is equivalent to [`Self::get`]
+    /// but lets hot intermediate records carry two `u32` offsets instead of a 16-byte slice fat
+    /// pointer on 64-bit targets.
+    #[inline]
+    pub fn span(&self, representative: &usize) -> Option<(u32, u32)> {
+        // Fetch both adjacent CSR offsets with one range check. Every hot watcher lookup used to
+        // perform two independent `slice::get` bounds checks for these same adjacent entries.
+        let range_end = representative.checked_add(2)?;
+        let bounds = self.offsets.get(*representative..range_end)?;
+        let (start, end) = (bounds[0], bounds[1]);
+        (start != end).then_some((start, end))
     }
 
     pub const fn len(&self) -> usize {
         self.entries
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &[usize])> {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &[u32])> {
         self.offsets
             .windows(2)
             .enumerate()
@@ -581,7 +601,9 @@ pub struct ProverOnlyCircuitData<
     /// decrementing on first population, instead of traversing the entire watcher map at the
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
-    pub generator_watch_counts: Vec<usize>,
+    /// Counts are checked `u32` values, halving both this seed table and every
+    /// witness-local unresolved-counter clone on 64-bit hosts.
+    pub generator_watch_counts: Vec<u32>,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -953,10 +975,10 @@ mod generator_watch_index_tests {
 
         assert_eq!(index.len(), 2);
         assert_eq!(index.get(&0), None);
-        assert_eq!(index.get(&1), Some([2usize, 5].as_slice()));
+        assert_eq!(index.get(&1), Some([2u32, 5].as_slice()));
         assert_eq!(index.get(&2), None);
         assert_eq!(index.get(&3), None);
-        assert_eq!(index.get(&4), Some([3usize].as_slice()));
+        assert_eq!(index.get(&4), Some([3u32].as_slice()));
         assert_eq!(index.get(&5), None);
 
         let entries = index

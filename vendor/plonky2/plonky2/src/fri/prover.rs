@@ -8,7 +8,7 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::oracle::coset_fft_zero_tail;
+use crate::fri::oracle::coset_fft_zero_tail_base_shift;
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
@@ -216,9 +216,9 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // unread — everything below this loop uses only `coeffs` — so the
         // last round's transform is entirely dead work. Skip it.
         if round + 1 < num_rounds {
-            values = coset_fft_zero_tail(
+            values = coset_fft_zero_tail_base_shift::<F, D>(
                 &coeffs,
-                shift.into(),
+                shift,
                 live_chunks,
                 Some(fri_params.config.rate_bits),
                 None,
@@ -284,8 +284,9 @@ pub(crate) fn fri_proof_of_work<
     // one more element of our sponge state with the candidate, then apply the permutation,
     // obtaining our duplex's post-state which contains the PoW response.
     let mut duplex_intermediate_state = challenger.sponge_state;
-    let witness_input_pos = challenger.input_buffer.len();
-    duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
+    let buffered_inputs = challenger.buffered_inputs();
+    let witness_input_pos = buffered_inputs.len();
+    duplex_intermediate_state.set_from_iter(buffered_inputs.iter().copied(), 0);
 
     let pow_witness = (0..=F::NEG_ONE.to_canonical_u64())
         .into_par_iter()
@@ -339,7 +340,7 @@ fn fri_prover_query_round<
     mut x_index: usize,
     fri_params: &FriParams,
 ) -> FriQueryRound<F, C::Hasher, D> {
-    let mut query_steps = Vec::new();
+    let mut query_steps = Vec::with_capacity(trees.len());
     let initial_proof = initial_merkle_trees
         .iter()
         .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))

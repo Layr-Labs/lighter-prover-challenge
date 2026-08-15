@@ -105,6 +105,217 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+#[derive(Default)]
+struct GeneratorWorklistScratch {
+    pending: Vec<u32>,
+    next: Vec<u32>,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Persistent proof workers repeatedly generate witnesses on the same OS thread. Keep the
+    /// two compact round queues in TLS so their high-water capacities survive across proofs.
+    static GENERATOR_WORKLIST_CACHE: core::cell::RefCell<Option<GeneratorWorklistScratch>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+struct GeneratorWorklistLease {
+    scratch: Option<GeneratorWorklistScratch>,
+}
+
+impl GeneratorWorklistLease {
+    fn new() -> Self {
+        #[cfg(feature = "std")]
+        let scratch = GENERATOR_WORKLIST_CACHE
+            .with(|cache| cache.borrow_mut().take())
+            .unwrap_or_default();
+        #[cfg(not(feature = "std"))]
+        let scratch = GeneratorWorklistScratch::default();
+
+        Self {
+            scratch: Some(scratch),
+        }
+    }
+
+    fn pending_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.scratch.as_mut().unwrap().pending
+    }
+
+    fn queue_all(&mut self, generator_count: u32) {
+        let (pending, next) = self.queues_mut();
+        let generator_count_usize = generator_count as usize;
+        pending.reserve_exact(generator_count_usize);
+        next.reserve_exact(generator_count_usize);
+        pending.extend(0..generator_count);
+    }
+
+    fn queues_mut(&mut self) -> (&mut Vec<u32>, &mut Vec<u32>) {
+        let scratch = self.scratch.as_mut().unwrap();
+        (&mut scratch.pending, &mut scratch.next)
+    }
+}
+
+impl Drop for GeneratorWorklistLease {
+    fn drop(&mut self) {
+        let Some(mut scratch) = self.scratch.take() else {
+            return;
+        };
+        scratch.pending.clear();
+        scratch.next.clear();
+
+        #[cfg(feature = "std")]
+        GENERATOR_WORKLIST_CACHE.with(|cache| {
+            let mut cached = cache.borrow_mut();
+            let replace = cached.as_ref().is_none_or(|existing| {
+                scratch.pending.capacity() + scratch.next.capacity()
+                    > existing.pending.capacity() + existing.next.capacity()
+            });
+            if replace {
+                *cached = Some(scratch);
+            }
+        });
+    }
+}
+
+const GENERATOR_EXPIRED_MASK: u32 = 1 << 31;
+
+#[inline]
+fn generator_is_expired(generator_states: &[u32], generator_idx: usize) -> bool {
+    generator_states[generator_idx] & GENERATOR_EXPIRED_MASK != 0
+}
+
+#[inline]
+fn generator_is_ready(generator_states: &[u32], generator_idx: usize) -> bool {
+    generator_states[generator_idx] & !GENERATOR_EXPIRED_MASK == 0
+}
+
+#[inline]
+fn decrement_unresolved_watch(generator_states: &mut [u32], generator_idx: usize) {
+    debug_assert!(!generator_is_expired(generator_states, generator_idx));
+    debug_assert_ne!(
+        generator_states[generator_idx] & !GENERATOR_EXPIRED_MASK,
+        0
+    );
+    generator_states[generator_idx] -= 1;
+}
+
+#[inline]
+fn expire_generator(generator_states: &mut [u32], generator_idx: usize) {
+    debug_assert!(!generator_is_expired(generator_states, generator_idx));
+    generator_states[generator_idx] |= GENERATOR_EXPIRED_MASK;
+}
+
+#[derive(Default)]
+struct GeneratorStateScratch {
+    states: Vec<u32>,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Witness generation repeatedly creates identically sized per-generator state on the same
+    /// worker thread. Retain its allocations between witnesses; every lease still overwrites all
+    /// logical entries before they are observed.
+    static GENERATOR_STATE_CACHE: core::cell::RefCell<Option<GeneratorStateScratch>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+struct GeneratorStateLease {
+    scratch: Option<GeneratorStateScratch>,
+}
+
+impl GeneratorStateLease {
+    fn new(generator_watch_counts: &[u32]) -> Self {
+        #[cfg(feature = "std")]
+        let mut scratch = GENERATOR_STATE_CACHE
+            .with(|cache| cache.borrow_mut().take())
+            .unwrap_or_default();
+        #[cfg(not(feature = "std"))]
+        let mut scratch = GeneratorStateScratch::default();
+
+        debug_assert!(
+            generator_watch_counts
+                .iter()
+                .all(|&count| count < GENERATOR_EXPIRED_MASK),
+            "generator watch count consumes compact expired bit"
+        );
+        scratch.states.clear();
+        scratch.states.extend_from_slice(generator_watch_counts);
+        Self {
+            scratch: Some(scratch),
+        }
+    }
+
+    fn states_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.scratch.as_mut().unwrap().states
+    }
+}
+
+impl Drop for GeneratorStateLease {
+    fn drop(&mut self) {
+        let Some(mut scratch) = self.scratch.take() else {
+            return;
+        };
+        scratch.states.clear();
+
+        #[cfg(feature = "std")]
+        GENERATOR_STATE_CACHE.with(|cache| {
+            let mut cached = cache.borrow_mut();
+            let retained_bytes = |state: &GeneratorStateScratch| {
+                state.states.capacity() * core::mem::size_of::<u32>()
+            };
+            if cached
+                .as_ref()
+                .is_none_or(|existing| retained_bytes(&scratch) > retained_bytes(existing))
+            {
+                *cached = Some(scratch);
+            }
+        });
+    }
+}
+
+/// Per-generator merge metadata produced by a parallel scheduler round. Native-width tuple fields
+/// made this 24 bytes on 64-bit targets. Checked compact indices/counts plus the finished flag in
+/// the count's high bit keep it to 8 bytes, cutting the ordered merge list to one third its former
+/// footprint.
+struct GeneratorRoundEntry {
+    generator_idx: u32,
+    value_count_and_finished: u32,
+}
+
+impl GeneratorRoundEntry {
+    const FINISHED_MASK: u32 = 1 << 31;
+
+    fn new(generator_idx: u32, value_count: usize, finished: bool) -> Self {
+        let value_count = u32::try_from(value_count)
+            .expect("generator output count exceeds compact round metadata");
+        assert!(
+            value_count < Self::FINISHED_MASK,
+            "generator output count consumes compact finished bit"
+        );
+        Self {
+            generator_idx,
+            value_count_and_finished: value_count
+                | if finished { Self::FINISHED_MASK } else { 0 },
+        }
+    }
+
+    fn value_count(&self) -> usize {
+        (self.value_count_and_finished & !Self::FINISHED_MASK) as usize
+    }
+
+    fn finished(&self) -> bool {
+        self.value_count_and_finished & Self::FINISHED_MASK != 0
+    }
+}
+
+/// Minimal value record crossing the parallel-run/sequential-merge boundary. Watchers are looked
+/// up only after the merge confirms this value newly populated its representative, avoiding both
+/// stored span metadata and speculative lookups for duplicate/already-set outputs.
+struct AnnotatedGeneratedValue<F: Field> {
+    value: F,
+    target_index: u32,
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -121,17 +332,23 @@ fn run_generator_worklist<
 >(
     witness: &mut PartitionWitness<F>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
-    unresolved_watches: &mut [usize],
-    generator_is_expired: &mut [bool],
+    generator_states: &mut [u32],
     remaining_generators: &mut usize,
-    mut pending_generator_indices: Vec<usize>,
+    buffer: &mut GeneratedValues<F>,
+    mut worklists: GeneratorWorklistLease,
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
 
     let parallel_rounds = parallel_rounds_enabled();
-    let mut buffer = GeneratedValues::empty();
+    let (pending_generator_indices, next_pending_generator_indices) = worklists.queues_mut();
+    #[allow(clippy::type_complexity)]
+    let mut round_outputs: Vec<(
+        Vec<GeneratorRoundEntry>,
+        Vec<AnnotatedGeneratedValue<F>>,
+        GeneratedValues<F>,
+    )> = Vec::new();
 
     // The two round queues are swapped rather than reallocated. Every round used
     // to start from a fresh `Vec::new()` and end by *moving* it over the old
@@ -141,11 +358,10 @@ fn run_generator_worklist<
     // generation, and there is one witness generation per transaction chunk and
     // per chain step. Swapping keeps both buffers at their high-water capacity,
     // so after the first few rounds a round costs no allocation and no growth
-    // copies at all. `clear()` only resets the length (`usize` has no `Drop`),
+    // copies at all. The compact u32 indices halve queue capacity and copy bandwidth
+    // on 64-bit hosts; `clear()` only resets the length (`u32` has no `Drop`),
     // so each round still observes an empty queue and pushes exactly the same
     // indices in exactly the same order.
-    let mut next_pending_generator_indices = Vec::new();
-
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
         next_pending_generator_indices.clear();
@@ -161,69 +377,94 @@ fn run_generator_worklist<
             // per-task scheduling and allocation across cheap generators. Each produced value is
             // annotated with the watchers of its (snapshot-unpopulated) representative here,
             // moving those read-only watcher-index lookups off the sequential merge. Chunk
-            // boundaries only group the outputs: `collect` preserves chunk order and each chunk
-            // records its generators in ready-set order, so the merge below observes ascending
-            // generator-index order regardless of thread count.
+            // boundaries only group the outputs. The fixed output slots preserve chunk order and
+            // each chunk records its generators in ready-set order, so the merge below observes
+            // ascending generator-index order regardless of thread count. Slot vectors retain
+            // their high-water capacities across dependency rounds.
             let round_witness: &PartitionWitness<F> = witness;
-            let round_unresolved_watches: &[usize] = unresolved_watches;
-            let round_generator_is_expired: &[bool] = generator_is_expired;
-            #[allow(clippy::type_complexity)]
-            let round_outputs: Vec<(
-                Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[usize]>)>,
-            )> = pending_generator_indices
-                .par_chunks(PARALLEL_WORKLIST_CHUNK)
-                .map(|chunk| {
-                    let mut entries = Vec::with_capacity(chunk.len());
-                    let mut annotated_values = Vec::new();
-                    let mut round_buffer = GeneratedValues::empty();
-                    for &generator_idx in chunk {
-                        if round_generator_is_expired[generator_idx] {
+            let round_generator_states: &[u32] = generator_states;
+            let chunk_count = pending_generator_indices
+                .len()
+                .div_ceil(PARALLEL_WORKLIST_CHUNK);
+            if round_outputs.len() < chunk_count {
+                round_outputs.resize_with(chunk_count, || {
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        GeneratedValues::with_capacity(2),
+                    )
+                });
+            }
+            round_outputs[..chunk_count]
+                .par_iter_mut()
+                .zip(pending_generator_indices.par_chunks(PARALLEL_WORKLIST_CHUNK))
+                .for_each(|((entries, annotated_values, round_buffer), chunk)| {
+                    entries.clear();
+                    annotated_values.clear();
+                    entries.reserve(chunk.len());
+                    annotated_values.reserve(chunk.len());
+                    debug_assert_eq!(round_buffer.len(), 0);
+                    // The common one- and two-target generators stay inline without making each
+                    // chunk slot excessively large. Generators that exceed that retain their
+                    // spill allocation across dependency rounds instead of re-allocating it.
+                    for &compact_generator_idx in chunk {
+                        let generator_idx = compact_generator_idx as usize;
+                        if generator_is_expired(round_generator_states, generator_idx) {
                             continue;
                         }
                         let finished = generators[generator_idx].0.run_with_ready_hint(
                             round_witness,
-                            &mut round_buffer,
-                            round_unresolved_watches[generator_idx] == 0,
+                            round_buffer,
+                            generator_is_ready(round_generator_states, generator_idx),
                         );
-                        entries.push((generator_idx, finished, round_buffer.target_values.len()));
-                        for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
-                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
-                                generator_indices_by_watches.get(&rep_index)
-                            } else {
-                                // The representative is populated in the snapshot, so the merge
-                                // cannot newly populate it and never needs watchers.
-                                None
-                            };
-                            annotated_values.push((t, v, watchers));
+                        entries.push(GeneratorRoundEntry::new(
+                            compact_generator_idx,
+                            round_buffer.len(),
+                            finished,
+                        ));
+                        // Reserve the exact additional payload before draining. This deletes the
+                        // geometric growth copies for generators whose output exceeds the
+                        // one-value-per-generator initial estimate.
+                        annotated_values.reserve(round_buffer.len());
+                        for (t, v) in round_buffer.drain() {
+                            let target_index = round_witness.target_index(t);
+                            annotated_values.push(AnnotatedGeneratedValue {
+                                value: v,
+                                target_index: u32::try_from(target_index)
+                                    .expect("target index exceeds compact round metadata"),
+                            });
                         }
                     }
-                    (entries, annotated_values)
-                })
-                .collect();
+                });
 
             // Merge phase: sequential and in ascending generator-index order, exactly like the
             // sequential loop's per-generator merge.
-            for (entries, annotated_values) in round_outputs {
-                let mut annotated_values = annotated_values.into_iter();
-                for (generator_idx, finished, value_count) in entries {
-                    if finished {
-                        generator_is_expired[generator_idx] = true;
+            for (entries, annotated_values, _) in &mut round_outputs[..chunk_count] {
+                let mut annotated_values = annotated_values.drain(..);
+                for entry in entries.drain(..) {
+                    let generator_idx = entry.generator_idx as usize;
+                    if entry.finished() {
+                        expire_generator(generator_states, generator_idx);
                         *remaining_generators -= 1;
                     }
 
-                    for (t, v, watchers) in annotated_values.by_ref().take(value_count) {
-                        if witness.set_target_returning_rep(t, v)?.is_none() {
+                    for annotated in annotated_values.by_ref().take(entry.value_count()) {
+                        let Some(watch) = witness
+                            .set_target_index_returning_rep(
+                                annotated.target_index as usize,
+                                annotated.value,
+                            )?
+                        else {
                             continue;
-                        }
-                        if let Some(watchers) = watchers {
+                        };
+                        if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                             for &watching_generator_idx in watchers {
-                                if !generator_is_expired[watching_generator_idx] {
-                                    debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                    unresolved_watches[watching_generator_idx] -= 1;
+                                let watching_generator = watching_generator_idx as usize;
+                                if !generator_is_expired(generator_states, watching_generator) {
+                                    decrement_unresolved_watch(
+                                        generator_states,
+                                        watching_generator,
+                                    );
                                     next_pending_generator_indices.push(watching_generator_idx);
                                 }
                             }
@@ -233,24 +474,25 @@ fn run_generator_worklist<
             }
 
             core::mem::swap(
-                &mut pending_generator_indices,
-                &mut next_pending_generator_indices,
+                pending_generator_indices,
+                next_pending_generator_indices,
             );
             continue;
         }
 
-        for &generator_idx in &pending_generator_indices {
-            if generator_is_expired[generator_idx] {
+        for &generator_idx in pending_generator_indices.iter() {
+            let generator_idx = generator_idx as usize;
+            if generator_is_expired(generator_states, generator_idx) {
                 continue;
             }
 
             let finished = generators[generator_idx].0.run_with_ready_hint(
                 witness,
-                &mut buffer,
-                unresolved_watches[generator_idx] == 0,
+                buffer,
+                generator_is_ready(generator_states, generator_idx),
             );
             if finished {
-                generator_is_expired[generator_idx] = true;
+                expire_generator(generator_states, generator_idx);
                 *remaining_generators -= 1;
             }
 
@@ -261,13 +503,13 @@ fn run_generator_worklist<
             // touch disjoint state, so fusing the two passes deletes the per-run intermediate
             // rep Vec while preserving both the `set_target_returning_rep` call order and the
             // pending-queue push order exactly.
-            for (t, v) in buffer.target_values.drain(..) {
+            for (t, v) in buffer.drain() {
                 if let Some(watch) = witness.set_target_returning_rep(t, v)? {
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
-                            if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
+                            let watching_generator = watching_generator_idx as usize;
+                            if !generator_is_expired(generator_states, watching_generator) {
+                                decrement_unresolved_watch(generator_states, watching_generator);
                                 next_pending_generator_indices.push(watching_generator_idx);
                             }
                         }
@@ -277,8 +519,8 @@ fn run_generator_worklist<
         }
 
         core::mem::swap(
-            &mut pending_generator_indices,
-            &mut next_pending_generator_indices,
+            pending_generator_indices,
+            next_pending_generator_indices,
         );
     }
 
@@ -301,23 +543,21 @@ fn run_generator_worklist<
 fn seed_inputs_and_unresolved_watches<F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
-    generator_watch_counts: &[usize],
+    generator_states: &mut [u32],
     generator_indices_by_watches: &GeneratorWatchIndex,
-) -> Result<Vec<usize>> {
-    let mut unresolved_watches = generator_watch_counts.to_vec();
-
+) -> Result<()> {
     for (t, v) in inputs.target_values.into_iter() {
         if let Some(watch) = witness.set_target_returning_rep(t, v)? {
             if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
-                    debug_assert_ne!(unresolved_watches[generator_idx], 0);
-                    unresolved_watches[generator_idx] -= 1;
+                    let generator_idx = generator_idx as usize;
+                    decrement_unresolved_watch(generator_states, generator_idx);
                 }
             }
         }
     }
 
-    Ok(unresolved_watches)
+    Ok(())
 }
 
 /// Direct-seeding adapter: writes values straight into the partition's
@@ -329,7 +569,7 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
 /// inputs decrement at most once and no counter can underflow.
 pub struct PartitionSeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
+    generator_states: &'b mut [u32],
     generator_indices_by_watches: &'b GeneratorWatchIndex,
 }
 
@@ -344,8 +584,8 @@ impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
-                    debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
-                    self.unresolved_watches[generator_idx] -= 1;
+                    let generator_idx = generator_idx as usize;
+                    decrement_unresolved_watch(self.generator_states, generator_idx);
                 }
             }
         }
@@ -366,9 +606,8 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
 /// worklist; expired generators are skipped.
 pub struct PartitionFeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
-    generator_is_expired: &'b [bool],
-    pending_generator_indices: &'b mut Vec<usize>,
+    generator_states: &'b mut [u32],
+    pending_generator_indices: &'b mut Vec<u32>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
 }
 
@@ -383,9 +622,9 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &watching_generator_idx in watchers {
-                    if !self.generator_is_expired[watching_generator_idx] {
-                        debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                        self.unresolved_watches[watching_generator_idx] -= 1;
+                    let watching_generator = watching_generator_idx as usize;
+                    if !generator_is_expired(self.generator_states, watching_generator) {
+                        decrement_unresolved_watch(self.generator_states, watching_generator);
                         self.pending_generator_indices.push(watching_generator_idx);
                     }
                 }
@@ -415,9 +654,14 @@ pub struct PendingPartitionWitness<
     const D: usize,
 > {
     witness: PartitionWitness<'a, F>,
-    unresolved_watches: Vec<usize>,
-    generator_is_expired: Vec<bool>,
+    // One hot counter per generator, refreshed for every witness. Builder and loader boundaries
+    // check u32 overflow, halving the state cache footprint on 64-bit hosts.
+    generator_state: GeneratorStateLease,
     remaining_generators: usize,
+    // Generator output is drained after every invocation, so its allocation can be retained and
+    // reused across the start/feed phases of one resumable witness instead of rebuilding a Vec
+    // from zero capacity at every phase.
+    generator_buffer: GeneratedValues<F>,
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
     parallel_threshold: usize,
 }
@@ -465,32 +709,38 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
-        let mut unresolved_watches = seed_inputs_and_unresolved_watches(
+        let mut generator_state = GeneratorStateLease::new(&prover_data.generator_watch_counts);
+        let generator_states = generator_state.states_mut();
+        seed_inputs_and_unresolved_watches(
             &mut witness,
             inputs,
-            &prover_data.generator_watch_counts,
+            generator_states,
             &prover_data.generator_indices_by_watches,
         )?;
 
-        let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let generator_count =
+            u32::try_from(generators.len()).expect("generator count exceeds compact worklist");
+        let mut worklists = GeneratorWorklistLease::new();
+        worklists.queue_all(generator_count);
+        let mut generator_buffer = GeneratedValues::with_capacity(2);
 
         // Initially, all generators are queued.
         run_generator_worklist(
             &mut witness,
             prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
+            generator_states,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            &mut generator_buffer,
+            worklists,
             parallel_threshold,
         )?;
 
         Ok(Self {
             witness,
-            unresolved_watches,
-            generator_is_expired,
+            generator_state,
             remaining_generators,
+            generator_buffer,
             prover_data,
             parallel_threshold,
         })
@@ -514,32 +764,37 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let mut generator_state = GeneratorStateLease::new(&prover_data.generator_watch_counts);
+        let generator_states = generator_state.states_mut();
         seed(&mut PartitionSeeder {
             witness: &mut witness,
-            unresolved_watches: &mut unresolved_watches,
+            generator_states,
             generator_indices_by_watches: &prover_data.generator_indices_by_watches,
         })?;
 
-        let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let generator_count =
+            u32::try_from(generators.len()).expect("generator count exceeds compact worklist");
+        let mut worklists = GeneratorWorklistLease::new();
+        worklists.queue_all(generator_count);
+        let mut generator_buffer = GeneratedValues::with_capacity(2);
 
         // Initially, all generators are queued.
         run_generator_worklist(
             &mut witness,
             prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
+            generator_states,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            &mut generator_buffer,
+            worklists,
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
         Ok(Self {
             witness,
-            unresolved_watches,
-            generator_is_expired,
+            generator_state,
             remaining_generators,
+            generator_buffer,
             prover_data,
             parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
         })
@@ -550,16 +805,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// run to quiescence and cannot make progress without new values.
     pub fn feed(&mut self, inputs: PartialWitness<F>) -> Result<()> {
         let generator_indices_by_watches = &self.prover_data.generator_indices_by_watches;
+        let generator_states = self.generator_state.states_mut();
 
-        let mut pending_generator_indices = Vec::new();
+        let mut worklists = GeneratorWorklistLease::new();
         for (t, v) in inputs.target_values.into_iter() {
             if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
                 if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                     for &watching_generator_idx in watchers {
-                        if !self.generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                            self.unresolved_watches[watching_generator_idx] -= 1;
-                            pending_generator_indices.push(watching_generator_idx);
+                        let watching_generator = watching_generator_idx as usize;
+                        if !generator_is_expired(generator_states, watching_generator) {
+                            decrement_unresolved_watch(generator_states, watching_generator);
+                            worklists.pending_mut().push(watching_generator_idx);
                         }
                     }
                 }
@@ -569,10 +825,10 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         run_generator_worklist(
             &mut self.witness,
             self.prover_data,
-            &mut self.unresolved_watches,
-            &mut self.generator_is_expired,
+            generator_states,
             &mut self.remaining_generators,
-            pending_generator_indices,
+            &mut self.generator_buffer,
+            worklists,
             self.parallel_threshold,
         )
     }
@@ -586,22 +842,22 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         &mut self,
         seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
     ) -> Result<()> {
-        let mut pending_generator_indices = Vec::new();
+        let generator_states = self.generator_state.states_mut();
+        let mut worklists = GeneratorWorklistLease::new();
         seed(&mut PartitionFeeder {
             witness: &mut self.witness,
-            unresolved_watches: &mut self.unresolved_watches,
-            generator_is_expired: &self.generator_is_expired,
-            pending_generator_indices: &mut pending_generator_indices,
+            generator_states,
+            pending_generator_indices: worklists.pending_mut(),
             generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
         })?;
 
         run_generator_worklist(
             &mut self.witness,
             self.prover_data,
-            &mut self.unresolved_watches,
-            &mut self.generator_is_expired,
+            generator_states,
             &mut self.remaining_generators,
-            pending_generator_indices,
+            &mut self.generator_buffer,
+            worklists,
             self.parallel_threshold,
         )
     }
@@ -683,20 +939,65 @@ impl<F: RichField + Extendable<D>, const D: usize> Debug for WitnessGeneratorRef
 }
 
 /// Values generated by a generator invocation.
+const GENERATED_VALUES_INLINE_CAPACITY: usize = 2;
+
+#[derive(Debug)]
+enum GeneratedValuesStorage<F: Field> {
+    Inline {
+        target_values: [Option<(Target, F)>; GENERATED_VALUES_INLINE_CAPACITY],
+        len: u8,
+    },
+    Heap(Vec<(Target, F)>),
+}
+
+#[cfg(feature = "std")]
+type GeneratedValuesHeapDrain<'a, F> = std::vec::Drain<'a, (Target, F)>;
+#[cfg(not(feature = "std"))]
+type GeneratedValuesHeapDrain<'a, F> = alloc::vec::Drain<'a, (Target, F)>;
+
+enum GeneratedValuesDrain<'a, F: Field> {
+    Inline(core::slice::IterMut<'a, Option<(Target, F)>>),
+    Heap(GeneratedValuesHeapDrain<'a, F>),
+}
+
+impl<F: Field> Iterator for GeneratedValuesDrain<'_, F> {
+    type Item = (Target, F);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Inline(values) => values.next().map(|value| value.take().unwrap()),
+            Self::Heap(values) => values.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Inline(values) => values.size_hint(),
+            Self::Heap(values) => values.size_hint(),
+        }
+    }
+}
+
+impl<F: Field> ExactSizeIterator for GeneratedValuesDrain<'_, F> {}
+
 #[derive(Debug)]
 pub struct GeneratedValues<F: Field> {
-    pub target_values: Vec<(Target, F)>,
+    storage: GeneratedValuesStorage<F>,
 }
 
 impl<F: Field> From<Vec<(Target, F)>> for GeneratedValues<F> {
     fn from(target_values: Vec<(Target, F)>) -> Self {
-        Self { target_values }
+        let mut values = Self::with_capacity(target_values.len());
+        for target_value in target_values {
+            values.push(target_value);
+        }
+        values
     }
 }
 
 impl<F: Field> WitnessWrite<F> for GeneratedValues<F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
-        self.target_values.push((target, value));
+        self.push((target, value));
 
         Ok(())
     }
@@ -704,11 +1005,78 @@ impl<F: Field> WitnessWrite<F> for GeneratedValues<F> {
 
 impl<F: Field> GeneratedValues<F> {
     pub fn with_capacity(capacity: usize) -> Self {
-        Vec::with_capacity(capacity).into()
+        Self {
+            storage: if capacity > GENERATED_VALUES_INLINE_CAPACITY {
+                GeneratedValuesStorage::Heap(Vec::with_capacity(capacity))
+            } else {
+                GeneratedValuesStorage::Inline {
+                    target_values: [None; GENERATED_VALUES_INLINE_CAPACITY],
+                    len: 0,
+                }
+            },
+        }
     }
 
     pub fn empty() -> Self {
-        Vec::new().into()
+        Self::with_capacity(0)
+    }
+
+    #[inline]
+    fn push(&mut self, target_value: (Target, F)) {
+        match &mut self.storage {
+            GeneratedValuesStorage::Inline { target_values, len }
+                if (*len as usize) < GENERATED_VALUES_INLINE_CAPACITY =>
+            {
+                target_values[*len as usize] = Some(target_value);
+                *len += 1;
+                return;
+            }
+            GeneratedValuesStorage::Heap(target_values) => {
+                target_values.push(target_value);
+                return;
+            }
+            GeneratedValuesStorage::Inline { .. } => {}
+        }
+
+        let old_storage = core::mem::replace(
+            &mut self.storage,
+            GeneratedValuesStorage::Heap(Vec::with_capacity(
+                GENERATED_VALUES_INLINE_CAPACITY * 2,
+            )),
+        );
+        let GeneratedValuesStorage::Inline { target_values, len } = old_storage else {
+            unreachable!();
+        };
+        debug_assert_eq!(len as usize, GENERATED_VALUES_INLINE_CAPACITY);
+        let GeneratedValuesStorage::Heap(heap_target_values) = &mut self.storage else {
+            unreachable!();
+        };
+        for slot in target_values {
+            heap_target_values.push(slot.unwrap());
+        }
+        heap_target_values.push(target_value);
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match &self.storage {
+            GeneratedValuesStorage::Inline { len, .. } => *len as usize,
+            GeneratedValuesStorage::Heap(target_values) => target_values.len(),
+        }
+    }
+
+    #[inline]
+    fn drain(&mut self) -> GeneratedValuesDrain<'_, F> {
+        match &mut self.storage {
+            GeneratedValuesStorage::Inline { target_values, len } => {
+                let active_len = *len as usize;
+                *len = 0;
+                GeneratedValuesDrain::Inline(target_values[..active_len].iter_mut())
+            }
+            GeneratedValuesStorage::Heap(target_values) => {
+                GeneratedValuesDrain::Heap(target_values.drain(..))
+            }
+        }
     }
 
     pub fn singleton_wire(wire: Wire, value: F) -> Self {
@@ -716,7 +1084,9 @@ impl<F: Field> GeneratedValues<F> {
     }
 
     pub fn singleton_target(target: Target, value: F) -> Self {
-        vec![(target, value)].into()
+        let mut values = Self::empty();
+        values.push((target, value));
+        values
     }
 
     pub fn singleton_extension_target<const D: usize>(
@@ -1204,7 +1574,7 @@ mod tests {
         witness: &mut PartitionWitness<F>,
         inputs: PartialWitness<F>,
         prover_data: &ProverOnlyCircuitData<F, C, D>,
-    ) -> Result<Vec<usize>>
+    ) -> Result<Vec<u32>>
     where
         F: RichField + Extendable<D>,
     {
@@ -1212,10 +1582,11 @@ mod tests {
             witness.set_target(t, v)?;
         }
 
-        let mut unresolved_watches = vec![0usize; prover_data.generators.len()];
+        let mut unresolved_watches = vec![0u32; prover_data.generators.len()];
         for (watch, watchers) in prover_data.generator_indices_by_watches.iter() {
             if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
+                    let generator_idx = generator_idx as usize;
                     unresolved_watches[generator_idx] += 1;
                 }
             }
@@ -1233,9 +1604,10 @@ mod tests {
 
         // The builder-derived counts must equal the number of watcher-list occurrences of each
         // generator across the whole map (the "no representative is populated yet" case).
-        let mut occurrences = vec![0usize; prover_data.generators.len()];
+        let mut occurrences = vec![0u32; prover_data.generators.len()];
         for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
             for &generator_idx in watchers {
+                let generator_idx = generator_idx as usize;
                 occurrences[generator_idx] += 1;
             }
         }
@@ -1263,10 +1635,11 @@ mod tests {
                 outer.common.degree(),
                 &prover_data.representative_map,
             );
-            let new_counts = seed_inputs_and_unresolved_watches(
+            let mut new_counts = prover_data.generator_watch_counts.clone();
+            seed_inputs_and_unresolved_watches(
                 &mut new_witness,
                 inputs.clone(),
-                &prover_data.generator_watch_counts,
+                &mut new_counts,
                 &prover_data.generator_indices_by_watches,
             )?;
 
