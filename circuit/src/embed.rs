@@ -260,7 +260,6 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     let mut buf = Vec::with_capacity(4 * watchers.len() + 8);
     write_uvarint(&mut buf, watchers.len() as u64);
     for &watcher in watchers {
-        let watcher = u32::try_from(watcher).context("generator index exceeds u32")?;
         buf.extend_from_slice(&watcher.to_le_bytes());
     }
     write_compressed_section(&mut out, &buf);
@@ -419,15 +418,18 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     );
     let mut watchers = Vec::with_capacity(watchers_len);
     for chunk in section[vpos..].chunks_exact(4) {
-        let watcher = u32::from_le_bytes(chunk.try_into().unwrap()) as usize;
-        ensure!(watcher < generator_count, "watcher index out of range");
+        let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
+        ensure!(
+            (watcher as usize) < generator_count,
+            "watcher index out of range"
+        );
         watchers.push(watcher);
     }
     // Watch counts are a pure function of the (deduplicated) watcher lists;
     // this mirrors `read_prover_only_circuit_data`'s reconstruction.
     let mut generator_watch_counts = vec![0usize; generator_count];
     for &watcher in &watchers {
-        generator_watch_counts[watcher] += 1;
+        generator_watch_counts[watcher as usize] += 1;
     }
     let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 

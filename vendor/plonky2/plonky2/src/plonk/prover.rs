@@ -31,8 +31,8 @@ use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
-    VanishingScratch,
+    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, ColumnBatch,
+    PermutationBatch, VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
@@ -1801,6 +1801,109 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Reusable per-worker storage for quotient evaluation.
+///
+/// A proof used to create one of these packages for every Rayon folder and
+/// drop all of its buffers when that proof finished. The light pipeline keeps
+/// several proofs active and repeats the same quotient shapes dozens of times,
+/// so that pattern continually returns large buffers to jemalloc and reacquires
+/// them for the next proof. Keeping one package in each Rayon worker's TLS
+/// preserves capacity across proofs and removes both allocator traffic and the
+/// recursive `Vec` teardown from the critical path.
+struct QuotientScratch<F: RichField> {
+    indices: Vec<usize>,
+    indices_next: Vec<usize>,
+    local_constants: Vec<F>,
+    local_wires: Vec<F>,
+    s_sigmas_flat: Vec<F>,
+    zs_local_flat: Vec<F>,
+    zs_next_flat: Vec<F>,
+    vanishing: VanishingScratch<F>,
+}
+
+impl<F: RichField> QuotientScratch<F> {
+    fn new() -> Self {
+        Self {
+            indices: Vec::with_capacity(BATCH_SIZE),
+            indices_next: Vec::with_capacity(BATCH_SIZE),
+            local_constants: Vec::new(),
+            local_wires: Vec::new(),
+            s_sigmas_flat: Vec::new(),
+            zs_local_flat: Vec::new(),
+            zs_next_flat: Vec::new(),
+            vanishing: VanishingScratch::default(),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+    /// Type-erased because the prover entry point remains generic over the
+    /// field. `Field: 'static`, so the concrete scratch package can be safely
+    /// recovered by `TypeId` without changing any public generic bound.
+    static QUOTIENT_SCRATCH_CACHE: core::cell::RefCell<
+        HashMap<core::any::TypeId, Box<dyn core::any::Any>>
+    > = core::cell::RefCell::new(HashMap::new());
+}
+
+struct QuotientScratchLease<F: RichField> {
+    scratch: Option<QuotientScratch<F>>,
+}
+
+impl<F: RichField> QuotientScratchLease<F> {
+    fn acquire() -> Self {
+        #[cfg(feature = "std")]
+        let scratch = QUOTIENT_SCRATCH_CACHE
+            .with(|cache| cache.borrow_mut().remove(&core::any::TypeId::of::<F>()))
+            .and_then(|cached| cached.downcast::<QuotientScratch<F>>().ok())
+            .map(|cached| *cached)
+            .unwrap_or_else(QuotientScratch::new);
+
+        #[cfg(not(feature = "std"))]
+        let scratch = QuotientScratch::new();
+
+        Self {
+            scratch: Some(scratch),
+        }
+    }
+}
+
+impl<F: RichField> core::ops::Deref for QuotientScratchLease<F> {
+    type Target = QuotientScratch<F>;
+
+    fn deref(&self) -> &Self::Target {
+        self.scratch
+            .as_ref()
+            .expect("quotient scratch lease must remain populated")
+    }
+}
+
+impl<F: RichField> core::ops::DerefMut for QuotientScratchLease<F> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.scratch
+            .as_mut()
+            .expect("quotient scratch lease must remain populated")
+    }
+}
+
+impl<F: RichField> Drop for QuotientScratchLease<F> {
+    fn drop(&mut self) {
+        #[cfg(feature = "std")]
+        if let Some(scratch) = self.scratch.take() {
+            QUOTIENT_SCRATCH_CACHE.with(|cache| {
+                // Re-entrant Rayon work can temporarily have more than one
+                // lease on a worker. Retain the first returned package; any
+                // extra package follows the old drop behavior rather than
+                // displacing a reusable cache entry.
+                cache
+                    .borrow_mut()
+                    .entry(core::any::TypeId::of::<F>())
+                    .or_insert_with(|| Box::new(scratch));
+            });
+        }
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2004,17 +2107,6 @@ fn compute_quotient_polys<
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 
-    struct QuotientScratch<F: RichField> {
-        indices: Vec<usize>,
-        indices_next: Vec<usize>,
-        local_constants: Vec<F>,
-        local_wires: Vec<F>,
-        s_sigmas_flat: Vec<F>,
-        zs_local_flat: Vec<F>,
-        zs_next_flat: Vec<F>,
-        vanishing: VanishingScratch<F>,
-    }
-
     let zs_row_width = zs_partial_products_and_lookup_commitment.lde_row_width();
     let num_routed_wires = common_data.config.num_routed_wires;
     // GPU-specialized gates read the retained full-width wire commitment
@@ -2089,17 +2181,16 @@ fn compute_quotient_polys<
         .zip(points_batches)
         .enumerate()
         .for_each_init(
-            || QuotientScratch::<F> {
-                indices: Vec::with_capacity(BATCH_SIZE),
-                indices_next: Vec::with_capacity(BATCH_SIZE),
-                local_constants: Vec::new(),
-                local_wires: Vec::new(),
-                s_sigmas_flat: Vec::new(),
-                zs_local_flat: Vec::new(),
-                zs_next_flat: Vec::new(),
-                vanishing: VanishingScratch::default(),
-            },
+            QuotientScratchLease::<F>::acquire,
             |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
+                // Work with the concrete scratch package so Rust can prove
+                // that the immutable input buffers and mutable output buffers
+                // below are disjoint fields. Going through the lease's Deref
+                // makes those same zero-copy borrows appear to alias.
+                let scratch = scratch
+                    .scratch
+                    .as_mut()
+                    .expect("quotient scratch lease must remain populated");
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
                     xs_batch.len() == BATCH_SIZE
@@ -2136,6 +2227,8 @@ fn compute_quotient_polys<
                 } else {
                     None
                 };
+                let mut cached_constants = None;
+                let mut cached_sigmas = None;
                 if let Some(cache) = constants_cache {
                     debug_assert_eq!(
                         prover_data.constants_sigmas_quotient_step, step,
@@ -2143,23 +2236,31 @@ fn compute_quotient_polys<
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
-                    for ci in 0..cc {
-                        scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
-                            &cache[ci * q + cache_start..ci * q + cache_start + n],
-                        );
-                    }
+                    // Constants/selectors are already column-major in the
+                    // circuit-wide quotient cache. Preserve that storage and
+                    // let `EvaluationVarsBaseBatch` address the current point
+                    // window with `(stride=q, offset=cache_start)`, removing
+                    // the proof-local repack and its full write/read cycle.
+                    scratch.local_constants.clear();
+                    cached_constants = Some((&cache[..cc * q], cc, q, cache_start));
                     if permutation_products_offloaded {
                         scratch.s_sigmas_flat.clear();
                     } else {
                         let sc = common_data.sigmas_range().len();
-                        scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
-                        for ci in 0..sc {
-                            scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
-                                &cache[(cc + ci) * q + cache_start
-                                    ..(cc + ci) * q + cache_start + n],
-                            );
-                        }
+                        // Keep the large sigma package in its circuit-wide
+                        // column cache. Every batch consumes a contiguous
+                        // `n`-point window from each column, so a borrowed
+                        // strided view gives the evaluator the same slices
+                        // while deleting the copy into (and subsequent read
+                        // from) `s_sigmas_flat` for every proof worker.
+                        scratch.s_sigmas_flat.clear();
+                        cached_sigmas = Some(ColumnBatch::new(
+                            &cache[cc * q..(cc + sc) * q],
+                            sc,
+                            q,
+                            cache_start,
+                            n,
+                        ));
                     }
                 } else {
                     prover_data.constants_sigmas_commitment.fill_lde_batch(
@@ -2288,10 +2389,21 @@ fn compute_quotient_polys<
                 };
 
                 let perm = if col_major_perm {
+                    let s_sigmas_cols = if permutation_products_offloaded {
+                        ColumnBatch::empty(n)
+                    } else if let Some(cached) = cached_sigmas {
+                        cached
+                    } else {
+                        ColumnBatch::contiguous(
+                            &scratch.s_sigmas_flat,
+                            num_routed_wires,
+                            n,
+                        )
+                    };
                     PermutationBatch::Cols {
                         zs_partial_products_cols: &scratch.zs_local_flat,
                         zs_next_cols: &scratch.zs_next_flat,
-                        s_sigmas_cols: &scratch.s_sigmas_flat,
+                        s_sigmas_cols,
                     }
                 } else {
                     PermutationBatch::Rows {
@@ -2302,12 +2414,25 @@ fn compute_quotient_polys<
                     }
                 };
 
-                let vars_batch = EvaluationVarsBaseBatch::new(
-                    n,
-                    &scratch.local_constants,
-                    &scratch.local_wires,
-                    public_inputs_hash,
-                );
+                let vars_batch = if let Some((constants, columns, stride, offset)) = cached_constants
+                {
+                    EvaluationVarsBaseBatch::new_with_strided_constants(
+                        n,
+                        constants,
+                        columns,
+                        stride,
+                        offset,
+                        &scratch.local_wires,
+                        public_inputs_hash,
+                    )
+                } else {
+                    EvaluationVarsBaseBatch::new(
+                        n,
+                        &scratch.local_constants,
+                        &scratch.local_wires,
+                        public_inputs_hash,
+                    )
+                };
 
                 let quotient_values_batch = &mut quotient_values_batch[..n * num_challenges];
                 eval_vanishing_poly_base_batch::<F, D>(
