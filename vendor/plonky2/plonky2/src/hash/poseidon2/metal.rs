@@ -130,7 +130,7 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
-/// window and is treated as contaminated evidence.
+/// window and is treated as contaminated evidence. (hermes-c4-1786812783-91)
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 /// Lower routing threshold used only while an exclusive serial proving phase
 /// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
@@ -156,7 +156,7 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// GPU tree builds exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
 /// official ranked host (submission 41467098), so concurrent GPU submission is
-/// intentionally disabled.
+/// intentionally disabled. (hermes-c4-1786812783-91)
 const MAX_BUFFER_SETS: usize = 1;
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;

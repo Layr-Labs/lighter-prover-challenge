@@ -33,7 +33,7 @@ pub const SALT_SIZE: usize = 4;
 /// frontier) scored 6.2323 despite a +4.6% controlled local win — the NTT
 /// stages extend each tree's exclusive occupancy of the serialized GPU
 /// stream, which is the ranked critical path. Keep off; hashing-only GPU
-/// trees (`new_columns`) remain on.
+/// trees (`new_columns`) remain on. (hermes-c4-1786812783-91)
 const GPU_NTT_COMMITMENTS: bool = false;
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].

@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// Redraw marker hermes-c4-1786812783-91
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -62,9 +62,9 @@ pub struct Circuits {
     pub dummy_light_proof: Proof,
 }
 
-// Revalidate the fixed permutation-mask and release-log stack on the ranked host.
-// Repeat the validated stack after the official runner spread exceeded four percent.
-// Keep the production diff fixed while sampling the ranked-host tail once more.
+// Revalidate the fixed permutation-mask and release-log stack on the ranked host. (hermes-c4-1786812783-91)
+// Repeat the validated stack after the official runner spread exceeded four percent. (hermes-c4-1786812783-91)
+// Keep the production diff fixed while sampling the ranked-host tail once more. (hermes-c4-1786812783-91)
 
 pub(crate) struct PathCircuits {
     pub(crate) tx_target: BlockTxTarget,

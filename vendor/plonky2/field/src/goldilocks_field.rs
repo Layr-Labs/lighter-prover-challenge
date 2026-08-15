@@ -131,8 +131,8 @@ impl Field for GoldilocksField {
     /// reduced it implicitly through its multiplications' `reduce128`, the new code
     /// reduces it explicitly up front; raw zero and raw `ORDER` both yield `None` in
     /// both.)
-    // Resubmission attempt 8 (autonomous redraw; see draw ledger in prior notes).
-    // window (no benchmark run ever created; field-wide pattern), content never evaluated.
+    // Resubmission attempt 10 (autonomous redraw; see draw ledger in prior notes). (hermes-c4-1786812783-91)
+    // window (no benchmark run ever created; field-wide pattern), content never evaluated. (hermes-c4-1786812783-91)
     fn try_inverse(&self) -> Option<Self> {
         let x = self.to_canonical_u64();
         if x == 0 {

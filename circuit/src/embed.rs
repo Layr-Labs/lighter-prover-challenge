@@ -530,7 +530,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let circuit_digest = verifier_only.circuit_digest;
 
     // Mirror the builder's quotient-domain constants/sigmas cache (added by the
-    // Metal quotient-gate union frontier). It is a pure derivation from the
+    // Metal quotient-gate union frontier (hermes-c4-1786812783-91). It is a pure derivation from the
     // freshly recomputed column-backed commitment — the same extraction the
     // builder performs — and the documented `None` fallback keeps the quotient
     // path correct if extraction declines.
