@@ -225,6 +225,21 @@ pub struct SelectionBaseGenerator<F: RichField + Extendable<D>, const D: usize> 
     _phantom: PhantomData<F>,
 }
 
+impl<F: RichField + Extendable<D>, const D: usize> SelectionBaseGenerator<F, D> {
+    #[inline]
+    fn generated_values(&self, witness: &PartitionWitness<F>) -> [(Target, F); 2] {
+        let get_wire = |wire: usize| witness.get_target(Target::wire(self.row, wire));
+        let b = get_wire(self.gate.wire_ith_selector(self.i));
+        let x = get_wire(self.gate.wire_ith_element_0(self.i));
+        let y = get_wire(self.gate.wire_ith_element_1(self.i));
+        let temp = Target::wire(self.row, self.gate.wire_ith_temporary(self.i, 0));
+        let result = Target::wire(self.row, self.gate.wire_ith_output(self.i));
+        let temp_value = b * y - y;
+        let result_value = b * x - temp_value;
+        [(temp, temp_value), (result, result_value)]
+    }
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
     for SelectionBaseGenerator<F, D>
 {
@@ -248,21 +263,14 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let get_wire = |wire: usize| -> F { witness.get_target(Target::wire(self.row, wire)) };
-
-        let b = get_wire(self.gate.wire_ith_selector(self.i));
-        let x = get_wire(self.gate.wire_ith_element_0(self.i));
-        let y = get_wire(self.gate.wire_ith_element_1(self.i));
-        let result = Target::wire(self.row, self.gate.wire_ith_output(self.i));
-        let temp = Target::wire(self.row, self.gate.wire_ith_temporary(self.i, 0));
-
-        let temp_value = b * y - y;
-        let result_value = b * x - temp_value;
-
-        out_buffer.set_target(temp, temp_value)?;
-        out_buffer.set_target(result, result_value)?;
-
+        for (target, value) in self.generated_values(witness) {
+            out_buffer.set_target(target, value)?;
+        }
         Ok(())
+    }
+
+    fn run_once_pair(&self, witness: &PartitionWitness<F>) -> Option<Result<[(Target, F); 2]>> {
+        Some(Ok(self.generated_values(witness)))
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -289,13 +297,14 @@ mod tests {
     use anyhow::Result;
 
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Field;
     #[allow(unused_imports)]
     use crate::field::types::Field64;
+    use crate::field::types::{Field, PrimeField64};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::gates::select_base::SelectionGate;
+    use crate::iop::generator::{GeneratedValues, SimpleGenerator};
     use crate::iop::target::Target;
-    use crate::iop::witness::{PartialWitness, WitnessWrite};
+    use crate::iop::witness::{PartialWitness, PartitionWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -367,6 +376,62 @@ mod tests {
 
         let proof = circuit_data.prove(pw)?;
         circuit_data.verify(proof)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pair_output_matches_buffered_raw_representatives() -> Result<()> {
+        type F = GoldilocksField;
+        const D: usize = 2;
+        const P: u64 = 0xffff_ffff_0000_0001;
+        let config = CircuitConfig::standard_recursion_config();
+        let gate = SelectionGate::new_from_config(&config);
+        let representative_map = (0..config.num_wires).map(|i| i as u32).collect::<Vec<_>>();
+        let cases = [
+            (0, 0, 1),
+            (1, P - 1, P),
+            (0, P + 1, u64::MAX),
+            (1, u64::MAX - 1, u64::MAX),
+            (P, P + 1, P - 1),
+        ];
+
+        for (selector, x, y) in cases {
+            let generator = super::SelectionBaseGenerator::<F, D> {
+                gate: gate.clone(),
+                row: 0,
+                i: 0,
+                _phantom: core::marker::PhantomData,
+            };
+            let mut witness = PartitionWitness::new(config.num_wires, 1, &representative_map);
+            witness.set_target(
+                Target::wire(0, gate.wire_ith_selector(0)),
+                GoldilocksField(selector),
+            )?;
+            witness.set_target(
+                Target::wire(0, gate.wire_ith_element_0(0)),
+                GoldilocksField(x),
+            )?;
+            witness.set_target(
+                Target::wire(0, gate.wire_ith_element_1(0)),
+                GoldilocksField(y),
+            )?;
+
+            let mut buffered = GeneratedValues::empty();
+            generator.run_once(&witness, &mut buffered)?;
+            let direct = generator
+                .run_once_pair(&witness)
+                .expect("selection generator has a pair-output fast path")?;
+            assert_eq!(buffered.target_values.len(), 2);
+            for ((buffered_target, buffered_value), (direct_target, direct_value)) in
+                buffered.target_values.iter().zip(direct)
+            {
+                assert_eq!(*buffered_target, direct_target);
+                assert_eq!(
+                    buffered_value.to_noncanonical_u64(),
+                    direct_value.to_noncanonical_u64(),
+                );
+            }
+        }
         Ok(())
     }
 }
