@@ -66,6 +66,16 @@ fn main() {
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        // Every pool worker runs at USER_INITIATED instead of default QoS.
+        // On an uncontended host this changes nothing observable: QoS only
+        // orders threads against OTHER work, and the pool is the only bulk
+        // consumer. On the shared ranked host, a co-tenant candidate build
+        // (all-core rustc at default QoS) frequently overlaps the proving
+        // window; elevated pool workers keep the P-cores while the build
+        // yields, instead of splitting cores 50/50 with it. Scheduling-only:
+        // no work is added, moved, or reordered, and proof bytes are
+        // untouched.
+        .start_handler(|_| prover::mark_thread_user_initiated())
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]

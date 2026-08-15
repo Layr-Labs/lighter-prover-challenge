@@ -314,7 +314,7 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Poseidon2 gate quotient command buffer ended with status {:?}",
@@ -330,7 +330,7 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "RangeCheck gate quotient command buffer ended with status {:?}",
@@ -362,7 +362,7 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 
 impl<F: RichField> PermutationQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Permutation quotient command buffer ended with status {:?}",
@@ -587,18 +587,17 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
-    // Stash BEFORE walking: a final block arriving mid-walk takes a
-    // partially-warmed buffer instead of missing the stash entirely; the
-    // remaining walk touches pages the fill writes anyway — value-exact.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer.clone());
-    }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
+    }
+    // Publish only after the last page touch; the consumer writes this buffer
+    // without synchronizing with the detached prewarm thread.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer);
     }
 }
 
@@ -1291,6 +1290,44 @@ pub fn set_exclusive_gpu_phase(enabled: bool) {
 /// idle CPU workers without changing proof semantics.
 pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Completion wait that skips kernel-wakeup latency while an exclusive
+/// serial phase (the chain drain / final block) owns the machine: the spine
+/// thread has the whole CPU, so a bounded spin returns the instant the GPU
+/// completes instead of paying roughly a millisecond of scheduling latency
+/// per command buffer. Outside exclusive phases this is exactly the blocking
+/// wait, so the steady pipeline's pool threads are untouched. Value-exact:
+/// scheduling only; every computed value is identical.
+fn wait_command_buffer(command_buffer: &metal::CommandBufferRef) {
+    // The spin path only exists in production builds: the metal test suite
+    // sets the process-global exclusive flag in one test while ~25 other GPU
+    // tests run concurrently, so spinning there would saturate the test
+    // harness's cores and starve the completion-signal reader. Tests exercise
+    // every computed value; the spin is scheduling-only.
+    #[cfg(test)]
+    {
+        command_buffer.wait_until_completed();
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        if !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+            command_buffer.wait_until_completed();
+            return;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            if command_buffer.status() == MTLCommandBufferStatus::Completed {
+                return;
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(250) {
+                command_buffer.wait_until_completed();
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
 }
 
 /// Runnable-but-unproven chain steps: incremented by the orchestrator when a
@@ -2049,15 +2086,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
-    // only when the GPU stream is unoccupied at entry, the same occupancy
-    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
-    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
-    // while an already-busy stream would just queue the absorb groups behind
-    // another tree and stretch both.
+    // Exclusive serial phases own the GPU: admit production 2^17 spine trees
+    // so CPU LDE-fill overlaps GPU absorb on the sequential critical path.
+    // The old exclusive floor 2^20 matched no ranked exclusive shape. Outside
+    // exclusive, keep 2^19 + idle-GPU (always-on concurrent wire stream is a
+    // closed contention lane).
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
@@ -2191,12 +2226,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         command_buffer.to_owned()
     });
 
-    parents_command.wait_until_completed();
+    wait_command_buffer(&parents_command);
     let all_ok = absorb_commands
         .iter()
         .chain(core::iter::once(&parents_command))
         .all(|command_buffer| {
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
     drop(job);
@@ -3293,7 +3328,7 @@ impl MetalShared {
                 command_buffer.to_owned()
             });
 
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(format!(
                     "command buffer ended with status {:?}",
@@ -3557,7 +3592,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -3786,7 +3821,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -4052,7 +4087,7 @@ mod tests {
         let completed = autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
             command_buffer.commit();
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
             command_buffer.to_owned()
         });
@@ -4077,7 +4112,7 @@ mod tests {
         let completed = autoreleasepool(|| {
             let command_buffer = queue.new_command_buffer();
             command_buffer.commit();
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             command_buffer.to_owned()
         });
         let completed_output = output();
@@ -5724,7 +5759,7 @@ kernel void goldilocks_mul_bench_native(
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(
                 command_buffer.status(),
                 MTLCommandBufferStatus::Completed,
@@ -5814,7 +5849,7 @@ kernel void goldilocks_mul_bench_native(
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(
                 command_buffer.status(),
                 MTLCommandBufferStatus::Completed,
@@ -5876,7 +5911,7 @@ kernel void goldilocks_mul_bench_native(
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             assert_eq!(
                 command_buffer.status(),
                 MTLCommandBufferStatus::Completed,

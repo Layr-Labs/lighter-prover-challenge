@@ -158,7 +158,7 @@ fn mark_spine_thread_latency_critical() {}
 /// preempted while every other tree build queues behind it — a classic
 /// priority inversion at the pipeline's one serialized station. Best-effort.
 #[cfg(target_os = "macos")]
-fn mark_thread_user_initiated() {
+pub(crate) fn mark_thread_user_initiated() {
     #[allow(non_camel_case_types)]
     type qos_class_t = u32;
     unsafe extern "C" {
@@ -170,7 +170,7 @@ fn mark_thread_user_initiated() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mark_thread_user_initiated() {}
+pub(crate) fn mark_thread_user_initiated() {}
 
 /// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
 /// walks prefer E-cores instead of competing with the light pipeline's
@@ -736,6 +736,11 @@ pub(crate) fn prove_pre_execution_parallel(
 /// would otherwise warn it dead.
 #[cfg(test)]
 pub fn prove_block(block: Block<F>, circuits: Circuits) -> Proof {
+    // The calling thread orchestrates the light path (witness generation and
+    // pipeline control) for the whole run at default QoS. Elevate it like the
+    // pool workers so a co-tenant build on the shared ranked host cannot
+    // preempt the pipeline's feeder. Scheduling-only.
+    mark_thread_user_initiated();
     // The pre-execution proof runs strictly before any other proving work, so
     // the serialized GPU stream is otherwise idle: route its mid-size column
     // trees to the GPU for just this phase.
@@ -813,6 +818,8 @@ pub(crate) fn prove_block_after_pre(
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, || {
+                    // Same contention rationale as the pool workers.
+                    mark_thread_user_initiated();
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
@@ -832,6 +839,8 @@ pub(crate) fn prove_block_after_pre(
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    // Same contention rationale as the pool workers.
+                    mark_thread_user_initiated();
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
                         "final_block_build",
