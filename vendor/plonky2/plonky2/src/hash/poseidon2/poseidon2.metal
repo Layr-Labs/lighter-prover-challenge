@@ -1768,20 +1768,41 @@ kernel void poseidon2_hash_parents(
     constant ulong* parameters [[buffer(2)]],
     constant uint& parent_count [[buffer(3)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= parent_count) {
+    // Two parents per thread, dispatched with parent_count.div_ceil(2).
+    // Each parent still runs exactly the one-parent computation; only the
+    // thread mapping changed. parent_count is even on every level of every
+    // tree except the final cap level of a cap_height-0 tree, where the last
+    // thread hashes a single parent.
+    uint p0 = gid * 2;
+    if (p0 >= parent_count) {
         return;
     }
 
-    const device ulong* input = children + (ulong)gid * 8;
-    ulong state[12] = { 0 };
-    for (uint i = 0; i < 8; ++i) {
-        state[i] = input[i];
-    }
-    poseidon2(state, parameters);
+    {
+        const device ulong* input = children + (ulong)p0 * 8;
+        ulong state[12] = { 0 };
+        for (uint i = 0; i < 8; ++i) {
+            state[i] = input[i];
+        }
+        poseidon2(state, parameters);
 
-    device ulong* output = parents + (ulong)gid * 4;
-    for (uint i = 0; i < 4; ++i) {
-        output[i] = gl_canonicalize(state[i]);
+        device ulong* output = parents + (ulong)p0 * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(state[i]);
+        }
+    }
+    if (p0 + 1 < parent_count) {
+        const device ulong* input = children + (ulong)(p0 + 1) * 8;
+        ulong state[12] = { 0 };
+        for (uint i = 0; i < 8; ++i) {
+            state[i] = input[i];
+        }
+        poseidon2(state, parameters);
+
+        device ulong* output = parents + (ulong)(p0 + 1) * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(state[i]);
+        }
     }
 }
 
@@ -1793,6 +1814,15 @@ kernel void poseidon2_hash_parents(
 // column group lets the CPU compute group g+1's LDE columns while the GPU
 // absorbs group g; the arithmetic per pass is identical to the fused
 // kernel's corresponding loop iteration.
+//
+// Two leaves per thread (natural rows 2*gid and 2*gid+1), dispatched with
+// leaf_count.div_ceil(2) threads. Each row still performs exactly the
+// one-leaf computation; only the thread mapping changed, so every value is
+// bit-identical. leaf_count is a power of two on every streamed path, so the
+// second row exists for all but the last thread of an odd leaf_count, which
+// the has_second guards cover. Halving the thread count removes half the
+// thread-dispatch overhead per group at the cost of a second 12-lane state
+// in registers, which the compiler keeps live across the two permutes.
 kernel void poseidon2_absorb_pass(
     const device ulong* leaves [[buffer(0)]],
     device ulong* state [[buffer(1)]],
@@ -1805,30 +1835,54 @@ kernel void poseidon2_absorb_pass(
     constant uint& first_pass [[buffer(8)]],
     constant uint& final_pass [[buffer(9)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= leaf_count) {
+    uint g0 = gid * 2;
+    if (g0 >= leaf_count) {
         return;
     }
-    ulong st[12] = { 0 };
+    bool has_second = g0 + 1 < leaf_count;
+    ulong st0[12] = { 0 };
+    ulong st1[12] = { 0 };
     if (first_pass == 0u) {
         for (uint i = 0; i < 12; ++i) {
-            st[i] = state[(ulong)i * leaf_count + gid];
+            st0[i] = state[(ulong)i * leaf_count + g0];
+            if (has_second) {
+                st1[i] = state[(ulong)i * leaf_count + g0 + 1];
+            }
         }
     }
     for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        st0[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + g0]);
+        if (has_second) {
+            st1[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + g0 + 1]);
+        }
     }
-    poseidon2(st, parameters);
+    poseidon2(st0, parameters);
+    if (has_second) {
+        poseidon2(st1, parameters);
+    }
     if (final_pass != 0u) {
-        uint out_row = log_leaf_count == 0
-            ? gid
-            : (reverse_bits(gid) >> (32 - log_leaf_count));
-        device ulong* output = hashes + (ulong)out_row * 4;
+        uint out0 = log_leaf_count == 0
+            ? g0
+            : (reverse_bits(g0) >> (32 - log_leaf_count));
+        device ulong* output0 = hashes + (ulong)out0 * 4;
         for (uint i = 0; i < 4; ++i) {
-            output[i] = gl_canonicalize(st[i]);
+            output0[i] = gl_canonicalize(st0[i]);
+        }
+        if (has_second) {
+            uint out1 = log_leaf_count == 0
+                ? g0 + 1
+                : (reverse_bits(g0 + 1) >> (32 - log_leaf_count));
+            device ulong* output1 = hashes + (ulong)out1 * 4;
+            for (uint i = 0; i < 4; ++i) {
+                output1[i] = gl_canonicalize(st1[i]);
+            }
         }
     } else {
         for (uint i = 0; i < 12; ++i) {
-            state[(ulong)i * leaf_count + gid] = st[i];
+            state[(ulong)i * leaf_count + g0] = st0[i];
+            if (has_second) {
+                state[(ulong)i * leaf_count + g0 + 1] = st1[i];
+            }
         }
     }
 }
