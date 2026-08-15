@@ -723,10 +723,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                numerator_0 *= wire_value.multiply_accumulate(beta_k_is_0[j], x) + gamma_0;
+                                numerator_1 *= wire_value.multiply_accumulate(beta_k_is_1[j], x) + gamma_1;
+                                denominator_0 *= wire_value.multiply_accumulate(beta_0, sigma) + gamma_0;
+                                denominator_1 *= wire_value.multiply_accumulate(beta_1, sigma) + gamma_1;
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
