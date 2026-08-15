@@ -1,4 +1,5 @@
-// Redraw marker opus-fatlib-33
+// Opt7 drain-early chain Phase-1 marker 2026-08-15
+// beibei-decode-overlap-1786795800
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

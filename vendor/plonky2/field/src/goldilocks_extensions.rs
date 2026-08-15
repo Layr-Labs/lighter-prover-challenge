@@ -1,4 +1,6 @@
 use alloc::vec::Vec;
+#[cfg(target_arch = "aarch64")]
+use core::arch::asm;
 use core::ops::Mul;
 
 use static_assertions::const_assert;
@@ -219,6 +221,91 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     *hi += carry as u32;
 }
 
+/// Split 160-bit accumulator used by the AArch64 pair kernel so the inner
+/// loop never re-packs a `u128` between terms.
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct U160Acc {
+    lo: u64,
+    mid: u64,
+    hi: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl U160Acc {
+    const ZERO: Self = Self {
+        lo: 0,
+        mid: 0,
+        hi: 0,
+    };
+
+    #[inline(always)]
+    fn reduce(self) -> GoldilocksField {
+        // SAFETY: callers inherit `ext2_base_scalar_dot_slots`'s term-count
+        // bound, which is far under `reduce160`'s precondition.
+        unsafe { reduce160((self.lo as u128) | ((self.mid as u128) << 64), self.hi as u32) }
+    }
+}
+
+/// Two independent `u160_add_product` steps, interleaved so the `umulh`/`mul`
+/// pair for each lane hides the other's latency. Accumulators stay in the
+/// split `(lo, mid, hi)` form; the mathematical 160-bit sum is identical to
+/// two scalar adds.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn u160_add_product_pair(
+    acc0: &mut U160Acc,
+    a0: u64,
+    b0: u64,
+    acc1: &mut U160Acc,
+    a1: u64,
+    b1: u64,
+) {
+    let mut lo0 = acc0.lo;
+    let mut mid0 = acc0.mid;
+    let mut hi0 = acc0.hi;
+    let mut lo1 = acc1.lo;
+    let mut mid1 = acc1.mid;
+    let mut hi1 = acc1.hi;
+    let prod0 = a0;
+    let prod1 = a1;
+
+    unsafe {
+        asm!(
+            "umulh {ph0}, {prod0}, {scratch0}",
+            "umulh {ph1}, {prod1}, {scratch1}",
+            "mul   {prod0}, {prod0}, {scratch0}",
+            "mul   {prod1}, {prod1}, {scratch1}",
+            "adds  {lo0}, {lo0}, {prod0}",
+            "adcs  {mid0}, {mid0}, {ph0}",
+            "adc   {hi0}, {hi0}, xzr",
+            "adds  {lo1}, {lo1}, {prod1}",
+            "adcs  {mid1}, {mid1}, {ph1}",
+            "adc   {hi1}, {hi1}, xzr",
+            prod0 = inout(reg) prod0 => _,
+            prod1 = inout(reg) prod1 => _,
+            scratch0 = in(reg) b0,
+            scratch1 = in(reg) b1,
+            ph0 = out(reg) _,
+            ph1 = out(reg) _,
+            lo0 = inout(reg) lo0,
+            mid0 = inout(reg) mid0,
+            hi0 = inout(reg) hi0,
+            lo1 = inout(reg) lo1,
+            mid1 = inout(reg) mid1,
+            hi1 = inout(reg) hi1,
+            options(pure, nomem, nostack),
+        );
+    }
+
+    acc0.lo = lo0;
+    acc0.mid = mid0;
+    acc0.hi = hi0;
+    acc1.lo = lo1;
+    acc1.mid = mid1;
+    acc1.hi = hi1;
+}
+
 /// Compute `sum_i extension_values[i].scalar_mul(base_scalars[i])` in
 /// GF(p^2), delaying reduction across the complete dot product.
 ///
@@ -365,16 +452,32 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        ext2_base_scalar_dot_slots_neon(out, &full, &partial);
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        ext2_base_scalar_dot_slots_scalar(out, &full, &partial);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn ext2_base_scalar_dot_slots_scalar(
+    out: &mut [QuadraticExtension<GoldilocksField>],
+    full: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+    partial: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+) {
     for (i, o) in out.iter_mut().enumerate() {
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
+        for &(p, QuadraticExtension([b0, b1])) in full {
             // SAFETY: every slice in `full` has length exactly `out.len()`.
             let c = unsafe { p.get_unchecked(i).0 };
             u160_add_product(&mut lo0, &mut hi0, b0.0, c);
             u160_add_product(&mut lo1, &mut hi1, b1.0, c);
         }
-        for &(p, QuadraticExtension([b0, b1])) in &partial {
+        for &(p, QuadraticExtension([b0, b1])) in partial {
             if i < p.len() {
                 let c = p[i].0;
                 u160_add_product(&mut lo0, &mut hi0, b0.0, c);
@@ -388,6 +491,64 @@ pub fn ext2_base_scalar_dot_slots(
             unsafe { reduce160(lo0, hi0) },
             unsafe { reduce160(lo1, hi1) },
         ]);
+    }
+}
+
+/// AArch64 path: two output slots (or the two extension limbs of one leftover
+/// slot) share one interleaved `umulh`/`mul` u160 pair so the widening
+/// multiplies stay in flight. Coefficients are copied into a local `[u64; 2]`
+/// rather than reinterpreting a possibly short slice as a packed view.
+#[cfg(target_arch = "aarch64")]
+fn ext2_base_scalar_dot_slots_neon(
+    out: &mut [QuadraticExtension<GoldilocksField>],
+    full: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+    partial: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+) {
+    let n = out.len();
+    let mut i = 0;
+    while i + 1 < n {
+        let mut s0l0 = U160Acc::ZERO;
+        let mut s0l1 = U160Acc::ZERO;
+        let mut s1l0 = U160Acc::ZERO;
+        let mut s1l1 = U160Acc::ZERO;
+        for &(p, QuadraticExtension([b0, b1])) in full {
+            // SAFETY: every slice in `full` has length exactly `out.len()`.
+            let coeffs = [
+                unsafe { p.get_unchecked(i).0 },
+                unsafe { p.get_unchecked(i + 1).0 },
+            ];
+            u160_add_product_pair(&mut s0l0, b0.0, coeffs[0], &mut s1l0, b0.0, coeffs[1]);
+            u160_add_product_pair(&mut s0l1, b1.0, coeffs[0], &mut s1l1, b1.0, coeffs[1]);
+        }
+        for &(p, QuadraticExtension([b0, b1])) in partial {
+            if i + 1 < p.len() {
+                let coeffs = [p[i].0, p[i + 1].0];
+                u160_add_product_pair(&mut s0l0, b0.0, coeffs[0], &mut s1l0, b0.0, coeffs[1]);
+                u160_add_product_pair(&mut s0l1, b1.0, coeffs[0], &mut s1l1, b1.0, coeffs[1]);
+            } else if i < p.len() {
+                let c = p[i].0;
+                u160_add_product_pair(&mut s0l0, b0.0, c, &mut s0l1, b1.0, c);
+            }
+        }
+        out[i] = QuadraticExtension([s0l0.reduce(), s0l1.reduce()]);
+        out[i + 1] = QuadraticExtension([s1l0.reduce(), s1l1.reduce()]);
+        i += 2;
+    }
+    if i < n {
+        let mut acc0 = U160Acc::ZERO;
+        let mut acc1 = U160Acc::ZERO;
+        for &(p, QuadraticExtension([b0, b1])) in full {
+            // SAFETY: every slice in `full` has length exactly `out.len()`.
+            let c = unsafe { p.get_unchecked(i).0 };
+            u160_add_product_pair(&mut acc0, b0.0, c, &mut acc1, b1.0, c);
+        }
+        for &(p, QuadraticExtension([b0, b1])) in partial {
+            if i < p.len() {
+                let c = p[i].0;
+                u160_add_product_pair(&mut acc0, b0.0, c, &mut acc1, b1.0, c);
+            }
+        }
+        out[i] = QuadraticExtension([acc0.reduce(), acc1.reduce()]);
     }
 }
 
@@ -1091,5 +1252,200 @@ mod tests {
             }
         }
         assert!(QE::ZERO.try_inverse().is_none());
+    }
+
+    fn reference_dot_slots(
+        out_len: usize,
+        start: usize,
+        polys: &[&[GF]],
+        powers: &[Q2],
+    ) -> Vec<Q2> {
+        let mut out = vec![Q2::ZERO; out_len];
+        for (&p, &pw) in polys.iter().zip(powers) {
+            for (i, slot) in out.iter_mut().enumerate() {
+                let idx = start + i;
+                if idx < p.len() {
+                    *slot += <Q2 as FieldExtension<2>>::scalar_mul(&pw, p[idx]);
+                }
+            }
+        }
+        out
+    }
+
+    fn assert_dot_slots_canonical(
+        out_len: usize,
+        start: usize,
+        polys: &[&[GF]],
+        powers: &[Q2],
+    ) {
+        let mut actual = vec![Q2::ZERO; out_len];
+        super::ext2_base_scalar_dot_slots(&mut actual, start, polys, powers);
+        let expected = reference_dot_slots(out_len, start, polys, powers);
+        for (i, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            for limb in 0..2 {
+                assert_eq!(
+                    got.0[limb].to_canonical_u64(),
+                    want.0[limb].to_canonical_u64(),
+                    "canonical limb {limb} mismatch at slot {i} (out_len={out_len}, start={start})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ext2_base_scalar_dot_slots_matches_scalar_mul_sum() {
+        let p = GF::ORDER;
+        let raw_specials = [0u64, 1, 2, p - 1, p, p + 1, u64::MAX];
+
+        let mut state = 0xC2B2_AE3D_27D4_EB4Fu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // Empty output, empty batch, and a single slot (the leftover path).
+        assert_dot_slots_canonical(0, 0, &[], &[]);
+        assert_dot_slots_canonical(3, 0, &[], &[]);
+        let one_poly = [GF::ONE, GF::TWO];
+        let one_power = [Q2::ONE];
+        assert_dot_slots_canonical(1, 0, &[&one_poly], &one_power);
+        assert_dot_slots_canonical(2, 0, &[&one_poly], &one_power);
+
+        // Lengths that hit the 2-slot kernel, the odd leftover, and mixed
+        // full / partial covering relative to `start`.
+        let out_lens = [0, 1, 2, 3, 5, 16, 17, 33];
+        let starts = [0, 1, 7];
+        let poly_lens = [0, 1, 2, 3, 8, 16, 17, 32, 40];
+
+        for &out_len in &out_lens {
+            for &start in &starts {
+                for n_polys in [0, 1, 2, 3, 7, 16, 17] {
+                    let owned: Vec<Vec<GF>> = (0..n_polys)
+                        .map(|j| {
+                            let len = poly_lens[(j + start) % poly_lens.len()];
+                            (0..len)
+                                .map(|k| {
+                                    let raw = if k < raw_specials.len() {
+                                        raw_specials[(k + j) % raw_specials.len()]
+                                    } else {
+                                        next()
+                                    };
+                                    GoldilocksField(raw)
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let polys: Vec<&[GF]> = owned.iter().map(|v| v.as_slice()).collect();
+                    let powers: Vec<Q2> = (0..n_polys)
+                        .map(|j| {
+                            QuadraticExtension([
+                                GoldilocksField(if j < raw_specials.len() {
+                                    raw_specials[j]
+                                } else {
+                                    next()
+                                }),
+                                GoldilocksField(if j < raw_specials.len() {
+                                    raw_specials[raw_specials.len() - 1 - j]
+                                } else {
+                                    next()
+                                }),
+                            ])
+                        })
+                        .collect();
+                    assert_dot_slots_canonical(out_len, start, &polys, &powers);
+                }
+            }
+        }
+
+        // Random batches with every raw limb in the full u64 range, including
+        // non-canonical representatives.
+        for trial in 0..40 {
+            let out_len = 1 + (next() as usize % 48);
+            let start = next() as usize % 8;
+            let n_polys = 1 + (next() as usize % 24);
+            let owned: Vec<Vec<GF>> = (0..n_polys)
+                .map(|_| {
+                    let len = start + out_len + (next() as usize % 5);
+                    let len = if trial % 5 == 0 {
+                        start + (next() as usize % (out_len + 1))
+                    } else {
+                        len
+                    };
+                    (0..len).map(|_| GoldilocksField(next())).collect()
+                })
+                .collect();
+            let polys: Vec<&[GF]> = owned.iter().map(|v| v.as_slice()).collect();
+            let powers: Vec<Q2> = (0..n_polys)
+                .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+                .collect();
+            assert_dot_slots_canonical(out_len, start, &polys, &powers);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn u160_add_product_pair_matches_scalar_u160() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let specials = [
+            0u64,
+            1,
+            2,
+            GF::ORDER - 1,
+            GF::ORDER,
+            GF::ORDER + 1,
+            u64::MAX,
+        ];
+        for &a0 in &specials {
+            for &b0 in &specials {
+                for &a1 in &specials {
+                    for &b1 in &specials {
+                        let mut acc0 = super::U160Acc::ZERO;
+                        let mut acc1 = super::U160Acc::ZERO;
+                        super::u160_add_product_pair(&mut acc0, a0, b0, &mut acc1, a1, b1);
+                        let (mut lo0, mut hi0) = (0u128, 0u32);
+                        let (mut lo1, mut hi1) = (0u128, 0u32);
+                        super::u160_add_product(&mut lo0, &mut hi0, a0, b0);
+                        super::u160_add_product(&mut lo1, &mut hi1, a1, b1);
+                        assert_eq!(
+                            (acc0.lo as u128) | ((acc0.mid as u128) << 64),
+                            lo0
+                        );
+                        assert_eq!(acc0.hi as u32, hi0);
+                        assert_eq!(
+                            (acc1.lo as u128) | ((acc1.mid as u128) << 64),
+                            lo1
+                        );
+                        assert_eq!(acc1.hi as u32, hi1);
+                    }
+                }
+            }
+        }
+
+        let mut acc0 = super::U160Acc::ZERO;
+        let mut acc1 = super::U160Acc::ZERO;
+        let (mut lo0, mut hi0) = (0u128, 0u32);
+        let (mut lo1, mut hi1) = (0u128, 0u32);
+        for _ in 0..64 {
+            let a0 = next();
+            let b0 = next();
+            let a1 = next();
+            let b1 = next();
+            super::u160_add_product_pair(&mut acc0, a0, b0, &mut acc1, a1, b1);
+            super::u160_add_product(&mut lo0, &mut hi0, a0, b0);
+            super::u160_add_product(&mut lo1, &mut hi1, a1, b1);
+        }
+        assert_eq!((acc0.lo as u128) | ((acc0.mid as u128) << 64), lo0);
+        assert_eq!(acc0.hi as u32, hi0);
+        assert_eq!((acc1.lo as u128) | ((acc1.mid as u128) << 64), lo1);
+        assert_eq!(acc1.hi as u32, hi1);
     }
 }

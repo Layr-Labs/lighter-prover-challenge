@@ -542,7 +542,50 @@ fn prove_path(
                 } else {
                     1
                 };
-            if in_flight.len() >= max_in_flight {
+            if next_witness.is_none() {
+                // Drain has begun: this was the last tx proof this path will
+                // spawn. Join every already-retired in-flight proof and spawn
+                // its chain step now so Phase-1 (tx-proof-only) starts before
+                // the blocking drain, without waiting for the light window to
+                // fill. The pipelined branch below is unchanged on purpose:
+                // joining a finished proof while we still spawn replacements
+                // would shrink depth-6 overlap toward depth 4. Measured: 6
+                // beats 4 by ~4.6% on a quiet host and the ordering inverts
+                // under load (see `light_tx_proof_window`).
+                while in_flight
+                    .front()
+                    .is_some_and(|(_, handle)| handle.is_finished())
+                {
+                    let (proof_step, proof_handle) = in_flight
+                        .pop_front()
+                        .expect("finished drain prefix must not be empty");
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _join_wait =
+                        plonky2::util::profile::span("wait", "tx_proof_drain_early_join");
+                    let tx_proof = proof_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    let previous = chain.take();
+                    plonky2::hash::poseidon2::spine_backlog_add(1);
+                    let handle = std::thread::Builder::new()
+                        .name(format!("{path:?}-chain-drain-{proof_step}"))
+                        .stack_size(PROVER_THREAD_STACK_BYTES)
+                        .spawn_scoped(scope, move || {
+                            chain_step_proof(
+                                path,
+                                chain_target,
+                                chain_data,
+                                proof_step,
+                                previous,
+                                base,
+                                dummy_proof,
+                                &tx_proof,
+                            )
+                        })
+                        .expect("chain drain thread must start");
+                    chain = Some(ChainState::InFlight(handle));
+                }
+            } else if in_flight.len() >= max_in_flight {
                 let (proof_step, proof_handle) = in_flight
                     .pop_front()
                     .expect("transaction proof window must not be empty");
@@ -587,11 +630,13 @@ fn prove_path(
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases — but only once this path is the
-        // last one proving, since the switch is process-global (see
+        // Past this point the pipeline spawns no new chunk work. Any
+        // already-retired prefix was joined and spawned on the last spawn
+        // iteration; the loop below blocking-joins the remainder. The drain
+        // is the strictly sequential chain tail, so its mid-size commitment
+        // trees can use the mostly idle GPU exactly like the pre-execution
+        // and final block phases — but only once this path is the last one
+        // proving, since the switch is process-global (see
         // [`claims_exclusive_gpu_phase`]).
         let mut exclusive_drain = false;
         #[cfg(feature = "diagnostic_profile")]
