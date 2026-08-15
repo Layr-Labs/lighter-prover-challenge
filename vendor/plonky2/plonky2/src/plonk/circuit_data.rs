@@ -368,35 +368,58 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 #[derive(Eq, PartialEq, Debug)]
 pub struct GeneratorWatchIndex {
     offsets: Vec<u32>,
-    watchers: Vec<usize>,
+    watchers: Vec<u32>,
     entries: usize,
 }
 
 impl GeneratorWatchIndex {
-    pub fn from_map(map: BTreeMap<usize, Vec<usize>>) -> Self {
-        let entries = map.values().filter(|watchers| !watchers.is_empty()).count();
+    /// Builds the CSR from the legacy `usize` map representation, narrowing every watcher with a
+    /// checked conversion. `generator_count` is part of the validation boundary: no stored watcher
+    /// may name a generator outside the corresponding generator array.
+    pub fn from_map(map: BTreeMap<usize, Vec<usize>>, generator_count: usize) -> Self {
+        let narrowed = map
+            .into_iter()
+            .map(|(representative, watchers)| {
+                let watchers = watchers
+                    .into_iter()
+                    .map(|watcher| {
+                        let watcher = u32::try_from(watcher)
+                            .expect("generator watcher index exceeds u32");
+                        assert!(
+                            (watcher as usize) < generator_count,
+                            "generator watcher index out of range"
+                        );
+                        watcher
+                    })
+                    .collect();
+                (representative, watchers)
+            })
+            .collect();
+        Self::from_u32_map(narrowed, generator_count)
+            .expect("invalid generator watcher index map")
+    }
+
+    /// The generic deserializer already reads checked `usize`-encoded `u32` words, so it can avoid
+    /// widening them merely to narrow them again here.
+    pub(crate) fn from_u32_map(
+        map: BTreeMap<usize, Vec<u32>>,
+        generator_count: usize,
+    ) -> Option<Self> {
         let Some((&max_representative, _)) = map.last_key_value() else {
-            return Self {
-                offsets: vec![0],
-                watchers: Vec::new(),
-                entries: 0,
-            };
+            return Self::from_parts(vec![0], Vec::new(), generator_count);
         };
 
-        let offsets_len = max_representative
-            .checked_add(2)
-            .expect("generator watch representative index overflow");
-        let total_watchers = map.values().map(Vec::len).sum::<usize>();
-        assert!(
-            u32::try_from(total_watchers).is_ok(),
-            "generator watch index exceeds u32 offsets"
-        );
+        let offsets_len = max_representative.checked_add(2)?;
+        let total_watchers = map
+            .values()
+            .try_fold(0usize, |total, watchers| total.checked_add(watchers.len()))?;
+        u32::try_from(total_watchers).ok()?;
 
         let mut offsets = vec![0u32; offsets_len];
         let mut watchers = Vec::with_capacity(total_watchers);
         let mut entries_iter = map.into_iter().peekable();
         for representative in 0..=max_representative {
-            offsets[representative] = watchers.len() as u32;
+            offsets[representative] = u32::try_from(watchers.len()).ok()?;
             if entries_iter
                 .peek()
                 .is_some_and(|(key, _)| *key == representative)
@@ -405,14 +428,10 @@ impl GeneratorWatchIndex {
                 watchers.extend(representative_watchers);
             }
         }
-        offsets[max_representative + 1] = watchers.len() as u32;
+        offsets[max_representative + 1] = u32::try_from(watchers.len()).ok()?;
         debug_assert!(entries_iter.next().is_none());
 
-        Self {
-            offsets,
-            watchers,
-            entries,
-        }
+        Self::from_parts(offsets, watchers, generator_count)
     }
 
     /// Builds the CSR directly from consecutive, per-generator groups of sorted, distinct
@@ -424,11 +443,19 @@ impl GeneratorWatchIndex {
         representatives: &[u32],
         generator_watch_counts: &[usize],
     ) -> Self {
-        debug_assert_eq!(
-            generator_watch_counts.iter().sum::<usize>(),
-            representatives.len()
+        let counted = generator_watch_counts
+            .iter()
+            .try_fold(0usize, |total, &count| total.checked_add(count))
+            .expect("generator watch count overflow");
+        assert_eq!(counted, representatives.len());
+        assert!(
+            generator_watch_counts
+                .len()
+                .checked_sub(1)
+                .is_none_or(|last| u32::try_from(last).is_ok()),
+            "generator index exceeds u32"
         );
-        debug_assert!({
+        assert!({
             let mut end = 0usize;
             generator_watch_counts.iter().all(|&count| {
                 let start = end;
@@ -440,11 +467,8 @@ impl GeneratorWatchIndex {
         });
 
         let Some(&max_representative) = representatives.iter().max() else {
-            return Self {
-                offsets: vec![0],
-                watchers: Vec::new(),
-                entries: 0,
-            };
+            return Self::from_parts(vec![0], Vec::new(), generator_watch_counts.len())
+                .expect("empty generator watch index must be valid");
         };
         let max_representative = max_representative as usize;
         let offsets_len = max_representative
@@ -458,26 +482,29 @@ impl GeneratorWatchIndex {
         // First form cumulative end offsets. Counts live in slot `representative + 1`, so the
         // prefix sum is already the normal CSR layout before it is reused as a fill cursor below.
         let mut offsets = vec![0u32; offsets_len];
-        let mut entries = 0usize;
         for &representative in representatives {
             let count = &mut offsets[representative as usize + 1];
-            entries += usize::from(*count == 0);
-            *count += 1;
+            *count = count
+                .checked_add(1)
+                .expect("generator watch representative count exceeds u32");
         }
         let mut total = 0u32;
         for offset in &mut offsets[1..] {
-            total += *offset;
+            total = total
+                .checked_add(*offset)
+                .expect("generator watch index exceeds u32 offsets");
             *offset = total;
         }
-        debug_assert_eq!(total as usize, representatives.len());
+        assert_eq!(total as usize, representatives.len());
 
         // Fill each representative's slice backwards while visiting generators backwards. This
         // preserves the old ascending generator order without a second cursor array. Afterwards,
         // each end cursor has become the next representative's start, so one overlapping shift
         // restores the original CSR offsets.
-        let mut watchers = vec![0usize; representatives.len()];
+        let mut watchers = vec![0u32; representatives.len()];
         let mut group_end = representatives.len();
         for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
+            let generator = u32::try_from(generator).expect("generator index exceeds u32");
             let group_start = group_end - count;
             for &representative in &representatives[group_start..group_end] {
                 let cursor = &mut offsets[representative as usize + 1];
@@ -486,15 +513,12 @@ impl GeneratorWatchIndex {
             }
             group_end = group_start;
         }
-        debug_assert_eq!(group_end, 0);
+        assert_eq!(group_end, 0);
         offsets.copy_within(2.., 1);
         *offsets.last_mut().unwrap() = total;
 
-        Self {
-            offsets,
-            watchers,
-            entries,
-        }
+        Self::from_parts(offsets, watchers, generator_watch_counts.len())
+            .expect("builder produced an invalid generator watch index")
     }
 
     /// The raw CSR offset table (`representative -> [start, end)` into
@@ -504,39 +528,40 @@ impl GeneratorWatchIndex {
     }
 
     /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
-    pub fn watchers(&self) -> &[usize] {
+    pub fn watchers(&self) -> &[u32] {
         &self.watchers
     }
 
-    /// Rebuilds the index from its raw CSR parts (as exposed by
-    /// [`Self::offsets`] and [`Self::watchers`]); the `entries` count is a pure
-    /// function of the offsets and is re-derived. The offsets must be
-    /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
-    /// exactly as [`Self::from_map`] produces them.
-    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
-        assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
-        assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
-        assert_eq!(
-            *offsets.last().unwrap() as usize,
-            watchers.len(),
-            "watch index offsets must cover the watcher list"
-        );
-        let mut entries = 0usize;
-        for bounds in offsets.windows(2) {
-            assert!(bounds[0] <= bounds[1], "watch index offsets must be sorted");
-            if bounds[0] != bounds[1] {
-                entries += 1;
-            }
+    /// Rebuilds and validates the index from its raw CSR parts. Offsets must be non-empty,
+    /// monotonically nondecreasing, start at zero, and end exactly at `watchers.len()`. Every
+    /// watcher must name an existing generator.
+    pub fn from_parts(
+        offsets: Vec<u32>,
+        watchers: Vec<u32>,
+        generator_count: usize,
+    ) -> Option<Self> {
+        if offsets.first() != Some(&0)
+            || offsets.last().copied().map(|x| x as usize) != Some(watchers.len())
+            || offsets.windows(2).any(|bounds| bounds[0] > bounds[1])
+            || watchers
+                .iter()
+                .any(|&watcher| watcher as usize >= generator_count)
+        {
+            return None;
         }
-        Self {
+        let entries = offsets
+            .windows(2)
+            .filter(|bounds| bounds[0] != bounds[1])
+            .count();
+        Some(Self {
             offsets,
             watchers,
             entries,
-        }
+        })
     }
 
     #[inline]
-    pub fn get(&self, representative: &usize) -> Option<&[usize]> {
+    pub fn get(&self, representative: &usize) -> Option<&[u32]> {
         let end_index = representative.checked_add(1)?;
         let (&start, &end) = (
             self.offsets.get(*representative)?,
@@ -549,7 +574,7 @@ impl GeneratorWatchIndex {
         self.entries
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &[usize])> {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &[u32])> {
         self.offsets
             .windows(2)
             .enumerate()
@@ -949,14 +974,14 @@ mod generator_watch_index_tests {
     #[test]
     fn sparse_watch_index_preserves_lists_and_empty_representatives() {
         let map = BTreeMap::from([(1usize, vec![2usize, 5]), (4, vec![3])]);
-        let index = GeneratorWatchIndex::from_map(map);
+        let index = GeneratorWatchIndex::from_map(map, 6);
 
         assert_eq!(index.len(), 2);
         assert_eq!(index.get(&0), None);
-        assert_eq!(index.get(&1), Some([2usize, 5].as_slice()));
+        assert_eq!(index.get(&1), Some([2u32, 5].as_slice()));
         assert_eq!(index.get(&2), None);
         assert_eq!(index.get(&3), None);
-        assert_eq!(index.get(&4), Some([3usize].as_slice()));
+        assert_eq!(index.get(&4), Some([3u32].as_slice()));
         assert_eq!(index.get(&5), None);
 
         let entries = index
@@ -964,5 +989,41 @@ mod generator_watch_index_tests {
             .map(|(representative, watchers)| (representative, watchers.to_vec()))
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![(1, vec![2, 5]), (4, vec![3])]);
+    }
+
+    #[test]
+    fn raw_watch_index_parts_validate_offsets_and_generator_range() {
+        let valid = GeneratorWatchIndex::from_parts(vec![0, 0, 2, 3], vec![1, 3, 2], 4)
+            .expect("valid CSR parts rejected");
+        assert_eq!(valid.get(&1), Some([1u32, 3].as_slice()));
+        assert_eq!(valid.get(&2), Some([2u32].as_slice()));
+
+        assert!(GeneratorWatchIndex::from_parts(Vec::new(), Vec::new(), 0).is_none());
+        assert!(GeneratorWatchIndex::from_parts(vec![1], Vec::new(), 0).is_none());
+        assert!(GeneratorWatchIndex::from_parts(vec![0, 2, 1], vec![0], 1).is_none());
+        assert!(GeneratorWatchIndex::from_parts(vec![0, 0], vec![0], 1).is_none());
+        assert!(GeneratorWatchIndex::from_parts(vec![0, 1], vec![2], 2).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "generator watcher index out of range")]
+    fn map_watch_index_rejects_generator_out_of_range() {
+        let _ = GeneratorWatchIndex::from_map(BTreeMap::from([(0, vec![2])]), 2);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    #[should_panic(expected = "generator watcher index exceeds u32")]
+    fn map_watch_index_rejects_u32_overflow() {
+        let _ = GeneratorWatchIndex::from_map(
+            BTreeMap::from([(0, vec![u32::MAX as usize + 1])]),
+            u32::MAX as usize + 2,
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn sorted_watch_index_rejects_inconsistent_group_counts() {
+        let _ = GeneratorWatchIndex::from_sorted_generator_representatives(&[0, 1], &[1]);
     }
 }
