@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// exp49x-joelchristianai3-jpg-1786754350587
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -170,6 +170,7 @@ impl Circuits {
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
+        self.pre_data.prover_only.sigmas = Vec::new();
         for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
@@ -184,6 +185,7 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            data.prover_only.sigmas = Vec::new();
         }
     }
 
@@ -220,6 +222,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            data.prover_only.sigmas = Vec::new();
         }
     }
 
@@ -244,6 +247,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            data.prover_only.sigmas = Vec::new();
         }
     }
 
