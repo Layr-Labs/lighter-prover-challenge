@@ -42,45 +42,25 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
 // Keep the promoted writer path while exercising a second submission from that baseline.
-// The serialized proof measures ~196 KB at the ranked circuit shapes, so the
-// prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
-// a single write(2) with ~2.6x headroom over the measured size, while cutting
-// the per-worker buffer allocation 4x. Value-exact: buffer capacity changes
-// only syscall batching, never the serialized bytes.
-const PROOF_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
+const PROOF_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
 
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let profile_process = plonky2::util::profile::span("process", "prove_worker");
-    // First statements in the process: the Metal shader compile and pipeline
+    // First statement in the process: the Metal shader compile and pipeline
     // lowering behind the GPU hash path cost the better part of a second on a
     // cold OS shader cache, and the benchmark sandbox denies writes to that
     // cache, which disables it entirely — so every scored worker pays the full
     // price. Starting it here overlaps it with the startup work below instead
     // of stalling the first proving step that wants the GPU. Pure scheduling:
     // the compiled kernels are identical either way.
-    //
-    // Before submitting the prewarm, register the proof-output directory as the
-    // staging area for the prebuilt pipeline archive: `MTLBinaryArchive` opens
-    // from a file URL only, and that directory is the one path the ranked
-    // Seatbelt profile lets this process write. An archive hit lets the prewarm
-    // skip the AIR->ISA lowering outright. Reading argv here — and asserting its
-    // shape only after the prewarm is in flight — keeps the lowering off the
-    // critical path even by the few microseconds argument handling costs.
-    let mut args = env::args().skip(1);
-    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
-    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
-    if let Some(dir) = std::path::Path::new(&output).parent() {
-        plonky2::hash::poseidon2::set_pipeline_archive_dir(dir);
-    }
     {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("startup", "metal_prewarm_submit");
         plonky2::hash::poseidon2::prewarm_gpu();
     }
-    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
@@ -95,12 +75,27 @@ fn main() {
         rayon::current_num_threads() as u64,
     );
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
+    let mut args = env::args().skip(1);
+    let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
+    let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    assert!(args.next().is_none(), "usage: prove FIXTURE OUTPUT");
+
+    // Read once. The pre-execution circuit does not read `txs`; strip that
+    // array so its serde parse can start immediately, and keep the original
+    // bytes as the authority for the full block parse, which now overlaps
+    // the pre-execution proof instead of delaying it.
+    let json = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span = plonky2::util::profile::span("startup", "fixture_read");
+        fs::read(&fixture).expect("cannot read prover fixture")
+    };
+    let stripped = circuit::block::without_top_level_txs(&json);
+    let full_block_handle = std::thread::Builder::new()
+        .name("full-fixture-parse".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
             #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
+            let _span = plonky2::util::profile::span("startup", "fixture_full_parse");
             Block::<F>::from_json_with_empty_txs(
                 &json,
                 HEAVY_TX_PER_PROOF,
@@ -109,6 +104,13 @@ fn main() {
                 PUBLIC_LIGHT_TX_COUNT,
             )
             .expect("invalid prover fixture")
+        })
+        .expect("full fixture parse thread must start");
+    let (pre_block, pre_circuits) = rayon::join(
+        || {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = plonky2::util::profile::span("startup", "pre_exec_fixture_parse");
+            Block::<F>::from_json_pre_exec_only(&stripped).expect("invalid prover fixture header")
         },
         || {
             #[cfg(feature = "diagnostic_profile")]
@@ -143,7 +145,7 @@ fn main() {
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
-            circuit::block_pre_execution::BlockPreExec::from_block(&block)
+            circuit::block_pre_execution::BlockPreExec::from_block(&pre_block)
         };
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
@@ -205,6 +207,9 @@ fn main() {
         }
         None => Circuits::load(),
     };
+    let block = full_block_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
@@ -267,4 +272,6 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// zarar-arc-1
+// arithmetic-on-promoted-frontier-1786506400
+
+// p90-fire-top1-50-1786515495
