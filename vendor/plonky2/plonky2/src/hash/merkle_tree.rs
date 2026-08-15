@@ -515,11 +515,12 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 const GATHER_TILE_LEAVES: usize = 16;
 
 /// Widest leaf the gathering path keeps on the stack. The tile is
-/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (4 KiB at
-/// `size_of::<F>() == 8`), and one tile is live per recursion frame, so the
-/// bound also bounds the recursion's stack growth. Wider leaves take the
-/// materializing path in [`MerkleTree::new_column_store`].
-const GATHER_MAX_WIDTH: usize = 32;
+/// `GATHER_TILE_LEAVES * GATHER_MAX_WIDTH` field elements (17 KiB at
+/// `size_of::<F>() == 8`). The array is created only in the base case, so one
+/// tile is live per active leaf task rather than at every recursion level.
+/// Wider leaves take the materializing path in
+/// [`MerkleTree::new_column_store`].
+const GATHER_MAX_WIDTH: usize = 136;
 
 /// [`fill_subtree_flat`] over natural-order columns instead of a materialized
 /// bit-reversed row-major matrix: leaf `i` of the tree is
@@ -844,15 +845,37 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             ColumnStore::Owned(owned) => crate::util::transpose_to_bitrev_flat(owned),
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
             ColumnStore::Shared(_) => {
-                let mut flat = vec![F::ZERO; num_leaves * num_columns];
-                flat.par_chunks_mut(num_columns)
-                    .enumerate()
-                    .for_each(|(leaf, row)| {
-                        let natural = crate::util::reverse_bits(leaf, log_rows);
-                        for (column, value) in row.iter_mut().enumerate() {
-                            *value = columns.col(column)[natural];
-                        }
-                    });
+                // The fill below writes every slot of this buffer before anything
+                // reads it, so the zeroing `vec![F::ZERO; _]` performed first was a
+                // dead store pass over the whole `num_leaves * num_columns`
+                // allocation — tens of megabytes at the shapes this path sees, and
+                // not `calloc`-elidable because the pass then dirties every page
+                // anyway. Reserving the capacity uninitialized and writing straight
+                // into it is the pattern the sibling `Owned` arm of this same match
+                // already uses (`crate::util::transpose_to_bitrev_flat`). The values
+                // written, their order, and the buffer handed to `cpu_digests` are
+                // unchanged.
+                let mut flat: Vec<F> = Vec::with_capacity(num_leaves * num_columns);
+                {
+                    let spare =
+                        &mut flat.spare_capacity_mut()[..num_leaves * num_columns];
+                    spare
+                        .par_chunks_mut(num_columns)
+                        .enumerate()
+                        .for_each(|(leaf, row)| {
+                            let natural = crate::util::reverse_bits(leaf, log_rows);
+                            for (column, slot) in row.iter_mut().enumerate() {
+                                slot.write(columns.col(column)[natural]);
+                            }
+                        });
+                }
+
+                // SAFETY: `par_chunks_mut(num_columns)` partitions the whole
+                // `num_leaves * num_columns` prefix into `num_leaves` disjoint chunks
+                // of exactly `num_columns` slots (the length is an exact multiple, so
+                // there is no short remainder), and the loop above writes every slot
+                // of every chunk exactly once, so the prefix is fully initialized.
+                unsafe { flat.set_len(num_leaves * num_columns) };
                 flat
             }
         };
@@ -1156,6 +1179,14 @@ pub(crate) mod tests {
             (20, 9, 2),
             (31, 7, 1),
             (32, 11, 4),
+            (33, 7, 2),
+            (40, 9, 3),
+            (63, 8, 4),
+            (64, 10, 4),
+            (65, 7, 2),
+            (82, 9, 3),
+            (135, 8, 4),
+            (136, 10, 4),
         ] {
             let n = 1usize << log_n;
             let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
@@ -1279,5 +1310,97 @@ pub(crate) mod tests {
         }
 
         Ok(())
+    }
+
+    /// The `ColumnStore::Shared` arm of [`MerkleTree::new_column_store`]'s
+    /// materializing fallback — the arm taken when a shared allocation is
+    /// admitted but the GPU then declines the build that follows it — fills a
+    /// reservation of uninitialized capacity rather than overwriting a zeroed
+    /// buffer. Nothing else in this suite reaches that arm: the gathering path
+    /// above it absorbs every width up to `GATHER_MAX_WIDTH`, and every tree
+    /// this prover builds is narrower than that.
+    ///
+    /// So the reservation is checked here against the sibling `Owned` arm of
+    /// the same `match`, which materializes the same matrix through
+    /// `transpose_to_bitrev_flat`. Both arms hand their buffer to the same
+    /// `cpu_digests`, and every element of a leaf feeds its digest, so
+    /// agreement on raw digest limbs is agreement on every slot of the
+    /// buffer: a slot left uninitialized, or written with the wrong value,
+    /// moves the digest of the leaf that contains it.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn shared_column_fallback_matches_owned() {
+        use crate::hash::poseidon2::metal;
+
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        // Wider than the gathering path accepts, so the materializing `match`
+        // is reached at all. The shape is then chosen so `gpu_worthwhile` is
+        // true under the exclusive-phase cutoff (2^16 permutations) and false
+        // under the ordinary one (2^19): 25 * 4096 leaf permutations + 4095
+        // parent permutations = 106495. The allocation is therefore admitted
+        // and the build that follows it is declined, which is precisely the
+        // pairing that reaches the arm under test.
+        const WIDTH: usize = 200;
+        const LOG_N: usize = 12;
+        const CAP_HEIGHT: usize = 0;
+        assert!(WIDTH > GATHER_MAX_WIDTH);
+        let n = 1usize << LOG_N;
+
+        let columns: Vec<Vec<F>> = (0..WIDTH).map(|_| F::rand_vec(n)).collect();
+
+        metal::set_exclusive_gpu_phase(true);
+        // The allocation entry point spends a one-shot latch while the Metal
+        // context is still coming up; the request after it routes normally.
+        let mut shared = None;
+        for _ in 0..3 {
+            shared = metal::allocate_columns::<F>(WIDTH, n, CAP_HEIGHT);
+            if shared.is_some() {
+                break;
+            }
+        }
+        metal::set_exclusive_gpu_phase(false);
+
+        let Some(mut shared) = shared else {
+            // No Metal device on this host: no shared store can exist, so the
+            // arm is unreachable here rather than unchecked.
+            return;
+        };
+
+        {
+            let mut slots = shared.columns_mut().expect("a fresh handle is unique");
+            assert_eq!(slots.len(), WIDTH);
+            for (slot, column) in slots.iter_mut().zip(&columns) {
+                slot.copy_from_slice(column);
+            }
+        }
+
+        let got = MerkleTree::<F, H>::new_column_store(ColumnStore::Shared(shared), CAP_HEIGHT);
+        let want = MerkleTree::<F, H>::new_column_store(ColumnStore::Owned(columns), CAP_HEIGHT);
+
+        // Both must have taken the CPU fallback: a GPU-built tree carries its
+        // digests in `level_digests` instead, which would leave the comparison
+        // below comparing two empty vectors.
+        assert!(
+            got.level_digests.is_none(),
+            "the shared-column CPU fallback was not reached"
+        );
+        assert!(
+            want.level_digests.is_none(),
+            "the owned CPU fallback was not reached"
+        );
+        assert!(!got.digests.is_empty());
+
+        let raw = |digests: &[<H as Hasher<F>>::Hash]| -> Vec<u64> {
+            digests
+                .iter()
+                .flat_map(|hash| hash.elements.iter().map(|e| e.to_noncanonical_u64()))
+                .collect()
+        };
+        assert_eq!(raw(&got.digests), raw(&want.digests), "digests");
+        assert_eq!(raw(&got.cap.0), raw(&want.cap.0), "cap");
     }
 }
