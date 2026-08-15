@@ -110,6 +110,25 @@ pub trait Extendable<const D: usize>: Field + Sized {
         [a0 * b0 + Self::W * a1 * b1, a0 * b1 + a1 * b0]
     }
 
+    /// Internal hook backing `QuadraticExtension::multiply_accumulate`:
+    /// `acc + a * b` in GF(p^2). The default folds the addend into each
+    /// coordinate through the base field's own multiply-accumulate, which is
+    /// already one reduction per product rather than a product followed by a
+    /// separate add. A base field that delays reduction across a quadratic
+    /// product may instead fold `acc` into that wider accumulator.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn mul_acc_quadratic(acc: [Self; 2], a: [Self; 2], b: [Self; 2]) -> [Self; 2] {
+        let [c0, c1] = acc;
+        let [a0, a1] = a;
+        let [b0, b1] = b;
+        [
+            c0.multiply_accumulate(a0, b0)
+                .multiply_accumulate(Self::W * a1, b1),
+            c1.multiply_accumulate(a0, b1).multiply_accumulate(a1, b0),
+        ]
+    }
+
     /// Internal fixed-shape FRI hook. The default keeps the historical
     /// reversed Horner recurrence, including its raw field representation.
     /// A base field may specialize the production arity without changing the
