@@ -203,6 +203,19 @@ pub struct AdditionBaseGenerator<F: RichField + Extendable<D>, const D: usize> {
     i: usize,
 }
 
+impl<F: RichField + Extendable<D>, const D: usize> AdditionBaseGenerator<F, D> {
+    #[inline]
+    fn generated_value(&self, witness: &PartitionWitness<F>) -> (Target, F) {
+        let get_wire = |wire: usize| witness.get_target(Target::wire(self.row, wire));
+        let addend_0 = get_wire(AdditionGate::wire_ith_addend_0(self.i));
+        let addend_1 = get_wire(AdditionGate::wire_ith_addend_1(self.i));
+        let output_target = Target::wire(self.row, AdditionGate::wire_ith_output(self.i));
+        let computed_output = addend_0 * self.const_0 + addend_1 * self.const_1;
+        (output_target, computed_output)
+    }
+}
+
+
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
     for AdditionBaseGenerator<F, D>
 {
@@ -225,16 +238,12 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let get_wire = |wire: usize| -> F { witness.get_target(Target::wire(self.row, wire)) };
+        let (target, value) = self.generated_value(witness);
+        out_buffer.set_target(target, value)
+    }
 
-        let addend_0 = get_wire(AdditionGate::wire_ith_addend_0(self.i));
-        let addend_1 = get_wire(AdditionGate::wire_ith_addend_1(self.i));
-
-        let output_target = Target::wire(self.row, AdditionGate::wire_ith_output(self.i));
-
-        let computed_output = addend_0 * self.const_0 + addend_1 * self.const_1;
-
-        out_buffer.set_target(output_target, computed_output)
+    fn run_once_single(&self, witness: &PartitionWitness<F>) -> Option<Result<(Target, F)>> {
+        Some(Ok(self.generated_value(witness)))
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -263,6 +272,9 @@ mod tests {
     use anyhow::Result;
 
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::iop::generator::{GeneratedValues, SimpleGenerator};
+    use crate::iop::target::Target;
+    use crate::iop::witness::{PartitionWitness, WitnessWrite};
     use crate::gates::addition_base::AdditionGate;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::plonk::circuit_data::CircuitConfig;
@@ -295,4 +307,47 @@ mod tests {
             Some(U32QuotientGate::BaseAddition { num_ops: 26 })
         );
     }
+
+    #[test]
+    fn single_output_matches_buffered_raw_representatives() -> Result<()> {
+        type F = GoldilocksField;
+        const D: usize = 2;
+        const P: u64 = 0xffff_ffff_0000_0001;
+        let config = CircuitConfig::standard_recursion_config();
+        let representative_map = (0..config.num_wires).map(|i| i as u32).collect::<Vec<_>>();
+        let cases = [
+            (0, 1, P - 1, P),
+            (P, P + 1, u64::MAX, 1),
+            (u64::MAX - 1, u64::MAX, P + 1, P - 1),
+        ];
+
+        for (a, b, const_0, const_1) in cases {
+            let generator = super::AdditionBaseGenerator::<F, D> {
+                row: 0,
+                const_0: GoldilocksField(const_0),
+                const_1: GoldilocksField(const_1),
+                i: 0,
+            };
+            let mut witness = PartitionWitness::new(config.num_wires, 1, &representative_map);
+            witness.set_target(
+                Target::wire(0, AdditionGate::wire_ith_addend_0(0)),
+                GoldilocksField(a),
+            )?;
+            witness.set_target(
+                Target::wire(0, AdditionGate::wire_ith_addend_1(0)),
+                GoldilocksField(b),
+            )?;
+
+            let mut buffered = GeneratedValues::empty();
+            generator.run_once(&witness, &mut buffered)?;
+            let direct = generator
+                .run_once_single(&witness)
+                .expect("addition generator has a single-output fast path")?;
+            assert_eq!(buffered.target_values.len(), 1);
+            assert_eq!(buffered.target_values[0].0, direct.0);
+            assert_eq!(buffered.target_values[0].1.0, direct.1.0);
+        }
+        Ok(())
+    }
+
 }
