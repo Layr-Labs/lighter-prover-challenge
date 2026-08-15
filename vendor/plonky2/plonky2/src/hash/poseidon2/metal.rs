@@ -1994,20 +1994,48 @@ pub(crate) fn allocate_columns<F: RichField>(
     rows: usize,
     cap_height: usize,
 ) -> Option<MetalColumns<F>> {
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || cols == 0
-        || rows == 0
-        || !rows.is_power_of_two()
-        || rows > u32::MAX as usize
-        || cols > u32::MAX as usize
-        || cap_height > rows.ilog2() as usize
-        || !gpu_worthwhile(cols, rows, cap_height)
-    {
+    if !columns_shape_supported::<F>(cols, rows, cap_height) {
         return None;
     }
 
     let context = ready_context_for_allocation(cols, rows)?;
+    allocate_columns_with_context(context, rows, cols)
+}
+
+/// Allocates shared columns after waiting for Metal initialization. This is
+/// reserved for restoring precomputed commitments whose downstream quotient
+/// kernels require GPU-visible constants; ordinary commitments keep using the
+/// nonblocking routing above.
+pub(crate) fn allocate_columns_blocking<F: RichField>(
+    cols: usize,
+    rows: usize,
+    cap_height: usize,
+) -> Option<MetalColumns<F>> {
+    if !columns_shape_supported::<F>(cols, rows, cap_height) {
+        return None;
+    }
+
+    let context = shared_context()?;
+    allocate_columns_with_context(context, rows, cols)
+}
+
+fn columns_shape_supported<F: RichField>(cols: usize, rows: usize, cap_height: usize) -> bool {
+    F::ORDER == 0xffff_ffff_0000_0001
+        && size_of::<F>() == size_of::<u64>()
+        && cols != 0
+        && rows != 0
+        && rows.is_power_of_two()
+        && rows <= u32::MAX as usize
+        && cols <= u32::MAX as usize
+        && cap_height <= rows.ilog2() as usize
+        && gpu_worthwhile(cols, rows, cap_height)
+}
+
+fn allocate_columns_with_context<F: RichField>(
+    context: &MetalShared,
+    rows: usize,
+    cols: usize,
+) -> Option<MetalColumns<F>> {
     match context.allocate_columns(rows, cols) {
         Ok(columns) => Some(columns),
         Err(error) => {
@@ -2049,7 +2077,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
+    // Exclusive phases stream the 2^17+ trees. Outside them, the
     // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
     // only when the GPU stream is unoccupied at entry, the same occupancy
     // condition gpu_worthwhile uses for the serial-critical shapes: streaming
@@ -2057,7 +2085,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // while an already-busy stream would just queue the absorb groups behind
     // another tree and stretch both.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0

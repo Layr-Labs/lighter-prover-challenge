@@ -8,6 +8,7 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
@@ -613,10 +614,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // partial-product traversal from the CPU without moving a transcript
         // barrier or changing an alpha exponent.
         assert_eq!(permutation_gate_scales.len(), num_challenges);
-        for k in 0..n {
-            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-            let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-            let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
+        let mut reduce_point = |k: usize, z1_0: F, z1_1: F| {
             let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
             for ((&alpha, &gate_scale), value) in alphas
                 .iter()
@@ -625,6 +623,59 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             {
                 let gate_terms = *value * gate_scale;
                 *value = z1_0 + z1_1 * alpha + gate_terms;
+            }
+        };
+        if let Some(l_0_xs) = z_h_on_coset.eval_l_0_slice(indices_batch[0], n) {
+            type Packing<F> = <F as Packable>::Packing;
+            let width = <Packing<F> as crate::field::packed::PackedField>::WIDTH;
+            let packed_len = n - n % width;
+            let (l_0_prefix, l_0_tail) = l_0_xs.split_at(packed_len);
+            let (z_0_prefix, z_0_tail) = zs_partial_products_cols[..n].split_at(packed_len);
+            let (z_1_prefix, z_1_tail) =
+                zs_partial_products_cols[n..2 * n].split_at(packed_len);
+            for (group, ((&l_0, &z_0), &z_1)) in
+                <Packing<F> as crate::field::packed::PackedField>::pack_slice(l_0_prefix)
+                .iter()
+                .zip(<Packing<F> as crate::field::packed::PackedField>::pack_slice(
+                    z_0_prefix,
+                ))
+                .zip(<Packing<F> as crate::field::packed::PackedField>::pack_slice(
+                    z_1_prefix,
+                ))
+                .enumerate()
+            {
+                let z1_0 = l_0
+                    * (z_0 - <Packing<F> as crate::field::packed::PackedField>::ONES);
+                let z1_1 = l_0
+                    * (z_1 - <Packing<F> as crate::field::packed::PackedField>::ONES);
+                for (lane, (&value_0, &value_1)) in
+                    <Packing<F> as crate::field::packed::PackedField>::as_slice(&z1_0)
+                        .iter()
+                        .zip(<Packing<F> as crate::field::packed::PackedField>::as_slice(
+                            &z1_1,
+                        ))
+                        .enumerate()
+                {
+                    reduce_point(group * width + lane, value_0, value_1);
+                }
+            }
+            for (offset, ((&l_0, &z_0), &z_1)) in
+                l_0_tail.iter().zip(z_0_tail).zip(z_1_tail).enumerate()
+            {
+                reduce_point(
+                    packed_len + offset,
+                    l_0 * z_0.sub_one(),
+                    l_0 * z_1.sub_one(),
+                );
+            }
+        } else {
+            for k in 0..n {
+                let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
+                reduce_point(
+                    k,
+                    l_0_x * zs_partial_products_cols[k].sub_one(),
+                    l_0_x * zs_partial_products_cols[n + k].sub_one(),
+                );
             }
         }
         return;

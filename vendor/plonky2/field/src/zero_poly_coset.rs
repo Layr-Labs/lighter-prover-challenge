@@ -28,6 +28,11 @@ pub struct ZeroPolyOnCoset<F: Field> {
     /// `(self.n * (x - F::ONE)).inverse()`, the value [`Self::eval_l_0`] computes without the
     /// table.
     l_0_denominator_inverses: Option<Arc<Vec<F>>>,
+    /// Optional complete `L_0(x)` values for every coset point. This is the
+    /// final product of `evals[i]` and `l_0_denominator_inverses[i]`, so a
+    /// prover-shape cache can remove that repeated multiplication as well as
+    /// the inversion.
+    l_0_evals: Option<Arc<Vec<F>>>,
 }
 
 impl<F: Field> ZeroPolyOnCoset<F> {
@@ -44,6 +49,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
             evals,
             inverses,
             l_0_denominator_inverses: None,
+            l_0_evals: None,
         }
     }
 
@@ -52,6 +58,13 @@ impl<F: Field> ZeroPolyOnCoset<F> {
     /// computing the per-point field inversion.
     pub fn with_l_0_denominator_inverses(mut self, table: Arc<Vec<F>>) -> Self {
         self.l_0_denominator_inverses = Some(table);
+        self
+    }
+
+    /// Attaches complete precomputed `L_0(x)` evaluations indexed by the
+    /// quotient-domain point.
+    pub fn with_l_0_evals(mut self, table: Arc<Vec<F>>) -> Self {
+        self.l_0_evals = Some(table);
         self
     }
 
@@ -78,11 +91,23 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 
     /// Returns `L_0(x) = Z_H(x)/(n * (x - 1))` with `x = w^i`.
     pub fn eval_l_0(&self, i: usize, x: F) -> F {
+        if let Some(table) = &self.l_0_evals {
+            return table[i];
+        }
         if let Some(table) = &self.l_0_denominator_inverses {
             // The table entry is bit-identical to the expression below, so the product is too.
             return self.eval(i) * table[i];
         }
         self.eval(i) * (self.n * (x - F::ONE)).inverse()
+    }
+
+    /// Returns a contiguous range of complete cached `L_0` evaluations when
+    /// available. Quotient batches use this to apply the field's preferred
+    /// packing without materializing another copy.
+    pub fn eval_l_0_slice(&self, i_start: usize, len: usize) -> Option<&[F]> {
+        self.l_0_evals
+            .as_ref()
+            .and_then(|table| table.get(i_start..i_start.checked_add(len)?))
     }
 }
 
