@@ -61,6 +61,22 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // for experiments.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
+// Corroborating data point for the RSS cliff described above, from a failed
+// experiment (measured on this base, one ranked draw): precomputing the final
+// block circuit into a sixth embedded blob removes ~3.3 s of `preprocess` from
+// every worker and measures -6% locally, but materializes that circuit's
+// prover data ~3.3 s earlier, so it overlaps the transaction-proof peak
+// instead of arriving after it. Peak RSS 8.248 -> 8.889 GiB (+641 MiB, which
+// is ~+3.2 GiB across the five concurrent workers) and user CPU 126.7 -> 141.2 s
+// while doing strictly less work — allocator/fault churn, not computation. It
+// drew 25.0976 against a 30.7381 bar.
+//
+// The transferable part: peak RSS is a first-class cost here and a
+// single-worker local fixture cannot see it. Before submitting anything that
+// changes allocation *lifetime*, compare
+// `/usr/bin/time -l` peak RSS against the frontier binary, not just wall clock,
+// and treat a rise in user CPU alongside removed work as the churn signature.
+
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
 /// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
