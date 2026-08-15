@@ -841,6 +841,39 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    // Wait for the heavy chain proof *before* materializing this
+                    // circuit. (Measured: peak RSS 8.724 -> 8.123 GiB mean over
+                    // seven alternating paired runs, -6.9%; median 8.911 ->
+                    // 8.022 GiB, -10%. Sampled RSS timeline peaks at t~9 s,
+                    // which is the window this join covers. Draw history for this
+                    // change: 24.38, 24.21, 25.43, 25.86, 25.48 — all slow-pool, so the
+                    // ranked effect is still unmeasured, not disproven.) The block circuit is leaked and therefore resident
+                    // from construction until process exit, and constructing it
+                    // first put ~all of it across the run's peak-RSS window: a
+                    // sampled RSS timeline peaks at t~9 s, which is precisely the
+                    // window this join was covering. The scored configuration runs
+                    // five concurrent workers on a 48 GiB host at ~8.25 GiB each
+                    // (~41 GiB in flight), and `light_tx_proof_window`'s comment
+                    // documents a collapse at ~9.5 GiB per worker from
+                    // allocator/fault churn, so residency across that window is
+                    // the expensive property, not the CPU spent building.
+                    //
+                    // Nothing is lost by reordering. The only work that preceded
+                    // the join was this construction plus the early witness phase,
+                    // whose output is not read until the final block proof — which
+                    // cannot start before the heavy chain proof exists anyway. The
+                    // lane previously finished ~9.6 s into a run whose final block
+                    // proof begins ~20.5 s, i.e. it had ~11 s of slack; spending a
+                    // few of those seconds after the join instead of before it
+                    // keeps the same finish-by deadline with room to spare.
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _heavy_wait =
+                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
+                    let heavy_chain_proof = heavy_handle_outer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    #[cfg(feature = "diagnostic_profile")]
+                    drop(_heavy_wait);
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -861,16 +894,12 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`
-                    // returned above. Nothing reads those two circuits again:
+                    // returned just above (the construction now follows the join
+                    // rather than preceding it, but it still completes before
+                    // this point, so the release obligation is unchanged). Nothing reads those two circuits again:
                     // the light pipeline uses the light pair, and the final
                     // block proof uses only `block_data`, the three finished
                     // proofs and the block. Retire their preprocessed
