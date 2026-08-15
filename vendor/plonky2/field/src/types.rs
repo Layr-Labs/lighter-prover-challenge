@@ -589,6 +589,13 @@ pub trait PrimeField64: PrimeField + Field64 {
     fn to_canonical(&self) -> Self {
         Self::from_canonical_u64(self.to_canonical_u64())
     }
+
+    /// Compute two independent products. Implementations may interleave the lanes.
+    #[doc(hidden)]
+    #[inline(always)]
+    fn pair_multiply(x: [Self; 2], y: [Self; 2]) -> [Self; 2] {
+        [x[0] * y[0], x[1] * y[1]]
+    }
 }
 
 /// An iterator over the powers of a certain base element `b`: `b^0, b^1, b^2, ...`.

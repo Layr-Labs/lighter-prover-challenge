@@ -705,10 +705,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
-                            let mut numerator_0 = F::ONE;
-                            let mut numerator_1 = F::ONE;
-                            let mut denominator_0 = F::ONE;
-                            let mut denominator_1 = F::ONE;
+                            let mut numerators = [F::ONE; 2];
+                            let mut denominators = [F::ONE; 2];
                             for j in start..end {
                                 // A singleton routed copy component maps this position to itself:
                                 // sigma(i,j) = k_j * x. Its numerator and denominator factors are
@@ -723,16 +721,32 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let numerator_products = F::pair_multiply(
+                                    [beta_k_is_0[j], beta_k_is_1[j]],
+                                    [x; 2],
+                                );
+                                numerators = F::pair_multiply(
+                                    numerators,
+                                    [
+                                        wire_value + numerator_products[0] + gamma_0,
+                                        wire_value + numerator_products[1] + gamma_1,
+                                    ],
+                                );
+                                let denominator_products =
+                                    F::pair_multiply([beta_0, beta_1], [sigma; 2]);
+                                denominators = F::pair_multiply(
+                                    denominators,
+                                    [
+                                        wire_value + denominator_products[0] + gamma_0,
+                                        wire_value + denominator_products[1] + gamma_1,
+                                    ],
+                                );
                             }
                             let output = t * num_chunks + chunk;
-                            products_0[output].write(numerator_0);
-                            products_1[output].write(numerator_1);
-                            denominators_0.push(denominator_0);
-                            denominators_1.push(denominator_1);
+                            products_0[output].write(numerators[0]);
+                            products_1[output].write(numerators[1]);
+                            denominators_0.push(denominators[0]);
+                            denominators_1.push(denominators[1]);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both

@@ -7,6 +7,8 @@ use num::{BigUint, Integer, ToPrimitive};
 use plonky2_util::{assume, branch_hint};
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_arch = "aarch64")]
+use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 use crate::ops::Square;
 use crate::types::{Field, Field64, PrimeField, PrimeField64, Sample};
 
@@ -273,6 +275,12 @@ impl PrimeField64 for GoldilocksField {
     #[inline(always)]
     fn to_noncanonical_u64(&self) -> u64 {
         self.0
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn pair_multiply(x: [Self; 2], y: [Self; 2]) -> [Self; 2] {
+        (NeonGoldilocksField(x) * NeonGoldilocksField(y)).0
     }
 }
 
