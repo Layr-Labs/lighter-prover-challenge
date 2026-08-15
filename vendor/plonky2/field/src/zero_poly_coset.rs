@@ -77,6 +77,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
     }
 
     /// Returns `L_0(x) = Z_H(x)/(n * (x - 1))` with `x = w^i`.
+    #[inline(always)]
     pub fn eval_l_0(&self, i: usize, x: F) -> F {
         if let Some(table) = &self.l_0_denominator_inverses {
             // The table entry is bit-identical to the expression below, so the product is too.
