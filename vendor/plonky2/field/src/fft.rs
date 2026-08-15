@@ -1021,6 +1021,153 @@ fn fft_classic_simd_single_layer_neon_ext(
     }
 }
 
+/// Two consecutive FRI butterfly layers over quadratic-extension elements in
+/// one traversal, for full-array ranges whose passes leave the caches.
+///
+/// Mirrors `fft_classic_simd_two_layers_neon` for the base field: blocks of
+/// `4q` extension elements split into quarters A|B|C|D at stride `q`; layer
+/// `lg_half_m` pairs (A[j],B[j]) and (C[j],D[j]) with `w1_row[j]`, then layer
+/// `lg_half_m + 1` pairs (A[j],C[j]) with `w2_lo[j]` and (B[j],D[j]) with
+/// `w2_hi[j]`. Same blocks, pairing, twiddles and per-element order as running
+/// `fft_classic_simd_single_layer_neon_ext` for the two layers back to back.
+/// Each extension product uses the row-level base-subfield fast path when every
+/// twiddle is `[w, 0]` (two base multiplications instead of four), and the
+/// butterfly add/sub reductions run as two-lane vectors reproducing
+/// `impl Add/Sub for GoldilocksField` word for word. The extension field is
+/// `WIDTH == 1`, so unlike the base-field packed kernel there is no packed-value
+/// spilling: each iteration carries a single `[GoldilocksField; 2]` element.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_two_layers_neon_ext(
+    values: &mut [crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    lg_half_m: usize,
+    w1_row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    w2_row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    const W: u64 = 7;
+    debug_assert!(lg_half_m >= 1);
+    let q = 1usize << lg_half_m;
+    let w1_row = &w1_row[..q];
+    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+
+    let base_subfield = w1_row.iter().all(|w| w.0[1].0 == 0)
+        && w2_lo.iter().all(|w| w.0[1].0 == 0)
+        && w2_hi.iter().all(|w| w.0[1].0 == 0);
+
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        for block in values.chunks_exact_mut(4 * q) {
+            let (ab, cd) = block.split_at_mut(2 * q);
+            let (quarter_a, quarter_b) = ab.split_at_mut(q);
+            let (quarter_c, quarter_d) = cd.split_at_mut(q);
+            for j in 0..q {
+                let a = *quarter_a.get_unchecked(j);
+                let b = *quarter_b.get_unchecked(j);
+                let c = *quarter_c.get_unchecked(j);
+                let d = *quarter_d.get_unchecked(j);
+                let w1 = *w1_row.get_unchecked(j);
+                let w2l = *w2_lo.get_unchecked(j);
+                let w2h = *w2_hi.get_unchecked(j);
+
+                // Stage-1 products t1 = w1*b and t2 = w1*d.
+                let (t1_0, t1_1) = if base_subfield {
+                    let p = NeonGoldilocksField([w1.0[0], w1.0[0]])
+                        * NeonGoldilocksField([b.0[0], b.0[1]]);
+                    (p.0[0].0, p.0[1].0)
+                } else {
+                    let wv = NeonGoldilocksField([w1.0[0], w1.0[1]]);
+                    let p = wv * NeonGoldilocksField([b.0[0], b.0[1]]);
+                    let qq = wv * NeonGoldilocksField([b.0[1], b.0[0]]);
+                    ((p.0[0] + GoldilocksField(W) * p.0[1]).0, (qq.0[0] + qq.0[1]).0)
+                };
+                let (t2_0, t2_1) = if base_subfield {
+                    let p = NeonGoldilocksField([w1.0[0], w1.0[0]])
+                        * NeonGoldilocksField([d.0[0], d.0[1]]);
+                    (p.0[0].0, p.0[1].0)
+                } else {
+                    let wv = NeonGoldilocksField([w1.0[0], w1.0[1]]);
+                    let p = wv * NeonGoldilocksField([d.0[0], d.0[1]]);
+                    let qq = wv * NeonGoldilocksField([d.0[1], d.0[0]]);
+                    ((p.0[0] + GoldilocksField(W) * p.0[1]).0, (qq.0[0] + qq.0[1]).0)
+                };
+
+                // A/B and C/D stage-1 butterflies.
+                let av = vcombine_u64(vcreate_u64(a.0[0].0), vcreate_u64(a.0[1].0));
+                let t1v = vcombine_u64(vcreate_u64(t1_0), vcreate_u64(t1_1));
+                let ab0 = gl_add_neon(av, t1v, eps);
+                let ab1 = gl_sub_neon(av, t1v, eps);
+                let cv = vcombine_u64(vcreate_u64(c.0[0].0), vcreate_u64(c.0[1].0));
+                let t2v = vcombine_u64(vcreate_u64(t2_0), vcreate_u64(t2_1));
+                let cd0 = gl_add_neon(cv, t2v, eps);
+                let cd1 = gl_sub_neon(cv, t2v, eps);
+
+                // Stage-2 products t3 = w2l*cd0 and t4 = w2h*cd1.
+                let cd0_0 = vgetq_lane_u64(cd0, 0);
+                let cd0_1 = vgetq_lane_u64(cd0, 1);
+                let cd1_0 = vgetq_lane_u64(cd1, 0);
+                let cd1_1 = vgetq_lane_u64(cd1, 1);
+                let (t3_0, t3_1) = if base_subfield {
+                    let p = NeonGoldilocksField([w2l.0[0], w2l.0[0]])
+                        * NeonGoldilocksField([GoldilocksField(cd0_0), GoldilocksField(cd0_1)]);
+                    (p.0[0].0, p.0[1].0)
+                } else {
+                    let wv = NeonGoldilocksField([w2l.0[0], w2l.0[1]]);
+                    let p = wv * NeonGoldilocksField([GoldilocksField(cd0_0), GoldilocksField(cd0_1)]);
+                    let qq = wv * NeonGoldilocksField([GoldilocksField(cd0_1), GoldilocksField(cd0_0)]);
+                    ((p.0[0] + GoldilocksField(W) * p.0[1]).0, (qq.0[0] + qq.0[1]).0)
+                };
+                let (t4_0, t4_1) = if base_subfield {
+                    let p = NeonGoldilocksField([w2h.0[0], w2h.0[0]])
+                        * NeonGoldilocksField([GoldilocksField(cd1_0), GoldilocksField(cd1_1)]);
+                    (p.0[0].0, p.0[1].0)
+                } else {
+                    let wv = NeonGoldilocksField([w2h.0[0], w2h.0[1]]);
+                    let p = wv * NeonGoldilocksField([GoldilocksField(cd1_0), GoldilocksField(cd1_1)]);
+                    let qq = wv * NeonGoldilocksField([GoldilocksField(cd1_1), GoldilocksField(cd1_0)]);
+                    ((p.0[0] + GoldilocksField(W) * p.0[1]).0, (qq.0[0] + qq.0[1]).0)
+                };
+
+                // Stage-2 butterflies: A = ab0 + t3, C = ab0 - t3, B = ab1 + t4,
+                // D = ab1 - t4.
+                let t3v = vcombine_u64(vcreate_u64(t3_0), vcreate_u64(t3_1));
+                let t4v = vcombine_u64(vcreate_u64(t4_0), vcreate_u64(t4_1));
+                let a_out = gl_add_neon(ab0, t3v, eps);
+                let c_out = gl_sub_neon(ab0, t3v, eps);
+                let b_out = gl_add_neon(ab1, t4v, eps);
+                let d_out = gl_sub_neon(ab1, t4v, eps);
+                *quarter_a.get_unchecked_mut(j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(a_out, 0)),
+                    GoldilocksField(vgetq_lane_u64(a_out, 1)),
+                ]);
+                *quarter_c.get_unchecked_mut(j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(c_out, 0)),
+                    GoldilocksField(vgetq_lane_u64(c_out, 1)),
+                ]);
+                *quarter_b.get_unchecked_mut(j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(b_out, 0)),
+                    GoldilocksField(vgetq_lane_u64(b_out, 1)),
+                ]);
+                *quarter_d.get_unchecked_mut(j) = QuadraticExtension([
+                    GoldilocksField(vgetq_lane_u64(d_out, 0)),
+                    GoldilocksField(vgetq_lane_u64(d_out, 1)),
+                ]);
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn fft_classic_simd_single_layer_with<P, M>(
     packed_values: &mut [P],
@@ -1208,6 +1355,13 @@ fn fft_classic_simd_fused_two_layers_with<P, M>(
 #[cfg(target_arch = "aarch64")]
 const FUSED_PAIR_MIN_SCALARS: usize = 1 << 16;
 
+/// Quadratic-extension (FRI) ranges at or above this many elements take
+/// consecutive layers two at a time through the fused pair-column kernel.
+/// The extension field is `WIDTH == 1` and streams two Goldilocks words per
+/// element, so its full-array passes are at least as memory-bound as the base
+/// field's; the same `1 << 16` threshold is used as the initial gate.
+const EXT_FUSED_MIN_SCALARS: usize = 1 << 16;
+
 /// Run FFT stages `start..end`, one whole-buffer pass each — except that
 /// base-field ranges streaming at least `FUSED_PAIR_MIN_SCALARS` take the
 /// stages two at a time, one whole-buffer pass per PAIR.
@@ -1296,6 +1450,94 @@ fn fft_classic_simd_layers<P, M>(
                     )
                 };
                 fft_classic_simd_two_layers_neon_w4(scalars, lg_half_m, w1_row, w2_row);
+                lg_half_m += 2;
+            }
+        }
+        if lg_half_m < end {
+            fft_classic_simd_single_layer_with::<P, M>(
+                packed_values,
+                lg_half_m,
+                lg_packed_width,
+                root_table,
+            );
+        }
+        return;
+    }
+
+    // Quadratic-extension (FRI) fused-pair arm: the extension field is
+    // `WIDTH == 1`, so every full-array transform streams two Goldilocks words
+    // per element and is memory-bound exactly like the base field's full-array
+    // passes. Fusing consecutive layers halves whole-array passes while keeping
+    // the same per-element arithmetic, mirroring the base-field pair-column
+    // win. Guarded on exact type identity the same way. The twiddle marker `M`
+    // is deliberately not referenced by the aarch64 arm because the extension
+    // kernels re-derive the base-subfield fast path from the rows themselves
+    // (matching `fft_classic_simd_single_layer_neon_ext`), which is correct for
+    // both markers; the generic arm passes `M` through as the base-field arm
+    // does.
+    if start + 2 <= end
+        && (packed_values.len() << lg_packed_width) >= EXT_FUSED_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::extension::quadratic::QuadraticExtension<
+                    crate::goldilocks_field::GoldilocksField,
+                >,
+            >()
+    {
+        let mut lg_half_m = start;
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: the `TypeId` compare proves `P` is exactly
+            // `QuadraticExtension<GoldilocksField>`, whose `PackedField` WIDTH
+            // is 1, so `packed_values` is exactly `len` contiguous extension
+            // elements with the same alignment (a single `[GoldilocksField; 2]`
+            // field, no padding). The omega rows already hold that element type.
+            let ext_values = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values.as_mut_ptr().cast::<
+                        crate::extension::quadratic::QuadraticExtension<
+                            crate::goldilocks_field::GoldilocksField,
+                        >,
+                    >(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            while lg_half_m + 2 <= end {
+                let w1_row = unsafe {
+                    let row = &root_table[lg_half_m];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<
+                            crate::extension::quadratic::QuadraticExtension<
+                                crate::goldilocks_field::GoldilocksField,
+                            >,
+                        >(),
+                        row.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    let row = &root_table[lg_half_m + 1];
+                    core::slice::from_raw_parts(
+                        row.as_ptr().cast::<
+                            crate::extension::quadratic::QuadraticExtension<
+                                crate::goldilocks_field::GoldilocksField,
+                            >,
+                        >(),
+                        row.len(),
+                    )
+                };
+                fft_classic_simd_two_layers_neon_ext(ext_values, lg_half_m, w1_row, w2_row);
+                lg_half_m += 2;
+            }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            while lg_half_m + 2 <= end {
+                fft_classic_simd_fused_two_layers_with::<P, M>(
+                    packed_values,
+                    lg_half_m,
+                    lg_packed_width,
+                    root_table,
+                );
                 lg_half_m += 2;
             }
         }
