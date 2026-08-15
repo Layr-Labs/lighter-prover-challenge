@@ -53,22 +53,20 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
-// The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
-// ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
-// occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
-// machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
-// for experiments.
-const LIGHT_TX_PROOF_WINDOW: usize = 6;
+// On the current decode/FRI/early-drop stack, three interleaved trusted A/B
+// pairs made depth 5 faster than depth 6 in every pair (including a heavily
+// loaded pair: 40.904 s vs 45.482 s). Depth 7 was slower than both. The
+// shallower queue reduces allocator/fault churn and GPU FIFO contention while
+// retaining enough transaction proofs to cover the serial chain spine.
+// LIGHTER_LIGHT_WINDOW remains available for experiments.
+const LIGHT_TX_PROOF_WINDOW: usize = 5;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
 /// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
 /// RSS on a 24 GiB machine — the collapse is allocator/fault churn from more
 /// concurrent proof allocations, not memory capacity, and a 48 GiB host runs
-/// the same allocator. Measured: depth 6 beats 4 by ~4.6% on a quiet
-/// machine; under heavy external load the ordering inverts, so depth tuning
-/// beyond 6 needs quiet-host evidence first.
+/// the same allocator.
 fn light_tx_proof_window() -> usize {
     static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WINDOW.get_or_init(|| {
@@ -827,7 +825,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -852,7 +849,7 @@ pub(crate) fn prove_block_after_pre(
                     let early = BlockCircuit::witness_inputs_early(
                         &block_target,
                         block_ref,
-                        pre_proof_ref,
+                        &pre_proof,
                     )
                     .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
@@ -861,6 +858,8 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
+                    // Every remaining stage consumes `pre_output`, not this proof.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
