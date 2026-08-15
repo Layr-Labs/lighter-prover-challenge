@@ -61,7 +61,21 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
 // machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
 // for experiments.
-const LIGHT_TX_PROOF_WINDOW: usize = 6;
+// Retuned 6 -> 4 for the *scored* configuration, which runs five concurrent
+// workers rather than the single worker a local run exercises. The depth-6
+// evidence above was gathered one worker at a time; with five workers sharing
+// 14 cores and 48 GiB against an 8.1-8.7 GiB per-worker peak, depth 6 puts
+// ~30 transaction proofs in flight machine-wide, into the allocator/fault
+// churn the ~9.5 GiB collapse note above describes.
+//
+// Measured with two concurrent workers (the smallest harness that reproduces
+// GPU sharing and memory contention at all), wall time until both finish.
+// On this base, three interleaved rounds: depth 6 = 44.77 s, depth 4 = 39.20 /
+// 39.76 / 42.62 s, mean 40.53 s (-9.5%), depth 4 winning every round. On the
+// previous base a fuller sweep gave depth 6 = 55.34 s, 5 = 53.63, 4 = 47.02
+// (-15.1%), 3 = 46.22 (-16.5%), 2 = 50.16 (-9.4%) — depth 2 being worse than 3
+// makes this an interior optimum rather than "less parallelism is better".
+const LIGHT_TX_PROOF_WINDOW: usize = 4;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
