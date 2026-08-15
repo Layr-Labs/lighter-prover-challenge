@@ -576,6 +576,14 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Divide a dense numerator batch by its denominator batch with Montgomery's
+/// trick, consuming each recovered inverse directly into its final quotient.
+///
+/// `inverse_scratch` retains only the stride-four prefix products. The previous
+/// path overwrote those prefixes with a complete inverse array, then immediately
+/// read that array back in a second loop to update `numerator_products`. Folding
+/// that sole consumer into the reverse walk removes one store and one load per
+/// element while preserving the inverse and quotient multiplication order.
 #[inline]
 fn divide_chunk_products<F: Field>(
     numerator_products: &mut [F],
@@ -583,9 +591,58 @@ fn divide_chunk_products<F: Field>(
     inverse_scratch: &mut Vec<F>,
 ) {
     debug_assert_eq!(numerator_products.len(), denominator_products.len());
-    F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
-    for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
-        *product *= inverse;
+
+    // Keep the field implementation's exact special-case formulas. Production
+    // batches are much larger; this branch also makes empty and short inputs
+    // inherit the established behavior without duplicating it.
+    const WIDTH: usize = 4;
+    let n = denominator_products.len();
+    if n < WIDTH {
+        F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+        for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
+            *product *= inverse;
+        }
+        return;
+    }
+
+    inverse_scratch.clear();
+    inverse_scratch.reserve(n);
+
+    // Four stride-interleaved prefix chains, identical to
+    // `Field::batch_multiplicative_inverse_into` at this exact base.
+    let mut cumul_prod: [F; WIDTH] = denominator_products[..WIDTH].try_into().unwrap();
+    inverse_scratch.extend(cumul_prod);
+    for (i, &denominator) in denominator_products[WIDTH..].iter().enumerate() {
+        let lane = i % WIDTH;
+        cumul_prod[lane] *= denominator;
+        inverse_scratch.push(cumul_prod[lane]);
+    }
+    debug_assert_eq!(inverse_scratch.len(), n);
+
+    let mut accumulator_inverses = {
+        let c01 = cumul_prod[0] * cumul_prod[1];
+        let c23 = cumul_prod[2] * cumul_prod[3];
+        let c0123_inverse = (c01 * c23).inverse();
+        let c01_inverse = c0123_inverse * c23;
+        let c23_inverse = c0123_inverse * c01;
+        [
+            c01_inverse * cumul_prod[1],
+            c01_inverse * cumul_prod[0],
+            c23_inverse * cumul_prod[3],
+            c23_inverse * cumul_prod[2],
+        ]
+    };
+
+    for i in (WIDTH..n).rev() {
+        let lane = i % WIDTH;
+        // This is the same recovered inverse previously written to
+        // `inverse_scratch[i]`; consume it before advancing the chain.
+        let inverse = inverse_scratch[i - WIDTH] * accumulator_inverses[lane];
+        numerator_products[i] *= inverse;
+        accumulator_inverses[lane] *= denominator_products[i];
+    }
+    for i in 0..WIDTH {
+        numerator_products[i] *= accumulator_inverses[i];
     }
 }
 
@@ -3077,7 +3134,7 @@ mod l_0_table_cache {
 #[cfg(test)]
 mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::{Field, PrimeField64};
+    use plonky2_field::types::{Field, Field64, PrimeField64};
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
@@ -3135,6 +3192,101 @@ mod flat_chunk_products_tests {
 
     fn raw(values: &[F]) -> Vec<u64> {
         values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    fn materialized_divide_chunk_products(
+        numerator_products: &mut [F],
+        denominator_products: &[F],
+        inverse_scratch: &mut Vec<F>,
+    ) {
+        F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+        for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
+            *product *= inverse;
+        }
+    }
+
+    /// Raw-representation differential for the consumer-fused reverse
+    /// Montgomery walk. It covers every short-path length, stride-four tails,
+    /// Rayon batch boundaries, and the exact 128-row by 10-chunk production
+    /// density. Denominators are always nonzero; numerators deliberately include
+    /// zero and noncanonical zero representatives.
+    #[test]
+    fn consumer_fused_division_matches_materialized_inverses_in_raw_limbs() {
+        const PRODUCT_EDGES: [u64; 9] = [
+            0,
+            1,
+            2,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        const DENOMINATOR_EDGES: [u64; 7] = [
+            1,
+            2,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        let lengths = (0..33).chain([
+            63usize, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1279, 1280,
+            1281,
+        ]);
+
+        for n in lengths {
+            for seed in 0..8u64 {
+                let mut state = seed.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let mut next = || {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state
+                };
+                let numerators = (0..n)
+                    .map(|i| {
+                        let raw = if i < PRODUCT_EDGES.len() {
+                            PRODUCT_EDGES[(i + seed as usize) % PRODUCT_EDGES.len()]
+                        } else {
+                            next()
+                        };
+                        F::from_noncanonical_u64(raw)
+                    })
+                    .collect::<Vec<_>>();
+                let denominators = (0..n)
+                    .map(|i| {
+                        let raw = if i < DENOMINATOR_EDGES.len() {
+                            DENOMINATOR_EDGES[(3 * i + seed as usize) % DENOMINATOR_EDGES.len()]
+                        } else {
+                            loop {
+                                let raw = next();
+                                if !F::from_noncanonical_u64(raw).is_zero() {
+                                    break raw;
+                                }
+                            }
+                        };
+                        F::from_noncanonical_u64(raw)
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut expected = numerators.clone();
+                let mut actual = numerators;
+                let mut expected_scratch = vec![F::from_noncanonical_u64(u64::MAX); n + 3];
+                let mut actual_scratch = vec![F::from_noncanonical_u64(F::ORDER + 1); n + 5];
+                materialized_divide_chunk_products(
+                    &mut expected,
+                    &denominators,
+                    &mut expected_scratch,
+                );
+                divide_chunk_products(&mut actual, &denominators, &mut actual_scratch);
+
+                assert_eq!(raw(&actual), raw(&expected), "length={n}, seed={seed}");
+                assert_eq!(actual_scratch.len(), n, "scratch length={n}, seed={seed}");
+            }
+        }
     }
 
     /// The Z accumulation exactly as `wires_permutation_partial_products_and_zs` performs it,

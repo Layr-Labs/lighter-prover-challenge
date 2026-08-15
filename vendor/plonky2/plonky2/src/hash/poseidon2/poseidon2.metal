@@ -621,26 +621,37 @@ kernel void permutation_quotient(
         ulong wire = wires[(ulong)j_start * lde_rows + source_row];
         ulong sigma = constants_sigmas[
             (ulong)(sigma_start + j_start) * lde_rows + source_row];
-        ulong beta_k0 = challenges[4u + j_start];
-        ulong beta_k1 = challenges[4u + num_routed_wires + j_start];
-        ulong numerator0 = gl_add(gl_mul_add(beta_k0, x, wire), gamma0);
-        ulong denominator0 = gl_add(gl_mul_add(beta0, sigma, wire), gamma0);
-        ulong numerator1 = gl_add(gl_mul_add(beta_k1, x, wire), gamma1);
-        ulong denominator1 = gl_add(gl_mul_add(beta1, sigma, wire), gamma1);
+
+        // Both factors for one challenge contain `wire + gamma`. Form that
+        // shared addend once, then finish the numerator and denominator with
+        // `gl_mul_add`. Reuse the temporary for challenge one before moving to
+        // the next wire so both shared addends and beta-k values are never live
+        // together in this register-heavy quotient kernel.
+        ulong wire_gamma = gl_add(wire, gamma0);
+        ulong numerator0 = gl_mul_add(challenges[4u + j_start], x, wire_gamma);
+        ulong denominator0 = gl_mul_add(beta0, sigma, wire_gamma);
+        wire_gamma = gl_add(wire, gamma1);
+        ulong numerator1 = gl_mul_add(
+            challenges[4u + num_routed_wires + j_start], x, wire_gamma);
+        ulong denominator1 = gl_mul_add(beta1, sigma, wire_gamma);
         for (uint j = j_start + 1u; j < j_end; ++j) {
             wire = wires[(ulong)j * lde_rows + source_row];
             sigma = constants_sigmas[
                 (ulong)(sigma_start + j) * lde_rows + source_row];
-            beta_k0 = challenges[4u + j];
-            beta_k1 = challenges[4u + num_routed_wires + j];
+
+            wire_gamma = gl_add(wire, gamma0);
             numerator0 = gl_mul(
-                numerator0, gl_add(gl_mul_add(beta_k0, x, wire), gamma0));
+                numerator0, gl_mul_add(challenges[4u + j], x, wire_gamma));
             denominator0 = gl_mul(
-                denominator0, gl_add(gl_mul_add(beta0, sigma, wire), gamma0));
+                denominator0, gl_mul_add(beta0, sigma, wire_gamma));
+
+            wire_gamma = gl_add(wire, gamma1);
             numerator1 = gl_mul(
-                numerator1, gl_add(gl_mul_add(beta_k1, x, wire), gamma1));
+                numerator1,
+                gl_mul_add(
+                    challenges[4u + num_routed_wires + j], x, wire_gamma));
             denominator1 = gl_mul(
-                denominator1, gl_add(gl_mul_add(beta1, sigma, wire), gamma1));
+                denominator1, gl_mul_add(beta1, sigma, wire_gamma));
         }
 
         uint previous_column0 = chunk == 0u ? 0u : 1u + chunk;

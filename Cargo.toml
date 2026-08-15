@@ -65,9 +65,10 @@ panic = "abort"
 # per-spawn weight. Stripping them cannot change what any instruction does.
 strip = "symbols"
 
-# bench/build.rs constructs and serializes the five startup circuits at
-# compile time. Build scripts default to opt-level 0, which would turn that
-# few-second construction into minutes of untimed-but-annoying work; compile
+# bench/build.rs constructs and serializes the five startup circuits and the
+# final block circuit at compile time. Build scripts default to opt-level 0,
+# which would turn that few-second construction into minutes of
+# untimed-but-annoying work; compile
 # the build-dependency graph optimized instead.
 [profile.release.build-override]
 opt-level = 3

@@ -1,4 +1,4 @@
-// Redraw marker opus-fatlib-33
+// threelay-1786660316
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -204,9 +204,10 @@ impl Circuits {
     /// remains, because every reader of these two circuits holds a shared guard
     /// for the whole span in which it may touch them — the heavy path from
     /// before its first witness until after its chain proof, and
-    /// [`Self::build_block_circuit`] for the duration of `BlockCircuit::define`.
-    /// The caller runs this after joining the heavy path's thread, so both
-    /// guards are already gone and the acquisition is uncontended.
+    /// [`Self::rebuild_block_circuit`] for the duration of a fallback
+    /// `BlockCircuit::define`. The caller runs this after joining the heavy
+    /// path's thread, so both guards are already gone and the acquisition is
+    /// uncontended.
     ///
     /// Value-exact and free: no quantity is computed differently and no work is
     /// added — storage that no subsequent read can reach is returned earlier.
@@ -227,9 +228,9 @@ impl Circuits {
     /// extensions as soon as the light path's thread has produced its chain
     /// proof. Same shape and proof obligation as
     /// [`Self::release_heavy_circuit_extensions`]: the light path holds the
-    /// shared guards for its whole run, [`Self::build_block_circuit`] holds a
-    /// light-chain guard for the duration of `define` (which finishes long
-    /// before the light path), and the caller joins the light thread before
+    /// shared guards for its whole run, [`Self::rebuild_block_circuit`] holds a
+    /// light-chain guard for the duration of a fallback `define` (which finishes
+    /// long before the light path), and the caller joins the light thread before
     /// acquiring the exclusive guard, so the acquisition is uncontended. The
     /// extensions are `2^19 * 88 + 2^17 * 86` field elements = 438 MiB of
     /// CPU-visible Metal shared buffers released seconds before
@@ -247,10 +248,36 @@ impl Circuits {
         }
     }
 
-    /// Builds the final block circuit, which depends on the pre-execution and
-    /// both chain circuits but is only needed for the final proof. Callers run
-    /// this concurrently with transaction/chain proving.
+    /// Loads the compile-time final block circuit, falling back to the legacy
+    /// fresh build if its checked shrunken blob is unavailable. Callers run
+    /// this lane concurrently with transaction/chain proving.
+    ///
+    /// `LIGHTER_BUILD_BLOCK_CIRCUIT=1` forces only this circuit's legacy path
+    /// for a same-binary worker A/B; `LIGHTER_BUILD_CIRCUITS=1` continues to
+    /// force every circuit build.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        let force_build = [
+            "LIGHTER_BUILD_BLOCK_CIRCUIT",
+            "LIGHTER_BUILD_CIRCUITS",
+        ]
+        .into_iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| value == "1"));
+        if !force_build {
+            match Self::load_block_embedded() {
+                Ok(block) => return block,
+                Err(error) => {
+                    log::warn!(
+                        "embedded final block circuit unavailable ({error:#}); building from scratch"
+                    );
+                }
+            }
+        }
+        self.rebuild_block_circuit()
+    }
+
+    /// Fresh-build fallback and equality oracle for the embedded final block
+    /// circuit. Production normally uses [`Self::build_block_circuit`].
+    pub(crate) fn rebuild_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is
