@@ -12,6 +12,14 @@ extern crate std;
 
 pub(crate) mod arch;
 
+/// Two Goldilocks elements multiplied through a single interleaved reduction
+/// block. Re-exported on its own so callers outside this crate can reach the
+/// paired assembly — the Poseidon2 partial-round S-box has products that are
+/// independent of each other and wants them scheduled together — without the
+/// `arch` tree as a whole becoming public API.
+#[cfg(target_arch = "aarch64")]
+pub use arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
 pub mod batch_util;
 pub mod cosets;
 pub mod extension;
