@@ -255,3 +255,8 @@ fn main() {
 // arithmetic-on-promoted-frontier-1786506400
 
 // p90-fire-top1-50-1786515495
+
+// p90-fire-hermes-swe-1786803723-54
+
+// p90-fire-hermes-swe2-1786804774-86
+// p90-fire-hermes-swe3-1786805914-14
