@@ -132,15 +132,61 @@ unsafe fn multiply(x: u64, y: u64) -> u64 {
     add_with_wraparound(res0, xy_hi_lo_mul_epsilon)
 }
 
+
+/// Two independent `reduce128(a * b)` reductions, interleaved for ILP.
+///
+/// Bit-for-bit copy of `plonky2_field::arch::aarch64::neon_goldilocks_field::mul_reduce_pair`.
+/// Same intermediates as scalar `reduce128` / this file's `multiply()`. Do not
+/// merge the two conditional folds — that is field-equal but a different raw u64.
+#[inline(always)]
+fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
+    let mut result0 = a0;
+    let mut result1 = a1;
+    let scratch0 = b0;
+    let scratch1 = b1;
+
+    unsafe {
+        asm!(
+            "umulh {hi0}, {result0}, {scratch0}",
+            "umulh {hi1}, {result1}, {scratch1}",
+            "mul   {result0}, {result0}, {scratch0}",
+            "mul   {result1}, {result1}, {scratch1}",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            result0 = inout(reg) result0,
+            result1 = inout(reg) result1,
+            scratch0 = inout(reg) scratch0 => _,
+            scratch1 = inout(reg) scratch1 => _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            epsilon = in(reg) EPSILON,
+            options(pure, nomem, nostack),
+        );
+    }
+
+    (result0, result1)
+}
+
 // ========================================== FULL ROUNDS ==========================================
 
-/// Full S-box.
+/// Reference full S-box: today's 1-wide `multiply()` body.
+/// Three waves, not 48 independent squares: x², then (x³, x⁴), then x⁷.
+/// Kept so the new kernel can be checked raw-limb against this function.
 #[inline(always)]
 #[unroll_for_loops]
-unsafe fn sbox_layer_full(state: [u64; WIDTH]) -> [u64; WIDTH] {
-    // This is done in scalar. S-boxes in vector are only slightly slower throughput-wise but have
-    // an insane latency (~100 cycles) on the M1.
-
+unsafe fn sbox_layer_full_reference(state: [u64; WIDTH]) -> [u64; WIDTH] {
     let mut state2 = [0u64; WIDTH];
     assert!(WIDTH == 12);
     for i in 0..12 {
@@ -159,6 +205,51 @@ unsafe fn sbox_layer_full(state: [u64; WIDTH]) -> [u64; WIDTH] {
     assert!(WIDTH == 12);
     for i in 0..12 {
         state7[i] = multiply(state3[i], state4[i]);
+    }
+
+    state7
+}
+
+/// Full S-box. Same three waves as `sbox_layer_full_reference`.
+/// Pair only *inside* a wave with `mul_reduce_pair`. Vector sbox stays dead
+/// (M1 ~100-cycle latency). Do not treat the 48 multiplies as independent.
+#[inline(always)]
+unsafe fn sbox_layer_full(state: [u64; WIDTH]) -> [u64; WIDTH] {
+    debug_assert!(WIDTH == 12);
+
+    // Wave 1: 12 independent x². Pair adjacent lanes.
+    let mut state2 = [0u64; WIDTH];
+    let mut i = 0;
+    while i < WIDTH {
+        let (lo, hi) = mul_reduce_pair(state[i], state[i], state[i + 1], state[i + 1]);
+        state2[i] = lo;
+        state2[i + 1] = hi;
+        i += 2;
+    }
+
+    // Wave 2: 12 x³ and 12 x⁴, independent of each other given x².
+    // Pair only inside each product family (x³ with x³, x⁴ with x⁴).
+    let mut state3 = [0u64; WIDTH];
+    let mut state4 = [0u64; WIDTH];
+    i = 0;
+    while i < WIDTH {
+        let (lo3, hi3) = mul_reduce_pair(state[i], state2[i], state[i + 1], state2[i + 1]);
+        let (lo4, hi4) = mul_reduce_pair(state2[i], state2[i], state2[i + 1], state2[i + 1]);
+        state3[i] = lo3;
+        state3[i + 1] = hi3;
+        state4[i] = lo4;
+        state4[i + 1] = hi4;
+        i += 2;
+    }
+
+    // Wave 3: 12 x⁷ = x³·x⁴. Depends on wave 2. Pair adjacent lanes.
+    let mut state7 = [0u64; WIDTH];
+    i = 0;
+    while i < WIDTH {
+        let (lo, hi) = mul_reduce_pair(state3[i], state4[i], state3[i + 1], state4[i + 1]);
+        state7[i] = lo;
+        state7[i + 1] = hi;
+        i += 2;
     }
 
     state7
@@ -939,4 +1030,52 @@ pub unsafe fn vector_add(a: &[u64; WIDTH], b: &[u64; WIDTH]) -> [u64; WIDTH] {
         vst1q_u64(res[i..].as_mut_ptr(), result);
     }
     res
+}
+
+#[cfg(test)]
+mod sbox_identity_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field64;
+
+    /// Non-canonical included. Oracle is raw `.0`, not GoldilocksField PartialEq
+    /// and not `to_canonical_u64`.
+    fn noncanonical_limbs() -> [u64; 12] {
+        let p = GoldilocksField::ORDER;
+        [
+            0,
+            1,
+            2,
+            p - 1,
+            p,
+            p.wrapping_add(1),
+            u32::MAX as u64,
+            1u64 << 32,
+            (1u64 << 32) + 1,
+            u64::MAX,
+            0x0123_4567_89ab_cdef,
+            0xfedc_ba98_7654_3210,
+        ]
+    }
+
+    #[test]
+    fn multiply_matches_mul_reduce_pair_raw_u64() {
+        let xs = noncanonical_limbs();
+        for i in 0..xs.len() {
+            for j in 0..xs.len() {
+                let one = unsafe { multiply(xs[i], xs[j]) };
+                let (pair, _) = mul_reduce_pair(xs[i], xs[j], 0, 1);
+                assert_eq!(one, pair, "i={i} j={j} raw limb");
+            }
+        }
+    }
+
+    #[test]
+    fn sbox_layer_full_matches_reference_raw_u64() {
+        let input = noncanonical_limbs();
+        let got = unsafe { sbox_layer_full(input) };
+        let want = unsafe { sbox_layer_full_reference(input) };
+        // unwrap .0 contract: these *are* the raw limbs. Do not wrap and PartialEq.
+        assert_eq!(got, want);
+    }
 }
