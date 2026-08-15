@@ -109,7 +109,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "2d226bdc447fbc2a56f318b5363c7070de7bf214e27ba4e9c459cdcb7ba8ad66";
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -314,7 +314,7 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Poseidon2 gate quotient command buffer ended with status {:?}",
@@ -330,7 +330,7 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "RangeCheck gate quotient command buffer ended with status {:?}",
@@ -362,7 +362,7 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 
 impl<F: RichField> PermutationQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
+        wait_command_buffer(&self.command_buffer);
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "Permutation quotient command buffer ended with status {:?}",
@@ -1293,6 +1293,40 @@ pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Completion wait that skips kernel-wakeup latency while an exclusive
+/// serial phase (the chain drain / final block) owns the machine: the spine
+/// thread has the whole CPU, so a bounded spin returns the instant the GPU
+/// completes instead of paying roughly a millisecond of scheduling latency
+/// per command buffer. Outside exclusive phases this is exactly the blocking
+/// wait, so the steady pipeline's pool threads are untouched. Value-exact:
+/// scheduling only; every computed value is identical.
+#[inline]
+pub(crate) fn wait_command_buffer(command_buffer: &metal::CommandBufferRef) {
+    #[cfg(test)]
+    {
+        command_buffer.wait_until_completed();
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        if !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+            command_buffer.wait_until_completed();
+            return;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            if command_buffer.status() == MTLCommandBufferStatus::Completed {
+                return;
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(250) {
+                command_buffer.wait_until_completed();
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Runnable-but-unproven chain steps: incremented by the orchestrator when a
 /// chain step's transaction proof is ready (the step could prove right now),
 /// decremented when its proof completes. While this backlog is at or above
@@ -2141,7 +2175,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch(encoder, pipeline, leaf_count.div_ceil(2));
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
@@ -2180,7 +2214,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             );
             parent_encoder.set_buffer(2, Some(&context.parameters), 0);
             set_u32(parent_encoder, 3, parent_count_u32);
-            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+            dispatch(
+                parent_encoder,
+                &context.parent_pipeline,
+                parent_count.div_ceil(2),
+            );
             parent_encoder.end_encoding();
 
             child_count = parent_count;
@@ -2191,12 +2229,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         command_buffer.to_owned()
     });
 
-    parents_command.wait_until_completed();
+    wait_command_buffer(&parents_command);
     let all_ok = absorb_commands
         .iter()
         .chain(core::iter::once(&parents_command))
         .all(|command_buffer| {
-            command_buffer.wait_until_completed();
+            wait_command_buffer(command_buffer);
             command_buffer.status() == MTLCommandBufferStatus::Completed
         });
     drop(job);
@@ -3277,7 +3315,11 @@ impl MetalShared {
                     );
                     parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                     set_u32(parent_encoder, 3, parent_count_u32);
-                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                    dispatch(
+                        parent_encoder,
+                        &self.parent_pipeline,
+                        parent_count.div_ceil(2),
+                    );
                     parent_encoder.end_encoding();
 
                     child_count = parent_count;
@@ -3293,7 +3335,7 @@ impl MetalShared {
                 command_buffer.to_owned()
             });
 
-            command_buffer.wait_until_completed();
+            wait_command_buffer(&command_buffer);
             if command_buffer.status() != MTLCommandBufferStatus::Completed {
                 return Err(format!(
                     "command buffer ended with status {:?}",
@@ -3541,7 +3583,11 @@ impl MetalShared {
                 );
                 parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                 set_u32(parent_encoder, 3, parent_count_u32);
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                dispatch(
+                    parent_encoder,
+                    &self.parent_pipeline,
+                    parent_count.div_ceil(2),
+                );
                 parent_encoder.end_encoding();
 
                 child_count = parent_count;
@@ -3557,7 +3603,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -3770,7 +3816,11 @@ impl MetalShared {
                     size_of::<u32>() as NSUInteger,
                     (&parent_count_u32 as *const u32).cast::<c_void>(),
                 );
-                dispatch(encoder, &self.parent_pipeline, parent_count);
+                dispatch(
+                    encoder,
+                    &self.parent_pipeline,
+                    parent_count.div_ceil(2),
+                );
 
                 child_count = parent_count;
             }
@@ -3786,7 +3836,7 @@ impl MetalShared {
             command_buffer.to_owned()
         });
 
-        command_buffer.wait_until_completed();
+        wait_command_buffer(&command_buffer);
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(format!(
                 "command buffer ended with status {:?}",
@@ -5868,7 +5918,7 @@ kernel void goldilocks_mul_bench_native(
                     );
                     parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                     set_u32(parent_encoder, 3, parent_count as u32);
-                    dispatch(parent_encoder, parent_pipeline, parent_count);
+                    dispatch(parent_encoder, parent_pipeline, parent_count.div_ceil(2));
                     parent_encoder.end_encoding();
                     child_count = parent_count;
                 }
