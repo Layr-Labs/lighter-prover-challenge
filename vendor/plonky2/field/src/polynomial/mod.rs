@@ -82,8 +82,10 @@ impl<F: Field> PolynomialValues<F> {
     }
 
     /// Same as [`Self::coset_ifft_with_powers`], except the caller's powers
-    /// already contain the IFFT's `1/n` normalization, so the post-pass costs
-    /// one multiply per output slot instead of two.
+    /// already contain the IFFT's `1/n` normalization. The post-pass then
+    /// performs one multiply per output slot instead of two; the values are
+    /// identical to the two-multiply form because the factors are equal and
+    /// field multiplication is commutative.
     pub fn coset_ifft_with_prescaled_powers(
         self,
         prescaled_inverse_shift_powers: &[F],
@@ -464,7 +466,7 @@ mod tests {
 
     use super::*;
     use crate::goldilocks_field::GoldilocksField;
-    use crate::types::Sample;
+    use crate::types::{Field64, PrimeField64, Sample};
 
     #[test]
     fn test_trimmed() {
@@ -566,52 +568,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_coset_ifft_with_prescaled_powers_matches_postscale() {
-        use crate::types::PrimeField64;
-
+    fn check_prescaled_coset_ifft_case(k: usize, mut state: u64) {
         type F = GoldilocksField;
 
-        for k in [1usize, 2, 3, 5, 8, 11] {
-            let n = 1 << k;
-            let evals = PolynomialValues::new(
-                (0..n)
-                    .map(|i| {
-                        F::from_noncanonical_u64(
-                            u64::MAX.wrapping_sub((i as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-                        )
-                    })
-                    .collect(),
-            );
-            let shift = F::coset_shift();
-            let n_inv = F::inverse_2exp(k);
-            let inverse_powers = shift.inverse().powers().take(n).collect::<Vec<_>>();
-            let prescaled = inverse_powers
-                .iter()
-                .map(|&power| n_inv * power)
-                .collect::<Vec<_>>();
+        let n = 1usize << k;
+        let edge_words = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let evals = PolynomialValues::new(
+            (0..n)
+                .map(|i| {
+                    // Exercise all raw Goldilocks aliases at fixed boundaries,
+                    // then fill the rest from a deterministic full-u64 stream.
+                    let word = if i < edge_words.len() {
+                        edge_words[i]
+                    } else {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state
+                    };
+                    GoldilocksField(word)
+                })
+                .collect(),
+        );
+        let inverse_powers = F::coset_shift()
+            .inverse()
+            .powers()
+            .take(n)
+            .collect::<Vec<_>>();
+        let n_inv = F::inverse_2exp(k);
+        let prescaled = inverse_powers
+            .iter()
+            .map(|&power| n_inv * power)
+            .collect::<Vec<_>>();
 
-            let expected = evals.clone().coset_ifft_with_powers(&inverse_powers);
-            let actual = evals.coset_ifft_with_prescaled_powers(&prescaled);
-
-            // Field-value equality is the contract; the raw representatives
-            // agree here as well, and any divergence would be a `reduce128`
-            // wrap that both forms are already exposed to.
+        let expected = evals.clone().coset_ifft_with_powers(&inverse_powers);
+        let actual = evals.coset_ifft_with_prescaled_powers(&prescaled);
+        assert_eq!(actual.len(), expected.len());
+        for (i, (&actual, &expected)) in actual.coeffs.iter().zip(&expected.coeffs).enumerate() {
             assert_eq!(
-                actual
-                    .coeffs
-                    .iter()
-                    .map(|value| value.to_canonical_u64())
-                    .collect::<Vec<_>>(),
-                expected
-                    .coeffs
-                    .iter()
-                    .map(|value| value.to_canonical_u64())
-                    .collect::<Vec<_>>()
+                actual.to_canonical_u64(),
+                expected.to_canonical_u64(),
+                "prescaled coset IFFT diverged at degree 2^{k}, coefficient {i}, seed {state:#x}",
             );
         }
     }
 
+    #[test]
+    fn test_coset_ifft_with_prescaled_powers_matches_postscale() {
+        // Cover the n=1/n=2 reversal boundaries, both parities, cache-sized
+        // transforms and multiple deterministic full-range input streams.
+        for k in [0usize, 1, 2, 3, 5, 8, 12] {
+            for seed in [
+                1,
+                0x9e37_79b9_7f4a_7c15,
+                0x0123_4567_89ab_cdef,
+                u64::MAX,
+            ] {
+                check_prescaled_coset_ifft_case(k, seed);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "production quotient-domain differential; run explicitly in release mode"]
+    fn test_coset_ifft_with_prescaled_powers_production_domains() {
+        // The ranked chain, transaction and final-block quotient domains.
+        for (k, seed) in [
+            (17, 0x243f_6a88_85a3_08d3),
+            (19, 0x1319_8a2e_0370_7344),
+            (21, 0xa409_3822_299f_31d0),
+        ] {
+            check_prescaled_coset_ifft_case(k, seed);
+        }
+    }
 
     #[test]
     fn test_polynomial_multiplication() {

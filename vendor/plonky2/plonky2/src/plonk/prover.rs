@@ -576,6 +576,14 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Divide a dense numerator batch by its denominator batch with Montgomery's
+/// trick, consuming each recovered inverse directly into its final quotient.
+///
+/// `inverse_scratch` retains only the stride-four prefix products. The previous
+/// path overwrote those prefixes with a complete inverse array, then immediately
+/// read that array back in a second loop to update `numerator_products`. Folding
+/// that sole consumer into the reverse walk removes one store and one load per
+/// element while preserving the inverse and quotient multiplication order.
 #[inline]
 fn divide_chunk_products<F: Field>(
     numerator_products: &mut [F],
@@ -583,9 +591,58 @@ fn divide_chunk_products<F: Field>(
     inverse_scratch: &mut Vec<F>,
 ) {
     debug_assert_eq!(numerator_products.len(), denominator_products.len());
-    F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
-    for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
-        *product *= inverse;
+
+    // Keep the field implementation's exact special-case formulas. Production
+    // batches are much larger; this branch also makes empty and short inputs
+    // inherit the established behavior without duplicating it.
+    const WIDTH: usize = 4;
+    let n = denominator_products.len();
+    if n < WIDTH {
+        F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+        for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
+            *product *= inverse;
+        }
+        return;
+    }
+
+    inverse_scratch.clear();
+    inverse_scratch.reserve(n);
+
+    // Four stride-interleaved prefix chains, identical to
+    // `Field::batch_multiplicative_inverse_into` at this exact base.
+    let mut cumul_prod: [F; WIDTH] = denominator_products[..WIDTH].try_into().unwrap();
+    inverse_scratch.extend(cumul_prod);
+    for (i, &denominator) in denominator_products[WIDTH..].iter().enumerate() {
+        let lane = i % WIDTH;
+        cumul_prod[lane] *= denominator;
+        inverse_scratch.push(cumul_prod[lane]);
+    }
+    debug_assert_eq!(inverse_scratch.len(), n);
+
+    let mut accumulator_inverses = {
+        let c01 = cumul_prod[0] * cumul_prod[1];
+        let c23 = cumul_prod[2] * cumul_prod[3];
+        let c0123_inverse = (c01 * c23).inverse();
+        let c01_inverse = c0123_inverse * c23;
+        let c23_inverse = c0123_inverse * c01;
+        [
+            c01_inverse * cumul_prod[1],
+            c01_inverse * cumul_prod[0],
+            c23_inverse * cumul_prod[3],
+            c23_inverse * cumul_prod[2],
+        ]
+    };
+
+    for i in (WIDTH..n).rev() {
+        let lane = i % WIDTH;
+        // This is the same recovered inverse previously written to
+        // `inverse_scratch[i]`; consume it before advancing the chain.
+        let inverse = inverse_scratch[i - WIDTH] * accumulator_inverses[lane];
+        numerator_products[i] *= inverse;
+        accumulator_inverses[lane] *= denominator_products[i];
+    }
+    for i in 0..WIDTH {
+        numerator_products[i] *= accumulator_inverses[i];
     }
 }
 
@@ -688,14 +745,16 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
             .for_each_init(
                 || {
                     (
-                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
-                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
+                        Vec::with_capacity(num_chunks * INV_BATCH),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators, denominator_inverses) = scratch;
-                    denominators.clear();
+                    let (denominators_0, denominators_1, denominator_inverses) = scratch;
+                    denominators_0.clear();
+                    denominators_1.clear();
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
@@ -729,8 +788,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
                             products_1[output].write(numerator_1);
-                            denominators.push(denominator_0);
-                            denominators.push(denominator_1);
+                            denominators_0.push(denominator_0);
+                            denominators_1.push(denominator_1);
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -745,20 +804,8 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     let products_1 = unsafe {
                         &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
                     };
-                    // Montgomery's trick pays for one ordinary inverse per
-                    // call. Interleave both challenges so this chunk pays it
-                    // once, while retaining each challenge's denominator and
-                    // quotient-product order.
-                    F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
-                    debug_assert_eq!(denominator_inverses.len(), 2 * products_0.len());
-                    for ((product_0, product_1), inverses) in products_0
-                        .iter_mut()
-                        .zip(products_1.iter_mut())
-                        .zip(denominator_inverses.chunks_exact(2))
-                    {
-                        *product_0 *= inverses[0];
-                        *product_1 *= inverses[1];
-                    }
+                    divide_chunk_products(products_0, denominators_0, denominator_inverses);
+                    divide_chunk_products(products_1, denominators_1, denominator_inverses);
                 },
             );
     }
@@ -771,23 +818,10 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
         quotient_products_1.set_len(product_count);
     }
 
-    // The final block's two independent Z chains each traverse 2^18 rows and
-    // form `num_chunks` dependent products per row. They were run serially
-    // after the parallel ratio pass even though this exclusive tail has no
-    // competing proof work. Keep smaller transaction/chain proofs sequential
-    // so the steady pipeline's Rayon demand and scheduling stay unchanged.
-    let (columns_0, columns_1) = if subgroup.len() >= 1 << 18 {
-        rayon::join(
-            || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-            || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-        )
-    } else {
-        (
-            z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
-            z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
-        )
-    };
-    vec![columns_0, columns_1]
+    vec![
+        z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
+        z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
+    ]
 }
 
 /// Compute the partial products used in the `Z` polynomial.
@@ -1824,6 +1858,26 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// Same-binary measurement switch for the isolated quotient-IFFT change.
+/// The ranked environment is cleared, so the one-multiply path is the default;
+/// setting `LIGHTER_QUOTIENT_PRESCALED_IFFT=0` restores the promoted
+/// two-multiply post-pass. The environment is read once per process and the
+/// resulting branch runs once per proof, outside every coefficient loop.
+#[cfg(feature = "std")]
+fn quotient_prescaled_ifft_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_QUOTIENT_PRESCALED_IFFT")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
+#[cfg(not(feature = "std"))]
+const fn quotient_prescaled_ifft_enabled() -> bool {
+    true
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2370,8 +2424,8 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
-        let values = match job.finish() {
+    if let Some((_, job)) = &gpu_poseidon {
+        let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2402,15 +2456,22 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(values.len(), quotient_values.len());
-        Some(values)
-    } else {
-        None
-    };
+        debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(gpu_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (cpu_values, gpu_values))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                    *cpu += gpu * denominator_inv;
+                }
+            });
+    }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range_values = if let Some((_, job)) = &gpu_range {
-        let values = match job.finish() {
+    if let Some((_, job)) = &gpu_range {
+        let gpu_values = match job.finish() {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2444,15 +2505,22 @@ fn compute_quotient_polys<
                 return result;
             }
         };
-        debug_assert_eq!(values.len(), quotient_values.len());
-        Some(values)
-    } else {
-        None
-    };
+        debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(gpu_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (cpu_values, gpu_values))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                    *cpu += gpu * denominator_inv;
+                }
+            });
+    }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_permutation_values = if let Some(job) = &gpu_permutation {
-        let values = match job.finish() {
+    if let Some(job) = &gpu_permutation {
+        let gpu_values = match job.finish() {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2474,13 +2542,27 @@ fn compute_quotient_polys<
                 );
             }
         };
-        debug_assert_eq!(values.len(), quotient_values.len());
-        Some(values)
-    } else {
-        None
-    };
+        debug_assert_eq!(gpu_values.len(), quotient_values.len());
+        quotient_values
+            .par_chunks_exact_mut(num_challenges)
+            .zip(gpu_values.par_chunks_exact(num_challenges))
+            .enumerate()
+            .for_each(|(i, (cpu_values, gpu_values))| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                for (cpu, &gpu) in cpu_values.iter_mut().zip(gpu_values) {
+                    *cpu += gpu * denominator_inv;
+                }
+            });
+    }
 
     debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    // Parallel scatter of the interleaved point-major buffer into the
+    // per-challenge columns. The former single streaming pass was serial:
+    // 16 MiB of traffic per d16 proof (32 MiB for the final block proof)
+    // walked by one thread between the parallel quotient evaluation and the
+    // parallel IFFT while every other core sat idle. Each parallel chunk
+    // below owns a disjoint point range, and column position `i` is written
+    // exactly once with the identical value the serial pass stored there.
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
@@ -2499,78 +2581,46 @@ fn compute_quotient_polys<
         .map(|column| ColPtr(column.as_mut_ptr()))
         .collect();
     let column_ptrs = &column_ptrs;
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let has_gpu_values = gpu_poseidon_values.is_some()
-        || gpu_range_values.is_some()
-        || gpu_permutation_values.is_some();
-    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-    let has_gpu_values = false;
-
-    if has_gpu_values {
-        // The per-challenge columns are the next (IFFT) consumer, so write
-        // the completed quotient directly into them. This folds the former
-        // GPU accumulation pass and point-major scatter pass into one walk:
-        // CPU quotient pages are now read once and never dirtied again.
-        // validator population; this comment changes no executable behavior.
-        quotient_values
-            .par_chunks_exact(num_challenges)
-            .enumerate()
-            .for_each(|(i, cpu_values)| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                let start = i * num_challenges;
-                for (challenge, (&cpu, column)) in
-                    cpu_values.iter().zip(column_ptrs).enumerate()
-                {
-                    let mut value = cpu;
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    {
-                        if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge] * denominator_inv;
-                        }
-                        if let Some(values) = gpu_range_values {
-                            value += values[start + challenge] * denominator_inv;
-                        }
-                        if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge] * denominator_inv;
-                        }
-                    }
-                    // SAFETY: point `i` is owned by this parallel iteration,
-                    // and every (challenge, point) destination is written once.
-                    unsafe { *column.0.add(i) = value };
+    quotient_values
+        .par_chunks(BATCH_SIZE * num_challenges)
+        .enumerate()
+        .for_each(|(chunk_i, chunk)| {
+            let base = BATCH_SIZE * chunk_i;
+            for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                for (column, &value) in column_ptrs.iter().zip(point_values) {
+                    // SAFETY: `base + k` lies in this chunk's disjoint range.
+                    unsafe { *column.0.add(base + k) = value };
                 }
-            });
+            }
+        });
+    if quotient_prescaled_ifft_enabled() {
+        let prescaled_inverse_coset_shift_powers =
+            precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
+        challenge_columns
+            .into_par_iter()
+            .map(|column| {
+                // The cached chain already carries the IFFT's `1/n`
+                // normalization, so each coefficient receives exactly one
+                // multiply in the post-pass instead of a `1/n` multiply
+                // followed by the shift-power multiply. The FFT dispatch and
+                // every butterfly are unchanged.
+                PolynomialValues::new(column).coset_ifft_with_prescaled_powers(
+                    prescaled_inverse_coset_shift_powers.as_slice(),
+                )
+            })
+            .collect()
     } else {
-        // CPU-only path: parallel scatter of the interleaved point-major
-        // buffer into the per-challenge columns.
-        quotient_values
-            .par_chunks(BATCH_SIZE * num_challenges)
-            .enumerate()
-            .for_each(|(chunk_i, chunk)| {
-                let base = BATCH_SIZE * chunk_i;
-                for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                    for (column, &value) in column_ptrs.iter().zip(point_values) {
-                        // SAFETY: `base + k` lies in this chunk's disjoint range.
-                        unsafe { *column.0.add(base + k) = value };
-                    }
-                }
-            });
+        // Same-binary control arm: byte-for-byte promoted post-pass.
+        let inverse_coset_shift_powers =
+            precomputed::inverse_coset_shift_powers::<F>(points.len());
+        challenge_columns
+            .into_par_iter()
+            .map(|column| {
+                PolynomialValues::new(column)
+                    .coset_ifft_with_powers(inverse_coset_shift_powers.as_slice())
+            })
+            .collect()
     }
-    let inverse_coset_shift_powers =
-        precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
-    challenge_columns
-        .into_par_iter()
-        .map(|column| {
-            // Fuse the coset post-scaling into the IFFT instead of walking the
-            // whole coefficient vector again afterwards, reusing a
-            // process-global inverse-shift power chain. That cached chain
-            // already carries the IFFT's `1/n` normalization, so each
-            // coefficient takes exactly one multiply in the post-pass
-            // instead of a `1/n` multiply followed by the shift-power one.
-            PolynomialValues::new(column)
-                .coset_ifft_with_prescaled_powers(inverse_coset_shift_powers.as_slice())
-        })
-        .collect()
 }
 
 /// Process-global caches for deterministic per-degree precomputations that
@@ -2588,20 +2638,17 @@ pub(crate) mod precomputed {
         use std::collections::HashMap;
         use std::sync::{Arc, OnceLock, RwLock};
 
+        use plonky2_util::log2_strict;
+
         use crate::field::types::Field;
 
         type Map = RwLock<HashMap<(TypeId, usize), Arc<dyn Any + Send + Sync>>>;
-        /// One entry per field type; the inner list is keyed by the shift
-        /// itself, of which the FRI folding schedule uses only a handful
-        /// (`g`, then `g^arity` per reduction round) for a given circuit.
-        type ShiftTables<F> = RwLock<Vec<(F, Arc<Vec<F>>)>>;
-        type ShiftMap = RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>;
 
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
+        static INVERSE_COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
-        static SHIFT_POWERS: OnceLock<ShiftMap> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -2641,57 +2688,6 @@ pub(crate) mod precomputed {
             })
         }
 
-        /// Cached `shift.powers().take(len)` for an arbitrary `shift`, i.e.
-        /// exactly the successive-multiply chain `1, s, s^2, ...` the
-        /// `Powers` iterator produces. A cached table is only ever read as
-        /// a prefix, and `Powers` is a deterministic pure iterator, so the
-        /// `i`-th element handed back is the same field element — and the
-        /// same raw word — the caller would have computed itself.
-        pub(crate) fn shift_powers<F: Field>(shift: F, len: usize) -> Arc<Vec<F>> {
-            let map = SHIFT_POWERS.get_or_init(|| RwLock::new(HashMap::new()));
-            let key = TypeId::of::<F>();
-            let existing = map.read().unwrap().get(&key).map(Arc::clone);
-            let erased = match existing {
-                Some(entry) => entry,
-                None => {
-                    let mut map = map.write().unwrap();
-                    Arc::clone(map.entry(key).or_insert_with(|| {
-                        Arc::new(ShiftTables::<F>::new(Vec::new()))
-                            as Arc<dyn Any + Send + Sync>
-                    }))
-                }
-            };
-            let tables = erased
-                .downcast::<ShiftTables<F>>()
-                .ok()
-                .expect("type-keyed cache entry has the keyed type");
-            if let Some(hit) = tables
-                .read()
-                .unwrap()
-                .iter()
-                .find(|(cached_shift, table)| *cached_shift == shift && table.len() >= len)
-                .map(|(_, table)| Arc::clone(table))
-            {
-                return hit;
-            }
-            let computed: Arc<Vec<F>> = Arc::new(shift.powers().take(len).collect());
-            let mut tables = tables.write().unwrap();
-            match tables.iter_mut().find(|(cached_shift, _)| *cached_shift == shift) {
-                Some(slot) => {
-                    // Keep the longest table for this shift; every shorter one
-                    // is a prefix of it.
-                    if slot.1.len() < len {
-                        slot.1 = Arc::clone(&computed);
-                    }
-                    Arc::clone(&slot.1)
-                }
-                None => {
-                    tables.push((shift, Arc::clone(&computed)));
-                    computed
-                }
-            }
-        }
-
         /// Cached `x * F::coset_shift()` over the whole two-adic subgroup of
         /// size `1 << n_log`. The quotient evaluator needs the shifted point
         /// for every domain element of every proof, and the domain depends
@@ -2704,15 +2700,27 @@ pub(crate) mod precomputed {
             })
         }
 
+        /// Cached `F::coset_shift().inverse().powers().take(degree)`. The
+        /// quotient columns' coset IFFT post-scaling uses the same power chain
+        /// on every proof of a given size, so build it once per process.
+        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            get_or_compute(&INVERSE_COSET_POWERS, degree, || {
+                F::coset_shift().inverse().powers().take(degree).collect()
+            })
+        }
+
         /// Cached `n_inv * F::coset_shift().inverse().powers().take(degree)`.
         /// The quotient columns' coset IFFT post-scaling multiplies every
-        /// coefficient by both `1/n` and its inverse shift power, so the two
-        /// canonical factors are folded once per process into one per-slot
-        /// multiply. Field multiplication is associative, so every resulting
-        /// coefficient is the same field element.
-        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(degree: usize) -> Arc<Vec<F>> {
+        /// coefficient by both `1/n` and the inverse shift power, so the two
+        /// canonical factors are folded into one per-slot multiply. The
+        /// value for each slot is the product of the same two factors the
+        /// two-multiply form uses; field multiplication is commutative, so
+        /// every coefficient is field-identical.
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
             get_or_compute(&INVERSE_COSET_POWERS_SCALED, degree, || {
-                let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
+                let n_inv = F::inverse_2exp(log2_strict(degree));
                 F::coset_shift()
                     .inverse()
                     .powers()
@@ -2740,16 +2748,24 @@ pub(crate) mod precomputed {
             Arc::new(F::coset_shift().powers().take(degree).collect::<Vec<F>>())
         }
 
-        pub(crate) fn shift_powers<F: Field>(shift: F, len: usize) -> Arc<Vec<F>> {
-            Arc::new(shift.powers().take(len).collect::<Vec<F>>())
-        }
-
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             let shift = F::coset_shift();
             Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
         }
 
-        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(degree: usize) -> Arc<Vec<F>> {
+        pub(crate) fn inverse_coset_shift_powers<F: Field>(degree: usize) -> Arc<Vec<F>> {
+            Arc::new(
+                F::coset_shift()
+                    .inverse()
+                    .powers()
+                    .take(degree)
+                    .collect::<Vec<F>>(),
+            )
+        }
+
+        pub(crate) fn inverse_coset_shift_powers_scaled<F: Field>(
+            degree: usize,
+        ) -> Arc<Vec<F>> {
             let n_inv = F::inverse_2exp(plonky2_util::log2_strict(degree));
             Arc::new(
                 F::coset_shift()
@@ -2763,7 +2779,7 @@ pub(crate) mod precomputed {
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers_scaled, shift_powers,
+        coset_shift_powers, inverse_coset_shift_powers, inverse_coset_shift_powers_scaled,
         shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
@@ -2775,11 +2791,10 @@ mod quotient_layout_tests {
     use anyhow::Result;
 
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
-    use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -2796,6 +2811,30 @@ mod quotient_layout_tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn prescaled_inverse_coset_cache_matches_promoted_factors() {
+        for degree_bits in 0usize..=12 {
+            let degree = 1usize << degree_bits;
+            let promoted = precomputed::inverse_coset_shift_powers::<F>(degree);
+            let prescaled = precomputed::inverse_coset_shift_powers_scaled::<F>(degree);
+            let prescaled_again = precomputed::inverse_coset_shift_powers_scaled::<F>(degree);
+            assert!(std::sync::Arc::ptr_eq(&prescaled, &prescaled_again));
+            assert_eq!(promoted.len(), degree);
+            assert_eq!(prescaled.len(), degree);
+
+            let n_inv = F::inverse_2exp(degree_bits);
+            for (i, (&old_factor, &new_factor)) in
+                promoted.iter().zip(prescaled.iter()).enumerate()
+            {
+                assert_eq!(
+                    new_factor.to_canonical_u64(),
+                    (n_inv * old_factor).to_canonical_u64(),
+                    "prescaled cache mismatch at degree 2^{degree_bits}, slot {i}",
+                );
+            }
+        }
+    }
 
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
@@ -3124,53 +3163,6 @@ mod quotient_layout_tests {
         }
     }
 
-    /// Q2: the shift-keyed power cache must be raw-`u64`-identical to the
-    /// `Powers` chain it replaces, on the miss path, the hit path, and after
-    /// a longer request has replaced a shorter table. The shifts swept are
-    /// the ones `coset_fft_zero_tail` actually sees: the coset shift and the
-    /// FRI round shifts `g^(arity^k)`, lifted into the extension.
-    #[test]
-    fn shift_powers_cache_matches_powers_chain() {
-        type FE = QuadraticExtension<GoldilocksField>;
-        let mut shifts: Vec<FE> = vec![FE::from(F::coset_shift())];
-        let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
-        for _ in 0..4 {
-            shift = shift.exp_u64(16);
-            shifts.push(FE::from(shift));
-        }
-        for &s in &shifts {
-            // Ascending, repeated, shrinking and growing requests: the
-            // repeats are pure cache hits and the growth replaces a table
-            // whose prefix must still agree word for word.
-            for len in [0usize, 8, 8, 4, 96, 17, 96, 257] {
-                let cached = precomputed::shift_powers::<FE>(s, len);
-                let direct: Vec<FE> = s.powers().take(len).collect();
-                assert!(cached.len() >= len);
-                for (i, (c, d)) in cached[..len].iter().zip(&direct).enumerate() {
-                    assert_eq!(c.0[0].0, d.0[0].0, "limb 0 differs at {i} (len {len})");
-                    assert_eq!(c.0[1].0, d.0[1].0, "limb 1 differs at {i} (len {len})");
-                }
-            }
-        }
-    }
-
-    /// Sabotage control for the differential above: the classic off-by-one
-    /// (a chain seeded at `shift` instead of `ONE`) must be caught by the
-    /// same raw-limb comparison, so the assertions are not vacuous.
-    #[test]
-    fn shift_powers_differential_catches_a_shifted_chain() {
-        type FE = QuadraticExtension<GoldilocksField>;
-        let s = FE::from(F::coset_shift());
-        let good: Vec<FE> = s.powers().take(16).collect();
-        let sabotaged: Vec<FE> = s.shifted_powers(s).take(16).collect();
-        assert!(
-            good.iter()
-                .zip(&sabotaged)
-                .any(|(g, b)| g.0[0].0 != b.0[0].0 || g.0[1].0 != b.0[1].0),
-            "raw-limb comparison failed to separate a shifted power chain"
-        );
-    }
-
     /// D1: `ONE * a == a` bitwise for Goldilocks, canonical or not, so peeling
     /// the first factor of each chunk product into a direct assignment is
     /// value-exact.
@@ -3241,7 +3233,7 @@ mod l_0_table_cache {
 #[cfg(test)]
 mod flat_chunk_products_tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::{Field, PrimeField64};
+    use plonky2_field::types::{Field, Field64, PrimeField64};
 
     use crate::util::partial_products::quotient_chunk_products_into;
 
@@ -3299,6 +3291,101 @@ mod flat_chunk_products_tests {
 
     fn raw(values: &[F]) -> Vec<u64> {
         values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    fn materialized_divide_chunk_products(
+        numerator_products: &mut [F],
+        denominator_products: &[F],
+        inverse_scratch: &mut Vec<F>,
+    ) {
+        F::batch_multiplicative_inverse_into(denominator_products, inverse_scratch);
+        for (product, &inverse) in numerator_products.iter_mut().zip(inverse_scratch.iter()) {
+            *product *= inverse;
+        }
+    }
+
+    /// Raw-representation differential for the consumer-fused reverse
+    /// Montgomery walk. It covers every short-path length, stride-four tails,
+    /// Rayon batch boundaries, and the exact 128-row by 10-chunk production
+    /// density. Denominators are always nonzero; numerators deliberately include
+    /// zero and noncanonical zero representatives.
+    #[test]
+    fn consumer_fused_division_matches_materialized_inverses_in_raw_limbs() {
+        const PRODUCT_EDGES: [u64; 9] = [
+            0,
+            1,
+            2,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        const DENOMINATOR_EDGES: [u64; 7] = [
+            1,
+            2,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        let lengths = (0..33).chain([
+            63usize, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1279, 1280,
+            1281,
+        ]);
+
+        for n in lengths {
+            for seed in 0..8u64 {
+                let mut state = seed.wrapping_add(1).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                let mut next = || {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state
+                };
+                let numerators = (0..n)
+                    .map(|i| {
+                        let raw = if i < PRODUCT_EDGES.len() {
+                            PRODUCT_EDGES[(i + seed as usize) % PRODUCT_EDGES.len()]
+                        } else {
+                            next()
+                        };
+                        F::from_noncanonical_u64(raw)
+                    })
+                    .collect::<Vec<_>>();
+                let denominators = (0..n)
+                    .map(|i| {
+                        let raw = if i < DENOMINATOR_EDGES.len() {
+                            DENOMINATOR_EDGES[(3 * i + seed as usize) % DENOMINATOR_EDGES.len()]
+                        } else {
+                            loop {
+                                let raw = next();
+                                if !F::from_noncanonical_u64(raw).is_zero() {
+                                    break raw;
+                                }
+                            }
+                        };
+                        F::from_noncanonical_u64(raw)
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut expected = numerators.clone();
+                let mut actual = numerators;
+                let mut expected_scratch = vec![F::from_noncanonical_u64(u64::MAX); n + 3];
+                let mut actual_scratch = vec![F::from_noncanonical_u64(F::ORDER + 1); n + 5];
+                materialized_divide_chunk_products(
+                    &mut expected,
+                    &denominators,
+                    &mut expected_scratch,
+                );
+                divide_chunk_products(&mut actual, &denominators, &mut actual_scratch);
+
+                assert_eq!(raw(&actual), raw(&expected), "length={n}, seed={seed}");
+                assert_eq!(actual_scratch.len(), n, "scratch length={n}, seed={seed}");
+            }
+        }
     }
 
     /// The Z accumulation exactly as `wires_permutation_partial_products_and_zs` performs it,
@@ -3634,10 +3721,10 @@ mod permutation_pairing_tests {
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
-        // PolynomialValues requires power-of-two domains. Span a single
-        // point, short batches, the inversion boundary (INV_BATCH = 128),
-        // and several complete batches.
-        for &n_points in &[1usize, 2, 64, 128, 256, 512] {
+        // Point counts spanning: a single point, a short first batch, the
+        // inversion batch boundary (INV_BATCH = 128) exactly, one past it, and
+        // several batches with a short tail.
+        for &n_points in &[1usize, 5, 127, 128, 129, 300] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
 
             let subgroup: Vec<F> = (0..n_points).map(|_| rng.next_field()).collect();

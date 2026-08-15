@@ -874,7 +874,7 @@ pub trait Read {
         let mut generator_indices_by_watches = BTreeMap::new();
         for _ in 0..map_len {
             let k = self.read_usize()?;
-            generator_indices_by_watches.insert(k, self.read_usize_vec()?);
+            generator_indices_by_watches.insert(k, self.read_usize_encoded_u32_vec()?);
         }
 
         // `generator_watch_counts` is runtime-only and carries no bytes: it is a pure function of
@@ -884,14 +884,18 @@ pub trait Read {
         let mut generator_watch_counts = vec![0usize; generators.len()];
         for watchers in generator_indices_by_watches.values() {
             for &generator_idx in watchers {
+                let generator_idx = generator_idx as usize;
                 if generator_idx >= generators.len() {
                     return Err(IoError);
                 }
                 generator_watch_counts[generator_idx] += 1;
             }
         }
-        let generator_indices_by_watches =
-            GeneratorWatchIndex::from_map(generator_indices_by_watches);
+        let generator_indices_by_watches = GeneratorWatchIndex::from_u32_map(
+            generator_indices_by_watches,
+            generators.len(),
+        )
+        .ok_or(IoError)?;
 
         let constants_sigmas_commitment = self.read_polynomial_batch()?;
         let sigmas_len = self.read_usize()?;
@@ -947,16 +951,10 @@ pub trait Read {
             lut_to_lookups.push(self.read_target_lut()?);
         }
 
-        // Runtime-only, like `generator_watch_counts`: a pure function of `generators`.
-        let generators_defer_until_ready = generators
-            .iter()
-            .all(|generator| generator.0.defers_until_ready());
-
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
             generator_watch_counts,
-            generators_defer_until_ready,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1936,8 +1934,6 @@ pub trait Write {
             // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
             // contributes no bytes and the serialized format is unchanged.
             generator_watch_counts: _,
-            // Runtime-only: re-derived from `generators` on read; contributes no bytes.
-            generators_defer_until_ready: _,
             // Runtime-only: contributes no bytes; the serialized format is unchanged.
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
@@ -1964,8 +1960,6 @@ pub trait Write {
         self.write_usize(generator_indices_by_watches.len())?;
         for (k, v) in generator_indices_by_watches.iter() {
             self.write_usize(k)?;
-            // Byte-identical to `write_usize_vec` on the widened vector; the
-            // watcher payload is `u32` in memory but 8-byte LE on the wire.
             self.write_usize_encoded_u32_vec(v)?;
         }
 
@@ -2491,6 +2485,30 @@ mod tests {
                 .windows(legacy_map_bytes.len())
                 .any(|w| w == legacy_map_bytes.as_slice()),
             "the legacy representative-map encoding does not appear in the serialized bytes"
+        );
+
+        // The narrowed watcher values retain the complete legacy map encoding too: map length and
+        // representative keys are `usize` words, and each `u32` watcher is widened to the same
+        // 8-byte `usize` word written before the in-memory narrowing.
+        let watch_index = &circuit.prover_only.generator_indices_by_watches;
+        let mut legacy_watch_bytes = Vec::new();
+        legacy_watch_bytes.write_usize(watch_index.len()).unwrap();
+        for (representative, watchers) in watch_index.iter() {
+            legacy_watch_bytes.write_usize(representative).unwrap();
+            legacy_watch_bytes
+                .write_usize_vec(
+                    &watchers
+                        .iter()
+                        .map(|&watcher| watcher as usize)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+        }
+        assert!(
+            bytes
+                .windows(legacy_watch_bytes.len())
+                .any(|w| w == legacy_watch_bytes.as_slice()),
+            "the legacy watcher-map encoding does not appear in the serialized bytes"
         );
 
         let mut inputs = PartialWitness::new();

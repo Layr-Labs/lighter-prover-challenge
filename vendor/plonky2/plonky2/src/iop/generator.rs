@@ -129,14 +129,6 @@ fn run_generator_worklist<
 ) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
-    // When every generator defers until ready, a queued-but-unready generator's `run` is a
-    // proven no-op (`ProverOnlyCircuitData::generators_defer_until_ready`), so the loops below
-    // drop straight through instead of dispatching. Both loops already load the counter to
-    // form the hint, so the test itself reads nothing new; what disappears is the scattered
-    // `generators[idx]` load and the indirect call behind it. Skipping an inert call leaves
-    // the witness, `generator_is_expired`, `remaining_generators` and the pending queue
-    // byte-for-byte as they were, so the fixpoint and every value in it are unchanged.
-    let skip_unready = prover_data.generators_defer_until_ready;
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
@@ -189,28 +181,61 @@ fn run_generator_worklist<
                         if round_generator_is_expired[generator_idx] {
                             continue;
                         }
-                        let ready = round_unresolved_watches[generator_idx] == 0;
-                        if skip_unready && !ready {
-                            continue;
-                        }
-                        let finished = generators[generator_idx].0.run_with_ready_hint(
+                        let run = generators[generator_idx].0.run_with_ready_hint(
                             round_witness,
                             &mut round_buffer,
-                            ready,
+                            round_unresolved_watches[generator_idx] == 0,
                         );
-                        entries.push((generator_idx, finished, round_buffer.target_values.len()));
-                        for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
-                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
-                                generator_indices_by_watches.get(&rep_index)
-                            } else {
-                                // The representative is populated in the snapshot, so the merge
-                                // cannot newly populate it and never needs watchers.
-                                None
-                            };
-                            annotated_values.push((t, v, watchers));
+                        match run {
+                            GeneratorRun::Buffered(finished) => {
+                                entries.push((
+                                    generator_idx,
+                                    finished,
+                                    round_buffer.target_values.len(),
+                                ));
+                                for (t, v) in round_buffer.target_values.drain(..) {
+                                    let rep_index = round_witness.representative_map
+                                        [round_witness.target_index(t)]
+                                        as usize;
+                                    let watchers =
+                                        if !round_witness.is_set_by_rep_index(rep_index) {
+                                            generator_indices_by_watches.get(&rep_index)
+                                        } else {
+                                            // The representative is populated in the snapshot,
+                                            // so the merge cannot newly populate it and never
+                                            // needs watchers.
+                                            None
+                                        };
+                                    annotated_values.push((t, v, watchers));
+                                }
+                            }
+                            GeneratorRun::Single { target, value } => {
+                                let rep_index = round_witness.representative_map
+                                    [round_witness.target_index(target)]
+                                    as usize;
+                                let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
+                                    generator_indices_by_watches.get(&rep_index)
+                                } else {
+                                    None
+                                };
+                                entries.push((generator_idx, true, 1));
+                                annotated_values.push((target, value, watchers));
+                            }
+                            GeneratorRun::Pair { values } => {
+                                entries.push((generator_idx, true, 2));
+                                for (target, value) in values {
+                                    let rep_index = round_witness.representative_map
+                                        [round_witness.target_index(target)]
+                                        as usize;
+                                    let watchers =
+                                        if !round_witness.is_set_by_rep_index(rep_index) {
+                                            generator_indices_by_watches.get(&rep_index)
+                                        } else {
+                                            None
+                                        };
+                                    annotated_values.push((target, value, watchers));
+                                }
+                            }
                         }
                     }
                     (entries, annotated_values)
@@ -256,36 +281,83 @@ fn run_generator_worklist<
             if generator_is_expired[generator_idx] {
                 continue;
             }
-            let ready = unresolved_watches[generator_idx] == 0;
-            if skip_unready && !ready {
-                continue;
-            }
 
-            let finished =
-                generators[generator_idx]
-                    .0
-                    .run_with_ready_hint(witness, &mut buffer, ready);
-            if finished {
-                generator_is_expired[generator_idx] = true;
-                *remaining_generators -= 1;
-            }
+            let run = generators[generator_idx].0.run_with_ready_hint(
+                witness,
+                &mut buffer,
+                unresolved_watches[generator_idx] == 0,
+            );
+            match run {
+                GeneratorRun::Buffered(finished) => {
+                    if finished {
+                        generator_is_expired[generator_idx] = true;
+                        *remaining_generators -= 1;
+                    }
 
-            // Merge any generated values into our witness and, for each newly populated
-            // target's representative, immediately enqueue the unfinished generators watching
-            // it. The witness merge (`witness`) and the watcher bookkeeping
-            // (`generator_indices_by_watches`, `generator_is_expired`, `unresolved_watches`)
-            // touch disjoint state, so fusing the two passes deletes the per-run intermediate
-            // rep Vec while preserving both the `set_target_returning_rep` call order and the
-            // pending-queue push order exactly.
-            for (t, v) in buffer.target_values.drain(..) {
-                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
-                    if let Some(watchers) = generator_indices_by_watches.get(&watch) {
-                        for &watching_generator_idx in watchers {
-                            let watching_generator_idx = watching_generator_idx as usize;
-                            if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
+                    // Merge any generated values into our witness and, for each newly populated
+                    // target's representative, immediately enqueue the unfinished generators
+                    // watching it. The witness merge (`witness`) and watcher bookkeeping touch
+                    // disjoint state, so the passes stay fused without an intermediate rep Vec.
+                    for (t, v) in buffer.target_values.drain(..) {
+                        if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                                for &watching_generator_idx in watchers {
+                                    let watching_generator_idx = watching_generator_idx as usize;
+                                    if !generator_is_expired[watching_generator_idx] {
+                                        debug_assert_ne!(
+                                            unresolved_watches[watching_generator_idx],
+                                            0
+                                        );
+                                        unresolved_watches[watching_generator_idx] -= 1;
+                                        next_pending_generator_indices
+                                            .push(watching_generator_idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                GeneratorRun::Single { target, value } => {
+                    // Simple one-output generators always finish. Expire before notifying
+                    // watchers, matching the buffered merge's observable scheduler order.
+                    generator_is_expired[generator_idx] = true;
+                    *remaining_generators -= 1;
+                    if let Some(watch) = witness.set_target_returning_rep(target, value)? {
+                        if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                            for &watching_generator_idx in watchers {
+                                let watching_generator_idx = watching_generator_idx as usize;
+                                if !generator_is_expired[watching_generator_idx] {
+                                    debug_assert_ne!(
+                                        unresolved_watches[watching_generator_idx],
+                                        0
+                                    );
+                                    unresolved_watches[watching_generator_idx] -= 1;
+                                    next_pending_generator_indices.push(watching_generator_idx);
+                                }
+                            }
+                        }
+                    }
+                }
+                GeneratorRun::Pair { values } => {
+                    // Pair-output generators always finish. Expire before notifying watchers and
+                    // merge values in buffered insertion order.
+                    generator_is_expired[generator_idx] = true;
+                    *remaining_generators -= 1;
+                    for (target, value) in values {
+                        if let Some(watch) = witness.set_target_returning_rep(target, value)? {
+                            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                                for &watching_generator_idx in watchers {
+                                    let watching_generator_idx = watching_generator_idx as usize;
+                                    if !generator_is_expired[watching_generator_idx] {
+                                        debug_assert_ne!(
+                                            unresolved_watches[watching_generator_idx],
+                                            0
+                                        );
+                                        unresolved_watches[watching_generator_idx] -= 1;
+                                        next_pending_generator_indices
+                                            .push(watching_generator_idx);
+                                    }
+                                }
                             }
                         }
                     }
@@ -349,119 +421,6 @@ pub struct PartitionSeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
     unresolved_watches: &'b mut [usize],
     generator_indices_by_watches: &'b GeneratorWatchIndex,
-    layout: SeedLayoutMode<'b>,
-}
-
-/// A recorded seed layout cannot be applied to this circuit/input shape.
-///
-/// Only this error may be retried on the generic target-lookup path. Errors
-/// raised by the input writer itself keep their original type and propagate,
-/// so a stateful writer is never rerun for a reason that would recur.
-#[derive(Debug)]
-pub struct SeedLayoutMismatch(String);
-
-impl core::fmt::Display for SeedLayoutMismatch {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl core::error::Error for SeedLayoutMismatch {}
-
-fn seed_layout_mismatch(message: impl Into<String>) -> anyhow::Error {
-    SeedLayoutMismatch(message.into()).into()
-}
-
-/// Whether an error denotes only seed-layout applicability, for a guarded
-/// generic fallback.
-pub fn is_seed_layout_mismatch(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<SeedLayoutMismatch>().is_some()
-}
-
-/// Order-sensitive 64-bit fold of the target sequence a writer produces.
-///
-/// The recorded layout stores one bare `u32` representative per write rather
-/// than a `{Target, u32}` pair, so per-entry target equality is replaced by
-/// this single accumulated checksum, compared once at the end of a replay
-/// before any watcher decrement is applied or any generator is run. Feeding it
-/// `target_index` (pure arithmetic on the `Target` enum, no memory traffic)
-/// keeps the scattered `representative_map` gather deleted, which is the whole
-/// point of the layout.
-#[inline]
-fn fold_target_checksum(checksum: u64, target_index: usize) -> u64 {
-    checksum
-        .rotate_left(11)
-        .wrapping_add(0x517c_c1b7_2722_0a95)
-        ^ (target_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-}
-
-/// Exact target order and aggregate watcher effects of a fixed witness-input
-/// writer, replayable across later inputs of the same shape.
-///
-/// Values are deliberately absent: replay still receives and writes every value
-/// the caller supplies. The layout removes only the repeated target-to-
-/// representative lookup and the repeated traversal of the immutable watcher
-/// CSR for the same circuit/input shape.
-pub struct PartitionSeedLayout<
-    'a,
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
-> {
-    /// One representative per `set_target` call, in call order.
-    representatives: Vec<u32>,
-    /// Fold of the recorded target sequence; a replay whose targets differ in
-    /// value or order cannot reproduce it.
-    target_checksum: u64,
-    seeded_watch_decrements: Vec<(u32, u32)>,
-    /// Lifetime brand for the exact immutable prover topology used while
-    /// recording. Holding the whole owner borrowed prevents drop, mutation and
-    /// allocator-address reuse (ABA), while pointer equality binds the
-    /// representative map, generator list, watch counts and watcher CSR in O(1)
-    /// at replay.
-    prover_data: &'a ProverOnlyCircuitData<F, C, D>,
-    common_data: &'a CommonCircuitData<F, D>,
-}
-
-impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Debug
-    for PartitionSeedLayout<'_, F, C, D>
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PartitionSeedLayout")
-            .field("target_write_count", &self.representatives.len())
-            .field("changed_generator_count", &self.seeded_watch_decrements.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
-    PartitionSeedLayout<'_, F, C, D>
-{
-    /// Number of `set_target` calls captured by the fixed writer. Exposed for
-    /// census output only; replay never trusts a caller-supplied count.
-    pub fn target_write_count(&self) -> usize {
-        self.representatives.len()
-    }
-
-    /// Number of generators whose seeded watch count changes. Replay traverses
-    /// exactly this sparse list instead of every watcher list reached by every
-    /// input target.
-    pub fn changed_generator_count(&self) -> usize {
-        self.seeded_watch_decrements.len()
-    }
-}
-
-enum SeedLayoutMode<'a> {
-    Plain,
-    Record {
-        representatives: &'a mut Vec<u32>,
-        checksum: &'a mut u64,
-    },
-    Replay {
-        representatives: &'a [u32],
-        cursor: usize,
-        checksum: u64,
-    },
 }
 
 impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
@@ -472,50 +431,7 @@ impl<F: Field> Debug for PartitionSeeder<'_, '_, F> {
 
 impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
-        let newly_set = match &mut self.layout {
-            SeedLayoutMode::Plain => self.witness.set_target_returning_rep(target, value)?,
-            SeedLayoutMode::Record {
-                representatives,
-                checksum,
-            } => {
-                let target_index = self.witness.target_index(target);
-                let representative = self.witness.representative_map[target_index];
-                representatives.push(representative);
-                **checksum = fold_target_checksum(**checksum, target_index);
-                self.witness
-                    .set_rep_index_returning_new(representative as usize, target, value)?
-            }
-            SeedLayoutMode::Replay {
-                representatives,
-                cursor,
-                checksum,
-            } => {
-                let representative = *representatives.get(*cursor).ok_or_else(|| {
-                    seed_layout_mismatch(format!(
-                        "seed layout ended before target {target:?} at position {cursor}"
-                    ))
-                })?;
-                *checksum = fold_target_checksum(*checksum, self.witness.target_index(target));
-                *cursor += 1;
-                // A drifted layout can only put the value in the wrong (but
-                // in-bounds) slot, which surfaces here as an ordinary
-                // contradiction. Report it as a layout mismatch so the caller
-                // discards this witness and re-seeds through the generic path,
-                // where a genuine contradiction recurs with its own type.
-                self.witness
-                    .set_rep_index_returning_new(representative as usize, target, value)
-                    .map_err(|error| {
-                        seed_layout_mismatch(format!("seed layout replay write failed: {error}"))
-                    })?
-            }
-        };
-
-        if matches!(&self.layout, SeedLayoutMode::Replay { .. }) {
-            // Watcher decrements are applied once, in aggregate, after the
-            // checked replay.
-            return Ok(());
-        }
-        if let Some(watch) = newly_set {
+        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &generator_idx in watchers {
                     let generator_idx = generator_idx as usize;
@@ -695,7 +611,6 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             witness: &mut witness,
             unresolved_watches: &mut unresolved_watches,
             generator_indices_by_watches: &prover_data.generator_indices_by_watches,
-            layout: SeedLayoutMode::Plain,
         })?;
 
         let mut generator_is_expired = vec![false; generators.len()];
@@ -712,172 +627,6 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
-        Ok(Self {
-            witness,
-            unresolved_watches,
-            generator_is_expired,
-            remaining_generators,
-            prover_data,
-            parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
-        })
-    }
-
-    /// Records the checked representative layout while performing an ordinary
-    /// direct seed. The returned layout is specific to this circuit *instance*
-    /// and may be passed to [`Self::start_seeded_with_layout`] for later inputs
-    /// written in the same target order.
-    pub fn start_seeded_recording(
-        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
-        common_data: &'a CommonCircuitData<F, D>,
-        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
-    ) -> Result<(Self, PartitionSeedLayout<'a, F, C, D>)> {
-        let generators = &prover_data.generators;
-        let mut witness = PartitionWitness::new(
-            common_data.config.num_wires,
-            common_data.degree(),
-            &prover_data.representative_map,
-        );
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
-        let mut representatives = Vec::new();
-        let mut target_checksum = 0u64;
-        seed(&mut PartitionSeeder {
-            witness: &mut witness,
-            unresolved_watches: &mut unresolved_watches,
-            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
-            layout: SeedLayoutMode::Record {
-                representatives: &mut representatives,
-                checksum: &mut target_checksum,
-            },
-        })?;
-        // The aggregate effect of the seed on every watch counter. A replay
-        // applies exactly this sparse list instead of walking a watcher slice
-        // per newly populated representative.
-        let seeded_watch_decrements = prover_data
-            .generator_watch_counts
-            .iter()
-            .zip(&unresolved_watches)
-            .enumerate()
-            .filter_map(|(generator, (&total, &unresolved))| {
-                let decrement = total - unresolved;
-                (decrement != 0).then(|| {
-                    Ok((
-                        u32::try_from(generator)
-                            .map_err(|_| anyhow!("generator index exceeds u32"))?,
-                        u32::try_from(decrement)
-                            .map_err(|_| anyhow!("seed watcher decrement exceeds u32"))?,
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut generator_is_expired = vec![false; generators.len()];
-        let mut remaining_generators = generators.len();
-        run_generator_worklist(
-            &mut witness,
-            prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
-            &mut remaining_generators,
-            (0..generators.len()).collect(),
-            PARALLEL_WORKLIST_THRESHOLD,
-        )?;
-        Ok((
-            Self {
-                witness,
-                unresolved_watches,
-                generator_is_expired,
-                remaining_generators,
-                prover_data,
-                parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
-            },
-            PartitionSeedLayout {
-                representatives,
-                target_checksum,
-                seeded_watch_decrements,
-                prover_data,
-                common_data,
-            },
-        ))
-    }
-
-    /// Replays a previously recorded layout while preserving all runtime
-    /// values. Any target-order, length or circuit-instance mismatch fails
-    /// closed with a [`SeedLayoutMismatch`], leaving the partially written
-    /// witness to be dropped; [`Self::start_seeded`] remains the fallback.
-    pub fn start_seeded_with_layout(
-        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
-        common_data: &'a CommonCircuitData<F, D>,
-        layout: &PartitionSeedLayout<'a, F, C, D>,
-        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
-    ) -> Result<Self> {
-        let generators = &prover_data.generators;
-        if !core::ptr::eq(layout.prover_data, prover_data)
-            || !core::ptr::eq(layout.common_data, common_data)
-        {
-            return Err(seed_layout_mismatch(
-                "seed layout belongs to a different immutable circuit topology instance",
-            ));
-        }
-        let mut witness = PartitionWitness::new(
-            common_data.config.num_wires,
-            common_data.degree(),
-            &prover_data.representative_map,
-        );
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
-        let (cursor, checksum) = {
-            let mut seeder = PartitionSeeder {
-                witness: &mut witness,
-                unresolved_watches: &mut unresolved_watches,
-                generator_indices_by_watches: &prover_data.generator_indices_by_watches,
-                layout: SeedLayoutMode::Replay {
-                    representatives: &layout.representatives,
-                    cursor: 0,
-                    checksum: 0,
-                },
-            };
-            seed(&mut seeder)?;
-            match seeder.layout {
-                SeedLayoutMode::Replay {
-                    cursor, checksum, ..
-                } => (cursor, checksum),
-                _ => unreachable!(),
-            }
-        };
-        if cursor != layout.representatives.len() {
-            return Err(seed_layout_mismatch(format!(
-                "seed layout has {} trailing targets after replayed {}",
-                layout.representatives.len() - cursor,
-                cursor,
-            )));
-        }
-        // Checked before any watcher decrement is applied and before any
-        // generator runs, so a drifted target sequence can never reach the
-        // worklist.
-        if checksum != layout.target_checksum {
-            return Err(seed_layout_mismatch(
-                "seed layout target sequence checksum mismatch",
-            ));
-        }
-        for &(generator, decrement) in &layout.seeded_watch_decrements {
-            let count = &mut unresolved_watches[generator as usize];
-            let decrement = decrement as usize;
-            if *count < decrement {
-                return Err(seed_layout_mismatch("seed layout watcher decrement underflow"));
-            }
-            *count -= decrement;
-        }
-
-        let mut generator_is_expired = vec![false; generators.len()];
-        let mut remaining_generators = generators.len();
-        run_generator_worklist(
-            &mut witness,
-            prover_data,
-            &mut unresolved_watches,
-            &mut generator_is_expired,
-            &mut remaining_generators,
-            (0..generators.len()).collect(),
-            PARALLEL_WORKLIST_THRESHOLD,
-        )?;
         Ok(Self {
             witness,
             unresolved_watches,
@@ -989,26 +738,8 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
         _all_watches_populated: bool,
-    ) -> bool {
-        self.run(witness, out_buffer)
-    }
-
-    /// Whether `run_with_ready_hint(_, _, false)` is guaranteed to be a pure no-op: it writes
-    /// nothing to `out_buffer`, reads nothing from the witness, and returns `false`.
-    ///
-    /// The worklist calls every queued generator once per round even when the generator's
-    /// watched representatives are not all populated yet, because the default implementation
-    /// above forwards to [`Self::run`], which may legitimately emit partial output on such a
-    /// call (see `readiness_hint_preserves_incremental_witness_generator_fallback`). A
-    /// generator that opts in here promises that call is inert, which lets the worklist drop
-    /// the dispatch entirely instead of paying a scattered load of the boxed generator and an
-    /// indirect call to reach a short circuit.
-    ///
-    /// Conservative default: `false`. Only [`SimpleGeneratorAdapter`] overrides it, and its
-    /// `run_with_ready_hint` is literally `all_watches_populated && run_once(..)`, whose `&&`
-    /// short-circuits before `run_once` is reached.
-    fn defers_until_ready(&self) -> bool {
-        false
+    ) -> GeneratorRun<F> {
+        GeneratorRun::Buffered(self.run(witness, out_buffer))
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
@@ -1042,6 +773,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Debug for WitnessGeneratorRef
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", self.0.id())
     }
+}
+
+/// Result of running a generator from the ready worklist.
+#[derive(Debug)]
+pub enum GeneratorRun<F: Field> {
+    /// The generator used the reusable output buffer.
+    Buffered(bool),
+    /// A finished generator produced exactly one value without staging it in the buffer.
+    Single { target: Target, value: F },
+    /// A finished generator produced exactly two ordered values without staging them.
+    Pair { values: [(Target, F); 2] },
 }
 
 /// Values generated by a generator invocation.
@@ -1109,6 +851,21 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
 
+    /// Optional one-output fast path used by the sequential witness worklist.
+    /// Returning `Some` must perform exactly the same computation as `run_once`.
+    fn run_once_single(&self, _witness: &PartitionWitness<F>) -> Option<Result<(Target, F)>> {
+        None
+    }
+
+    /// Optional ordered two-output fast path. Returning `Some` must perform exactly the same
+    /// computation and preserve the same insertion order as `run_once`.
+    fn run_once_pair(
+        &self,
+        _witness: &PartitionWitness<F>,
+    ) -> Option<Result<[(Target, F); 2]>> {
+        None
+    }
+
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
         Self: Sized,
@@ -1160,14 +917,23 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
         all_watches_populated: bool,
-    ) -> bool {
-        all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
-    }
-
-    /// `&&` short-circuits, so a `false` hint returns `false` without reaching `run_once`:
-    /// nothing is read and nothing is written. See [`WitnessGenerator::defers_until_ready`].
-    fn defers_until_ready(&self) -> bool {
-        true
+    ) -> GeneratorRun<F> {
+        if !all_watches_populated {
+            return GeneratorRun::Buffered(false);
+        }
+        if let Some(result) = self.inner.run_once_single(witness) {
+            return match result {
+                Ok((target, value)) => GeneratorRun::Single { target, value },
+                Err(_) => GeneratorRun::Buffered(false),
+            };
+        }
+        if let Some(result) = self.inner.run_once_pair(witness) {
+            return match result {
+                Ok(values) => GeneratorRun::Pair { values },
+                Err(_) => GeneratorRun::Buffered(false),
+            };
+        }
+        GeneratorRun::Buffered(self.inner.run_once(witness, out_buffer).is_ok())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -1551,185 +1317,6 @@ mod tests {
         Ok((outer, early_inputs, late_inputs))
     }
 
-    /// A recorded layout must reproduce the generic seeded path *value for
-    /// value on raw `u64` limbs*, and every way of breaking it must fail closed
-    /// with a typed mismatch rather than seed a wrong witness. The sabotage
-    /// blocks are the controls: each one perturbs exactly one element of the
-    /// recorded layout and requires the replay to reject it.
-    #[test]
-    fn recorded_seed_layout_replays_raw_identically_and_fails_closed() -> Result<()> {
-        use crate::field::types::PrimeField64;
-
-        let (outer, early_inputs, late_inputs) = two_inner_proof_fixture()?;
-        let prover_data = &outer.prover_only;
-        let common_data = &outer.common;
-        let all_inputs = merged_inputs(&early_inputs, &late_inputs)?;
-        let write = |inputs: &PartialWitness<F>| {
-            let pairs: Vec<(Target, F)> = {
-                // A deterministic write order, so the layout is well defined.
-                let mut pairs: Vec<(Target, F)> =
-                    inputs.target_values.iter().map(|(&t, &v)| (t, v)).collect();
-                pairs.sort_by_key(|(t, _)| format!("{t:?}"));
-                pairs
-            };
-            move |seeder: &mut PartitionSeeder<'_, '_, F>| -> Result<()> {
-                for (t, v) in &pairs {
-                    seeder.set_target(*t, *v)?;
-                }
-                Ok(())
-            }
-        };
-
-        let raw = |witness: &PartitionWitness<'_, F>| -> Vec<u64> {
-            witness
-                .values
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| witness.is_set_by_rep_index(*i))
-                .map(|(_, v)| v.to_noncanonical_u64())
-                .collect()
-        };
-
-        // Reference: the generic seeded path this replaces.
-        let reference = PendingPartitionWitness::start_seeded(
-            prover_data,
-            common_data,
-            write(&all_inputs),
-        )
-        .and_then(PendingPartitionWitness::finish)?;
-
-        // Record on one input set, replay on the same shape.
-        let (recorded_pending, layout) = PendingPartitionWitness::start_seeded_recording(
-            prover_data,
-            common_data,
-            write(&all_inputs),
-        )?;
-        let recorded = recorded_pending.finish()?;
-        assert_eq!(recorded.set_bitmap, reference.set_bitmap);
-        assert_eq!(raw(&recorded), raw(&reference), "recorded seed diverges raw");
-        assert!(layout.target_write_count() > 0);
-
-        let replayed = PendingPartitionWitness::start_seeded_with_layout(
-            prover_data,
-            common_data,
-            &layout,
-            write(&all_inputs),
-        )
-        .and_then(PendingPartitionWitness::finish)?;
-        assert_eq!(replayed.set_bitmap, reference.set_bitmap);
-        assert_eq!(raw(&replayed), raw(&reference), "replayed seed diverges raw");
-
-        // Sabotage 1: a truncated layout. Replay must reject, not seed a
-        // partial witness.
-        let mut short = PendingPartitionWitness::start_seeded_recording(
-            prover_data,
-            common_data,
-            write(&all_inputs),
-        )?
-        .1;
-        short.representatives.truncate(short.representatives.len() - 1);
-        let error = PendingPartitionWitness::start_seeded_with_layout(
-            prover_data,
-            common_data,
-            &short,
-            write(&all_inputs),
-        )
-        .err()
-        .expect("a truncated layout must be rejected");
-        assert!(is_seed_layout_mismatch(&error), "{error:?}");
-
-        // Sabotage 2: a permuted layout. Not a reachable state -- for a
-        // pointer-identical prover data the representatives are a deterministic
-        // function of the target sequence the checksum already covers -- but it
-        // is the strongest corruption available, so require that it can never
-        // silently yield the reference witness. It fails closed either as a
-        // replay-write mismatch or as a generator-worklist contradiction.
-        let mut swapped = PendingPartitionWitness::start_seeded_recording(
-            prover_data,
-            common_data,
-            write(&all_inputs),
-        )?
-        .1;
-        let n = swapped.representatives.len();
-        swapped.representatives.swap(0, n - 1);
-        let swapped_result = PendingPartitionWitness::start_seeded_with_layout(
-            prover_data,
-            common_data,
-            &swapped,
-            write(&all_inputs),
-        )
-        .and_then(PendingPartitionWitness::finish);
-        match swapped_result {
-            Err(_) => {}
-            Ok(witness) => assert_ne!(
-                raw(&witness),
-                raw(&reference),
-                "sabotage control did not trip: a permuted layout produced the reference witness"
-            ),
-        }
-
-        // Sabotage 3: a corrupted target checksum. This is the check that
-        // replaces the rival's per-entry `Target` comparison, so it must be the
-        // thing that catches a drifted target sequence.
-        let mut wrong_checksum = PendingPartitionWitness::start_seeded_recording(
-            prover_data,
-            common_data,
-            write(&all_inputs),
-        )?
-        .1;
-        wrong_checksum.target_checksum ^= 1;
-        let error = PendingPartitionWitness::start_seeded_with_layout(
-            prover_data,
-            common_data,
-            &wrong_checksum,
-            write(&all_inputs),
-        )
-        .err()
-        .expect("a drifted target sequence must be rejected");
-        assert!(is_seed_layout_mismatch(&error), "{error:?}");
-
-        // Sabotage 4: a corrupted aggregate watch decrement must be caught
-        // rather than silently changing the generator schedule.
-        let mut wrong_decrements = PendingPartitionWitness::start_seeded_recording(
-            prover_data,
-            common_data,
-            write(&all_inputs),
-        )?
-        .1;
-        assert!(!wrong_decrements.seeded_watch_decrements.is_empty());
-        wrong_decrements.seeded_watch_decrements[0].1 = u32::MAX;
-        let error = PendingPartitionWitness::start_seeded_with_layout(
-            prover_data,
-            common_data,
-            &wrong_decrements,
-            write(&all_inputs),
-        )
-        .err()
-        .expect("an impossible watcher decrement must be rejected");
-        assert!(is_seed_layout_mismatch(&error), "{error:?}");
-
-        // Sabotage 5: a layout from a different circuit instance.
-        let (other, other_early, other_late) = two_inner_proof_fixture()?;
-        let other_all = merged_inputs(&other_early, &other_late)?;
-        let other_layout = PendingPartitionWitness::start_seeded_recording(
-            &other.prover_only,
-            &other.common,
-            write(&other_all),
-        )?
-        .1;
-        let error = PendingPartitionWitness::start_seeded_with_layout(
-            prover_data,
-            common_data,
-            &other_layout,
-            write(&all_inputs),
-        )
-        .err()
-        .expect("a foreign circuit instance must be rejected");
-        assert!(is_seed_layout_mismatch(&error), "{error:?}");
-
-        Ok(())
-    }
-
     fn merged_inputs(
         early_inputs: &PartialWitness<F>,
         late_inputs: &PartialWitness<F>,
@@ -1763,7 +1350,8 @@ mod tests {
         for (watch, watchers) in prover_data.generator_indices_by_watches.iter() {
             if !witness.is_set_by_rep_index(watch) {
                 for &generator_idx in watchers {
-                    unresolved_watches[generator_idx as usize] += 1;
+                    let generator_idx = generator_idx as usize;
+                    unresolved_watches[generator_idx] += 1;
                 }
             }
         }
@@ -1783,7 +1371,8 @@ mod tests {
         let mut occurrences = vec![0usize; prover_data.generators.len()];
         for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
             for &generator_idx in watchers {
-                occurrences[generator_idx as usize] += 1;
+                let generator_idx = generator_idx as usize;
+                occurrences[generator_idx] += 1;
             }
         }
         assert_eq!(

@@ -322,14 +322,15 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
 }
 
 /// Variant of [`ifft_with_options_and_postscale`] whose `prescaled_scales`
-/// already carry the IFFT's `1/n` normalization. The post-pass then performs
-/// exactly one field multiply per output slot instead of a `1/n` multiply
-/// followed by the caller's scale multiply; the FFT itself is untouched.
+/// already include the IFFT's `1/n` normalization. The post-pass then needs
+/// exactly one field multiply per output slot instead of one `1/n` multiply
+/// followed by one caller scale multiply; the FFT itself is identical.
 ///
-/// The caller guarantees `prescaled_scales[i] == n_inv * scale[i]` with both
-/// factors canonical. The two multiplication orders are field-equal, so every
-/// coefficient is the same field element the two-multiply form produces (see
-/// `test_coset_ifft_with_prescaled_powers_matches_postscale`).
+/// The caller is responsible for providing `prescaled_scales[i] ==
+/// n_inv * scale[i]`. Associativity makes the result field-equal to the
+/// two-multiply form. A field implementation may choose a different raw
+/// representative for the same residue after reassociation; every caller and
+/// proof consumer treats coefficients as field values.
 pub(crate) fn ifft_with_options_and_prescaled_postscale<F: Field>(
     poly: PolynomialValues<F>,
     zero_factor: Option<usize>,
@@ -341,21 +342,19 @@ pub(crate) fn ifft_with_options_and_prescaled_postscale<F: Field>(
     let PolynomialValues { values: mut buffer } = poly;
     fft_dispatch(&mut buffer, zero_factor, root_table);
 
-    // Same reversal and same write order as the two-multiply post-pass.
     buffer[0] *= prescaled_scales[0];
     if n > 1 {
         buffer[n / 2] *= prescaled_scales[n / 2];
-    }
-    for i in 1..(n / 2) {
-        let j = n - i;
-        let coeffs_i = buffer[j] * prescaled_scales[i];
-        let coeffs_j = buffer[i] * prescaled_scales[j];
-        buffer[i] = coeffs_i;
-        buffer[j] = coeffs_j;
+        for i in 1..(n / 2) {
+            let j = n - i;
+            let coeffs_i = buffer[j] * prescaled_scales[i];
+            let coeffs_j = buffer[i] * prescaled_scales[j];
+            buffer[i] = coeffs_i;
+            buffer[j] = coeffs_j;
+        }
     }
     PolynomialCoeffs { coeffs: buffer }
 }
-
 
 /// `ifft` of a borrowed column without the caller-side copy: the initial
 /// bit-reversal permutation is applied as an out-of-place gather from
