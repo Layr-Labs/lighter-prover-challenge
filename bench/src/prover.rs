@@ -257,6 +257,9 @@ fn chain_step_proof(
                 feeder,
             )
         })?;
+        // Narrow 2^17 Z/PP and quotient trees ride the GPU for this prove
+        // only. Guard is a counter so overlapping heavy/light steps nest.
+        let _chain_gpu = plonky2::hash::poseidon2::ChainCriticalGpuGuard::new();
         BlockTxChainCircuit::prove_prepared(pending, chain_data)
     })();
     // This step is no longer part of the runnable backlog (see the matching
@@ -827,7 +830,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -852,7 +854,7 @@ pub(crate) fn prove_block_after_pre(
                     let early = BlockCircuit::witness_inputs_early(
                         &block_target,
                         block_ref,
-                        pre_proof_ref,
+                        &pre_proof,
                     )
                     .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
@@ -861,6 +863,8 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
+                    // Every remaining stage consumes `pre_output`, not this proof.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
