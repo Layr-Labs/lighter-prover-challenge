@@ -405,6 +405,42 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         }
     }
 
+    /// [`Self::set_target_returning_rep`] with the representative supplied by
+    /// the caller instead of gathered from `representative_map`.
+    ///
+    /// The representative must be the one `representative_map` holds for
+    /// `target`; the caller is responsible for that (see
+    /// [`crate::iop::generator::PartitionSeedLayout`], which records it from
+    /// this very map under a pointer-equality binding to the owning prover
+    /// data). Everything after the gather -- the set-bitmap probe, the
+    /// contradiction check, the store and the mark -- is the identical
+    /// sequence on the identical slot, so the resulting witness is bit-for-bit
+    /// what `set_target_returning_rep` would have produced.
+    pub fn set_rep_index_returning_new(
+        &mut self,
+        rep_index: usize,
+        target: Target,
+        value: F,
+    ) -> Result<Option<usize>> {
+        if self.is_set_by_rep_index(rep_index) {
+            let old_value = self.values[rep_index];
+            if value != old_value {
+                return Err(anyhow!(
+                    "Partition containing {:?} was set twice with different values: {} != {}",
+                    target,
+                    old_value,
+                    value
+                ));
+            }
+
+            Ok(None)
+        } else {
+            self.values[rep_index] = value;
+            self.mark_set(rep_index);
+            Ok(Some(rep_index))
+        }
+    }
+
     pub(crate) fn target_index(&self, target: Target) -> usize {
         target.index(self.num_wires, self.degree)
     }
