@@ -157,8 +157,10 @@ impl<F: Extendable<2>> Add for QuadraticExtension<F> {
 }
 
 impl<F: Extendable<2>> AddAssign for QuadraticExtension<F> {
+    #[inline]
     fn add_assign(&mut self, rhs: Self) {
-        *self = *self + rhs;
+        self.0[0] += rhs.0[0];
+        self.0[1] += rhs.0[1];
     }
 }
 
@@ -180,7 +182,8 @@ impl<F: Extendable<2>> Sub for QuadraticExtension<F> {
 impl<F: Extendable<2>> SubAssign for QuadraticExtension<F> {
     #[inline]
     fn sub_assign(&mut self, rhs: Self) {
-        *self = *self - rhs;
+        self.0[0] -= rhs.0[0];
+        self.0[1] -= rhs.0[1];
     }
 }
 

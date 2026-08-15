@@ -489,7 +489,21 @@ fn reduce_gate_constraints_base_batch<F: Field>(
             }
         }
         for constraint_row in rows {
-            for (&term, result) in constraint_row.iter().zip(res_out.chunks_exact_mut(2)) {
+            let mut terms = constraint_row.chunks_exact(4);
+            let mut results = res_out.chunks_exact_mut(8);
+            for (t4, r8) in terms.by_ref().zip(results.by_ref()) {
+                r8[0] = t4[0].multiply_accumulate(r8[0], alpha_0);
+                r8[1] = t4[0].multiply_accumulate(r8[1], alpha_1);
+                r8[2] = t4[1].multiply_accumulate(r8[2], alpha_0);
+                r8[3] = t4[1].multiply_accumulate(r8[3], alpha_1);
+                r8[4] = t4[2].multiply_accumulate(r8[4], alpha_0);
+                r8[5] = t4[2].multiply_accumulate(r8[5], alpha_1);
+                r8[6] = t4[3].multiply_accumulate(r8[6], alpha_0);
+                r8[7] = t4[3].multiply_accumulate(r8[7], alpha_1);
+            }
+            let rem_terms = terms.remainder();
+            let rem_results = results.into_remainder();
+            for (&term, result) in rem_terms.iter().zip(rem_results.chunks_exact_mut(2)) {
                 result[0] = term.multiply_accumulate(result[0], alpha_0);
                 result[1] = term.multiply_accumulate(result[1], alpha_1);
             }
