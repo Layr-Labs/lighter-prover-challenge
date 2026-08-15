@@ -1373,6 +1373,15 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
             || leaf_width > 64
             || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
+    // Idle-only first-FRI admission, not the closed occupancy-veto-all-narrow-trees
+    // experiment: an unoccupied stream reuses the exclusive-phase cutoff so the
+    // light/heavy chunk first FRI tree (2^15 × 32, ~163k perms) hashes on GPU.
+    // Trees below 1<<16 stay on CPU.
+    let min_permutations = if GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
+    } else {
+        min_permutations
+    };
     leaf_permutations + parent_permutations >= min_permutations
 }
 
