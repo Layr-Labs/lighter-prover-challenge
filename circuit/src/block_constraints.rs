@@ -170,18 +170,35 @@ impl BlockCircuit {
         pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
         pw: &mut W,
     ) -> Result<()> {
-
-        pw.set_proof_with_pis_target(&target.pre_exec_proof, pre_exec_proof)?;
-
         let block_witness = BlockWitness::from_block(block, 1);
+        Self::seed_witness_early_from_block_witness_into(
+            target,
+            &block_witness,
+            &block.tx_chunks,
+            pre_exec_proof,
+            pw,
+        )
+    }
+
+    /// Seeds the final block's early inputs from the post-pre-execution view.
+    /// Its public witness is value-identical to [`BlockWitness::from_block`],
+    /// but the pre-execution-only block fields have already been dropped.
+    pub fn seed_witness_early_from_block_witness_into<W: Witness<F> + WitnessWrite<F>>(
+        target: &BlockTarget,
+        block_witness: &BlockWitness<F>,
+        tx_chunks: &[Vec<std::sync::Arc<crate::tx::Tx<F>>>],
+        pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
+        pw: &mut W,
+    ) -> Result<()> {
+        pw.set_proof_with_pis_target(&target.pre_exec_proof, pre_exec_proof)?;
 
         pw.set_target(
             target.block.block_number,
-            F::from_canonical_u64(block.block_number),
+            F::from_canonical_u64(block_witness.block_number),
         )?;
         pw.set_target(
             target.block.created_at,
-            F::from_canonical_u64(block.created_at as u64),
+            F::from_canonical_u64(block_witness.created_at as u64),
         )?;
 
         pw.set_hash_target(target.block.old_state_root, block_witness.old_state_root)?;
@@ -233,11 +250,11 @@ impl BlockCircuit {
             })?;
 
         // At least one tx per block is must. If block only has pre-exec, then the only tx is the empty tx
-        assert!(!block.tx_chunks.is_empty());
+        assert!(!tx_chunks.is_empty());
         target
             .new_market_risk_details_partial
             .iter()
-            .zip_eq(block.new_public_market_details.iter())
+            .zip_eq(block_witness.new_public_market_details.iter())
             .try_for_each(|(t, mi)| pw.set_partial_market_risk_details_target(t, mi))?;
 
         Ok(())
@@ -253,6 +270,25 @@ impl BlockCircuit {
     ) -> Result<PartialWitness<F>> {
         let mut pw = PartialWitness::new();
         Self::seed_witness_early_into(target, block, pre_exec_proof, &mut pw)?;
+        Ok(pw)
+    }
+
+    /// Equivalent to [`Self::witness_inputs_early`], but accepts the retained
+    /// post-pre-execution values instead of the complete parsed block.
+    pub fn witness_inputs_early_from_block_witness(
+        target: &BlockTarget,
+        block_witness: &BlockWitness<F>,
+        tx_chunks: &[Vec<std::sync::Arc<crate::tx::Tx<F>>>],
+        pre_exec_proof: &ProofWithPublicInputs<F, C, D>,
+    ) -> Result<PartialWitness<F>> {
+        let mut pw = PartialWitness::new();
+        Self::seed_witness_early_from_block_witness_into(
+            target,
+            block_witness,
+            tx_chunks,
+            pre_exec_proof,
+            &mut pw,
+        )?;
         Ok(pw)
     }
 

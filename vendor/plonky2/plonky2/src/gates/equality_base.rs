@@ -8,6 +8,7 @@ use anyhow::Result;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::Extendable;
 use crate::field::packed::PackedField;
+use crate::field::types::Field;
 use crate::gates::gate::Gate;
 use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
@@ -390,6 +391,31 @@ pub struct EqualityRowInverseGenerator {
     pub row: usize,
 }
 
+const EQUALITY_INVERSE_STACK_OPS: usize = 32;
+
+fn batch_invert_nonzero_diffs<F: Field>(diffs: &[F], inverses: &mut [F]) {
+    debug_assert_eq!(diffs.len(), inverses.len());
+    let mut acc = F::ONE;
+    let mut any_nonzero = false;
+    for (inverse, &diff) in inverses.iter_mut().zip(diffs) {
+        *inverse = acc;
+        if diff != F::ZERO {
+            acc *= diff;
+            any_nonzero = true;
+        }
+    }
+
+    let mut inv_acc = if any_nonzero { acc.inverse() } else { F::ONE };
+    for i in (0..diffs.len()).rev() {
+        if diffs[i] != F::ZERO {
+            inverses[i] *= inv_acc;
+            inv_acc *= diffs[i];
+        } else {
+            inverses[i] = F::ZERO;
+        }
+    }
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
     for EqualityRowInverseGenerator
 {
@@ -409,41 +435,27 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
         let num_ops = self.gate.num_ops;
-        let diffs: Vec<F> = (0..num_ops)
-            .map(|i| witness.get_target(Target::wire(self.row, self.gate.wire_ith_temporary(i, 0))))
-            .collect();
-
-        // Montgomery's trick over the row's nonzero diffs. Forward pass: prefix products
-        // of the nonzero diffs (zero diffs keep the running product unchanged and their
-        // `invdiff` stays zero, as in the per-slot formula).
-        let mut prefixes: Vec<F> = Vec::with_capacity(num_ops);
-        let mut acc = F::ONE;
-        let mut any_nonzero = false;
-        for &diff in &diffs {
-            prefixes.push(acc);
-            if diff != F::ZERO {
-                acc *= diff;
-                any_nonzero = true;
-            }
+        let mut diffs_stack = [F::ZERO; EQUALITY_INVERSE_STACK_OPS];
+        let mut inverses_stack = [F::ZERO; EQUALITY_INVERSE_STACK_OPS];
+        let mut diffs_heap = Vec::new();
+        let mut inverses_heap = Vec::new();
+        let (diffs, inverses): (&mut [F], &mut [F]) = if num_ops <= EQUALITY_INVERSE_STACK_OPS {
+            (&mut diffs_stack[..num_ops], &mut inverses_stack[..num_ops])
+        } else {
+            diffs_heap.resize(num_ops, F::ZERO);
+            inverses_heap.resize(num_ops, F::ZERO);
+            (&mut diffs_heap, &mut inverses_heap)
+        };
+        for (i, diff) in diffs.iter_mut().enumerate() {
+            *diff = witness.get_target(Target::wire(self.row, self.gate.wire_ith_temporary(i, 0)));
         }
 
-        // One shared inversion for the whole row; skipped entirely on all-equal rows,
-        // which also performed no inversions under the per-slot scheme.
-        let mut inv_acc = if any_nonzero { acc.inverse() } else { F::ONE };
+        // Standard circuit configs fit on the stack, removing the two heap
+        // allocations this hot generator previously made for every equality
+        // row. Oversized custom configs retain the same heap fallback.
+        batch_invert_nonzero_diffs(diffs, inverses);
 
-        // Backward pass: peel individual inverses off the shared inverse. Reuse
-        // `prefixes` to hold each slot's `invdiff` value.
-        for i in (0..num_ops).rev() {
-            let diff = diffs[i];
-            if diff != F::ZERO {
-                prefixes[i] *= inv_acc;
-                inv_acc *= diff;
-            } else {
-                prefixes[i] = F::ZERO;
-            }
-        }
-
-        for (i, inv_value) in prefixes.into_iter().enumerate() {
+        for (i, &inv_value) in inverses.iter().enumerate() {
             let invdiff = Target::wire(self.row, self.gate.wire_ith_temporary(i, 1));
             out_buffer.set_target(invdiff, inv_value)?;
         }
@@ -471,7 +483,7 @@ mod tests {
     #[allow(unused_imports)]
     use crate::field::types::Field64;
     use crate::field::types::{PrimeField64, Sample};
-    use crate::gates::equality_base::EqualityGate;
+    use crate::gates::equality_base::{batch_invert_nonzero_diffs, EqualityGate};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::iop::generator::generate_partial_witness;
     use crate::iop::target::{BoolTarget, Target};
@@ -494,6 +506,45 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = EqualityGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn batch_inverse_scratch_matches_elementwise_inverse_across_boundaries() {
+        type F = GoldilocksField;
+
+        // 22 is the production EqualityGate width, while 32/33 straddle the
+        // stack-scratch boundary used by EqualityRowInverseGenerator.
+        for len in [0, 1, 2, 22, 32, 33, 65] {
+            let diffs = (0..len)
+                .map(|i| match i % 7 {
+                    0 | 3 => F::ZERO,
+                    1 => F::ONE,
+                    2 => F::NEG_ONE,
+                    _ => F::from_canonical_usize(17 * i + 5),
+                })
+                .collect::<Vec<_>>();
+            let expected = diffs
+                .iter()
+                .map(|&diff| {
+                    if diff == F::ZERO {
+                        F::ZERO
+                    } else {
+                        diff.inverse()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut actual = vec![F::NEG_ONE; len];
+
+            batch_invert_nonzero_diffs(&diffs, &mut actual);
+
+            assert_eq!(actual, expected, "batch length {len}");
+            for (&diff, &inverse) in diffs.iter().zip(&actual) {
+                assert_eq!(
+                    diff * inverse,
+                    if diff == F::ZERO { F::ZERO } else { F::ONE }
+                );
+            }
+        }
     }
 
     #[test]

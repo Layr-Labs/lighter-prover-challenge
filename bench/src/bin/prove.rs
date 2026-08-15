@@ -193,7 +193,7 @@ fn main() {
     let proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
-        prover::prove_block_after_pre(block, circuits, pre_proof)
+        prover::prove_block_after_pre(block.into_post_pre(), circuits, pre_proof)
     };
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
