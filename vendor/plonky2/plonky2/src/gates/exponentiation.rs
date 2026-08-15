@@ -422,6 +422,53 @@ mod tests {
         test_eval_fns::<F, C, _, D>(gate)
     }
 
+    /// The common packed accumulator must preserve raw field words, including
+    /// at packed-width boundaries and with a pre-seeded quotient buffer.
+    #[test]
+    fn direct_accumulation_matches_materialized_raw_words() {
+        use plonky2_field::types::Sample;
+
+        use crate::field::batch_util::batch_multiply_add_inplace;
+        use crate::field::types::PrimeField64;
+        use crate::gates::gate::Gate;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let gate = ExponentiationGate::<F, D>::new(67);
+        for n in [1, 3, 4, 7, 31, 32, 33] {
+            let wires = F::rand_vec(gate.num_wires() * n);
+            let filters = F::rand_vec(n);
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &hash);
+            let initial = F::rand_vec(gate.num_constraints() * n);
+
+            let mut expected = initial.clone();
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            for (accumulator_row, constraint_row) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(accumulator_row, constraint_row, &filters);
+            }
+
+            let mut actual = initial;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_noncanonical_u64())
+                    .collect::<Vec<_>>(),
+                "batch size {n}"
+            );
+        }
+    }
+
     #[test]
     fn test_gate_constraint() {
         const D: usize = 2;

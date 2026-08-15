@@ -13,13 +13,39 @@ pub struct StridedConstraintConsumer<'a, P: PackedField> {
     start: *mut P::Scalar,
     end: *mut P::Scalar,
     stride: usize,
+    filter: Option<P>,
     _phantom: PhantomData<&'a mut [P::Scalar]>,
 }
 
 impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
     pub fn new(buffer: &'a mut [P::Scalar], stride: usize, offset: usize) -> Self {
+        Self::with_filter(buffer, stride, offset, None)
+    }
+
+    /// Creates a consumer which accumulates every emitted constraint into the
+    /// existing row with the supplied selector filter.
+    ///
+    /// The accumulator uses the same `multiply_accumulate` operation as the
+    /// materialize-then-add path. Keeping it in the consumer lets packed gates
+    /// write directly into the quotient buffer instead of a transient scratch
+    /// matrix.
+    pub fn accumulating(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: P,
+    ) -> Self {
+        Self::with_filter(buffer, stride, offset, Some(filter))
+    }
+
+    fn with_filter(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: Option<P>,
+    ) -> Self {
         assert!(stride >= P::WIDTH);
-        assert!(offset < stride);
+        assert!(offset <= stride - P::WIDTH);
         assert_eq!(buffer.len() % stride, 0);
         let ptr_range = buffer.as_mut_ptr_range();
         // `wrapping_add` is needed to avoid undefined behavior. Plain `add` causes UB if 'the ...
@@ -35,6 +61,7 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             start,
             end,
             stride,
+            filter,
             _phantom: PhantomData,
         }
     }
@@ -43,9 +70,29 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
     pub fn one(&mut self, constraint: P) {
         if !core::ptr::eq(self.start, self.end) {
             // # Safety
-            // The checks in `new` guarantee that this points to valid space.
+            // The checks in `with_filter` guarantee that this points to valid
+            // space for a complete packed row. Copying through scalar pointers
+            // avoids assuming a row-major scalar allocation has P alignment.
             unsafe {
-                *self.start.cast() = constraint;
+                if let Some(filter) = self.filter {
+                    let mut accumulated = P::ZEROS;
+                    core::ptr::copy_nonoverlapping(
+                        self.start,
+                        accumulated.as_slice_mut().as_mut_ptr(),
+                        P::WIDTH,
+                    );
+                    core::ptr::copy_nonoverlapping(
+                        accumulated.multiply_accumulate(constraint, filter).as_slice().as_ptr(),
+                        self.start,
+                        P::WIDTH,
+                    );
+                } else {
+                    core::ptr::copy_nonoverlapping(
+                        constraint.as_slice().as_ptr(),
+                        self.start,
+                        P::WIDTH,
+                    );
+                }
             }
             // See the comment in `new`. `wrapping_add` is needed to avoid UB if we've just
             // exhausted our buffer (and hence we're setting `self.start` to point past the end).
