@@ -31,6 +31,27 @@ use plonky2::util::timing::TimingTree;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
+/// Hideable work (final-block circuit compile/preprocess) runs on this pool
+/// so the chain spine keeps the full global rayon width. Exp-4 reserved
+/// threads *from* the spine and scored 27.20; this is the opposite split.
+/// Override with `LIGHTER_HIDEABLE_POOL_THREADS` (1..=8); default 2.
+fn hideable_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = std::env::var("LIGHTER_HIDEABLE_POOL_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|n: &usize| (1..=8).contains(n))
+            .unwrap_or(2);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("hideable-{i}"))
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build()
+            .expect("cannot build hideable rayon pool")
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
     Heavy,
@@ -827,7 +848,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -845,14 +865,17 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        // Nested `install` is safe: this is a `std::thread`,
+                        // not a global-pool worker. Witness feed below stays
+                        // on this OS thread (serial; no ParallelWitnessGuard).
+                        hideable_pool().install(|| circuits.build_block_circuit())
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
                     let early = BlockCircuit::witness_inputs_early(
                         &block_target,
                         block_ref,
-                        pre_proof_ref,
+                        &pre_proof,
                     )
                     .expect("final block early witness inputs failed");
                     let mut pending = PendingPartitionWitness::start(
@@ -861,6 +884,8 @@ pub(crate) fn prove_block_after_pre(
                         &block_data.common,
                     )
                     .expect("final block early witness phase failed");
+                    // Every remaining stage consumes `pre_output`, not this proof.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
