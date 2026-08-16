@@ -755,6 +755,21 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // The final block is the run's only 2^18 proof, so every
+                // per-size process-global domain table (quotient subgroup,
+                // coset variants, shift power chains) is cold when the block
+                // reaches it — including the 2^21 subgroup read *before* the
+                // Metal quotient jobs are submitted. Warm them here, serially
+                // on this utility thread, after the page walk (so the stash
+                // publish keeps its existing timing). Kept in sync with the
+                // block shape above (2^18 rows, 3 rate bits); a drift just
+                // leaves the tables to their in-place computation, unchanged.
+                const BLOCK_DEGREE_BITS: usize = 18;
+                const BLOCK_QUOTIENT_DEGREE_BITS: usize = 3;
+                plonky2::plonk::prover::prewarm_domain_tables::<F>(
+                    BLOCK_DEGREE_BITS,
+                    BLOCK_QUOTIENT_DEGREE_BITS,
+                );
             })
             .ok();
     }

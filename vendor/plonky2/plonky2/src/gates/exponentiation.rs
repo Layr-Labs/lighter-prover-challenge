@@ -243,38 +243,93 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
 
         // Rewrite `bit * base + (1 - bit)` as `1 + bit * (base - 1)`.
         // Besides deleting one packed subtraction per bit, this exposes the
-        // existing AArch64 multiply-accumulate specialization. Evaluate two
-        // independent transitions at a time to increase instruction-level
-        // parallelism without changing constraint emission order.
+        // existing AArch64 multiply-accumulate specialization. Each transition
+        // reads only witnessed wires (`intermediate_values[i - 1]`, the bit,
+        // and the base), never the previously computed constraint, so the
+        // transitions are mutually independent. Evaluate eight of them at a
+        // time (then four, then one) to increase instruction-level parallelism
+        // without changing constraint emission order.
         let base_minus_one = base - P::ONES;
+        let n = self.num_power_bits;
         let mut i = 0;
-        while i + 1 < self.num_power_bits {
+        while i + 8 <= n {
             let prev_0 = if i == 0 {
                 P::ONES
             } else {
                 intermediate_values[i - 1].square()
             };
             let prev_1 = intermediate_values[i].square();
+            let prev_2 = intermediate_values[i + 1].square();
+            let prev_3 = intermediate_values[i + 2].square();
+            let prev_4 = intermediate_values[i + 3].square();
+            let prev_5 = intermediate_values[i + 4].square();
+            let prev_6 = intermediate_values[i + 5].square();
+            let prev_7 = intermediate_values[i + 6].square();
 
             // power_bits is in LE order, but we accumulate in BE order.
-            let bit_0 = power_bits[self.num_power_bits - i - 1];
-            let bit_1 = power_bits[self.num_power_bits - i - 2];
+            let bit_0 = power_bits[n - i - 1];
+            let bit_1 = power_bits[n - i - 2];
+            let bit_2 = power_bits[n - i - 3];
+            let bit_3 = power_bits[n - i - 4];
+            let bit_4 = power_bits[n - i - 5];
+            let bit_5 = power_bits[n - i - 6];
+            let bit_6 = power_bits[n - i - 7];
+            let bit_7 = power_bits[n - i - 8];
             let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
             let mul_by_1 = P::ONES.multiply_accumulate(bit_1, base_minus_one);
+            let mul_by_2 = P::ONES.multiply_accumulate(bit_2, base_minus_one);
+            let mul_by_3 = P::ONES.multiply_accumulate(bit_3, base_minus_one);
+            let mul_by_4 = P::ONES.multiply_accumulate(bit_4, base_minus_one);
+            let mul_by_5 = P::ONES.multiply_accumulate(bit_5, base_minus_one);
+            let mul_by_6 = P::ONES.multiply_accumulate(bit_6, base_minus_one);
+            let mul_by_7 = P::ONES.multiply_accumulate(bit_7, base_minus_one);
 
             yield_constr.one(prev_0 * mul_by_0 - intermediate_values[i]);
             yield_constr.one(prev_1 * mul_by_1 - intermediate_values[i + 1]);
-            i += 2;
+            yield_constr.one(prev_2 * mul_by_2 - intermediate_values[i + 2]);
+            yield_constr.one(prev_3 * mul_by_3 - intermediate_values[i + 3]);
+            yield_constr.one(prev_4 * mul_by_4 - intermediate_values[i + 4]);
+            yield_constr.one(prev_5 * mul_by_5 - intermediate_values[i + 5]);
+            yield_constr.one(prev_6 * mul_by_6 - intermediate_values[i + 6]);
+            yield_constr.one(prev_7 * mul_by_7 - intermediate_values[i + 7]);
+            i += 8;
         }
-        if i < self.num_power_bits {
+        while i + 4 <= n {
+            let prev_0 = if i == 0 {
+                P::ONES
+            } else {
+                intermediate_values[i - 1].square()
+            };
+            let prev_1 = intermediate_values[i].square();
+            let prev_2 = intermediate_values[i + 1].square();
+            let prev_3 = intermediate_values[i + 2].square();
+
+            // power_bits is in LE order, but we accumulate in BE order.
+            let bit_0 = power_bits[n - i - 1];
+            let bit_1 = power_bits[n - i - 2];
+            let bit_2 = power_bits[n - i - 3];
+            let bit_3 = power_bits[n - i - 4];
+            let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
+            let mul_by_1 = P::ONES.multiply_accumulate(bit_1, base_minus_one);
+            let mul_by_2 = P::ONES.multiply_accumulate(bit_2, base_minus_one);
+            let mul_by_3 = P::ONES.multiply_accumulate(bit_3, base_minus_one);
+
+            yield_constr.one(prev_0 * mul_by_0 - intermediate_values[i]);
+            yield_constr.one(prev_1 * mul_by_1 - intermediate_values[i + 1]);
+            yield_constr.one(prev_2 * mul_by_2 - intermediate_values[i + 2]);
+            yield_constr.one(prev_3 * mul_by_3 - intermediate_values[i + 3]);
+            i += 4;
+        }
+        while i < n {
             let prev = if i == 0 {
                 P::ONES
             } else {
                 intermediate_values[i - 1].square()
             };
-            let bit = power_bits[self.num_power_bits - i - 1];
+            let bit = power_bits[n - i - 1];
             let mul_by = P::ONES.multiply_accumulate(bit, base_minus_one);
             yield_constr.one(prev * mul_by - intermediate_values[i]);
+            i += 1;
         }
 
         yield_constr.one(output - intermediate_values[self.num_power_bits - 1]);
@@ -484,6 +539,70 @@ mod tests {
             gate.eval_unfiltered(vars).iter().all(|x| x.is_zero()),
             "Gate constraints are not satisfied."
         );
+    }
+
+    /// Differential test: the packed base-field path (with its widened
+    /// independent-transition schedule) must produce field-equal constraint
+    /// values, in the same order, as a straightforward per-row reference
+    /// evaluation, over random witness data, various batch sizes, and bit
+    /// counts exercising the 8-way, 4-way, and scalar-tail schedules.
+    #[test]
+    fn test_packed_batch_matches_reference() {
+        use crate::gates::gate::Gate;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        for num_power_bits in [1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 17, 67] {
+            let gate = ExponentiationGate::<F, D> {
+                num_power_bits,
+                _phantom: PhantomData,
+            };
+            let num_wires = gate.num_wires();
+            let num_constraints = gate.num_constraints();
+
+            for batch_size in [1, 3, 4, 5, 7, 31, 32, 33] {
+                // Wires are stored wire-major: wire `w` of row `r` lives at
+                // `wires[w * batch_size + r]`.
+                let wires = F::rand_vec(num_wires * batch_size);
+                let constants: Vec<F> = Vec::new();
+                let hash = HashOut::ZERO;
+                let vars = EvaluationVarsBaseBatch::new(batch_size, &constants, &wires, &hash);
+
+                let actual = gate.eval_unfiltered_base_batch(vars);
+                assert_eq!(actual.len(), num_constraints * batch_size);
+
+                for r in 0..batch_size {
+                    let wire = |w: usize| wires[w * batch_size + r];
+                    let base = wire(gate.wire_base());
+                    let output = wire(gate.wire_output());
+                    let mut expected = Vec::with_capacity(num_constraints);
+                    for i in 0..num_power_bits {
+                        let prev = if i == 0 {
+                            F::ONE
+                        } else {
+                            wire(gate.wire_intermediate_value(i - 1)).square()
+                        };
+                        // power_bits is in LE order, but we accumulate in BE order.
+                        let bit = wire(gate.wire_power_bit(num_power_bits - i - 1));
+                        expected.push(
+                            prev * (bit * base + (F::ONE - bit))
+                                - wire(gate.wire_intermediate_value(i)),
+                        );
+                    }
+                    expected.push(output - wire(gate.wire_intermediate_value(num_power_bits - 1)));
+
+                    for (c, &e) in expected.iter().enumerate() {
+                        assert_eq!(
+                            actual[c * batch_size + r],
+                            e,
+                            "mismatch: num_power_bits={num_power_bits} batch_size={batch_size} constraint={c} row={r}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Manual timing harness comparing the packed-fused accumulate against the
