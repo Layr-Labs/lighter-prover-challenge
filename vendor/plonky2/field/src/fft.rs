@@ -1372,6 +1372,72 @@ fn fft_classic_simd_layers_parallel<P, M>(
 {
     let lg_packed_width = log2_strict(P::WIDTH);
     let scalar_len = packed_values.len() * P::WIDTH;
+
+    // Match the serial base-field schedule: pair consecutive layers before
+    // handing independent radix-4 blocks to Rayon. Besides halving the
+    // number of full-buffer passes, this coarsens each Rayon task enough to
+    // amortize scheduling without sharing any input or output between tasks.
+    // Submission comment R1: resubmit 1 of parallel fused WideGoldilocks pairs.
+    #[cfg(target_arch = "aarch64")]
+    let start = if start + 2 <= end
+        && scalar_len >= FUSED_PAIR_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
+            >()
+    {
+        let mut lg_half_m = start;
+        {
+            // SAFETY: the TypeId check proves the same representation facts
+            // as in `fft_classic_simd_layers`: the packed buffer is exactly a
+            // contiguous `GoldilocksField` slice, and both root rows contain
+            // that scalar type. Each parallel chunk is one complete 4*q
+            // block, so chunks are disjoint and the fused kernel cannot cross
+            // a task boundary.
+            let scalars = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    scalar_len,
+                )
+            };
+            while lg_half_m + 2 <= end {
+                let scalar_block_len = 1usize << (lg_half_m + 2);
+                let block_count = scalar_len / scalar_block_len;
+                let w1_row = unsafe {
+                    let row = &root_table[lg_half_m];
+                    core::slice::from_raw_parts(
+                        row.as_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    let row = &root_table[lg_half_m + 1];
+                    core::slice::from_raw_parts(
+                        row.as_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                if scalar_len >= PARALLEL_FFT_MIN_SCALARS && block_count >= 2 {
+                    MaybeParChunksMut::par_chunks_mut(scalars, scalar_block_len).for_each(
+                        |block| {
+                            fft_classic_simd_two_layers_neon_w4(block, lg_half_m, w1_row, w2_row);
+                        },
+                    );
+                } else {
+                    fft_classic_simd_two_layers_neon_w4(scalars, lg_half_m, w1_row, w2_row);
+                }
+                lg_half_m += 2;
+            }
+        }
+        lg_half_m
+    } else {
+        start
+    };
+
     for lg_half_m in start..end {
         let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
         let block_count = packed_values.len() / packed_m;
