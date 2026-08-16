@@ -186,6 +186,22 @@ pub(crate) struct VanishingScratch<F> {
     pub gate_filters: Vec<F>,
 }
 
+/// Grow or shrink `out` to `len` without a zero fill. The column evaluator
+/// writes every `term_rows` slot before the Horner read. `F` is a plain
+/// field wrapper.
+fn resize_overwritten<F: Field>(out: &mut Vec<F>, len: usize) {
+    if out.len() == len {
+        return;
+    }
+    if out.capacity() < len {
+        out.reserve(len - out.len());
+    }
+    // SAFETY: callers write every slot before any read.
+    unsafe {
+        out.set_len(len);
+    }
+}
+
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
 /// of two layouts.
 ///
@@ -744,18 +760,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let num_rows = num_challenges * (1 + num_chunks);
 
         let term_rows = &mut scratch.vanishing_partial_products_terms;
-        if term_rows.len() != num_rows * n {
-            term_rows.resize(num_rows * n, F::ZERO);
-        }
+        resize_overwritten(term_rows, num_rows * n);
 
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
-        l_0_xs.clear();
-        l_0_xs.extend(
-            indices_batch
+        l_0_xs.resize(n, F::ZERO);
+        if n > 0 {
+            debug_assert!(indices_batch
                 .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
-        );
+                .enumerate()
+                .all(|(k, &i)| i == indices_batch[0] + k));
+            z_h_on_coset.eval_l_0_into(indices_batch[0], xs_batch, l_0_xs);
+        }
 
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
