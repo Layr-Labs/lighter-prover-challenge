@@ -2396,10 +2396,16 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
-        command_buffer.wait_until_completed();
-        command_buffer.status() == MTLCommandBufferStatus::Completed
-    });
+    // Every buffer above is committed to the same queue in group order. The
+    // final completion therefore fences all earlier absorb passes and the
+    // parent ladder; retain every buffer until then so each terminal status can
+    // still be checked and any earlier command failure keeps the fallback live.
+    absorb_commands.last()?.wait_until_completed();
+    let all_ok = command_buffer_statuses_completed(
+        absorb_commands
+            .iter()
+            .map(|command_buffer| command_buffer.status()),
+    );
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
@@ -2431,6 +2437,23 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         leaf_count,
         cap_height,
     ))
+}
+
+/// Reduces retained command-buffer statuses without short-circuiting.
+///
+/// After the final same-queue completion fence every status must be terminal;
+/// treating an empty or non-completed sequence as failure keeps the caller's
+/// classic-path fallback fail-closed.
+fn command_buffer_statuses_completed(
+    statuses: impl IntoIterator<Item = MTLCommandBufferStatus>,
+) -> bool {
+    let mut saw_status = false;
+    let mut all_completed = true;
+    for status in statuses {
+        saw_status = true;
+        all_completed &= status == MTLCommandBufferStatus::Completed;
+    }
+    saw_status && all_completed
 }
 
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
@@ -4191,6 +4214,46 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn command_buffer_status_reducer_accepts_all_completed() {
+        assert!(command_buffer_statuses_completed([
+            MTLCommandBufferStatus::Completed,
+            MTLCommandBufferStatus::Completed,
+            MTLCommandBufferStatus::Completed,
+        ]));
+    }
+
+    #[test]
+    fn command_buffer_status_reducer_rejects_error_at_any_position() {
+        use MTLCommandBufferStatus::{Completed, Error};
+
+        assert!(!command_buffer_statuses_completed([
+            Error, Completed, Completed,
+        ]));
+        assert!(!command_buffer_statuses_completed([
+            Completed, Error, Completed,
+        ]));
+        assert!(!command_buffer_statuses_completed([
+            Completed, Completed, Error,
+        ]));
+    }
+
+    #[test]
+    fn command_buffer_status_reducer_rejects_nonterminal_or_empty_sequences() {
+        for status in [
+            MTLCommandBufferStatus::NotEnqueued,
+            MTLCommandBufferStatus::Committed,
+            MTLCommandBufferStatus::Scheduled,
+        ] {
+            assert!(!command_buffer_statuses_completed([
+                MTLCommandBufferStatus::Completed,
+                status,
+                MTLCommandBufferStatus::Completed,
+            ]));
+        }
+        assert!(!command_buffer_statuses_completed([]));
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
