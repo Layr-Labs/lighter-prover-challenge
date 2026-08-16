@@ -25,6 +25,7 @@ use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::merkle_tree::{DigestStore, LevelOrderDigests};
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+use crate::hash::poseidon2::SpinePath;
 
 #[cfg(feature = "diagnostic_profile")]
 static PROFILE_COMMAND_SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -1492,26 +1493,54 @@ pub fn is_exclusive_gpu_phase() -> bool {
     EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Runnable-but-unproven chain steps: incremented by the orchestrator when a
-/// chain step's transaction proof is ready (the step could prove right now),
-/// decremented when its proof completes. While this backlog is at or above
-/// [`SPINE_URGENT_BACKLOG`], the chain is the pipeline's laggard and its
+/// Runnable-but-unproven chain steps, tracked independently for the heavy and
+/// light paths: incremented by the orchestrator when a chain step's transaction
+/// proof is ready (the step could prove right now), decremented when its proof
+/// completes. While either path's backlog is at or above
+/// [`SPINE_URGENT_BACKLOG`], that chain is the pipeline's laggard and its
 /// 2^17 spine trees take priority for the single GPU buffer set; below it,
 /// chunk trees keep plain FIFO so the transaction pipeline is not slowed on
 /// the spine's behalf while the spine has slack. A plain unconditional
 /// priority measured both directions: the chain's predecessor waits fell but
-/// the deferred chunk trees stretched the light path — this backlog gate is
-/// the balance point.
-static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
+/// the deferred chunk trees stretched the light path. Two runnable serial
+/// steps are already a full predecessor plus successor behind: waiting for a
+/// third lets the early heavy-chain steps sit behind multiple wide chunk
+/// commitments, precisely when both paths create the most queue pressure.
+/// Triggering at two preserves plain FIFO while either path has only one step
+/// of slack, but rescues the serial spine one step earlier once it is truly
+/// behind. Separate cache lines prevent the two producer paths from bouncing a
+/// shared atomic and, crucially, prevent one ready step on each path from
+/// looking like a two-step lag on one serial dependency chain.
+#[repr(align(128))]
+struct CacheLineAtomicIsize(core::sync::atomic::AtomicIsize);
 
-/// See [`SPINE_BACKLOG`].
-pub fn spine_backlog_add(delta: isize) {
-    SPINE_BACKLOG.fetch_add(delta, core::sync::atomic::Ordering::Relaxed);
+static HEAVY_SPINE_BACKLOG: CacheLineAtomicIsize =
+    CacheLineAtomicIsize(core::sync::atomic::AtomicIsize::new(0));
+static LIGHT_SPINE_BACKLOG: CacheLineAtomicIsize =
+    CacheLineAtomicIsize(core::sync::atomic::AtomicIsize::new(0));
+const SPINE_URGENT_BACKLOG: isize = 2;
+
+fn spine_backlog(path: SpinePath) -> &'static core::sync::atomic::AtomicIsize {
+    match path {
+        SpinePath::Heavy => &HEAVY_SPINE_BACKLOG.0,
+        SpinePath::Light => &LIGHT_SPINE_BACKLOG.0,
+    }
+}
+
+/// See [`HEAVY_SPINE_BACKLOG`] and [`LIGHT_SPINE_BACKLOG`].
+pub fn spine_backlog_add(path: SpinePath, delta: isize) {
+    spine_backlog(path).fetch_add(delta, core::sync::atomic::Ordering::Relaxed);
 }
 
 fn spine_urgent() -> bool {
-    SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed) >= SPINE_URGENT_BACKLOG
+    HEAVY_SPINE_BACKLOG
+        .0
+        .load(core::sync::atomic::Ordering::Relaxed)
+        >= SPINE_URGENT_BACKLOG
+        || LIGHT_SPINE_BACKLOG
+            .0
+            .load(core::sync::atomic::Ordering::Relaxed)
+            >= SPINE_URGENT_BACKLOG
 }
 
 /// Number of Merkle builds currently occupying the serialized GPU stream
@@ -3840,7 +3869,8 @@ impl MetalShared {
         let job = GpuJobGuard::begin();
         // Spine trees (the 2^17 serial-critical shapes, same predicate as
         // gpu_worthwhile) jump queued chunk-tree waiters for the single set —
-        // but only while the chain is actually the laggard (see SPINE_BACKLOG).
+        // but only while one path's chain is actually the laggard (see the
+        // per-path spine backlog counters).
         let spine = leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent();
         let mut set = self.acquire_set_priority(spine)?;
         let result = self.build_with_set(

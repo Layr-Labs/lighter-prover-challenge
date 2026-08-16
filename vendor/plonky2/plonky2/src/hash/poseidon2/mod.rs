@@ -1,6 +1,15 @@
 pub mod config;
 pub mod hash;
 
+/// Identifies the independent transaction-chain spine whose runnable backlog
+/// is being updated. The Metal scheduler keeps the two counters separate so
+/// one ready step on each path is not mistaken for a two-step lag on either.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpinePath {
+    Heavy,
+    Light,
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 pub(crate) mod metal;
 
@@ -29,7 +38,7 @@ pub fn prewarm_gpu() {}
 /// No-op fallback for the chain-backlog GPU priority hint on platforms
 /// without the Metal backend.
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-pub fn spine_backlog_add(_delta: isize) {}
+pub fn spine_backlog_add(_path: SpinePath, _delta: isize) {}
 
 /// No-op fallback for the large-store prewarm on platforms without the
 /// Metal backend.

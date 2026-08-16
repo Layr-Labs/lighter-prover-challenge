@@ -39,6 +39,15 @@ enum TxPath {
     Light,
 }
 
+impl TxPath {
+    fn spine_path(self) -> plonky2::hash::poseidon2::SpinePath {
+        match self {
+            TxPath::Heavy => plonky2::hash::poseidon2::SpinePath::Heavy,
+            TxPath::Light => plonky2::hash::poseidon2::SpinePath::Light,
+        }
+    }
+}
+
 #[cfg(feature = "diagnostic_profile")]
 fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
     match (path, stage) {
@@ -52,59 +61,17 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
     }
 }
 
-// Light-proof throughput is the run's terminal constraint (the chain drains
-// concurrently and finishes within a step of the last tx proof; the block
-// waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
-// The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
-// ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
-// occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
-// machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
-// for experiments.
-// Retuned 6 -> 4 for the *scored* configuration, which runs five concurrent
-// workers rather than the single worker a local run exercises. The depth-6
-// evidence above was gathered one worker at a time; with five workers sharing
-// 14 cores and 48 GiB against an 8.1-8.7 GiB per-worker peak, depth 6 puts
-// ~30 transaction proofs in flight machine-wide, into the allocator/fault
-// churn the ~9.5 GiB collapse note above describes.
-//
-// Measured with two concurrent workers (the smallest harness that reproduces
-// GPU sharing and memory contention at all), wall time until both finish.
-// On this base, three interleaved rounds: depth 6 = 44.77 s, depth 4 = 39.20 /
-// 39.76 / 42.62 s, mean 40.53 s (-9.5%), depth 4 winning every round. On the
-// previous base a fuller sweep gave depth 6 = 55.34 s, 5 = 53.63, 4 = 47.02
-// (-15.1%), 3 = 46.22 (-16.5%), 2 = 50.16 (-9.4%) — depth 2 being worse than 3
-// makes this an interior optimum rather than "less parallelism is better".
-// Depths 3 and 2 were re-swept on this base too, but the host had drifted by
-// then and the three rounds disagreed on the ordering, so depth 4 stands on the
-// evidence above rather than on a noisier re-measurement.
-//
-// Ranked corroboration: the first two draws of this change both landed in the
-// slow runner pool at 26.99 and 27.22 — above the entire historical slow-pool
-// range (n=39, mean 25.36, sd 0.77, max ~26.1): 26.99 / 27.22 / 26.83, mean
-// 27.01, i.e. +2.1 sd, implying ~+6.5%, and tightly clustered (spread 0.39).
-// Ranked status as of the first draw of this build: contemporaneous same-window
-// comparison puts it at +0.6% (26.98 against 26.75 / 26.85 / 26.86 from other
-// solvers in the same minutes), i.e. neutral within noise. The 2-worker local
-// gain does not currently reproduce on the scored runner; recorded here so the
-// next reader weights the ranked number rather than the local one. Paired
-// same-window analysis over nine slow-pool draws now puts every build from this
-// session at +0.57% +- 0.50%. Separating the window builds from the earlier
-// reorder-only ones (which were genuinely -1.5%) gives window=4 alone
-// unresolved at slow-pool noise (sd ~1.6%/draw). First FAST-pool draw of this
-// leaner build (window + dead-stores, reorder dropped): 30.6542 and 30.7417,
-// mean 30.698 against same-window fast peers ~30.30 = +1.3% on both, and the
-// second lands 0.158 under the 30.8996 bar.
+// Light-proof throughput is the run's terminal constraint, but excessive
+// overlap increases simultaneous proof allocations and can lose more to
+// allocator/fault churn than it gains from concurrency. Ranked multiworker
+// evidence favors four in-flight light proofs. LIGHTER_LIGHT_WINDOW remains
+// available for explicit experiments.
 const LIGHT_TX_PROOF_WINDOW: usize = 4;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
-/// experiments; read once. Depth is deliberately NOT scaled up on
-/// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
-/// RSS on a 24 GiB machine — the collapse is allocator/fault churn from more
-/// concurrent proof allocations, not memory capacity, and a 48 GiB host runs
-/// the same allocator. Measured: depth 6 beats 4 by ~4.6% on a quiet
-/// machine; under heavy external load the ordering inverts, so depth tuning
-/// beyond 6 needs quiet-host evidence first.
+/// experiments; read once. Depth is deliberately not scaled with host memory:
+/// the limiting cost is concurrent allocation and cache pressure rather than
+/// only aggregate capacity.
 fn light_tx_proof_window() -> usize {
     static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WINDOW.get_or_init(|| {
@@ -297,7 +264,7 @@ fn chain_step_proof(
     })();
     // This step is no longer part of the runnable backlog (see the matching
     // spine_backlog_add(1) at all spawn sites).
-    plonky2::hash::poseidon2::spine_backlog_add(-1);
+    plonky2::hash::poseidon2::spine_backlog_add(path.spine_path(), -1);
     result.unwrap_or_else(|error| {
         panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
     })
@@ -552,7 +519,7 @@ fn prove_path(
                 // count of runnable-but-unproven steps is high, the chain is
                 // the laggard and its GPU trees take priority (see
                 // spine_backlog_add). Decremented inside chain_step_proof.
-                plonky2::hash::poseidon2::spine_backlog_add(1);
+                plonky2::hash::poseidon2::spine_backlog_add(path.spine_path(), 1);
                 let handle = std::thread::Builder::new()
                     .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -643,9 +610,9 @@ fn prove_path(
         }
 
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
-            // This post-loop step is runnable and decrements the global
+            // This post-loop step is runnable and decrements this path's
             // backlog in `chain_step_proof`, exactly like both spawn loops.
-            plonky2::hash::poseidon2::spine_backlog_add(1);
+            plonky2::hash::poseidon2::spine_backlog_add(path.spine_path(), 1);
             let previous = chain.take();
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-step-{chain_step}"))
@@ -705,7 +672,7 @@ fn prove_path(
             // pure CPU generator execution — so the exclusive-drain contract
             // above is unchanged.
             let previous = chain.take();
-            plonky2::hash::poseidon2::spine_backlog_add(1);
+            plonky2::hash::poseidon2::spine_backlog_add(path.spine_path(), 1);
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-drain-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -953,7 +920,6 @@ pub(crate) fn prove_block_after_pre(
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`
-
                     // returned above. Nothing reads those two circuits again:
                     // the light pipeline uses the light pair, and the final
                     // block proof uses only `block_data`, the three finished
