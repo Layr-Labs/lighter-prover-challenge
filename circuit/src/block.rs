@@ -147,6 +147,17 @@ where
         Self::from_json_with_empty_txs(data, tx_per_proof, light_tx_per_proof, 0, 0)
     }
 
+    /// Deserialize a block whose top-level `txs` array has already been
+    /// replaced with `[]`. Used only to start the pre-execution proof: that
+    /// circuit reads no transaction. The full fixture parse remains the
+    /// authority for every transaction and for padding.
+    pub fn from_json_pre_exec_only(data: &[u8]) -> serde_json::Result<Self> {
+        let mut block: Self = serde_json::from_slice(data)?;
+        block.txs.clear();
+        block.tx_chunks.clear();
+        Ok(block)
+    }
+
     /// Like [`Self::from_json`], but when the block consists only of empty txs, appends
     /// `heavy_empty_tx_count` heavy and `light_empty_tx_count` light copies of the block's
     /// trailing empty tx before chunking. Blocks with active txs are parsed unchanged.
@@ -559,5 +570,166 @@ where
                 .try_into()
                 .unwrap(),
         }
+    }
+}
+
+/// Replace the root object's `txs` value with `[]` so a second serde parse
+/// can start the pre-execution proof without walking the transaction array.
+/// Nested `txs` keys and the same bytes inside strings are left untouched.
+/// On any structural surprise the original bytes are returned unchanged;
+/// the caller then pays a full parse, never a wrong parse.
+pub fn without_top_level_txs(input: &[u8]) -> Vec<u8> {
+    let mut i = 0usize;
+    skip_ws(input, &mut i);
+    if i >= input.len() || input[i] != b'{' {
+        return input.to_vec();
+    }
+    i += 1;
+    loop {
+        skip_ws(input, &mut i);
+        if i >= input.len() {
+            return input.to_vec();
+        }
+        match input[i] {
+            b'}' => return input.to_vec(),
+            b',' => {
+                i += 1;
+                continue;
+            }
+            b'"' => {}
+            _ => return input.to_vec(),
+        }
+        let key_start = i;
+        if !skip_string(input, &mut i) {
+            return input.to_vec();
+        }
+        let is_txs = &input[key_start..i] == b"\"txs\"";
+        skip_ws(input, &mut i);
+        if i >= input.len() || input[i] != b':' {
+            return input.to_vec();
+        }
+        i += 1;
+        skip_ws(input, &mut i);
+        let value_start = i;
+        if !skip_value(input, &mut i) {
+            return input.to_vec();
+        }
+        if is_txs {
+            let mut out = Vec::with_capacity(input.len() - (i - value_start) + 2);
+            out.extend_from_slice(&input[..value_start]);
+            out.extend_from_slice(b"[]");
+            out.extend_from_slice(&input[i..]);
+            return out;
+        }
+    }
+}
+
+fn skip_ws(input: &[u8], i: &mut usize) {
+    while *i < input.len() && input[*i].is_ascii_whitespace() {
+        *i += 1;
+    }
+}
+
+fn skip_string(input: &[u8], i: &mut usize) -> bool {
+    if *i >= input.len() || input[*i] != b'"' {
+        return false;
+    }
+    *i += 1;
+    while *i < input.len() {
+        match input[*i] {
+            b'\\' => {
+                *i += 1;
+                if *i >= input.len() {
+                    return false;
+                }
+                *i += 1;
+            }
+            b'"' => {
+                *i += 1;
+                return true;
+            }
+            _ => *i += 1,
+        }
+    }
+    false
+}
+
+fn skip_value(input: &[u8], i: &mut usize) -> bool {
+    if *i >= input.len() {
+        return false;
+    }
+    match input[*i] {
+        b'"' => skip_string(input, i),
+        b'{' => skip_container(input, i, b'}'),
+        b'[' => skip_container(input, i, b']'),
+        _ => {
+            while *i < input.len() && !matches!(input[*i], b',' | b'}' | b']') {
+                *i += 1;
+            }
+            true
+        }
+    }
+}
+
+fn skip_container(input: &[u8], i: &mut usize, close: u8) -> bool {
+    if *i >= input.len() {
+        return false;
+    }
+    *i += 1;
+    let mut depth = 1u32;
+    while *i < input.len() && depth > 0 {
+        match input[*i] {
+            b'"' => {
+                if !skip_string(input, i) {
+                    return false;
+                }
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                *i += 1;
+            }
+            c if c == close => {
+                depth -= 1;
+                *i += 1;
+            }
+            b'}' | b']' => {
+                if depth == 1 {
+                    return false;
+                }
+                depth -= 1;
+                *i += 1;
+            }
+            _ => *i += 1,
+        }
+    }
+    depth == 0
+}
+
+#[cfg(test)]
+mod without_top_level_txs_tests {
+    use super::without_top_level_txs;
+
+    #[test]
+    fn replaces_only_root_txs_and_keeps_nested_and_string_lookalikes() {
+        let input = br#"{
+            "ca": 1,
+            "nested": {"txs": [9]},
+            "note": "txs:[1,2] \"txs\"",
+            "txs": [{"x": "]", "y": "a\"b"}, 2],
+            "bn": 7
+        }"#;
+        let out = without_top_level_txs(input);
+        let v: serde_json::Value = serde_json::from_slice(&out).expect("stripped json");
+        assert_eq!(v["txs"], serde_json::json!([]));
+        assert_eq!(v["nested"]["txs"], serde_json::json!([9]));
+        assert_eq!(v["note"], "txs:[1,2] \"txs\"");
+        assert_eq!(v["bn"], 7);
+        assert_eq!(v["ca"], 1);
+    }
+
+    #[test]
+    fn leaves_bytes_unchanged_when_txs_is_absent() {
+        let input = br#"{"ca":1,"bn":2}"#;
+        assert_eq!(without_top_level_txs(input), input);
     }
 }
