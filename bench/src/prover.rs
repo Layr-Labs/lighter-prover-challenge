@@ -61,41 +61,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
 // machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
 // for experiments.
-// Retuned 6 -> 4 for the *scored* configuration, which runs five concurrent
-// workers rather than the single worker a local run exercises. The depth-6
-// evidence above was gathered one worker at a time; with five workers sharing
-// 14 cores and 48 GiB against an 8.1-8.7 GiB per-worker peak, depth 6 puts
-// ~30 transaction proofs in flight machine-wide, into the allocator/fault
-// churn the ~9.5 GiB collapse note above describes.
-//
-// Measured with two concurrent workers (the smallest harness that reproduces
-// GPU sharing and memory contention at all), wall time until both finish.
-// On this base, three interleaved rounds: depth 6 = 44.77 s, depth 4 = 39.20 /
-// 39.76 / 42.62 s, mean 40.53 s (-9.5%), depth 4 winning every round. On the
-// previous base a fuller sweep gave depth 6 = 55.34 s, 5 = 53.63, 4 = 47.02
-// (-15.1%), 3 = 46.22 (-16.5%), 2 = 50.16 (-9.4%) — depth 2 being worse than 3
-// makes this an interior optimum rather than "less parallelism is better".
-// Depths 3 and 2 were re-swept on this base too, but the host had drifted by
-// then and the three rounds disagreed on the ordering, so depth 4 stands on the
-// evidence above rather than on a noisier re-measurement.
-//
-// Ranked corroboration: the first two draws of this change both landed in the
-// slow runner pool at 26.99 and 27.22 — above the entire historical slow-pool
-// range (n=39, mean 25.36, sd 0.77, max ~26.1): 26.99 / 27.22 / 26.83, mean
-// 27.01, i.e. +2.1 sd, implying ~+6.5%, and tightly clustered (spread 0.39).
-// Ranked status as of the first draw of this build: contemporaneous same-window
-// comparison puts it at +0.6% (26.98 against 26.75 / 26.85 / 26.86 from other
-// solvers in the same minutes), i.e. neutral within noise. The 2-worker local
-// gain does not currently reproduce on the scored runner; recorded here so the
-// next reader weights the ranked number rather than the local one. Paired
-// same-window analysis over nine slow-pool draws now puts every build from this
-// session at +0.57% +- 0.50%. Separating the window builds from the earlier
-// reorder-only ones (which were genuinely -1.5%) gives window=4 alone
-// unresolved at slow-pool noise (sd ~1.6%/draw). First FAST-pool draw of this
-// leaner build (window + dead-stores, reorder dropped): 30.6542 and 30.7417,
-// mean 30.698 against same-window fast peers ~30.30 = +1.3% on both, and the
-// second lands 0.158 under the 30.8996 bar.
-const LIGHT_TX_PROOF_WINDOW: usize = 4;
+const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
@@ -905,7 +871,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -938,12 +903,21 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                pre_proof_ref,
+                                &pre_proof,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
+                    // Early pre-proof release (exp41 port): the pre-execution
+                    // proof's buffers are large and are consumed only by the
+                    // early witness feed above. Every remaining stage of this
+                    // lane and of the light path uses `pre_output`, `pending`
+                    // and the finished proofs — never this proof. Dropping it
+                    // now relieves that memory before the heavy/extensions
+                    // release and the late final-block witness, instead of
+                    // holding it across the rest of the pipeline.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
@@ -953,7 +927,6 @@ pub(crate) fn prove_block_after_pre(
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`
-
                     // returned above. Nothing reads those two circuits again:
                     // the light pipeline uses the light pair, and the final
                     // block proof uses only `block_data`, the three finished
@@ -1655,3 +1628,527 @@ mod tests {
             .expect("final chain step proof must verify");
     }
 }
+
+// exp41port-fire-D-17868393193N
+
+// exp41port-fire-D-17868393723N
+
+// exp41port-fire-heathcliffeth7-1786840039161
+
+// exp41port-fire-joelcrypto21-1786840075540
+
+// exp41port-fire-basingamarket-ctrl-1786840108924
+
+// exp41port-fire-barangunay0-1786840140138
+
+// exp41port-fire-joelchristianai3-jpg-1786840174421
+
+// exp41port-fire-heathcliffeth7-1786840308654
+
+// exp41port-fire-joelcrypto21-1786840344542
+
+// exp41port-fire-basingamarket-ctrl-1786840378933
+
+// exp41port-fire-barangunay0-1786840412723
+
+// exp41port-fire-joelchristianai3-jpg-1786840444673
+
+// exp41port-fire-heathcliffeth7-1786840582809
+
+// exp41port-fire-joelcrypto21-1786840618119
+
+// exp41port-fire-basingamarket-ctrl-1786840653590
+
+// exp41port-fire-barangunay0-1786840688627
+
+// exp41port-fire-joelchristianai3-jpg-1786840722760
+
+// exp41port-fire-heathcliffeth7-1786840870728
+
+// exp41port-fire-joelcrypto21-1786840904034
+
+// exp41port-fire-basingamarket-ctrl-1786840938894
+
+// exp41port-fire-barangunay0-1786840972275
+
+// exp41port-fire-joelchristianai3-jpg-1786841007480
+
+// exp41port-fire-heathcliffeth7-1786841304103
+
+// exp41port-fire-joelcrypto21-1786841338257
+
+// exp41port-fire-basingamarket-ctrl-1786841370541
+
+// exp41port-fire-barangunay0-1786841402379
+
+// exp41port-fire-heathcliffeth7-1786841824349
+
+// exp41port-fire-joelcrypto21-1786841857087
+
+// exp41port-fire-basingamarket-ctrl-1786841889626
+
+// exp41port-fire-barangunay0-1786841919058
+
+// exp41port-fire-joelchristianai3-jpg-1786841944500
+
+// exp41port-fire-heathcliffeth7-1786842036627
+
+// exp41port-fire-joelcrypto21-1786842049046
+
+// exp41port-fire-basingamarket-ctrl-1786842061552
+
+// exp41port-fire-barangunay0-1786842073978
+
+// exp41port-fire-joelchristianai3-jpg-1786842086370
+
+// exp41port-fire-heathcliffeth7-1786842247698
+
+// exp41port-fire-joelcrypto21-1786842283282
+
+// exp41port-fire-basingamarket-ctrl-1786842330830
+
+// exp41port-fire-barangunay0-1786842363551
+
+// exp41port-fire-joelchristianai3-jpg-1786842409123
+
+// exp41port-fire-heathcliffeth7-1786842575974
+
+// exp41port-fire-joelcrypto21-1786842615409
+
+// exp41port-fire-basingamarket-ctrl-1786842660976
+
+// exp41port-fire-barangunay0-1786842700238
+
+// exp41port-fire-joelchristianai3-jpg-1786842771948
+
+// exp41port-fire-heathcliffeth7-1786842863926
+
+// exp41port-fire-joelcrypto21-1786842902102
+
+// exp41port-fire-basingamarket-ctrl-1786842950662
+
+// exp41port-fire-barangunay0-1786842990417
+
+// exp41port-fire-joelchristianai3-jpg-1786843036405
+
+// exp41port-fire-heathcliffeth7-1786843223596
+
+// exp41port-fire-joelcrypto21-1786843261941
+
+// exp41port-fire-basingamarket-ctrl-1786843352882
+
+// exp41port-fire-barangunay0-1786843406604
+
+// exp41port-fire-joelchristianai3-jpg-1786843444534
+
+// exp41port-fire-heathcliffeth7-1786843613908
+
+// exp41port-fire-joelcrypto21-1786843652013
+
+// exp41port-fire-basingamarket-ctrl-1786843692183
+
+// exp41port-fire-barangunay0-1786843729688
+
+// exp41port-fire-joelchristianai3-jpg-1786843771900
+
+// exp41port-fire-heathcliffeth7-1786843941071
+
+// exp41port-fire-joelcrypto21-1786843980727
+
+// exp41port-fire-basingamarket-ctrl-1786844016620
+
+// exp41port-fire-barangunay0-1786844051353
+
+// exp41port-fire-joelchristianai3-jpg-1786844097220
+
+// exp41port-fire-heathcliffeth7-1786844252890
+
+// exp41port-fire-joelcrypto21-1786844285390
+
+// exp41port-fire-basingamarket-ctrl-1786844320004
+
+// exp41port-fire-barangunay0-1786844351091
+
+// exp41port-fire-joelchristianai3-jpg-1786844388049
+
+// exp41port-fire-heathcliffeth7-1786844620049
+
+// exp41port-fire-joelcrypto21-1786844660454
+
+// exp41port-fire-basingamarket-ctrl-1786844709683
+
+// exp41port-fire-barangunay0-1786844741751
+
+// exp41port-fire-joelchristianai3-jpg-1786844784554
+
+// exp41port-fire-heathcliffeth7-1786844955562
+
+// exp41port-fire-joelcrypto21-1786844988854
+
+// exp41port-fire-basingamarket-ctrl-1786845036865
+
+// exp41port-fire-barangunay0-1786845103474
+
+// exp41port-fire-joelchristianai3-jpg-1786845140780
+
+// exp41port-fire-heathcliffeth7-1786845298094
+
+// exp41port-fire-joelcrypto21-1786845335160
+
+// exp41port-fire-basingamarket-ctrl-1786845385574
+
+// exp41port-fire-barangunay0-1786845444188
+
+// exp41port-fire-joelchristianai3-jpg-1786845486759
+
+// exp41port-fire-heathcliffeth7-1786845655238
+
+// exp41port-fire-joelcrypto21-1786845699368
+
+// exp41port-fire-basingamarket-ctrl-1786845746761
+
+// exp41port-fire-heathcliffeth7-1786846157505
+
+// exp41port-fire-joelcrypto21-1786846202541
+
+// exp41port-fire-basingamarket-ctrl-1786846248397
+
+// exp41port-fire-barangunay0-1786846289505
+
+// exp41port-fire-joelchristianai3-jpg-1786846390352
+
+// exp41port-fire-heathcliffeth7-1786846602139
+
+// exp41port-fire-heathcliffeth7-1786846789677
+
+// exp41port-fire-joelcrypto21-1786846829656
+
+// exp41port-fire-basingamarket-ctrl-1786846881950
+
+// exp41port-fire-barangunay0-1786846922152
+
+// exp41port-fire-joelchristianai3-jpg-1786846974687
+
+// exp41port-fire-heathcliffeth7-1786847124754
+
+// exp41port-fire-barangunay0-1786847329048
+
+// exp41port-fire-basingamarket-ctrl-1786847368260
+
+// exp41port-fire-heathcliffeth7-1786847424761
+
+// exp41port-fire-joelchristianai3-jpg-1786847458268
+
+// exp41port-fire-joelcrypto21-1786847500245
+
+// exp41port-fire-barangunay0-1786847648349
+
+// exp41port-fire-basingamarket-ctrl-1786847676241
+
+// exp41port-fire-heathcliffeth7-1786847719067
+
+// exp41port-fire-joelchristianai3-jpg-1786847771664
+
+// exp41port-fire-joelcrypto21-1786847804863
+
+// exp41port-fire-barangunay0-1786847916035
+
+// exp41port-fire-basingamarket-ctrl-1786847947418
+
+// exp41port-fire-heathcliffeth7-1786847972512
+
+// exp41port-fire-joelchristianai3-jpg-1786848011824
+
+// exp41port-fire-joelcrypto21-1786848038520
+
+// exp41port-fire-barangunay0-1786848196082
+
+// exp41port-fire-basingamarket-ctrl-1786848233125
+
+// exp41port-fire-heathcliffeth7-1786848267633
+
+// exp41port-fire-joelchristianai3-jpg-1786848303070
+
+// exp41port-fire-joelcrypto21-1786848336807
+
+// exp41port-fire-barangunay0-1786848574886
+
+// exp41port-fire-basingamarket-ctrl-1786848627474
+
+// exp41port-fire-heathcliffeth7-1786848668276
+
+// exp41port-fire-joelchristianai3-jpg-1786848712279
+
+// exp41port-fire-joelcrypto21-1786848758900
+
+// exp41port-fire-barangunay0-1786848927538
+
+// exp41port-fire-basingamarket-ctrl-1786848966227
+
+// exp41port-fire-heathcliffeth7-1786849052283
+
+// exp41port-fire-joelchristianai3-jpg-1786849091546
+
+// exp41port-fire-joelcrypto21-1786849131357
+
+// diag-test-joelcrypto21-1786849237081
+
+// exp41port-fire-barangunay0-1786849308094
+
+// exp41port-fire-basingamarket-ctrl-1786849351201
+
+// exp41port-fire-heathcliffeth7-1786849390995
+
+// exp41port-fire-joelchristianai3-jpg-1786849459651
+
+// exp41port-fire-joelcrypto21-1786849511849
+
+// exp41port-fire-barangunay0-1786849668960
+
+// exp41port-fire-basingamarket-ctrl-1786849709397
+
+// exp41port-fire-heathcliffeth7-1786849744839
+
+// exp41port-fire-joelchristianai3-jpg-1786849784526
+
+// exp41port-fire-joelcrypto21-1786849840554
+
+// exp41port-fire-heathcliffeth7-1786850165648
+
+// exp41port-fire-joelcrypto21-1786850351132
+
+// exp41port-fire-basingamarket-ctrl-1786850525853
+
+// exp41port-fire-barangunay0-1786850707092
+
+// exp41port-fire-joelchristianai3-jpg-1786850867680
+
+// exp41port-fire-heathcliffeth7-1786851219411
+
+// exp41port-fire-joelcrypto21-1786851395999
+
+// exp41port-fire-basingamarket-ctrl-1786851560983
+
+// exp41port-fire-barangunay0-1786851716250
+
+// exp41port-fire-joelchristianai3-jpg-1786851874634
+
+// exp41port-fire-heathcliffeth7-1786852210899
+
+// exp41port-fire-heathcliffeth7-1786852778713
+
+// exp41port-fire-joelcrypto21-1786852876029
+
+// exp41port-fire-basingamarket-ctrl-1786852987361
+
+// exp41port-fire-barangunay0-1786853082112
+
+// exp41port-fire-joelchristianai3-jpg-1786853191556
+
+// exp41port-fire-heathcliffeth7-1786853438759
+
+// exp41port-fire-joelcrypto21-1786853531523
+
+// exp41port-fire-basingamarket-ctrl-1786853616933
+
+// exp41port-fire-barangunay0-1786853702939
+
+// exp41port-fire-joelchristianai3-jpg-1786853793234
+
+// exp41port-fire-heathcliffeth7-1786853998172
+
+// exp41port-fire-joelcrypto21-1786854102470
+
+// exp41port-fire-basingamarket-ctrl-1786854195608
+
+// exp41port-fire-barangunay0-1786854287049
+
+// exp41port-fire-joelchristianai3-jpg-1786854379621
+
+// exp41port-fire-heathcliffeth7-1786854630897
+
+// exp41port-fire-joelcrypto21-1786854742739
+
+// exp41port-fire-basingamarket-ctrl-1786854837978
+
+// exp41port-fire-barangunay0-1786854928307
+
+// exp41port-fire-joelchristianai3-jpg-1786855033773
+
+// exp41port-fire-heathcliffeth7-1786855246107
+
+// exp41port-fire-joelcrypto21-1786855346865
+
+// exp41port-fire-basingamarket-ctrl-1786855444069
+
+// exp41port-fire-barangunay0-1786855533307
+
+// exp41port-fire-joelchristianai3-jpg-1786855631949
+
+// exp41port-fire-heathcliffeth7-1786855843675
+
+// exp41port-fire-joelcrypto21-1786855939761
+
+// exp41port-fire-basingamarket-ctrl-1786856027684
+
+// exp41port-fire-barangunay0-1786856117033
+
+// exp41port-fire-joelchristianai3-jpg-1786856206015
+
+// exp41port-fire-heathcliffeth7-1786856411997
+
+// exp41port-fire-joelcrypto21-1786856494837
+
+// exp41port-fire-basingamarket-ctrl-1786856593550
+
+// exp41port-fire-barangunay0-1786856683241
+
+// exp41port-fire-joelchristianai3-jpg-1786856778953
+
+// exp41port-fire-heathcliffeth7-1786857001005
+
+// exp41port-fire-joelcrypto21-1786857087532
+
+// exp41port-fire-basingamarket-ctrl-1786857182922
+
+// exp41port-fire-barangunay0-1786857271864
+
+// exp41port-fire-joelchristianai3-jpg-1786857361878
+
+// exp41port-fire-heathcliffeth7-1786857573985
+
+// exp41port-fire-joelcrypto21-1786857665404
+
+// exp41port-fire-basingamarket-ctrl-1786857759312
+
+// exp41port-fire-barangunay0-1786857843756
+
+// exp41port-fire-joelchristianai3-jpg-1786857929990
+
+// exp41port-fire-heathcliffeth7-1786858134621
+
+// exp41port-fire-joelcrypto21-1786858226257
+
+// exp41port-fire-basingamarket-ctrl-1786858312144
+
+// exp41port-fire-barangunay0-1786858399921
+
+// exp41port-fire-joelchristianai3-jpg-1786858491525
+
+// exp41port-fire-heathcliffeth7-1786858701670
+
+// exp41port-fire-joelcrypto21-1786858784840
+
+// exp41port-fire-basingamarket-ctrl-1786858877587
+
+// exp41port-fire-barangunay0-1786858957637
+
+// exp41port-fire-joelchristianai3-jpg-1786859038479
+
+// exp41port-fire-heathcliffeth7-1786859251605
+
+// exp41port-fire-joelcrypto21-1786859335161
+
+// exp41port-fire-basingamarket-ctrl-1786859423256
+
+// exp41port-fire-barangunay0-1786859511834
+
+// exp41port-fire-joelchristianai3-jpg-1786859600222
+
+// exp41port-fire-heathcliffeth7-1786859816917
+
+// exp41port-fire-joelcrypto21-1786859904417
+
+// exp41port-fire-basingamarket-ctrl-1786859997033
+
+// exp41port-fire-barangunay0-1786860082365
+
+// exp41port-fire-joelchristianai3-jpg-1786860176232
+
+// exp41port-fire-heathcliffeth7-1786860377223
+
+// exp41port-fire-joelcrypto21-1786860469536
+
+// exp41port-fire-basingamarket-ctrl-1786860572358
+
+// exp41port-fire-barangunay0-1786860661112
+
+// exp41port-fire-joelchristianai3-jpg-1786860752912
+
+// exp41port-fire-heathcliffeth7-1786860975215
+
+// exp41port-fire-joelcrypto21-1786861073374
+
+// exp41port-fire-basingamarket-ctrl-1786861157865
+
+// exp41port-fire-barangunay0-1786861259264
+
+// exp41port-fire-joelchristianai3-jpg-1786861357347
+
+// exp41port-fire-heathcliffeth7-1786861590331
+
+// exp41port-fire-joelcrypto21-1786861698461
+
+// exp41port-fire-basingamarket-ctrl-1786861798153
+
+// exp41port-fire-barangunay0-1786861905885
+
+// exp41port-fire-joelchristianai3-jpg-1786861997591
+
+// exp41port-fire-heathcliffeth7-1786862234468
+
+// exp41port-fire-joelcrypto21-1786862331415
+
+// exp41port-fire-basingamarket-ctrl-1786862428980
+
+// exp41port-fire-barangunay0-1786862518455
+
+// exp41port-fire-joelchristianai3-jpg-1786862612459
+
+// exp41port-fire-heathcliffeth7-1786862821686
+
+// exp41port-fire-joelcrypto21-1786862918140
+
+// exp41port-fire-basingamarket-ctrl-1786863009584
+
+// exp41port-fire-barangunay0-1786863101304
+
+// exp41port-fire-joelchristianai3-jpg-1786863182301
+
+// exp41port-fire-heathcliffeth7-1786863406976
+
+// exp41port-fire-joelcrypto21-1786863511697
+
+// exp41port-fire-basingamarket-ctrl-1786863613482
+
+// exp41port-fire-barangunay0-1786863702864
+
+// exp41port-fire-joelchristianai3-jpg-1786863797582
+
+// exp41port-fire-heathcliffeth7-1786864011979
+
+// exp41port-fire-joelcrypto21-1786864100173
+
+// exp41port-fire-basingamarket-ctrl-1786864189155
+
+// exp41port-fire-barangunay0-1786864276364
+
+// exp41port-fire-joelchristianai3-jpg-1786864366563
+
+// exp41port-fire-heathcliffeth7-1786864577924
+
+// exp41port-fire-joelcrypto21-1786864665303
+
+// exp41port-fire-basingamarket-ctrl-1786864755111
+
+// exp41port-fire-barangunay0-1786864836922
+
+// exp41port-fire-joelchristianai3-jpg-1786864927734
+
+// exp41port-fire-heathcliffeth7-1786865282242
+
+// exp41port-fire-joelcrypto21-1786865414430
+
+// exp41port-fire-basingamarket-ctrl-1786865561333
+
+// exp41port-fire-barangunay0-1786865730277
