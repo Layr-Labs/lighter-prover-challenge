@@ -1204,6 +1204,51 @@ mod tests {
         check::<<GoldilocksField as Extendable<2>>::Extension>();
     }
 
+    /// The base-scalar specialization is used before FFT butterflies and its
+    /// raw Goldilocks representatives therefore have to match the ordinary
+    /// extension multiplication it replaces, not merely be field-equal.
+    #[test]
+    fn base_scalar_mul_matches_embedded_extension_mul_raw_words() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::{Field64, PrimeField64};
+
+        type BF = GoldilocksField;
+        type E = <BF as Extendable<2>>::Extension;
+
+        let words = [
+            0,
+            1,
+            BF::ORDER - 1,
+            BF::ORDER,
+            BF::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+            0x9e37_79b9_7f4a_7c15,
+        ];
+        for &a0 in &words {
+            for &a1 in &words {
+                let coefficient = <E as FieldExtension<2>>::from_basefield_array([
+                    GoldilocksField(a0),
+                    GoldilocksField(a1),
+                ]);
+                for &scalar in &words {
+                    let scalar = GoldilocksField(scalar);
+                    let expected = coefficient * <E as FieldExtension<2>>::from_basefield(scalar);
+                    let actual = <E as FieldExtension<2>>::scalar_mul(&coefficient, scalar);
+                    let expected_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
+                        &expected,
+                    )
+                        .map(|x| x.to_noncanonical_u64());
+                    let actual_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
+                        &actual,
+                    )
+                        .map(|x| x.to_noncanonical_u64());
+                    assert_eq!(actual_raw, expected_raw, "a0={a0:#x}, a1={a1:#x}");
+                }
+            }
+        }
+    }
+
     /// A2's whole claim in one place: for the embedded shift both prover call
     /// sites actually pass, `c.scalar_mul(r)` and `[r, 0] * c` produce the
     /// *same raw `u64` words*, not merely the same field element. Compared on
