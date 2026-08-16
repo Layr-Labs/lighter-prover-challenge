@@ -1500,10 +1500,15 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// chunk trees keep plain FIFO so the transaction pipeline is not slowed on
 /// the spine's behalf while the spine has slack. A plain unconditional
 /// priority measured both directions: the chain's predecessor waits fell but
-/// the deferred chunk trees stretched the light path — this backlog gate is
-/// the balance point.
+/// the deferred chunk trees stretched the light path. Two runnable serial
+/// steps are already a full predecessor plus successor behind: waiting for a
+/// third lets the early heavy-chain steps sit behind multiple wide chunk
+/// commitments, precisely when both paths create the most queue pressure.
+/// Triggering at two preserves plain FIFO while either path has only one step
+/// of slack, but rescues the serial spine one step earlier once it is truly
+///  behind.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
+const SPINE_URGENT_BACKLOG: isize = 2;
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
