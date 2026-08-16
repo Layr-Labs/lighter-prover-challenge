@@ -1,4 +1,4 @@
-// Redraw marker 501
+// exact RA fixed-mask staged resample 2026-08-16
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
