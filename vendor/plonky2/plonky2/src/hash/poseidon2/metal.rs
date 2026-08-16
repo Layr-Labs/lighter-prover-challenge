@@ -14,9 +14,8 @@ use objc::runtime::Sel;
 #[cfg(feature = "diagnostic_profile")]
 use objc::Message;
 use metal::{
-    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
-    ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
+    Buffer, CommandBuffer, CommandQueue, CompileOptions, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize, NSUInteger,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -111,199 +110,6 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
-
-/// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
-/// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
-/// removes the MSL *front* end; this removes the *back* end. Every
-/// `newComputePipelineStateWithFunction:` otherwise lowers that kernel's AIR to
-/// GPU machine code through MTLCompilerService, and the ranked Seatbelt profile
-/// denies writes to `com.apple.metal` (see `write-benchmark-sandbox-profile.sh`),
-/// which disables the OS shader cache outright — reads miss too — so every
-/// scored worker pays the full cold lowering. Measured under that profile:
-/// ~1.54 s serial / ~0.84 s for the parallel-six-plus-deferred shape below,
-/// against ~1.4 ms when the pipelines come out of this archive.
-///
-/// The archive is keyed by GPU family and compiler build, so on any other device
-/// or OS revision every lookup misses and Metal lowers the AIR exactly as
-/// before: the pipelines, and therefore every value the GPU computes, are
-/// identical either way — only the instant at which they exist differs.
-///
-/// `MTLBinaryArchiveDescriptor` accepts a file URL and nothing else, and the
-/// ranked sandbox's sole writable path is the per-fixture scratch directory, so
-/// the worker stages these bytes there at startup
-/// ([`set_pipeline_archive_dir`]). Regenerate with the `record_pipeline_archive`
-/// ignored test whenever `poseidon2.metallib` changes, and re-check with
-/// `pipeline_archive_covers_metallib_on_this_device`: a stale archive still
-/// *loads*, it simply misses every lookup, and the only visible symptom is the
-/// startup cost coming back.
-const PIPELINE_ARCHIVE: &[u8] = include_bytes!("poseidon2-pipelines.metalarchive");
-
-/// Kernel used for the one `FailOnBinaryArchiveMiss` probe that decides whether
-/// a loaded archive serves this device at all. Chosen because it is required
-/// (its absence fails context construction anyway) and is built first.
-const ARCHIVE_PROBE_KERNEL: &str = "poseidon2_hash_leaves";
-
-/// Directory the worker may write the staged pipeline archive into. Set once by
-/// the bench worker (its proof-output directory: the one path writable under the
-/// ranked Seatbelt profile) before the first GPU use; unset (tests, library
-/// users) means pipeline creation simply proceeds without an archive.
-static PIPELINE_ARCHIVE_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-
-/// Registers the writable directory used to stage the embedded pipeline
-/// archive. Call before the first GPU use (in practice: before `prewarm`).
-/// Later calls are ignored; scheduling only, proof bytes are unaffected.
-pub fn set_pipeline_archive_dir(dir: &std::path::Path) {
-    let _ = PIPELINE_ARCHIVE_DIR.set(dir.to_path_buf());
-}
-
-/// What the archive did on this process, for the one-line startup self-report.
-/// A ranked draw is otherwise uninformative about the mechanism: the archive is
-/// GPU- and OS-build-keyed and misses are silent, so without this line a flat
-/// score cannot be told apart from an archive that never served.
-const ARCHIVE_STATE_OFF: u8 = 0;
-const ARCHIVE_STATE_UNUSABLE: u8 = 1;
-const ARCHIVE_STATE_MISS: u8 = 2;
-const ARCHIVE_STATE_SERVES: u8 = 3;
-static ARCHIVE_STATE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(ARCHIVE_STATE_OFF);
-/// Pipelines that resolved out of the archive, and pipelines whose archive
-/// lookup missed and fell back to an AIR lowering.
-static ARCHIVE_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static ARCHIVE_MISSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Pipelines that have settled (built or given up on), so the last one out can
-/// emit the report.
-static PIPELINES_SETTLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Wall time of the blocking part of the pipeline-creation phase, in
-/// microseconds: archive load through the join of the required kernels. This is
-/// the span the first GPU-wanting proving step actually waits on.
-static PIPELINE_BLOCKING_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Start of the whole pipeline-creation phase.
-static PIPELINE_PHASE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
-/// Records one settled pipeline and, when the last of them lands, writes the
-/// single startup self-report line to stderr.
-///
-/// One `write(2)` of well under a hundred bytes, once per process, off the
-/// proving path. Unconditional on purpose: the ranked host is the only machine
-/// whose answer matters and it is the one machine we cannot attach to.
-fn note_pipeline_settled() {
-    use std::sync::atomic::Ordering;
-
-    let settled = PIPELINES_SETTLED.fetch_add(1, Ordering::AcqRel) + 1;
-    if settled as usize != METALLIB_REQUIRED_KERNELS.len() {
-        return;
-    }
-    let lowering_us = PIPELINE_PHASE_START
-        .get()
-        .map_or(0, |start| start.elapsed().as_micros() as u64);
-    let state = match ARCHIVE_STATE.load(Ordering::Acquire) {
-        ARCHIVE_STATE_SERVES => "serves",
-        ARCHIVE_STATE_MISS => "miss",
-        ARCHIVE_STATE_UNUSABLE => "unusable",
-        _ => "off",
-    };
-    eprintln!(
-        "[metal-archive] archive={state} pipelines={settled} hits={} misses={} \
-         blocking_ms={:.3} lowering_ms={:.3}",
-        ARCHIVE_HITS.load(Ordering::Acquire),
-        ARCHIVE_MISSES.load(Ordering::Acquire),
-        PIPELINE_BLOCKING_US.load(Ordering::Acquire) as f64 / 1000.0,
-        lowering_us as f64 / 1000.0,
-    );
-}
-
-/// Stages the embedded archive to disk and opens it. Any failure — no
-/// registered directory, an unwritable directory, or a Metal load error —
-/// yields `None`, and pipeline creation proceeds exactly as without an archive.
-fn load_pipeline_archive(device: &Device) -> Option<BinaryArchive> {
-    use std::sync::atomic::Ordering;
-
-    let dir = PIPELINE_ARCHIVE_DIR.get()?;
-    let path = dir.join("poseidon2-pipelines.metalarchive");
-    if !path.is_file() && std::fs::write(&path, PIPELINE_ARCHIVE).is_err() {
-        return None;
-    }
-    let descriptor = BinaryArchiveDescriptor::new();
-    let url = URL::new_with_string(&format!("file://{}", path.display()));
-    descriptor.set_url(&url);
-    // `URLWithString:` returns an autoreleased object, but metal-rs wraps it in
-    // an owned `URL` whose drop releases it again. Forget the wrapper so the
-    // enclosing autorelease pool performs the single balancing release; without
-    // this the over-release faults the process inside `autoreleasepool`.
-    core::mem::forget(url);
-    match device.new_binary_archive_with_descriptor(&descriptor) {
-        Ok(archive) => Some(archive),
-        Err(error) => {
-            ARCHIVE_STATE.store(ARCHIVE_STATE_UNUSABLE, Ordering::Release);
-            log::debug!("pipeline archive unavailable ({error}); lowering AIR directly");
-            None
-        }
-    }
-}
-
-/// Creates one pipeline strictly out of `archive`, without letting Metal fall
-/// back to lowering the AIR. Returns `None` on a miss.
-///
-/// `ArgumentInfo` keeps the reflection object non-nil: the metal-rs binding
-/// retains and wraps it unconditionally.
-fn pipeline_from_archive(
-    device: &Device,
-    archive: &BinaryArchive,
-    function: &metal::Function,
-) -> Option<ComputePipelineState> {
-    let descriptor = ComputePipelineDescriptor::new();
-    descriptor.set_compute_function(Some(function));
-    descriptor.set_binary_archives(&[archive]);
-    device
-        .new_compute_pipeline_state_with_reflection(
-            &descriptor,
-            MTLPipelineOption::ArgumentInfo | MTLPipelineOption::FailOnBinaryArchiveMiss,
-        )
-        .ok()
-        .map(|(pipeline, _reflection)| pipeline)
-}
-
-/// One `FailOnBinaryArchiveMiss` lookup that decides whether a loaded archive
-/// was recorded for this GPU and compiler build. A foreign or stale archive
-/// still loads and simply misses every lookup, so this is the only way to tell.
-/// On a miss the archive is dropped entirely and every kernel takes the
-/// unchanged lowering path — worst case is today's behavior plus this one
-/// failed lookup.
-fn archive_serves(device: &Device, library: &metal::Library, archive: &BinaryArchive) -> bool {
-    library
-        .get_function(ARCHIVE_PROBE_KERNEL, None)
-        .ok()
-        .and_then(|function| pipeline_from_archive(device, archive, &function))
-        .is_some()
-}
-
-/// Builds a compute pipeline for `name`, taking it out of the staged binary
-/// archive when one serves this device. A hit skips the AIR->ISA lowering; a
-/// miss falls back to the plain function path, which is byte-for-byte the
-/// previous behavior. Per kernel, so one stale entry costs only its own
-/// lowering.
-fn build_pipeline(
-    device: &Device,
-    library: &metal::Library,
-    archive: Option<&BinaryArchive>,
-    name: &str,
-) -> Result<ComputePipelineState, String> {
-    use std::sync::atomic::Ordering;
-
-    let function = library
-        .get_function(name, None)
-        .map_err(|error| format!("{name} kernel unavailable: {error}"))?;
-    if let Some(archive) = archive {
-        if let Some(pipeline) = pipeline_from_archive(device, archive, &function) {
-            ARCHIVE_HITS.fetch_add(1, Ordering::AcqRel);
-            return Ok(pipeline);
-        }
-        ARCHIVE_MISSES.fetch_add(1, Ordering::AcqRel);
-    }
-    device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(|error| format!("{name} pipeline creation failed: {error}"))
-}
 
 /// Every kernel the shader defines. The prebuilt library is trusted only if all
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
@@ -781,20 +587,18 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if base.is_null() {
         return;
     }
+    // Stash BEFORE walking: a final block arriving mid-walk takes a
+    // partially-warmed buffer instead of missing the stash entirely; the
+    // remaining walk touches pages the fill writes anyway — value-exact.
+    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
+        *slot = Some(buffer.clone());
+    }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
     while (offset as u64) < bytes {
         // SAFETY: offset stays within the buffer's allocated length.
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
-    }
-    // Publish AFTER walking: the walk writes zeros through this buffer, so a
-    // final block that takes it mid-walk would race the LDE fill (the walk
-    // would re-zero pages the fill had already written). Publishing after the
-    // last store closes that window; a block arriving mid-walk simply misses
-    // the stash and allocates, which is correct and rare.
-    if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
-        *slot = Some(buffer);
     }
 }
 
@@ -1311,11 +1115,7 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
-fn spawn_optional_pipelines(
-    device: &Device,
-    library: &metal::Library,
-    archive: Option<&BinaryArchive>,
-) {
+fn spawn_optional_pipelines(device: &Device, library: &metal::Library) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
         (
@@ -1327,18 +1127,20 @@ fn spawn_optional_pipelines(
     ] {
         let device = device.clone();
         let library = library.clone();
-        let archive = archive.cloned();
         let spawned = std::thread::Builder::new()
             .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
-                    build_pipeline(&device, &library, archive.as_ref(), name).ok()
+                    library.get_function(name, None).ok().and_then(|function| {
+                        device
+                            .new_compute_pipeline_state_with_function(&function)
+                            .ok()
+                    })
                 });
                 if pipeline.is_none() {
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
                 }
                 let _ = slot.built.set(pipeline);
-                note_pipeline_settled();
             });
         match spawned {
             Ok(handle) => {
@@ -1350,7 +1152,6 @@ fn spawn_optional_pipelines(
             // so readers fall back instead of looking for a build in flight.
             Err(_) => {
                 let _ = slot.built.set(None);
-                note_pipeline_settled();
             }
         }
     }
@@ -1553,18 +1354,40 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // The 2^17-leaf commitment trees are produced only by the degree-2^14
     // serial circuits (chain steps and pre-execution; the pipelined chunk
     // circuits commit at 2^19 leaves and their FRI folds at 2^16 and below).
-    // Those trees sit on the strictly sequential critical path in every phase
-    // and are much cheaper on the GPU than on the CPU, so they take it.
-    //
-    // This admission is only worth having together with the streaming rule in
-    // `build_merkle_tree_shared_streamed` below, which keeps the pipelined
-    // wide commitment off the single buffer set: admitted without it, these
-    // trees hand back as acquisition wait everything they save in hashing.
-    // The two are one change; do not relax either alone.
+    // Those trees sit on the strictly sequential critical path in every
+    // phase and measured ~2x faster on the GPU when the stream is idle
+    // (2^17 width-8: CPU 14.9 ms vs GPU 7.8 ms). But command buffers execute
+    // FIFO per queue, so when a pipelined 2^19-leaf chunk tree is already in
+    // flight the fold tree waits behind it: phase-level spans on an M-series
+    // host measured the fold's commit phases at 200-320 ms under pipeline
+    // load versus 10-50 ms alone, while its pure-CPU phases inflated <1.3x.
+    // The ~15 ms CPU build beats that queue wait by an order of magnitude
+    // for the narrow shapes (width <= 64: the Z/partial-product and quotient
+    // trees), so route those to the GPU only while its stream is unoccupied.
+    // The width-135 wires tree stays on the GPU unconditionally: its CPU
+    // build (~17 permutations per leaf) costs about as much as the queue
+    // wait and measurably starves the fold's pure-CPU phases.
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
-        return true;
+        return exclusive
+            || leaf_width > 64
+            || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
+
+    // Mid-size FRI fold trees are below the normal GPU cutoff, so they
+    // normally run on the CPU. When the Metal queue is otherwise idle their
+    // data-parallel hashing can finish sooner; when it is busy, submitting
+    // them creates a FIFO wait on a dependency-sensitive fold path. Keep the
+    // established cutoff under contention and use Metal only in the idle case.
+    let idle_fold_tree = (17..=64).contains(&leaf_width)
+        && ((1 << 14)..=(1 << 17)).contains(&leaf_count)
+        && leaf_permutations + parent_permutations < MIN_GPU_PERMUTATIONS;
+    if idle_fold_tree {
+        // The occupancy observation is only a scheduling hint; both routes
+        // invoke the same Poseidon2 Merkle construction for this tree.
+        return exclusive || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    }
+
     leaf_permutations + parent_permutations >= min_permutations
 }
 
@@ -2242,22 +2065,17 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
     // Exclusive phases stream the 2^20+ trees as before. Outside them, the
-    // pipelined 2^19 commitments also stream: streaming converts the proof's
-    // serial CPU-fill-then-GPU-hash into max(fill, hash), and it runs out of
-    // this function's own retained buffers rather than the pooled buffer set.
-    //
-    // The pipeline's single widest commitment takes that path unconditionally.
-    // Keeping it off the buffer set is what lets the serial 2^17 trees
-    // admitted in `gpu_worthwhile` actually get the set when they ask; the
-    // narrower pipelined commitments still wait for an idle stream, because
-    // moving all of them costs the pipeline more latency than the serial path
-    // gains. See the note in `gpu_worthwhile`: these two rules are one change.
+    // pipelined 2^19 commitments (tx wires/Zs/quotient) also stream — but
+    // only when the GPU stream is unoccupied at entry, the same occupancy
+    // condition gpu_worthwhile uses for the serial-critical shapes: streaming
+    // converts the proof's serial CPU-fill-then-GPU-hash into max(fill, hash),
+    // while an already-busy stream would just queue the absorb groups behind
+    // another tree and stretch both.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
         leaf_count >= 1 << 20
     } else {
         leaf_count >= 1 << 19
-            && (leaf_width > 64
-                || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0)
+            && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0
     };
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -2307,9 +2125,6 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    // Filled by the final group's encoder, which now carries the parent ladder
-    // as well; see below.
-    let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
@@ -2342,51 +2157,6 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
             dispatch(encoder, pipeline, leaf_count);
-            // Parent levels over the completed leaf digests. Only the final
-            // absorb group squeezes the sponge into `output_buffer`, so the
-            // ladder depends on this encoder's dispatch and on nothing later:
-            // carry it here, separated by the same resource barrier the
-            // promoted single-encoder tree build uses, instead of opening a
-            // second command buffer with one encoder per level. Identical
-            // shaders, dispatch counts and buffer offsets; strictly fewer
-            // command buffers and encoders.
-            if group == groups - 1 {
-                let mut level_offset = 0usize;
-                let mut child_count = leaf_count;
-                level_offsets.push(level_offset);
-                let output_resource: &metal::ResourceRef = output_buffer;
-                if child_count > cap_count {
-                    encoder.set_compute_pipeline_state(&context.parent_pipeline);
-                }
-                while child_count > cap_count {
-                    // Every parent level reads the output written by the
-                    // preceding dispatch; preserve both the leaf-to-parent and
-                    // the parent-to-parent hazard.
-                    encoder.memory_barrier_with_resources(&[output_resource]);
-
-                    let parent_count = child_count / 2;
-                    let child_offset = level_offset;
-                    level_offset += child_count * 4;
-                    level_offsets.push(level_offset);
-
-                    let parent_count_u32 = parent_count as u32;
-                    encoder.set_buffer(
-                        0,
-                        Some(output_buffer),
-                        (child_offset * size_of::<u64>()) as NSUInteger,
-                    );
-                    encoder.set_buffer(
-                        1,
-                        Some(output_buffer),
-                        (level_offset * size_of::<u64>()) as NSUInteger,
-                    );
-                    encoder.set_buffer(2, Some(&context.parameters), 0);
-                    set_u32(encoder, 3, parent_count_u32);
-                    dispatch(encoder, &context.parent_pipeline, parent_count);
-
-                    child_count = parent_count;
-                }
-            }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
@@ -2396,10 +2166,54 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
-        command_buffer.wait_until_completed();
-        command_buffer.status() == MTLCommandBufferStatus::Completed
+    // Parent levels over the completed leaf digests, exactly as in the
+    // classic single-command build.
+    let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
+    let parents_command = autoreleasepool(|| -> CommandBuffer {
+        let command_buffer = context.queue.new_command_buffer();
+        let mut level_offset = 0usize;
+        let mut child_count = leaf_count;
+        level_offsets.push(level_offset);
+        while child_count > cap_count {
+            let parent_count = child_count / 2;
+            let child_offset = level_offset;
+            level_offset += child_count * 4;
+            level_offsets.push(level_offset);
+
+            let parent_count_u32 = parent_count as u32;
+            let parent_encoder = command_buffer.new_compute_command_encoder();
+            parent_encoder.set_compute_pipeline_state(&context.parent_pipeline);
+            parent_encoder.set_buffer(
+                0,
+                Some(output_buffer),
+                (child_offset * size_of::<u64>()) as NSUInteger,
+            );
+            parent_encoder.set_buffer(
+                1,
+                Some(output_buffer),
+                (level_offset * size_of::<u64>()) as NSUInteger,
+            );
+            parent_encoder.set_buffer(2, Some(&context.parameters), 0);
+            set_u32(parent_encoder, 3, parent_count_u32);
+            dispatch(parent_encoder, &context.parent_pipeline, parent_count);
+            parent_encoder.end_encoding();
+
+            child_count = parent_count;
+        }
+        #[cfg(feature = "diagnostic_profile")]
+        profile_command_buffer(command_buffer, "merkle_parents", leaf_count as u64);
+        command_buffer.commit();
+        command_buffer.to_owned()
     });
+
+    parents_command.wait_until_completed();
+    let all_ok = absorb_commands
+        .iter()
+        .chain(core::iter::once(&parents_command))
+        .all(|command_buffer| {
+            command_buffer.wait_until_completed();
+            command_buffer.status() == MTLCommandBufferStatus::Completed
+        });
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
@@ -2629,36 +2443,18 @@ impl MetalShared {
             // each worker thread gets its own autorelease pool so the temporary
             // `NSError`s the Metal API autoreleases are drained on the thread
             // that created them rather than leaking.
-            //
-            // The staged prebuilt archive short-circuits that lowering entirely
-            // where it serves this device: a hit is a lookup, not a compile. One
-            // `FailOnBinaryArchiveMiss` probe decides, because a foreign or stale
-            // archive still loads and then misses silently; on a miss the archive
-            // is dropped and every path below is exactly what it was.
-            let _ = PIPELINE_PHASE_START.set(std::time::Instant::now());
-            let archive = load_pipeline_archive(&device).filter(|archive| {
-                let serves = archive_serves(&device, &library, archive);
-                ARCHIVE_STATE.store(
-                    if serves {
-                        ARCHIVE_STATE_SERVES
-                    } else {
-                        ARCHIVE_STATE_MISS
-                    },
-                    core::sync::atomic::Ordering::Release,
-                );
-                serves
-            });
             let device_ref = &device;
             let library_ref = &library;
-            let archive_ref = archive.as_ref();
             let required = |name: &'static str, kind: &'static str| {
                 move || -> Result<ComputePipelineState, String> {
-                    let pipeline = autoreleasepool(|| {
-                        build_pipeline(device_ref, library_ref, archive_ref, name)
-                            .map_err(|error| format!("{kind}: {error}"))
-                    });
-                    note_pipeline_settled();
-                    pipeline
+                    autoreleasepool(|| {
+                        let function = library_ref
+                            .get_function(name, None)
+                            .map_err(|error| format!("{kind} kernel unavailable: {error}"))?;
+                        device_ref
+                            .new_compute_pipeline_state_with_function(&function)
+                            .map_err(|error| format!("{kind} pipeline creation failed: {error}"))
+                    })
                 }
             };
             // The two gate-quotient kernels are the two most expensive to lower
@@ -2716,14 +2512,6 @@ impl MetalShared {
                         .expect("ifft finalize pipeline thread panicked"),
                 )
             });
-            // Everything the context blocks on is now built; the four optional
-            // kernels below land on their own threads.
-            PIPELINE_BLOCKING_US.store(
-                PIPELINE_PHASE_START
-                    .get()
-                    .map_or(0, |start| start.elapsed().as_micros() as u64),
-                core::sync::atomic::Ordering::Release,
-            );
             // Surfaced in kernel order, so a single missing or unbuildable
             // kernel yields the same error string the sequential construction
             // produced. Only the tie-break between two simultaneous failures
@@ -2737,7 +2525,7 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library, archive.as_ref());
+            spawn_optional_pipelines(&device, &library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3093,24 +2881,11 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // With a spine waiter queued, whichever non-spine waiter the OS would
-        // hand a `notify_one` to would just re-block, so the wake must reach
-        // the spine thread. Otherwise, a released singleton set can satisfy
-        // only one waiter and broadcasting just creates mutex contention.
-        // slow-host band; this comment changes no executable behavior.
-        if pool.waiters == 0 {
-            return;
-        }
-        if pool.spine_waiters == 0 {
-            // All sleepers are interchangeable non-spine jobs. One released
-            // set can satisfy exactly one of them, so waking the rest only
-            // makes them contend for the mutex and go back to sleep. Keep the
-            // broadcast solely for the priority case below, where the OS may
-            // otherwise wake a non-spine waiter ahead of the chain spine.
-            self.available.notify_one();
-        } else {
-            self.available.notify_all();
-        }
+        // Wake every waiter: with a spine waiter queued, whichever non-spine
+        // waiter the OS would hand a `notify_one` to would just re-block, so
+        // the wake must reach the spine thread. Waiter counts here are tiny
+        // (window depth + one spine), so the thundering herd is a few threads.
+        self.available.notify_all();
     }
 
     fn try_detach_completed_output(
@@ -4233,116 +4008,6 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
-    }
-
-    /// Opens the committed archive from a scratch copy, exactly as
-    /// `load_pipeline_archive` does at startup.
-    fn open_recorded_archive(device: &Device, dir: &std::path::Path) -> BinaryArchive {
-        std::fs::create_dir_all(dir).expect("temp dir");
-        let path = dir.join("poseidon2-pipelines.metalarchive");
-        std::fs::write(&path, PIPELINE_ARCHIVE).expect("stage archive");
-        let descriptor = BinaryArchiveDescriptor::new();
-        let url = URL::new_with_string(&format!("file://{}", path.display()));
-        descriptor.set_url(&url);
-        // See `load_pipeline_archive`: `URLWithString:` is autoreleased; the
-        // owned wrapper's drop would over-release it.
-        core::mem::forget(url);
-        device
-            .new_binary_archive_with_descriptor(&descriptor)
-            .expect("recorded archive must load on the recording device")
-    }
-
-    /// On the device the archive was recorded on, every kernel must resolve
-    /// from the archive without falling back to an AIR lowering — otherwise the
-    /// archive is stale and gives back the startup cost it exists to remove.
-    /// A stale archive still *loads* and misses silently, so nothing else
-    /// catches it. Device- and OS-build-specific by design, hence ignored; run
-    /// it on the recording machine after any metallib change.
-    #[test]
-    #[ignore = "device-specific: validates the recorded archive on the recording machine"]
-    fn pipeline_archive_covers_metallib_on_this_device() {
-        let Some(device) = Device::system_default() else {
-            return;
-        };
-        let library = device
-            .new_library_with_data(SHADER_METALLIB)
-            .expect("prebuilt metallib must load");
-        let archive =
-            open_recorded_archive(&device, &std::env::temp_dir().join("lighter-archive-guard"));
-        assert!(
-            archive_serves(&device, &library, &archive),
-            "the recorded archive does not serve this device; regenerate with the \
-             record_pipeline_archive test"
-        );
-        let started = Instant::now();
-        for name in METALLIB_REQUIRED_KERNELS {
-            let function = library.get_function(name, None).expect(name);
-            assert!(
-                pipeline_from_archive(&device, &archive, &function).is_some(),
-                "kernel {name} missed the recorded pipeline archive; regenerate with the \
-                 record_pipeline_archive test"
-            );
-        }
-        let from_archive = started.elapsed();
-        // The comparison the mechanism rests on. Not asserted as a ratio: this
-        // process may hold a warm OS shader cache (the ranked worker never
-        // does), which only makes the AIR arm look better than it is on the
-        // scored path.
-        let started = Instant::now();
-        for name in METALLIB_REQUIRED_KERNELS {
-            let function = library.get_function(name, None).expect(name);
-            device
-                .new_compute_pipeline_state_with_function(&function)
-                .expect(name);
-        }
-        println!(
-            "pipeline creation, {} kernels: archive {:?}, AIR {:?}",
-            METALLIB_REQUIRED_KERNELS.len(),
-            from_archive,
-            started.elapsed()
-        );
-    }
-
-    /// Regenerates `poseidon2-pipelines.metalarchive` from the committed
-    /// metallib on this machine. Run after any `poseidon2.metal`/metallib
-    /// change:
-    ///   cargo test --release -p plonky2 record_pipeline_archive -- --ignored
-    /// then commit the artifact and re-run
-    /// `pipeline_archive_covers_metallib_on_this_device`.
-    #[test]
-    #[ignore = "writes the committed archive artifact; run manually on the recording machine"]
-    fn record_pipeline_archive() {
-        let device = Device::system_default().expect("recording requires a Metal device");
-        let library = device
-            .new_library_with_data(SHADER_METALLIB)
-            .expect("prebuilt metallib must load");
-        // No URL on the descriptor: that creates an empty archive to record
-        // into, rather than opening an existing one.
-        let descriptor = BinaryArchiveDescriptor::new();
-        let archive = device
-            .new_binary_archive_with_descriptor(&descriptor)
-            .expect("new archive");
-        for name in METALLIB_REQUIRED_KERNELS {
-            let function = library.get_function(name, None).expect(name);
-            // Only the compute function is set: the archive keys its entries by
-            // the descriptor, and the loading side uses this same default
-            // configuration.
-            let pipeline_descriptor = ComputePipelineDescriptor::new();
-            pipeline_descriptor.set_compute_function(Some(&function));
-            archive
-                .add_compute_pipeline_functions_with_descriptor(&pipeline_descriptor)
-                .unwrap_or_else(|error| panic!("recording {name} failed: {error}"));
-        }
-        // `serializeToURL:` rejects a relative URL with "Invalid URL".
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/hash/poseidon2/poseidon2-pipelines.metalarchive"
-        );
-        let url = URL::new_with_string(&format!("file://{path}"));
-        archive.serialize_to_url(&url).expect("serialize archive");
-        // See `load_pipeline_archive`: `URLWithString:` is autoreleased; the
-        // owned wrapper's drop would over-release it.
-        core::mem::forget(url);
     }
 
     #[test]
@@ -6828,9 +6493,7 @@ kernel void goldilocks_mul_bench_native(
 
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
-        // 17 columns is three absorb groups with a *partial* final group, so
-        // the group that now carries the parent ladder is the short one.
-        let cols = 17;
+        let cols = 16;
         let cap_height = 4;
         let columns = context
             .allocate_columns::<F>(rows, cols)

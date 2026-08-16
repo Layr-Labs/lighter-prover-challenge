@@ -13,7 +13,14 @@ pub struct StridedConstraintConsumer<'a, P: PackedField> {
     start: *mut P::Scalar,
     end: *mut P::Scalar,
     stride: usize,
+    mode: ConstraintConsumerMode<P>,
     _phantom: PhantomData<&'a mut [P::Scalar]>,
+}
+
+#[derive(Debug)]
+enum ConstraintConsumerMode<P: PackedField> {
+    Write,
+    Accumulate { filter: P },
 }
 
 impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
@@ -35,8 +42,24 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             start,
             end,
             stride,
+            mode: ConstraintConsumerMode::Write,
             _phantom: PhantomData,
         }
+    }
+
+    /// Emit each constraint directly into a filtered accumulator. This avoids
+    /// materializing a short-lived packed constraint matrix when the caller's
+    /// only consumer is the quotient accumulator.
+    pub fn accumulating(
+        buffer: &'a mut [P::Scalar],
+        stride: usize,
+        offset: usize,
+        filter: P,
+    ) -> Self {
+        assert!(offset + P::WIDTH <= stride);
+        let mut consumer = Self::new(buffer, stride, offset);
+        consumer.mode = ConstraintConsumerMode::Accumulate { filter };
+        consumer
     }
 
     /// Emit one constraint.
@@ -45,7 +68,21 @@ impl<'a, P: PackedField> StridedConstraintConsumer<'a, P> {
             // # Safety
             // The checks in `new` guarantee that this points to valid space.
             unsafe {
-                *self.start.cast() = constraint;
+                match self.mode {
+                    ConstraintConsumerMode::Write => *self.start.cast() = constraint,
+                    ConstraintConsumerMode::Accumulate { filter } => {
+                        // Do not cast this scalar allocation to `P`: packed backends
+                        // may require stricter alignment than `P::Scalar`. Copying
+                        // through a local packed value preserves the same packed
+                        // multiply-accumulate as the former scratch consumer.
+                        let row = core::slice::from_raw_parts_mut(self.start, P::WIDTH);
+                        let mut current = P::ZEROS;
+                        current.as_slice_mut().copy_from_slice(row);
+                        row.copy_from_slice(
+                            current.multiply_accumulate(constraint, filter).as_slice(),
+                        );
+                    }
+                }
             }
             // See the comment in `new`. `wrapping_add` is needed to avoid UB if we've just
             // exhausted our buffer (and hence we're setting `self.start` to point past the end).
