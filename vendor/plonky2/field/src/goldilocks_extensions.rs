@@ -1,4 +1,6 @@
 use alloc::vec::Vec;
+#[cfg(target_arch = "aarch64")]
+use core::arch::asm;
 use core::ops::Mul;
 
 use static_assertions::const_assert;
@@ -236,6 +238,70 @@ fn u160_add_product(lo: &mut u128, hi: &mut u32, a: u64, b: u64) {
     *hi += carry as u32;
 }
 
+/// Two independent [`u160_add_product`] steps. On aarch64 the `umulh`/`mul`
+/// pairs are interleaved so each lane hides the other's latency. The
+/// 160-bit sums are identical to two scalar adds.
+#[inline(always)]
+fn u160_add_product_pair(
+    lo0: &mut u128,
+    hi0: &mut u32,
+    a0: u64,
+    b0: u64,
+    lo1: &mut u128,
+    hi1: &mut u32,
+    a1: u64,
+    b1: u64,
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut lo0_lo = *lo0 as u64;
+        let mut lo0_hi = (*lo0 >> 64) as u64;
+        let mut h0 = *hi0 as u64;
+        let mut lo1_lo = *lo1 as u64;
+        let mut lo1_hi = (*lo1 >> 64) as u64;
+        let mut h1 = *hi1 as u64;
+        let mut prod0 = a0;
+        let mut prod1 = a1;
+        unsafe {
+            asm!(
+                "umulh {ph0}, {prod0}, {scratch0}",
+                "umulh {ph1}, {prod1}, {scratch1}",
+                "mul   {prod0}, {prod0}, {scratch0}",
+                "mul   {prod1}, {prod1}, {scratch1}",
+                "adds  {lo0}, {lo0}, {prod0}",
+                "adcs  {mid0}, {mid0}, {ph0}",
+                "adc   {hi0}, {hi0}, xzr",
+                "adds  {lo1}, {lo1}, {prod1}",
+                "adcs  {mid1}, {mid1}, {ph1}",
+                "adc   {hi1}, {hi1}, xzr",
+                prod0 = inout(reg) prod0,
+                prod1 = inout(reg) prod1,
+                scratch0 = in(reg) b0,
+                scratch1 = in(reg) b1,
+                ph0 = out(reg) _,
+                ph1 = out(reg) _,
+                lo0 = inout(reg) lo0_lo,
+                mid0 = inout(reg) lo0_hi,
+                hi0 = inout(reg) h0,
+                lo1 = inout(reg) lo1_lo,
+                mid1 = inout(reg) lo1_hi,
+                hi1 = inout(reg) h1,
+                options(pure, nomem, nostack),
+            );
+        }
+        let _ = (prod0, prod1);
+        *lo0 = (lo0_lo as u128) | ((lo0_hi as u128) << 64);
+        *hi0 = h0 as u32;
+        *lo1 = (lo1_lo as u128) | ((lo1_hi as u128) << 64);
+        *hi1 = h1 as u32;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        u160_add_product(lo0, hi0, a0, b0);
+        u160_add_product(lo1, hi1, a1, b1);
+    }
+}
+
 /// Merge two exact 160-bit partial sums. Callers prove that the combined sum
 /// is below `2^160`, so computing the high word through `u64` cannot truncate.
 #[inline(always)]
@@ -293,10 +359,26 @@ fn ext2_base_scalar_dot_product(
         for (value_pair, scalar_pair) in values.chunks_exact(2).zip(scalars.chunks_exact(2)) {
             let QuadraticExtension([a00, a10]) = value_pair[0];
             let QuadraticExtension([a01, a11]) = value_pair[1];
-            u160_add_product(&mut lo00, &mut hi00, a00.0, scalar_pair[0].0);
-            u160_add_product(&mut lo10, &mut hi10, a10.0, scalar_pair[0].0);
-            u160_add_product(&mut lo01, &mut hi01, a01.0, scalar_pair[1].0);
-            u160_add_product(&mut lo11, &mut hi11, a11.0, scalar_pair[1].0);
+            u160_add_product_pair(
+                &mut lo00,
+                &mut hi00,
+                a00.0,
+                scalar_pair[0].0,
+                &mut lo01,
+                &mut hi01,
+                a01.0,
+                scalar_pair[1].0,
+            );
+            u160_add_product_pair(
+                &mut lo10,
+                &mut hi10,
+                a10.0,
+                scalar_pair[0].0,
+                &mut lo11,
+                &mut hi11,
+                a11.0,
+                scalar_pair[1].0,
+            );
         }
         if values.len() % 2 != 0 {
             let QuadraticExtension([a0, a1]) = values[values.len() - 1];
@@ -379,10 +461,26 @@ fn ext2_base_scalar_dot_products_2(
         for ((&QuadraticExtension([v0, v1]), &ca), &cb) in
             values.iter().zip(poly_a).zip(poly_b)
         {
-            u160_add_product(&mut a0_lo, &mut a0_hi, v0.0, ca.0);
-            u160_add_product(&mut a1_lo, &mut a1_hi, v1.0, ca.0);
-            u160_add_product(&mut b0_lo, &mut b0_hi, v0.0, cb.0);
-            u160_add_product(&mut b1_lo, &mut b1_hi, v1.0, cb.0);
+            u160_add_product_pair(
+                &mut a0_lo,
+                &mut a0_hi,
+                v0.0,
+                ca.0,
+                &mut b0_lo,
+                &mut b0_hi,
+                v0.0,
+                cb.0,
+            );
+            u160_add_product_pair(
+                &mut a1_lo,
+                &mut a1_hi,
+                v1.0,
+                ca.0,
+                &mut b1_lo,
+                &mut b1_hi,
+                v1.0,
+                cb.0,
+            );
         }
         // SAFETY: the exact worst-case bound documented above covers arbitrary
         // u64 representatives for every term in this chunk.
@@ -470,10 +568,26 @@ fn ext2_base_scalar_dot_product_scaled(
             let QuadraticExtension([a01, a11]) = values[index + 1];
             let scalar_0 = coefficients[index] * scales[index];
             let scalar_1 = coefficients[index + 1] * scales[index + 1];
-            u160_add_product(&mut lo00, &mut hi00, a00.0, scalar_0.0);
-            u160_add_product(&mut lo10, &mut hi10, a10.0, scalar_0.0);
-            u160_add_product(&mut lo01, &mut hi01, a01.0, scalar_1.0);
-            u160_add_product(&mut lo11, &mut hi11, a11.0, scalar_1.0);
+            u160_add_product_pair(
+                &mut lo00,
+                &mut hi00,
+                a00.0,
+                scalar_0.0,
+                &mut lo01,
+                &mut hi01,
+                a01.0,
+                scalar_1.0,
+            );
+            u160_add_product_pair(
+                &mut lo10,
+                &mut hi10,
+                a10.0,
+                scalar_0.0,
+                &mut lo11,
+                &mut hi11,
+                a11.0,
+                scalar_1.0,
+            );
             index += 2;
         }
         if index < values.len() {
@@ -547,8 +661,18 @@ pub fn ext2_mul_add(
     let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
     let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
 
-    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, a0.0, b0.0);
-    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, a1.0, b1.0);
+    // c0's two products write independent 160-bit banks. Interleave the
+    // umulh/mul pair; c1 still shares one accumulator and stays scalar.
+    u160_add_product_pair(
+        &mut c0_plain_lo,
+        &mut c0_plain_hi,
+        a0.0,
+        b0.0,
+        &mut c0_w_lo,
+        &mut c0_w_hi,
+        a1.0,
+        b1.0,
+    );
     u160_add_product(&mut c1_lo, &mut c1_hi, a0.0, b1.0);
     u160_add_product(&mut c1_lo, &mut c1_hi, a1.0, b0.0);
 
@@ -592,8 +716,16 @@ fn ext2_dot_product_arity16(
     for i in 0..16 {
         let QuadraticExtension([a0, a1]) = terms[i];
         let QuadraticExtension([b0, b1]) = powers[i];
-        u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, a0.0, b0.0);
-        u160_add_product(&mut c0_w_lo, &mut c0_w_hi, a1.0, b1.0);
+        u160_add_product_pair(
+            &mut c0_plain_lo,
+            &mut c0_plain_hi,
+            a0.0,
+            b0.0,
+            &mut c0_w_lo,
+            &mut c0_w_hi,
+            a1.0,
+            b1.0,
+        );
         u160_add_product(&mut c1_lo, &mut c1_hi, a0.0, b1.0);
         u160_add_product(&mut c1_lo, &mut c1_hi, a1.0, b0.0);
     }
@@ -1896,5 +2028,61 @@ mod tests {
             }
         }
         assert!(QE::ZERO.try_inverse().is_none());
+    }
+
+    #[test]
+    fn u160_add_product_pair_matches_scalar_u160() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let specials = [
+            0u64,
+            1,
+            2,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u64::MAX,
+        ];
+        for &a0 in &specials {
+            for &b0 in &specials {
+                for &a1 in &specials {
+                    for &b1 in &specials {
+                        let (mut plo0, mut phi0) = (0u128, 0u32);
+                        let (mut plo1, mut phi1) = (0u128, 0u32);
+                        super::u160_add_product_pair(
+                            &mut plo0, &mut phi0, a0, b0, &mut plo1, &mut phi1, a1, b1,
+                        );
+                        let (mut slo0, mut shi0) = (0u128, 0u32);
+                        let (mut slo1, mut shi1) = (0u128, 0u32);
+                        super::u160_add_product(&mut slo0, &mut shi0, a0, b0);
+                        super::u160_add_product(&mut slo1, &mut shi1, a1, b1);
+                        assert_eq!((plo0, phi0), (slo0, shi0));
+                        assert_eq!((plo1, phi1), (slo1, shi1));
+                    }
+                }
+            }
+        }
+        for _ in 0..64 {
+            let (mut plo0, mut phi0) = (next() as u128, (next() & 0xffff) as u32);
+            let (mut plo1, mut phi1) = (next() as u128, (next() & 0xffff) as u32);
+            let a0 = next();
+            let b0 = next();
+            let a1 = next();
+            let b1 = next();
+            let (mut slo0, mut shi0) = (plo0, phi0);
+            let (mut slo1, mut shi1) = (plo1, phi1);
+            super::u160_add_product_pair(
+                &mut plo0, &mut phi0, a0, b0, &mut plo1, &mut phi1, a1, b1,
+            );
+            super::u160_add_product(&mut slo0, &mut shi0, a0, b0);
+            super::u160_add_product(&mut slo1, &mut shi1, a1, b1);
+            assert_eq!((plo0, phi0), (slo0, shi0));
+            assert_eq!((plo1, phi1), (slo1, shi1));
+        }
     }
 }
