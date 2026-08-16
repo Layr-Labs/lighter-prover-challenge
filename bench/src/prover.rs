@@ -919,11 +919,18 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    // This lazy blob load starts only after
+                    // `prove_block_after_pre` has entered its existing scoped
+                    // final-block lane. Keeping it here preserves the original
+                    // five-blob startup path and overlaps either deserialize or
+                    // runtime-build fallback with transaction/chain proving.
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
-                        let _span =
-                            plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        let _span = plonky2::util::profile::span(
+                            "orchestration",
+                            "lazy_load_or_build_block_circuit",
+                        );
+                        circuits.load_or_build_final_block_circuit()
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));

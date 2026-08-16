@@ -3,17 +3,19 @@
 
 //! Embedded startup circuits.
 //!
-//! `build.rs` constructs the five startup circuits during the untimed compile
-//! job and serializes them (see `circuit::embed`) into OUT_DIR blobs that are
-//! compiled into this binary. [`Circuits::from_embedded`] reconstitutes the
-//! exact `Circuits` value `Circuits::new` builds, several times faster than
-//! rebuilding, moving that work out of the scored worker lifetime.
+//! `build.rs` constructs the five startup circuits and final block circuit
+//! during the untimed compile job and serializes them (see `circuit::embed`)
+//! into OUT_DIR blobs that are compiled into this binary.
+//! [`Circuits::from_embedded`] reconstitutes the exact `Circuits` value
+//! `Circuits::new` builds, several times faster than rebuilding, moving that
+//! work out of the scored worker lifetime.
 //!
 //! [`Circuits::load`] is the production entry point: embedded first, build
 //! fallback on any error, `LIGHTER_BUILD_CIRCUITS=1` to force the build path
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +30,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -153,6 +156,35 @@ impl Circuits {
             }
         }
     }
+
+    /// Lazily loads the final block circuit in the existing final-block scoped
+    /// lane. This method is deliberately not called by `from_embedded` or
+    /// `load_remaining_embedded`, so block deserialization cannot become a
+    /// startup barrier. Missing/corrupt blobs and forced-build mode use the
+    /// source-equivalent runtime builder.
+    pub(crate) fn load_or_build_final_block_circuit(
+        &self,
+    ) -> (BlockTarget, CircuitData<F, C, D>) {
+        if std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1") {
+            return self.build_block_circuit();
+        }
+        self.load_or_build_final_block_from(BLOCK_BLOB)
+    }
+
+    fn load_or_build_final_block_from(
+        &self,
+        blob: &[u8],
+    ) -> (BlockTarget, CircuitData<F, C, D>) {
+        match load_blob::<BlockTarget>("block", blob) {
+            Ok(block) => block,
+            Err(error) => {
+                log::warn!(
+                    "embedded final block circuit unavailable ({error:#}); building from scratch"
+                );
+                self.build_block_circuit()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +224,28 @@ mod tests {
                 .expect("generator must serialize");
         }
         bytes
+    }
+
+    fn canonical_prover_bytes(data: &CircuitData<F, C, D>) -> Vec<u8> {
+        let serializer = EmbedGeneratorSerializer {
+            _phantom: Default::default(),
+            _phantom2: Default::default(),
+        };
+        data.prover_only
+            .to_bytes(&serializer, &data.common)
+            .expect("prover-only data must serialize canonically")
+    }
+
+    fn merkle_leaf_layout(data: &CircuitData<F, C, D>) -> &'static str {
+        match &data
+            .prover_only
+            .constants_sigmas_commitment
+            .merkle_tree
+            .leaves
+        {
+            plonky2::hash::merkle_tree::MerkleLeaves::Rows { .. } => "rows",
+            plonky2::hash::merkle_tree::MerkleLeaves::Columns { .. } => "columns",
+        }
     }
 
     fn assert_circuit_pair_identical<T: serde::Serialize>(
@@ -262,16 +316,89 @@ mod tests {
             "{name}: common circuit data diverges"
         );
 
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
+        let rebuilt_commitment = &rebuilt_data.prover_only.constants_sigmas_commitment;
+        let embedded_commitment = &embedded_data.prover_only.constants_sigmas_commitment;
+        assert_eq!(
+            rebuilt_commitment.polynomials, embedded_commitment.polynomials,
+            "{name}: commitment polynomials diverge"
+        );
+        assert_eq!(
+            rebuilt_commitment.degree_log, embedded_commitment.degree_log,
+            "{name}: commitment degree diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.rate_bits, embedded_commitment.rate_bits,
+            "{name}: commitment rate diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.blinding, embedded_commitment.blinding,
+            "{name}: commitment blinding diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.merkle_tree.num_leaves,
+            embedded_commitment.merkle_tree.num_leaves,
+            "{name}: Merkle leaf count diverges"
+        );
+        assert_eq!(
+            rebuilt_commitment.merkle_tree.leaf_width(),
+            embedded_commitment.merkle_tree.leaf_width(),
+            "{name}: Merkle leaf width diverges"
+        );
+
+        // The standard writer canonicalizes every logical leaf and converts
+        // level-order digests to the interleaved wire layout. This compares all
+        // proof-semantic prover data without requiring its CPU/Metal backing
+        // representation to match.
         assert!(
+            canonical_prover_bytes(rebuilt_data) == canonical_prover_bytes(embedded_data),
+            "{name}: canonical prover-only bytes diverge"
+        );
+
+        // These runtime-only fields carry no bytes in the standard serializer;
+        // compare them explicitly so canonical equality cannot mask a scheduler
+        // or quotient-cache mismatch.
+        assert_eq!(
+            rebuilt_data.prover_only.generator_watch_counts,
+            embedded_data.prover_only.generator_watch_counts,
+            "{name}: generator watch counts diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.generators_defer_until_ready,
+            embedded_data.prover_only.generators_defer_until_ready,
+            "{name}: generator defer flag diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.fixed_routed_wires,
+            embedded_data.prover_only.fixed_routed_wires,
+            "{name}: fixed routed-wire mask diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_cache,
+            embedded_data.prover_only.constants_sigmas_quotient_cache,
+            "{name}: quotient cache diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_step,
+            embedded_data.prover_only.constants_sigmas_quotient_step,
+            "{name}: quotient cache step diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_domain,
+            embedded_data.prover_only.constants_sigmas_quotient_domain,
+            "{name}: quotient cache domain diverges"
+        );
+
+        println!(
+            "{name}: raw_eq={} rebuilt_merkle={}/levels:{} embedded_merkle={}/levels:{}",
             rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
+            merkle_leaf_layout(rebuilt_data),
+            rebuilt_commitment.merkle_tree.level_digests.is_some(),
+            merkle_leaf_layout(embedded_data),
+            embedded_commitment.merkle_tree.level_digests.is_some(),
         );
     }
 
-    /// Determinism oracle for the embed mechanism: builds all five circuits
+    /// Determinism oracle for the embed mechanism: builds all six circuits
     /// from scratch AND loads the embedded set, then asserts value identity.
     /// This is the gate for `Circuits::from_embedded` — if it fails, the
     /// mechanism is wrong. Run:
@@ -334,6 +461,29 @@ mod tests {
                 ),
             );
 
+            let rebuilt_block = rebuilt.build_block_circuit();
+            let embedded_block = embedded.load_or_build_final_block_circuit();
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_block.0, &rebuilt_block.1),
+                (&embedded_block.0, &embedded_block.1),
+            );
+
+            // Empty and corrupt inputs must fail closed into the original
+            // runtime builder and reconstruct the identical circuit.
+            let empty_fallback = embedded.load_or_build_final_block_from(&[]);
+            assert_circuit_pair_identical(
+                "block_empty_fallback",
+                (&rebuilt_block.0, &rebuilt_block.1),
+                (&empty_fallback.0, &empty_fallback.1),
+            );
+            let corrupt_fallback = embedded.load_or_build_final_block_from(&[0; 8]);
+            assert_circuit_pair_identical(
+                "block_corrupt_fallback",
+                (&rebuilt_block.0, &rebuilt_block.1),
+                (&corrupt_fallback.0, &corrupt_fallback.1),
+            );
+
             // The gate serializer round trip below also pins the common data
             // encoding used by the blobs.
             let mut bytes = Vec::new();
@@ -345,7 +495,9 @@ mod tests {
                 .expect("common data must serialize");
             assert!(!bytes.is_empty());
 
-            println!("embedded_matches_rebuilt: all five circuits are value-identical");
+            println!(
+                "embedded_matches_rebuilt: all six circuits and empty/corrupt block fallbacks are value-identical"
+            );
         });
     }
 
@@ -388,6 +540,9 @@ mod tests {
             seq("light_chain", &|| {
                 drop(load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB).unwrap())
             });
+            seq("block", &|| {
+                drop(load_blob::<BlockTarget>("block", BLOCK_BLOB).unwrap())
+            });
             let t_embedded_sequential = t.elapsed();
 
             // The build path under its production overlapped layout.
@@ -424,11 +579,21 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),
                 "embedded circuit blob {name} is an empty stub"
             );
         }
+    }
+
+    #[test]
+    fn final_block_blob_fails_closed() {
+        let empty = load_blob::<BlockTarget>("block", &[]).unwrap_err();
+        assert!(format!("{empty:#}").contains("empty stub"));
+
+        let corrupt = load_blob::<BlockTarget>("block", &[0; 8]).unwrap_err();
+        assert!(format!("{corrupt:#}").contains("magic mismatch"));
     }
 }
