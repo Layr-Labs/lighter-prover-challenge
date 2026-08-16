@@ -8,6 +8,8 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
@@ -184,6 +186,40 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+}
+
+/// Grow or shrink `out` to `len` without a zero fill. The column evaluator
+/// writes every `term_rows` slot before the Horner read. `F` is a plain
+/// field wrapper.
+fn resize_overwritten<F: Field>(out: &mut Vec<F>, len: usize) {
+    if out.len() == len {
+        return;
+    }
+    if out.capacity() < len {
+        out.reserve(len - out.len());
+    }
+    // SAFETY: callers write every slot before any read.
+    unsafe {
+        out.set_len(len);
+    }
+}
+
+/// `out[k] = l0[k] * (z[k] - 1)`, packed. Bit-identical to the scalar loop.
+fn packed_mul_sub_one<F: Packable>(l0: &[F], z: &[F], out: &mut [F]) {
+    debug_assert_eq!(l0.len(), z.len());
+    debug_assert_eq!(l0.len(), out.len());
+    let width = F::Packing::WIDTH;
+    let n = l0.len();
+    let mut off = 0;
+    while off + width <= n {
+        let l = *F::Packing::from_slice(&l0[off..off + width]);
+        let zv = *F::Packing::from_slice(&z[off..off + width]);
+        out[off..off + width].copy_from_slice((l * (zv - F::Packing::ONES)).as_slice());
+        off += width;
+    }
+    for k in off..n {
+        out[k] = l0[k] * (z[k] - F::ONE);
+    }
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -744,18 +780,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let num_rows = num_challenges * (1 + num_chunks);
 
         let term_rows = &mut scratch.vanishing_partial_products_terms;
-        if term_rows.len() != num_rows * n {
-            term_rows.resize(num_rows * n, F::ZERO);
-        }
+        resize_overwritten(term_rows, num_rows * n);
 
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
-        l_0_xs.clear();
-        l_0_xs.extend(
-            indices_batch
+        l_0_xs.resize(n, F::ZERO);
+        if n > 0 {
+            debug_assert!(indices_batch
                 .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
-        );
+                .enumerate()
+                .all(|(k, &i)| i == indices_batch[0] + k));
+            z_h_on_coset.eval_l_0_into(indices_batch[0], xs_batch, l_0_xs);
+        }
 
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
@@ -782,9 +817,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         for i in 0..num_challenges {
             let z_col = acc_col(i, 0);
             let z1_row = &mut term_rows[i * n..][..n];
-            for k in 0..n {
-                z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
-            }
+            packed_mul_sub_one(l_0_xs, z_col, z1_row);
         }
 
         if num_challenges == 2 {
