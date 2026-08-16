@@ -721,6 +721,16 @@ struct ColumnStorePool {
 
 const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
 const MAX_COLUMN_STORE_POOL_BYTES: u64 = 2560 << 20;
+/// Below this size, only an exact-length free buffer satisfies a request.
+/// The recurring transaction shapes repeat at identical byte sizes every
+/// proof; pure best-fit let smaller requests consume the larger recurring
+/// buffers (36 oversized hits wasting ~1.9 GB of mapping in one diagnostic
+/// worker, alongside 26 misses re-requesting ~10.7 GB), so the next proof's
+/// exact shape missed and re-allocated. At or above the threshold best-fit is
+/// kept: terminal/final-block shapes may consume larger idle buffers without
+/// cannibalizing a recurring shape, and exact-everywhere forced fresh 256 and
+/// 320 MiB allocations in the final proof.
+const EXACT_COLUMN_REUSE_LIMIT_BYTES: u64 = 256 << 20;
 
 static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
     free: Vec::new(),
@@ -728,17 +738,24 @@ static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
 });
 
 impl ColumnStorePool {
-    /// Smallest free buffer that fits `bytes`. The recurring shapes match
-    /// their own previous allocation exactly; best-fit additionally tolerates
-    /// any allocator size rounding in `Buffer::length` without silent misses.
-    fn take_best_fit(&mut self, bytes: u64) -> Option<Buffer> {
-        let (index, length) = self
-            .free
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.length() >= bytes)
-            .min_by_key(|(_, b)| b.length())
-            .map(|(index, b)| (index, b.length()))?;
+    /// Exact-length match below [`EXACT_COLUMN_REUSE_LIMIT_BYTES`] (Metal
+    /// shared buffers report their requested length, so recurring shapes hit
+    /// their own previous allocation); smallest-fitting best-fit at or above
+    /// it (see the threshold's rationale).
+    fn take(&mut self, bytes: u64) -> Option<Buffer> {
+        let (index, length) = if bytes < EXACT_COLUMN_REUSE_LIMIT_BYTES {
+            self.free
+                .iter()
+                .position(|b| b.length() == bytes)
+                .map(|index| (index, bytes))?
+        } else {
+            self.free
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.length() >= bytes)
+                .min_by_key(|(_, b)| b.length())
+                .map(|(index, b)| (index, b.length()))?
+        };
         self.total_bytes -= length;
         Some(self.free.swap_remove(index))
     }
@@ -805,7 +822,7 @@ pub fn prewarm_large_column_store(bytes: u64) {
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
         if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
-            if let Some(buffer) = pool.take_best_fit(bytes) {
+            if let Some(buffer) = pool.take(bytes) {
                 return buffer;
             }
         }
@@ -4343,6 +4360,43 @@ mod tests {
         // See `load_pipeline_archive`: `URLWithString:` is autoreleased; the
         // owned wrapper's drop would over-release it.
         core::mem::forget(url);
+    }
+
+    /// Below the exact-reuse threshold, a smaller request must not consume a
+    /// larger recurring buffer (the cannibalization the hybrid policy exists
+    /// to stop); at or above the threshold, best-fit still hands large idle
+    /// buffers to terminal shapes.
+    #[test]
+    fn column_store_pool_preserves_exact_small_shapes() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = |bytes| {
+            autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
+        };
+        let mib = 1u64 << 20;
+        let mut pool = ColumnStorePool {
+            free: Vec::new(),
+            total_bytes: 0,
+        };
+
+        pool.recycle(buffer(96 * mib));
+        // A smaller request below the threshold misses instead of taking the
+        // 96 MiB recurring shape...
+        assert!(pool.take(64 * mib).is_none());
+        // ...while the exact shape still hits.
+        let exact = pool.take(96 * mib).expect("exact 96 MiB hit");
+        assert_eq!(exact.length(), 96 * mib);
+        assert_eq!(pool.total_bytes, 0);
+
+        // At or above the threshold, best-fit reuse is retained: a 256 MiB
+        // request may consume a larger idle buffer.
+        pool.recycle(buffer(320 * mib));
+        let large = pool
+            .take(EXACT_COLUMN_REUSE_LIMIT_BYTES)
+            .expect("best fit at threshold");
+        assert_eq!(large.length(), 320 * mib);
+        assert_eq!(pool.total_bytes, 0);
     }
 
     #[test]
