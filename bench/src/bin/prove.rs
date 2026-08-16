@@ -95,12 +95,22 @@ fn main() {
         rayon::current_num_threads() as u64,
     );
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
+    // Read once. Strip only the root `txs` array so the pre-execution parse
+    // (header / trees / markets) can start immediately. The full parse of
+    // the original bytes overlaps the pre-proof; it remains the authority
+    // for every transaction and for empty-tx padding.
+    let json = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span = plonky2::util::profile::span("startup", "fixture_read");
+        fs::read(&fixture).expect("cannot read prover fixture")
+    };
+    let stripped = circuit::block::without_top_level_txs(&json);
+    let full_block_handle = std::thread::Builder::new()
+        .name("full-fixture-parse".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
             #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
+            let _span = plonky2::util::profile::span("startup", "fixture_full_parse");
             Block::<F>::from_json_with_empty_txs(
                 &json,
                 HEAVY_TX_PER_PROOF,
@@ -109,6 +119,13 @@ fn main() {
                 PUBLIC_LIGHT_TX_COUNT,
             )
             .expect("invalid prover fixture")
+        })
+        .expect("full fixture parse thread must start");
+    let (pre_block, pre_circuits) = rayon::join(
+        || {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = plonky2::util::profile::span("startup", "pre_exec_fixture_parse");
+            Block::<F>::from_json_pre_exec_only(&stripped).expect("invalid prover fixture header")
         },
         || {
             #[cfg(feature = "diagnostic_profile")]
@@ -143,7 +160,7 @@ fn main() {
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
-            circuit::block_pre_execution::BlockPreExec::from_block(&block)
+            circuit::block_pre_execution::BlockPreExec::from_block(&pre_block)
         };
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
@@ -205,6 +222,9 @@ fn main() {
         }
         None => Circuits::load(),
     };
+    let block = full_block_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     let proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
