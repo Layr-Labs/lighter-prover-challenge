@@ -1043,6 +1043,22 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// Grow or shrink `out` to `len` without a zero fill. Callers overwrite every
+/// slot (here: per-column `copy_from_slice` of the constants/sigmas cache)
+/// before any read. `F` is a plain field wrapper.
+fn resize_overwritten<F: Field>(out: &mut Vec<F>, len: usize) {
+    if out.len() == len {
+        return;
+    }
+    if out.capacity() < len {
+        out.reserve(len - out.len());
+    }
+    // SAFETY: callers write every slot before any read.
+    unsafe {
+        out.set_len(len);
+    }
+}
+
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
 /// lookups, two challenges, the 135-wire/123-constraint Poseidon2 gate, and
@@ -2166,7 +2182,7 @@ fn compute_quotient_polys<
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
+                    resize_overwritten(&mut scratch.local_constants, cc * n);
                     for ci in 0..cc {
                         scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
                             &cache[ci * q + cache_start..ci * q + cache_start + n],
@@ -2176,7 +2192,7 @@ fn compute_quotient_polys<
                         scratch.s_sigmas_flat.clear();
                     } else {
                         let sc = common_data.sigmas_range().len();
-                        scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
+                        resize_overwritten(&mut scratch.s_sigmas_flat, sc * n);
                         for ci in 0..sc {
                             scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
                                 &cache[(cc + ci) * q + cache_start
@@ -2357,14 +2373,21 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                let n_pts = indices_batch.len();
+                if n_pts > 0 {
+                    debug_assert!(indices_batch
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &i)| i == indices_batch[0] + k));
+                    z_h_on_coset.for_each_inverse_run(indices_batch[0], n_pts, |k, invs| {
+                        let dest = &mut quotient_values_batch
+                            [k * num_challenges..(k + invs.len()) * num_challenges];
+                        for (inv, quotient_values) in
+                            invs.iter().zip(dest.chunks_exact_mut(num_challenges))
+                        {
+                            quotient_values.iter_mut().for_each(|v| *v *= *inv);
+                        }
+                    });
                 }
             },
         );

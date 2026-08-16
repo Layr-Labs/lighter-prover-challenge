@@ -66,7 +66,13 @@ impl<F: Field> ZeroPolyOnCoset<F> {
     }
 
     /// Like `eval_inverse`, but for a range of indices starting with `i_start`.
+    /// Consecutive table entries load with `from_slice`; the wrap at `rate`
+    /// still gathers. Bit-identical to the scalar loop.
     pub fn eval_inverse_packed<P: PackedField<Scalar = F>>(&self, i_start: usize) -> P {
+        let start = i_start & self.rate_mask;
+        if start + P::WIDTH <= self.inverses.len() {
+            return *P::from_slice(&self.inverses[start..start + P::WIDTH]);
+        }
         let mut packed = P::ZEROS;
         packed
             .as_slice_mut()
@@ -74,6 +80,21 @@ impl<F: Field> ZeroPolyOnCoset<F> {
             .enumerate()
             .for_each(|(j, packed_j)| *packed_j = self.eval_inverse(i_start + j));
         packed
+    }
+
+    /// Calls `visit(offset, inverses[start..start+run])` for each contiguous
+    /// run of `eval_inverse(i_start + offset + ·)` that does not wrap `rate`.
+    /// Covers `offset in 0..n`. Bit-identical to a scalar `eval_inverse` loop.
+    pub fn for_each_inverse_run(&self, i_start: usize, n: usize, mut visit: impl FnMut(usize, &[F])) {
+        let rate = self.rate_mask + 1;
+        debug_assert_eq!(self.inverses.len(), rate);
+        let mut k = 0;
+        while k < n {
+            let start = (i_start + k) & self.rate_mask;
+            let run = (rate - start).min(n - k);
+            visit(k, &self.inverses[start..start + run]);
+            k += run;
+        }
     }
 
     /// Returns `L_0(x) = Z_H(x)/(n * (x - 1))` with `x = w^i`.
@@ -110,6 +131,19 @@ mod tests {
                         z.inverses[i % rate].0,
                         "eval_inverse({i})"
                     );
+                }
+                let span = (1usize << n_log) * rate + 2 * rate;
+                let mut got = vec![F::ZERO; span.min(64)];
+                if !got.is_empty() {
+                    let mut k = 0;
+                    z.for_each_inverse_run(0, got.len(), |off, run| {
+                        got[off..off + run.len()].copy_from_slice(run);
+                        k += run.len();
+                    });
+                    assert_eq!(k, got.len());
+                    for (i, &v) in got.iter().enumerate() {
+                        assert_eq!(v.0, z.eval_inverse(i).0, "inverse_run({i})");
+                    }
                 }
             }
         }
