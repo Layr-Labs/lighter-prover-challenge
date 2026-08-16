@@ -2357,14 +2357,21 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                let n_pts = indices_batch.len();
+                if n_pts > 0 {
+                    debug_assert!(indices_batch
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &i)| i == indices_batch[0] + k));
+                    z_h_on_coset.for_each_inverse_run(indices_batch[0], n_pts, |k, invs| {
+                        let dest = &mut quotient_values_batch
+                            [k * num_challenges..(k + invs.len()) * num_challenges];
+                        for (inv, quotient_values) in
+                            invs.iter().zip(dest.chunks_exact_mut(num_challenges))
+                        {
+                            quotient_values.iter_mut().for_each(|v| *v *= *inv);
+                        }
+                    });
                 }
             },
         );
@@ -2514,31 +2521,45 @@ fn compute_quotient_polys<
         // CPU quotient pages are now read once and never dirtied again.
         // validator population; this comment changes no executable behavior.
         quotient_values
-            .par_chunks_exact(num_challenges)
+            .par_chunks(BATCH_SIZE * num_challenges)
             .enumerate()
-            .for_each(|(i, cpu_values)| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                let start = i * num_challenges;
-                for (challenge, (&cpu, column)) in
-                    cpu_values.iter().zip(column_ptrs).enumerate()
-                {
-                    let mut value = cpu;
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    {
-                        if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge] * denominator_inv;
-                        }
-                        if let Some(values) = gpu_range_values {
-                            value += values[start + challenge] * denominator_inv;
-                        }
-                        if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge] * denominator_inv;
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                let n_pts = chunk.len() / num_challenges;
+                debug_assert_eq!(chunk.len(), n_pts * num_challenges);
+                z_h_on_coset.for_each_inverse_run(base, n_pts, |k, invs| {
+                    for (off, &inv) in invs.iter().enumerate() {
+                        let local = k + off;
+                        let i = base + local;
+                        let cpu_values = &chunk
+                            [local * num_challenges..(local + 1) * num_challenges];
+                        let start = i * num_challenges;
+                        for (challenge, (&cpu, column)) in
+                            cpu_values.iter().zip(column_ptrs).enumerate()
+                        {
+                            let mut value = cpu;
+                            #[cfg(all(
+                                feature = "std",
+                                target_arch = "aarch64",
+                                target_os = "macos"
+                            ))] {
+                                if let Some(values) = gpu_poseidon_values {
+                                    value += values[start + challenge] * inv;
+                                }
+                                if let Some(values) = gpu_range_values {
+                                    value += values[start + challenge] * inv;
+                                }
+                                if let Some(values) = gpu_permutation_values {
+                                    value += values[start + challenge] * inv;
+                                }
+                            }
+                            // SAFETY: point `i` is owned by this chunk's
+                            // disjoint range; each (challenge, point) is
+                            // written once.
+                            unsafe { *column.0.add(i) = value };
                         }
                     }
-                    // SAFETY: point `i` is owned by this parallel iteration,
-                    // and every (challenge, point) destination is written once.
-                    unsafe { *column.0.add(i) = value };
-                }
+                });
             });
     } else {
         // CPU-only path: parallel scatter of the interleaved point-major
