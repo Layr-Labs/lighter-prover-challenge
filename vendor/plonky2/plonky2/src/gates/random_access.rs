@@ -329,13 +329,28 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
         let mut row = 0;
-        // The first selector fold reads the immutable wire columns directly,
-        // so only its `vec_size / 2` output columns need scratch storage. The
-        // former path zero-filled and copied all `vec_size` input columns here,
-        // then immediately consumed and discarded that mirror.
-        let item_count = (vec_size / 2) * n;
-        // The ranked shape is bits=4 over a 32-point batch: eight folded
-        // columns fit exactly here. Larger generic shapes retain heap storage.
+        // The sole ranked CPU shape is bits=6/copies=1/extras=2 over a
+        // 32-point batch. Fuse its first three selector levels while the
+        // source values are still immutable wire columns. This leaves eight
+        // output columns, which fit the established stack scratch, instead of
+        // allocating 32 columns on the heap and writing/reading the first two
+        // intermediate levels. All other shapes retain the original one-level
+        // prefix and storage fallback verbatim.
+        let fuse_three_levels =
+            self.bits == 6 && self.num_copies == 1 && self.num_extra_constants == 2 && n == 32;
+        let prefix_levels = if fuse_three_levels {
+            3
+        } else if self.bits == 0 {
+            0
+        } else {
+            1
+        };
+        let first_level_size = if self.bits == 0 {
+            0
+        } else {
+            vec_size >> prefix_levels
+        };
+        let item_count = first_level_size * n;
         let mut items_stack = [MaybeUninit::<F>::uninit(); 8 * 32];
         let mut items_heap;
         let items_uninit: &mut [MaybeUninit<F>] = if item_count <= items_stack.len() {
@@ -374,10 +389,36 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
             row += 1;
 
             // Repeatedly fold the list, selecting the left or right item from
-            // each pair based on the corresponding bit. Build the first level
-            // straight from the wire columns; this performs the same field
-            // expression in the same order as the mirror-backed reference.
-            if self.bits != 0 {
+            // each pair based on the corresponding bit. Both prefixes perform
+            // exactly `x + b * (y - x)` at every original tree node; the
+            // production prefix merely keeps its first two intermediate levels
+            // in locals rather than round-tripping them through scratch.
+            if fuse_three_levels {
+                let b0 = col(self.wire_bit(0, copy));
+                let b1 = col(self.wire_bit(1, copy));
+                let b2 = col(self.wire_bit(2, copy));
+                for k in 0..vec_size / 8 {
+                    let x0s = col(self.wire_list_item(8 * k, copy));
+                    let y0s = col(self.wire_list_item(8 * k + 1, copy));
+                    let x1s = col(self.wire_list_item(8 * k + 2, copy));
+                    let y1s = col(self.wire_list_item(8 * k + 3, copy));
+                    let x2s = col(self.wire_list_item(8 * k + 4, copy));
+                    let y2s = col(self.wire_list_item(8 * k + 5, copy));
+                    let x3s = col(self.wire_list_item(8 * k + 6, copy));
+                    let y3s = col(self.wire_list_item(8 * k + 7, copy));
+                    for p in 0..n {
+                        let select0 = b0[p];
+                        let select1 = b1[p];
+                        let x0 = x0s[p] + select0 * (y0s[p] - x0s[p]);
+                        let x1 = x1s[p] + select0 * (y1s[p] - x1s[p]);
+                        let x2 = x2s[p] + select0 * (y2s[p] - x2s[p]);
+                        let x3 = x3s[p] + select0 * (y3s[p] - x3s[p]);
+                        let y0 = x0 + select1 * (x1 - x0);
+                        let y1 = x2 + select1 * (x3 - x2);
+                        items_uninit[k * n + p].write(y0 + b2[p] * (y1 - y0));
+                    }
+                }
+            } else if self.bits != 0 {
                 let b = col(self.wire_bit(0, copy));
                 for k in 0..vec_size / 2 {
                     let xs = col(self.wire_list_item(2 * k, copy));
@@ -390,13 +431,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
                 }
             }
             // SAFETY: With zero index bits the slice is empty. Otherwise the
-            // first selector level initialized every element exactly once;
+            // chosen prefix initialized every element exactly once;
             // `MaybeUninit<F>` has the same layout and alignment as `F`.
             let items = unsafe {
                 core::slice::from_raw_parts_mut(items_uninit.as_mut_ptr().cast::<F>(), item_count)
             };
-            let mut level_size = vec_size / 2;
-            for i in 1..self.bits {
+            let mut level_size = first_level_size;
+            for i in prefix_levels..self.bits {
                 let b = col(self.wire_bit(i, copy));
                 for k in 0..level_size / 2 {
                     for p in 0..n {
@@ -737,51 +778,65 @@ mod tests {
         batch_sizes.dedup();
         for bits in [0, 1, 2, 3, 4, 6] {
             for &n in &batch_sizes {
-                let gate = RandomAccessGate::<F, D>::new(3, bits, 2);
-                let wires = (0..gate.num_wires() * n)
-                    .map(|i| value(i + 1))
-                    .collect::<Vec<_>>();
-                let constants = (0..gate.num_constants() * n)
-                    .map(|i| value(i + 10_001))
-                    .collect::<Vec<_>>();
-                let filters = (0..n)
-                    .map(|i| match i % 7 {
-                        0 => F::ZERO,
-                        1 => GoldilocksField(F::ORDER), // noncanonical zero
-                        _ => value(i + 20_001),
-                    })
-                    .collect::<Vec<_>>();
-                let hash = HashOut::ZERO;
-                let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+                // Exact production dispatch plus one-field-at-a-time sabotage
+                // of every admission property. The n=31/33 cases straddle the
+                // batch boundary; all other combinations stay on the old path.
+                let shapes: &[(usize, usize)] = if bits == 6 && n == 32 {
+                    &[(1, 2), (2, 2), (1, 1)]
+                } else if bits == 6 && (n == 31 || n == 33) {
+                    &[(1, 2)]
+                } else if bits == 4 && n == 32 {
+                    &[(1, 2), (3, 2)]
+                } else {
+                    &[(3, 2)]
+                };
+                for &(num_copies, num_extra_constants) in shapes {
+                    let gate = RandomAccessGate::<F, D>::new(num_copies, bits, num_extra_constants);
+                    let wires = (0..gate.num_wires() * n)
+                        .map(|i| value(i + 1))
+                        .collect::<Vec<_>>();
+                    let constants = (0..gate.num_constants() * n)
+                        .map(|i| value(i + 10_001))
+                        .collect::<Vec<_>>();
+                    let filters = (0..n)
+                        .map(|i| match i % 7 {
+                            0 => F::ZERO,
+                            1 => GoldilocksField(F::ORDER), // noncanonical zero
+                            _ => value(i + 20_001),
+                        })
+                        .collect::<Vec<_>>();
+                    let hash = HashOut::ZERO;
+                    let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
 
-                // `eval_unfiltered_base_batch` intentionally retains the old
-                // zero-fill + full list mirror + in-place fold and is the
-                // independent reference for the production accumulate path.
-                let materialized = gate.eval_unfiltered_base_batch(vars);
-                let initial = (0..gate.num_constraints() * n)
-                    .map(|i| match i % 11 {
-                        0 => F::ZERO,
-                        1 => GoldilocksField(F::ORDER), // noncanonical zero
-                        _ => value(i + 30_001),
-                    })
-                    .collect::<Vec<_>>();
-                let mut expected = initial.clone();
-                for (acc, constraints) in expected
-                    .chunks_exact_mut(n)
-                    .zip(materialized.chunks_exact(n))
-                {
-                    batch_multiply_add_inplace(acc, constraints, &filters);
-                }
+                    // `eval_unfiltered_base_batch` intentionally retains the old
+                    // zero-fill + full list mirror + in-place fold and is the
+                    // independent reference for the production accumulate path.
+                    let materialized = gate.eval_unfiltered_base_batch(vars);
+                    let initial = (0..gate.num_constraints() * n)
+                        .map(|i| match i % 11 {
+                            0 => F::ZERO,
+                            1 => GoldilocksField(F::ORDER), // noncanonical zero
+                            _ => value(i + 30_001),
+                        })
+                        .collect::<Vec<_>>();
+                    let mut expected = initial.clone();
+                    for (acc, constraints) in expected
+                        .chunks_exact_mut(n)
+                        .zip(materialized.chunks_exact(n))
+                    {
+                        batch_multiply_add_inplace(acc, constraints, &filters);
+                    }
 
-                let mut actual = initial;
-                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+                    let mut actual = initial;
+                    gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
 
-                for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
-                    assert_eq!(
-                        actual.to_noncanonical_u64(),
-                        expected.to_noncanonical_u64(),
-                        "bits={bits}, n={n}, output={i}"
-                    );
+                    for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                        assert_eq!(
+                            actual.to_noncanonical_u64(),
+                            expected.to_noncanonical_u64(),
+                            "shape=({bits},{n},{num_copies},{num_extra_constants}) output={i}"
+                        );
+                    }
                 }
             }
         }
