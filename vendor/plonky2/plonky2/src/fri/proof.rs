@@ -1,7 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
-use hashbrown::HashMap;
+use hashbrown::{hash_map::Entry, HashMap};
 use itertools::izip;
 use serde::{Deserialize, Serialize};
 
@@ -135,7 +135,7 @@ pub struct CompressedFriProof<F: RichField + Extendable<D>, H: Hasher<F>, const 
 
 impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriProof<F, H, D> {
     /// Compress all the Merkle paths in the FRI proof and remove duplicate indices.
-    pub fn compress(self, indices: &[usize], params: &FriParams) -> CompressedFriProof<F, H, D> {
+    pub fn compress(self, indices: Vec<usize>, params: &FriParams) -> CompressedFriProof<F, H, D> {
         let FriProof {
             commit_phase_merkle_caps,
             query_round_proofs,
@@ -147,20 +147,33 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriProof<F, H, 
         let reduction_arity_bits = &params.reduction_arity_bits;
         let num_reductions = reduction_arity_bits.len();
         let num_initial_trees = query_round_proofs[0].initial_trees_proof.evals_proofs.len();
+        let num_queries = indices.len();
 
         // "Transpose" the query round proofs, so that information for each Merkle tree is collected together.
-        let mut initial_trees_indices = vec![vec![]; num_initial_trees];
-        let mut initial_trees_leaves = vec![vec![]; num_initial_trees];
-        let mut initial_trees_proofs = vec![vec![]; num_initial_trees];
-        let mut steps_indices = vec![vec![]; num_reductions];
-        let mut steps_evals = vec![vec![]; num_reductions];
-        let mut steps_proofs = vec![vec![]; num_reductions];
+        let mut initial_trees_indices = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut initial_trees_leaves = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut initial_trees_proofs = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut steps_indices = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut steps_evals = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut steps_proofs = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
 
-        for (mut index, qrp) in indices.iter().cloned().zip(&query_round_proofs) {
+        for (mut index, qrp) in indices.iter().copied().zip(query_round_proofs) {
             let FriQueryRound {
                 initial_trees_proof,
                 steps,
-            } = qrp.clone();
+            } = qrp;
             for (i, (leaves_data, proof)) in
                 initial_trees_proof.evals_proofs.into_iter().enumerate()
             {
@@ -181,50 +194,57 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> FriProof<F, H, 
         }
 
         // Compress all Merkle proofs.
-        let initial_trees_proofs = initial_trees_indices
+        let mut initial_trees_proofs = initial_trees_indices
             .iter()
             .zip(initial_trees_proofs)
             .map(|(is, ps)| compress_merkle_proofs(cap_height, is, &ps))
             .collect::<Vec<_>>();
-        let steps_proofs = steps_indices
+        let mut steps_proofs = steps_indices
             .iter()
             .zip(steps_proofs)
             .map(|(is, ps)| compress_merkle_proofs(cap_height, is, &ps))
             .collect::<Vec<_>>();
 
         let mut compressed_query_proofs = CompressedFriQueryRounds {
-            indices: indices.to_vec(),
-            initial_trees_proofs: HashMap::with_capacity(indices.len()),
-            steps: vec![HashMap::new(); num_reductions],
+            indices: Vec::new(),
+            initial_trees_proofs: HashMap::with_capacity(num_queries),
+            steps: (0..num_reductions)
+                .map(|_| HashMap::with_capacity(num_queries))
+                .collect(),
         };
 
         // Replace the query round proofs with the compressed versions.
         for (i, mut index) in indices.iter().copied().enumerate() {
-            let initial_proof = FriInitialTreeProof {
-                evals_proofs: (0..num_initial_trees)
-                    .map(|j| {
-                        (
-                            initial_trees_leaves[j][i].clone(),
-                            initial_trees_proofs[j][i].clone(),
-                        )
-                    })
-                    .collect(),
-            };
-            compressed_query_proofs
-                .initial_trees_proofs
-                .entry(index)
-                .or_insert(initial_proof);
+            if let Entry::Vacant(entry) = compressed_query_proofs.initial_trees_proofs.entry(index)
+            {
+                entry.insert(FriInitialTreeProof {
+                    evals_proofs: (0..num_initial_trees)
+                        .map(|j| {
+                            (
+                                core::mem::take(&mut initial_trees_leaves[j][i]),
+                                MerkleProof {
+                                    siblings: core::mem::take(
+                                        &mut initial_trees_proofs[j][i].siblings,
+                                    ),
+                                },
+                            )
+                        })
+                        .collect(),
+                });
+            }
             for j in 0..num_reductions {
                 index >>= reduction_arity_bits[j];
-                let query_step = FriQueryStep {
-                    evals: steps_evals[j][i].clone(),
-                    merkle_proof: steps_proofs[j][i].clone(),
-                };
-                compressed_query_proofs.steps[j]
-                    .entry(index)
-                    .or_insert(query_step);
+                if let Entry::Vacant(entry) = compressed_query_proofs.steps[j].entry(index) {
+                    entry.insert(FriQueryStep {
+                        evals: core::mem::take(&mut steps_evals[j][i]),
+                        merkle_proof: MerkleProof {
+                            siblings: core::mem::take(&mut steps_proofs[j][i].siblings),
+                        },
+                    });
+                }
             }
         }
+        compressed_query_proofs.indices = indices;
 
         CompressedFriProof {
             commit_phase_merkle_caps,
@@ -245,7 +265,7 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> CompressedFriPr
     ) -> FriProof<F, H, D> {
         let CompressedFriProof {
             commit_phase_merkle_caps,
-            query_round_proofs,
+            mut query_round_proofs,
             final_poly,
             pow_witness,
             ..
@@ -265,14 +285,27 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> CompressedFriPr
             .unwrap()
             .evals_proofs
             .len();
+        let num_queries = indices.len();
 
         // "Transpose" the query round proofs, so that information for each Merkle tree is collected together.
-        let mut initial_trees_indices = vec![vec![]; num_initial_trees];
-        let mut initial_trees_leaves = vec![vec![]; num_initial_trees];
-        let mut initial_trees_proofs = vec![vec![]; num_initial_trees];
-        let mut steps_indices = vec![vec![]; num_reductions];
-        let mut steps_evals = vec![vec![]; num_reductions];
-        let mut steps_proofs = vec![vec![]; num_reductions];
+        let mut initial_trees_indices = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut initial_trees_leaves = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut initial_trees_proofs = (0..num_initial_trees)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut steps_indices = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut steps_evals = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        let mut steps_proofs = (0..num_reductions)
+            .map(|_| Vec::with_capacity(num_queries))
+            .collect::<Vec<_>>();
         let height = params.degree_bits + params.config.rate_bits;
         let heights = reduction_arity_bits
             .iter()
@@ -283,10 +316,19 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> CompressedFriPr
             .collect::<Vec<_>>();
 
         // Holds the `evals` vectors that have already been reconstructed at each reduction depth.
-        let mut evals_by_depth =
-            vec![HashMap::<usize, Vec<_>>::new(); params.reduction_arity_bits.len()];
-        for &(mut index) in indices {
-            let initial_trees_proof = query_round_proofs.initial_trees_proofs[&index].clone();
+        let mut evals_by_depth = (0..num_reductions)
+            .map(|_| HashMap::<usize, Vec<_>>::with_capacity(num_queries))
+            .collect::<Vec<_>>();
+        for (query_pos, &(mut index)) in indices.iter().enumerate() {
+            let later_indices = &indices[query_pos + 1..];
+            let initial_trees_proof = if later_indices.contains(&index) {
+                query_round_proofs.initial_trees_proofs[&index].clone()
+            } else {
+                query_round_proofs
+                    .initial_trees_proofs
+                    .remove(&index)
+                    .unwrap()
+            };
             for (i, (leaves_data, proof)) in
                 initial_trees_proof.evals_proofs.into_iter().enumerate()
             {
@@ -294,21 +336,36 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> CompressedFriPr
                 initial_trees_leaves[i].push(leaves_data);
                 initial_trees_proofs[i].push(proof);
             }
+            let mut reduced_bits = 0;
             for i in 0..num_reductions {
                 let index_within_coset = index & ((1 << reduction_arity_bits[i]) - 1);
+                reduced_bits += reduction_arity_bits[i];
                 index >>= reduction_arity_bits[i];
+                let reused_later = later_indices
+                    .iter()
+                    .any(|&later_index| later_index >> reduced_bits == index);
                 let FriQueryStep {
                     mut evals,
                     merkle_proof,
-                } = query_round_proofs.steps[i][&index].clone();
+                } = if reused_later {
+                    query_round_proofs.steps[i][&index].clone()
+                } else {
+                    query_round_proofs.steps[i].remove(&index).unwrap()
+                };
                 steps_indices[i].push(index);
-                if let Some(v) = evals_by_depth[i].get(&index) {
+                if evals_by_depth[i].contains_key(&index) {
                     // If this index has already been seen, get `evals` from the `HashMap`.
-                    evals = v.to_vec();
+                    evals = if reused_later {
+                        evals_by_depth[i][&index].clone()
+                    } else {
+                        evals_by_depth[i].remove(&index).unwrap()
+                    };
                 } else {
                     // Otherwise insert the next inferred element.
                     evals.insert(index_within_coset, fri_inferred_elements.next().unwrap());
-                    evals_by_depth[i].insert(index, evals.clone());
+                    if reused_later {
+                        evals_by_depth[i].insert(index, evals.clone());
+                    }
                 }
                 steps_evals[i].push(flatten(&evals));
                 steps_proofs[i].push(merkle_proof);
@@ -327,22 +384,35 @@ impl<F: RichField + Extendable<D>, H: Hasher<F>, const D: usize> CompressedFriPr
             .map(|(ls, is, ps, h)| decompress_merkle_proofs(ls, is, &ps, h, cap_height))
             .collect::<Vec<_>>();
 
-        let mut decompressed_query_proofs = Vec::with_capacity(num_reductions);
-        for i in 0..indices.len() {
+        // Turn the transposed buffers into iterators so each query can take ownership of its
+        // leaves and Merkle paths. These values are no longer needed by any other query.
+        let mut initial_trees_leaves = initial_trees_leaves
+            .into_iter()
+            .map(Vec::into_iter)
+            .collect::<Vec<_>>();
+        let mut initial_trees_proofs = initial_trees_proofs
+            .into_iter()
+            .map(Vec::into_iter)
+            .collect::<Vec<_>>();
+        let mut steps_evals = steps_evals
+            .into_iter()
+            .map(Vec::into_iter)
+            .collect::<Vec<_>>();
+        let mut steps_proofs = steps_proofs
+            .into_iter()
+            .map(Vec::into_iter)
+            .collect::<Vec<_>>();
+        let mut decompressed_query_proofs = Vec::with_capacity(num_queries);
+        for _ in 0..num_queries {
             let initial_trees_proof = FriInitialTreeProof {
-                evals_proofs: (0..num_initial_trees)
-                    .map(|j| {
-                        (
-                            initial_trees_leaves[j][i].clone(),
-                            initial_trees_proofs[j][i].clone(),
-                        )
-                    })
+                evals_proofs: izip!(&mut initial_trees_leaves, &mut initial_trees_proofs)
+                    .map(|(leaves, proof)| (leaves.next().unwrap(), proof.next().unwrap()))
                     .collect(),
             };
-            let steps = (0..num_reductions)
-                .map(|j| FriQueryStep {
-                    evals: unflatten(&steps_evals[j][i]),
-                    merkle_proof: steps_proofs[j][i].clone(),
+            let steps = izip!(&mut steps_evals, &mut steps_proofs)
+                .map(|(evals, proof)| FriQueryStep {
+                    evals: unflatten(&evals.next().unwrap()),
+                    merkle_proof: proof.next().unwrap(),
                 })
                 .collect();
             decompressed_query_proofs.push(FriQueryRound {
