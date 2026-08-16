@@ -231,6 +231,12 @@ enum ChainState<'scope> {
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
 }
 
+/// The light path reuses one immutable early-input layout across its forty-nine
+/// fixed-shape chain steps. The `Arc` lets each scoped step drop the mutex
+/// before it performs witness generation; the mutex is held across the first
+/// recording only, so exactly one step pays the generic layout discovery.
+type ChainSeedLayout<'a> = std::sync::Mutex<Option<Arc<PartitionSeedLayout<'a, F, C, D>>>>;
+
 impl ChainState<'_> {
     fn wait(self) -> Proof {
         #[cfg(feature = "diagnostic_profile")]
@@ -245,15 +251,119 @@ impl ChainState<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn chain_step_proof(
+fn prepare_chain_step_witness<'a>(
+    chain_target: &BlockTxChainTarget,
+    chain_data: &'a CircuitData<F, C, D>,
+    chain_step: u64,
+    dummy_proof: &Proof,
+    tx_proof: &Proof,
+    seed_layout: Option<&ChainSeedLayout<'a>>,
+) -> anyhow::Result<PendingPartitionWitness<'a, F, C, D>> {
+    let Some(seed_layout) = seed_layout else {
+        return PendingPartitionWitness::start_seeded(
+            &chain_data.prover_only,
+            &chain_data.common,
+            |seeder| {
+                BlockTxChainCircuit::witness_inputs_early_into(
+                    chain_target,
+                    chain_data,
+                    chain_step,
+                    dummy_proof,
+                    tx_proof,
+                    seeder,
+                )
+            },
+        );
+    };
+
+    let layout = {
+        let mut cached = seed_layout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(layout) = cached.as_ref() {
+            Arc::clone(layout)
+        } else {
+            let (pending, layout) = PendingPartitionWitness::start_seeded_recording(
+                &chain_data.prover_only,
+                &chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        tx_proof,
+                        seeder,
+                    )
+                },
+            )?;
+            *cached = Some(Arc::new(layout));
+            return Ok(pending);
+        }
+    };
+
+    let replay = PendingPartitionWitness::start_seeded_with_layout(
+        &chain_data.prover_only,
+        &chain_data.common,
+        &layout,
+        |seeder| {
+            BlockTxChainCircuit::witness_inputs_early_into(
+                chain_target,
+                chain_data,
+                chain_step,
+                dummy_proof,
+                tx_proof,
+                seeder,
+            )
+        },
+    );
+    match replay {
+        Err(error) if is_seed_layout_mismatch(&error) => {
+            // Fail closed: the replay implementation has already discarded
+            // the partially written witness before returning this typed
+            // mismatch. Retire only the layout we actually tried (another
+            // thread may have installed a replacement), then re-seed once via
+            // the checked generic target-to-representative path.
+            let mut cached = seed_layout
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if cached
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &layout))
+            {
+                *cached = None;
+            }
+            drop(cached);
+            PendingPartitionWitness::start_seeded(
+                &chain_data.prover_only,
+                &chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        tx_proof,
+                        seeder,
+                    )
+                },
+            )
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_step_proof<'a>(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
-    chain_data: &CircuitData<F, C, D>,
+    chain_data: &'a CircuitData<F, C, D>,
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    seed_layout: Option<&ChainSeedLayout<'a>>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -267,21 +377,17 @@ fn chain_step_proof(
     let result = (|| {
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
-        // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
+        // the partition's representative slots — no PartialWitness map or
+        // per-path template clone. The light path records the first step's
+        // fixed target layout and replays it for the remaining forty-eight;
+        // the three-step heavy path deliberately keeps the generic direct seed.
+        let mut pending = prepare_chain_step_witness(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            seed_layout,
         )?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
@@ -535,7 +641,10 @@ fn prove_path(
     );
     jump = next_jump;
 
-
+    // Only the long light chain amortizes layout recording. The heavy path has
+    // three steps and remains on the existing generic direct-seed path.
+    let light_chain_seed_layout: ChainSeedLayout<'_> = std::sync::Mutex::new(None);
+    let chain_seed_layout = (path == TxPath::Light).then_some(&light_chain_seed_layout);
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
@@ -566,6 +675,7 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            chain_seed_layout,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -660,6 +770,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        chain_seed_layout,
                     )
                 })
                 .expect("chain step pipeline thread must start");
@@ -719,6 +830,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        chain_seed_layout,
                     )
                 })
                 .expect("chain drain thread must start");
@@ -1558,6 +1670,7 @@ mod tests {
         );
 
         let mut previous: Option<Proof> = None;
+        let chain_seed_layout: ChainSeedLayout<'_> = std::sync::Mutex::new(None);
         for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
 
@@ -1637,6 +1750,7 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                Some(&chain_seed_layout),
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);
@@ -1648,6 +1762,20 @@ mod tests {
             );
             previous = Some(direct_proof);
         }
+
+        let cached = chain_seed_layout
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let layout = cached
+            .as_ref()
+            .expect("the first chain step must record a reusable seed layout");
+        println!(
+            "CHAIN_SEED_LAYOUT_CENSUS target_writes={} changed_generators={} replayed_steps={}",
+            layout.target_write_count(),
+            layout.changed_generator_count(),
+            CHAIN_STEPS - 1,
+        );
+        drop(cached);
 
         circuits
             .chain_data
