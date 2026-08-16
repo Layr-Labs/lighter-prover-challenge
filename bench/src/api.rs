@@ -1,4 +1,4 @@
-// Redraw marker 501
+// continued best-source regime sample 2026-08-16-c
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
