@@ -107,7 +107,7 @@ impl<F: RichField, const N: usize> Hasher<F> for KeccakHash<N> {
     type Permutation = KeccakPermutation<F>;
 
     fn hash_no_pad(input: &[F]) -> Self::Hash {
-        let mut buffer = Vec::with_capacity(input.len());
+        let mut buffer = Vec::with_capacity(input.len() * size_of::<u64>());
         buffer.write_field_vec(input).unwrap();
         let mut arr = [0; N];
         let hash_bytes = keccak(buffer).0;
