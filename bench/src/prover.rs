@@ -245,6 +245,42 @@ impl ChainState<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Dedicated rayon pool for serial-chain (spine) proving.
+///
+/// The chain is the run's critical path — under two-worker contention it is 90%
+/// of wall time — and it is strictly serial, so it can only ever use a sliver of
+/// the machine's parallelism. Its *internal* parallel work (Merkle builds, FFTs)
+/// nonetheless goes through the global rayon pool, where it queues behind the
+/// pipelined chunk proofs. Measured effect of that queueing: chain steps take
+/// ~1.2-2.0 s early in a contended run and ~0.15 s once the pipeline drains,
+/// a ~4.7x spread, and 52 steps sum to 34.1 s where an unstarved chain would
+/// need 7.7 s.
+///
+/// Giving the spine its own threads costs the chunk pipeline little — the chain
+/// runs one step at a time, so it cannot absorb many threads — while removing
+/// the queueing delay from the critical path. Thread count is overridable via
+/// `LIGHTER_SPINE_THREADS` for sweeps; 0 disables the pool entirely and restores
+/// the previous behaviour exactly.
+fn spine_pool() -> Option<&'static rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("LIGHTER_SPINE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4);
+        if threads == 0 {
+            return None;
+        }
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .thread_name(|i| format!("spine-{i}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
 fn chain_step_proof(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
@@ -269,31 +305,46 @@ fn chain_step_proof(
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
         // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
-        )?;
+        let pool = spine_pool();
+        let start = || {
+            PendingPartitionWitness::start_seeded(
+                &chain_data.prover_only,
+                &chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        tx_proof,
+                        seeder,
+                    )
+                },
+            )
+        };
+        let mut pending = match pool {
+            Some(pool) => pool.install(start)?,
+            None => start()?,
+        };
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
+        // The wait deliberately happens *outside* the spine pool: blocking a
+        // dedicated worker on the predecessor would idle a reserved thread.
         let previous_proof = previous.map(ChainState::wait);
-        pending.feed_seeded(|feeder| {
-            BlockTxChainCircuit::witness_inputs_cyclic_into(
-                chain_target,
-                previous_proof.as_ref().unwrap_or(base_proof),
-                feeder,
-            )
-        })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        let finish = move || {
+            pending.feed_seeded(|feeder| {
+                BlockTxChainCircuit::witness_inputs_cyclic_into(
+                    chain_target,
+                    previous_proof.as_ref().unwrap_or(base_proof),
+                    feeder,
+                )
+            })?;
+            BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        };
+        match pool {
+            Some(pool) => pool.install(finish),
+            None => finish(),
+        }
     })();
     // This step is no longer part of the runnable backlog (see the matching
     // spine_backlog_add(1) at all spawn sites).
