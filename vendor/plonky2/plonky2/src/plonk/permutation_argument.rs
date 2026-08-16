@@ -284,6 +284,15 @@ impl Forest {
         let degree = self.degree;
         let num_routed_wires = self.num_routed_wires;
         let mut sigma = vec![0u32; degree * num_routed_wires];
+        // Derive the singleton-routed mask while the same copy-class tail is hot. The first
+        // routed member starts as a sigma self-loop; insertion of the second member breaks that
+        // self-loop and clears the one bit. Later members can never make the class singleton
+        // again. This is exactly the predicate reconstructed by `fixed_routed_wire_mask`, but
+        // deletes its cardinality allocation and two later full routed-position passes.
+        let mut fixed_routed_wires = vec![0u8; (degree * num_routed_wires).div_ceil(8)];
+        let degree_is_power_of_two = degree.is_power_of_two();
+        let degree_log = degree.trailing_zeros() as usize;
+        let degree_mask = degree.wrapping_sub(1);
 
         // Bit 31 must be free to carry the tag. `Forest::new` bounds the forest by
         // `u32::MAX`; this tightens that to `2^31` and checks it rather than assuming it.
@@ -310,8 +319,23 @@ impl Forest {
                 let tail = self.parents[parent];
                 if tail & Self::TAIL_TAG == 0 {
                     sigma[index as usize] = index;
+                    let routed_index = row * num_routed_wires + column;
+                    fixed_routed_wires[routed_index >> 3] |= 1 << (routed_index & 7);
                 } else {
                     let old_tail = (tail & !Self::TAIL_TAG) as usize;
+                    // Only the second routed member sees a self-loop at the old tail. Clear the
+                    // bit set for that first member before splicing the new member into the same
+                    // sigma cycle. `old_tail` is the column-major sigma index.
+                    if sigma[old_tail] as usize == old_tail {
+                        let (old_row, old_column) = if degree_is_power_of_two {
+                            (old_tail & degree_mask, old_tail >> degree_log)
+                        } else {
+                            (old_tail % degree, old_tail / degree)
+                        };
+                        let old_routed_index = old_row * num_routed_wires + old_column;
+                        fixed_routed_wires[old_routed_index >> 3] &=
+                            !(1 << (old_routed_index & 7));
+                    }
                     sigma[index as usize] = sigma[old_tail];
                     sigma[old_tail] = index;
                 }
@@ -327,16 +351,24 @@ impl Forest {
             }
         }
 
-        WirePartition { sigma }
+        WirePartition {
+            sigma,
+            fixed_routed_wires,
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct WirePartition {
     sigma: Vec<u32>,
+    fixed_routed_wires: Vec<u8>,
 }
 
 impl WirePartition {
+    pub(crate) fn into_fixed_routed_wires(self) -> Vec<u8> {
+        self.fixed_routed_wires
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
@@ -941,8 +973,20 @@ mod tests {
                 "compressed parents diverge for num_wires {num_wires} degree {degree}"
             );
 
-            let sigma = forest.wire_partition().sigma;
+            let partition = forest.wire_partition();
             let expected_sigma = reference.wire_partition();
+            let expected_fixed = fixed_routed_wire_mask(
+                &expected_parents,
+                num_wires,
+                num_routed_wires,
+                degree,
+            )
+            .expect("valid compressed representative map");
+            assert_eq!(
+                partition.fixed_routed_wires, expected_fixed,
+                "fixed mask diverges for num_wires {num_wires} degree {degree}"
+            );
+            let sigma = partition.sigma;
             assert_eq!(sigma, expected_sigma, "sigma diverges for num_wires {num_wires} degree {degree}");
 
             assert_eq!(
@@ -955,9 +999,13 @@ mod tests {
             );
 
             // Idempotence: only possible if the restore was complete.
-            let sigma_again = forest.wire_partition().sigma;
+            let partition_again = forest.wire_partition();
             assert_eq!(
-                sigma_again, expected_sigma,
+                partition_again.fixed_routed_wires, expected_fixed,
+                "second fixed mask diverges for num_wires {num_wires} degree {degree}"
+            );
+            assert_eq!(
+                partition_again.sigma, expected_sigma,
                 "second wire_partition diverges for num_wires {num_wires} degree {degree}"
             );
             assert_eq!(
@@ -1063,15 +1111,18 @@ mod tests {
         );
         forest.compress_paths();
         let representative_map = forest.parents.clone();
-        let sigma = forest.wire_partition().sigma;
+        let partition = forest.wire_partition();
+        let sigma = &partition.sigma;
+        let mask = partition.fixed_routed_wires.as_slice();
 
-        let mask = fixed_routed_wire_mask(
+        let reference_mask = fixed_routed_wire_mask(
             &representative_map,
             num_wires,
             num_routed_wires,
             degree,
         )
         .expect("valid compressed representative map");
+        assert_eq!(mask, reference_mask);
         assert_eq!(mask.len(), (degree * num_routed_wires).div_ceil(8));
 
         for row in 0..degree {
