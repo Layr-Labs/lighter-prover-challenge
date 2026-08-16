@@ -368,9 +368,56 @@ const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 
+/// Leaf/LDE row count of the serial-critical shapes: the degree-2^14 chain
+/// steps and pre-execution circuit commit at 2^17 rows, while the pipelined
+/// chunk circuits commit at 2^19 and the final block circuit at 2^21. Used
+/// both to pick the spine command queue and (with `spine_urgent`) to pick the
+/// buffer set.
+const SPINE_LDE_ROWS: usize = 1 << 17;
+
+/// Quotient-domain size above which a quotient job is not spine work. The
+/// degree-2^14 serial circuits evaluate their quotient over 2^17 points; the
+/// 2^16 chunk circuits use 2^19 and the 2^18 block circuit 2^21.
+const SPINE_MAX_QUOTIENT_ROWS: usize = 1 << 17;
+
+/// A/B switch for the spine command queue: `LIGHTER_SPINE_QUEUE=0` routes every
+/// submission back to the single shared queue, which is the pre-change
+/// behaviour exactly. One binary, one changed decision, so a paired run differs
+/// in nothing else — including binary size and code-signature cost. Read once;
+/// the scored path never sets it.
+fn spine_queue_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_SPINE_QUEUE")
+            .map(|value| value != "0")
+            .unwrap_or(true)
+    })
+}
+
 struct MetalShared {
     device: Device,
     queue: CommandQueue,
+    /// Second command queue reserved for serial-critical (spine) submissions.
+    ///
+    /// Command buffers execute FIFO *per queue*, so on the single shared queue
+    /// a chain fold's small job is scheduled only after every chunk job already
+    /// enqueued ahead of it — measured on an M-series host as 62% of all
+    /// submit-to-completed GPU time being submit-to-*scheduled* queue wait,
+    /// with a median of 24.8 ms while the chunk pipeline runs against 0.2 ms
+    /// once it drains. Separate queues are scheduled independently, so a spine
+    /// job no longer inherits the chunk stream's backlog.
+    ///
+    /// This is not the `MAX_BUFFER_SETS` question. Merkle *builds* remain
+    /// serialized by the single buffer set (the 3-set experiment scored -21.6%
+    /// ranked and that bound is unchanged here); what this removes is the
+    /// ordering coupling between the spine's jobs and the chunk stream's,
+    /// including the quotient jobs, which never take a buffer set and so are
+    /// today the main occupants of the shared queue ahead of a fold.
+    ///
+    /// Purely a scheduling change: the same kernels read the same buffers and
+    /// write the same digests, so every tree, quotient and proof byte is
+    /// identical whichever queue carried the work.
+    spine_queue: CommandQueue,
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
@@ -2752,6 +2799,7 @@ impl MetalShared {
 
             Ok(Self {
                 queue: device.new_command_queue(),
+                spine_queue: device.new_command_queue(),
                 device,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -2794,6 +2842,18 @@ impl MetalShared {
         Ok(MetalColumns::with_buffer(buffer, rows, cols))
     }
 
+    /// Picks the command queue for a submission. Spine work goes to the
+    /// dedicated queue so it is not scheduled behind the chunk pipeline's
+    /// backlog; see [`MetalShared::spine_queue`]. Either choice runs the same
+    /// kernel over the same buffers, so this cannot change a result.
+    fn queue_for(&self, spine: bool) -> &CommandQueue {
+        if spine && spine_queue_enabled() {
+            &self.spine_queue
+        } else {
+            &self.queue
+        }
+    }
+
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
         if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
             if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
@@ -2831,8 +2891,11 @@ impl MetalShared {
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
         let job_guard = GpuJobGuard::begin();
+        // Quotient jobs take no buffer set, so on one queue they are what a
+        // fold's command buffer most often waits behind.
+        let spine = quotient_rows <= SPINE_MAX_QUOTIENT_ROWS;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self.queue_for(spine).new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -2901,8 +2964,11 @@ impl MetalShared {
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
         let job_guard = GpuJobGuard::begin();
+        // Quotient jobs take no buffer set, so on one queue they are what a
+        // fold's command buffer most often waits behind.
+        let spine = quotient_rows <= SPINE_MAX_QUOTIENT_ROWS;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self.queue_for(spine).new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -2993,8 +3059,11 @@ impl MetalShared {
             .ok_or("permutation quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
         let job_guard = GpuJobGuard::begin();
+        // Quotient jobs take no buffer set, so on one queue they are what a
+        // fold's command buffer most often waits behind.
+        let spine = quotient_rows <= SPINE_MAX_QUOTIENT_ROWS;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self.queue_for(spine).new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -3399,13 +3468,14 @@ impl MetalShared {
             let output_buffer = set.output.as_ref().unwrap();
 
             let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
+            let spine = lde_size == SPINE_LDE_ROWS;
             let command_buffer = autoreleasepool(|| -> CommandBuffer {
                 let degree_u32 = degree as u32;
                 let lde_size_u32 = lde_size as u32;
                 let log_degree_u32 = degree.ilog2();
                 let rate_bits_u32 = rate_bits as u32;
                 let cols_u32 = cols as u32;
-                let command_buffer = self.queue.new_command_buffer();
+                let command_buffer = self.queue_for(spine).new_command_buffer();
 
                 // Plain forward FFT of the values: bit-reversed gather (the
                 // identity "shift" table, no zero-run replication), then
@@ -3706,13 +3776,14 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(log_lde as usize + 1);
+        let spine = lde_size == SPINE_LDE_ROWS;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let degree_u32 = degree as u32;
             let lde_size_u32 = lde_size as u32;
             let log_degree_u32 = degree.ilog2();
             let rate_bits_u32 = rate_bits as u32;
             let cols_u32 = cols as u32;
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self.queue_for(spine).new_command_buffer();
 
             let prepare = command_buffer.new_compute_command_encoder();
             prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
@@ -3942,6 +4013,9 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
+        // Same shape predicate the buffer-set priority uses, without the
+        // backlog gate: queue choice costs nothing, so it need not be rationed.
+        let spine = leaf_count == SPINE_LDE_ROWS && leaf_width > 4;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let leaf_count_u32 = leaf_count as u32;
             let leaf_width_u32 = leaf_width as u32;
@@ -3950,7 +4024,7 @@ impl MetalShared {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self.queue_for(spine).new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(leaf_pipeline);
             encoder.set_buffer(0, Some(input_buffer), 0);
