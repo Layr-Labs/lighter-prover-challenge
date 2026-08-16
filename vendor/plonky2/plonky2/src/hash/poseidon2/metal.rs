@@ -407,7 +407,7 @@ struct NttRoots {
 /// An asynchronously submitted Poseidon2 gate-constraint evaluation. Its
 /// point-major output stays in shared storage for zero-copy CPU combination.
 pub(crate) struct PoseidonGateQuotientJob<F> {
-    command_buffer: CommandBuffer,
+    fence: Arc<QuotientBatchFence>,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
@@ -419,7 +419,7 @@ pub(crate) struct PoseidonGateQuotientJob<F> {
 /// contributions. Its layout matches [`PoseidonGateQuotientJob`]: two
 /// challenge values per quotient-domain point.
 pub(crate) struct RangeCheckGateQuotientJob<F> {
-    command_buffer: CommandBuffer,
+    fence: Arc<QuotientBatchFence>,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
@@ -433,12 +433,85 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
 /// The kernel emits only the partial-product terms (alpha rows 2 onward);
 /// the two cheap `L_0(x) * (Z_i(x) - 1)` rows stay on the CPU.
 pub(crate) struct PermutationQuotientJob<F> {
-    command_buffer: CommandBuffer,
+    fence: Arc<QuotientBatchFence>,
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
     _job: GpuJobGuard,
     _phantom: PhantomData<F>,
+}
+
+/// One retained command buffer shared by every active quotient output in a
+/// proof. The logical jobs keep separate output buffers and admission guards;
+/// only command-buffer creation, submission and completion are coalesced.
+struct QuotientBatchFence {
+    command_buffer: CommandBuffer,
+}
+
+/// Proof that the shared quotient command buffer reached `Completed`. Output
+/// accessors require this token, so no job can expose shared-buffer contents
+/// before the one batch fence has completed.
+pub(crate) struct QuotientBatchCompletion {
+    _private: (),
+}
+
+pub(crate) struct QuotientBatchJobs<F> {
+    pub(crate) poseidon: Option<PoseidonGateQuotientJob<F>>,
+    pub(crate) range: Option<RangeCheckGateQuotientJob<F>>,
+    pub(crate) permutation: Option<PermutationQuotientJob<F>>,
+    fence: Option<Arc<QuotientBatchFence>>,
+    #[cfg(test)]
+    mask: QuotientBatchMask,
+}
+
+impl<F> QuotientBatchJobs<F> {
+    fn empty() -> Self {
+        Self {
+            poseidon: None,
+            range: None,
+            permutation: None,
+            fence: None,
+            #[cfg(test)]
+            mask: QuotientBatchMask(0),
+        }
+    }
+
+    pub(crate) fn wait_until_completed(&self) -> Result<QuotientBatchCompletion, String> {
+        let Some(fence) = &self.fence else {
+            return Ok(QuotientBatchCompletion { _private: () });
+        };
+        fence.command_buffer.wait_until_completed();
+        let status = fence.command_buffer.status();
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "quotient batch command buffer ended with status {status:?}"
+            ));
+        }
+        Ok(QuotientBatchCompletion { _private: () })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_mask_for_tests(&self) -> u8 {
+        self.mask.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_one_fence_for_tests(&self) -> bool {
+        let Some(fence) = &self.fence else {
+            return self.mask.is_empty();
+        };
+        self.poseidon
+            .as_ref()
+            .map_or(true, |job| Arc::ptr_eq(fence, &job.fence))
+            && self
+                .range
+                .as_ref()
+                .map_or(true, |job| Arc::ptr_eq(fence, &job.fence))
+            && self
+                .permutation
+                .as_ref()
+                .map_or(true, |job| Arc::ptr_eq(fence, &job.fence))
+    }
 }
 
 #[cfg(test)]
@@ -507,14 +580,10 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
     }
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "Poseidon2 gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
-            ));
-        }
+    pub(crate) fn finish_after_fence(
+        &self,
+        _completion: &QuotientBatchCompletion,
+    ) -> Result<&[F], String> {
         // SAFETY: construction is restricted to an 8-byte Goldilocks field,
         // and the completed kernel canonicalized every output word.
         let output = self.output.as_ref().expect("quotient output present");
@@ -523,14 +592,10 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
 }
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "RangeCheck gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
-            ));
-        }
+    pub(crate) fn finish_after_fence(
+        &self,
+        _completion: &QuotientBatchCompletion,
+    ) -> Result<&[F], String> {
         #[cfg(test)]
         if let Some(observer) = &self.failure_observer {
             observer
@@ -555,14 +620,10 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 }
 
 impl<F: RichField> PermutationQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
-        self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(format!(
-                "Permutation quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
-            ));
-        }
+    pub(crate) fn finish_after_fence(
+        &self,
+        _completion: &QuotientBatchCompletion,
+    ) -> Result<&[F], String> {
         // SAFETY: construction is restricted to an 8-byte Goldilocks field,
         // and the completed kernel canonicalized every output word.
         let output = self.output.as_ref().expect("quotient output present");
@@ -571,14 +632,14 @@ impl<F: RichField> PermutationQuotientJob<F> {
 }
 
 fn recycle_completed_quotient_output(
-    command_buffer: &CommandBuffer,
+    fence: &QuotientBatchFence,
     output: &mut Option<Buffer>,
     pool: &Arc<Mutex<QuotientOutputPool>>,
 ) {
     // Never wait from Drop and never make an in-flight or failed resource
     // visible to another command. Default retained references keep an early-
     // dropped output alive for its original command buffer.
-    if command_buffer.status() != MTLCommandBufferStatus::Completed {
+    if !quotient_output_recyclable(fence.command_buffer.status()) {
         return;
     }
     let Some(buffer) = output.take() else {
@@ -591,10 +652,14 @@ fn recycle_completed_quotient_output(
     }
 }
 
+fn quotient_output_recyclable(status: MTLCommandBufferStatus) -> bool {
+    status == MTLCommandBufferStatus::Completed
+}
+
 impl<F> Drop for PoseidonGateQuotientJob<F> {
     fn drop(&mut self) {
         recycle_completed_quotient_output(
-            &self.command_buffer,
+            &self.fence,
             &mut self.output,
             &self.output_pool,
         );
@@ -604,7 +669,7 @@ impl<F> Drop for PoseidonGateQuotientJob<F> {
 impl<F> Drop for RangeCheckGateQuotientJob<F> {
     fn drop(&mut self) {
         recycle_completed_quotient_output(
-            &self.command_buffer,
+            &self.fence,
             &mut self.output,
             &self.output_pool,
         );
@@ -614,7 +679,7 @@ impl<F> Drop for RangeCheckGateQuotientJob<F> {
 impl<F> Drop for PermutationQuotientJob<F> {
     fn drop(&mut self) {
         recycle_completed_quotient_output(
-            &self.command_buffer,
+            &self.fence,
             &mut self.output,
             &self.output_pool,
         );
@@ -700,6 +765,96 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
+}
+
+pub(crate) struct PreparedPoseidonGateQuotient<'a, F> {
+    wires: &'a MetalColumns<F>,
+    constants: &'a MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    selector_column: usize,
+    gate_index: usize,
+    group: core::ops::Range<usize>,
+    include_unused_selector: bool,
+    alpha_powers: Vec<u64>,
+}
+
+pub(crate) struct PreparedRangeCheckGateQuotient<'a, F> {
+    wires: &'a MetalColumns<F>,
+    constants: &'a MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    metadata: Vec<u32>,
+    range_count: usize,
+    u32_count: usize,
+    alpha_powers: Vec<u64>,
+    alpha_stride: usize,
+}
+
+pub(crate) struct PreparedPermutationQuotient<'a, F> {
+    wires: &'a MetalColumns<F>,
+    constants_sigmas: &'a MetalColumns<F>,
+    zs_partial_products: &'a MetalColumns<F>,
+    shifted_points: &'a [F],
+    quotient_rows: usize,
+    step: usize,
+    next_step: usize,
+    sigma_start: usize,
+    num_routed_wires: usize,
+    num_partial_products: usize,
+    chunk_size: usize,
+    alpha_powers: Vec<u64>,
+    alpha_stride: usize,
+    challenges: Vec<u64>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotientEncoderKind {
+    Poseidon,
+    Range,
+    Permutation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QuotientBatchMask(u8);
+
+impl QuotientBatchMask {
+    const POSEIDON: u8 = 1;
+    const RANGE: u8 = 2;
+    const PERMUTATION: u8 = 4;
+
+    fn new(poseidon: bool, range: bool, permutation: bool) -> Self {
+        Self(
+            u8::from(poseidon) * Self::POSEIDON
+                | u8::from(range) * Self::RANGE
+                | u8::from(permutation) * Self::PERMUTATION,
+        )
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn active_count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    #[cfg(test)]
+    fn encoder_order(self) -> impl Iterator<Item = QuotientEncoderKind> {
+        [
+            (Self::POSEIDON, QuotientEncoderKind::Poseidon),
+            (Self::RANGE, QuotientEncoderKind::Range),
+            (Self::PERMUTATION, QuotientEncoderKind::Permutation),
+        ]
+        .into_iter()
+        .filter_map(move |(bit, kind)| (self.0 & bit != 0).then_some(kind))
+    }
+
+    #[cfg(test)]
+    fn command_buffer_count(self) -> usize {
+        usize::from(!self.is_empty())
+    }
 }
 
 /// Bounded exact-size cache of shared column-store buffers.
@@ -1684,13 +1839,14 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
     }
 }
 
-/// Starts a whole-domain Poseidon2Gate evaluation over retained natural-order
-/// LDE columns. `alpha_offset` is the number of non-gate vanishing terms that
+/// Validates and prepares a whole-domain Poseidon2Gate evaluation over
+/// retained natural-order LDE columns. `alpha_offset` is the number of
+/// non-gate vanishing terms that
 /// precede the gate constraints in the global alpha reduction.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
+pub(crate) fn prepare_poseidon2_gate_quotient<'a, F: RichField>(
+    wires: &'a MetalColumns<F>,
+    constants: &'a MetalColumns<F>,
     quotient_rows: usize,
     step: usize,
     selector_column: usize,
@@ -1699,7 +1855,7 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
     include_unused_selector: bool,
     alphas: &[F],
     alpha_offset: usize,
-) -> Option<PoseidonGateQuotientJob<F>> {
+) -> Option<PreparedPoseidonGateQuotient<'a, F>> {
     const POSEIDON_GATE_WIRES: usize = 135;
     const POSEIDON_GATE_CONSTRAINTS: usize = 123;
 
@@ -1734,8 +1890,7 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
         }
     }
 
-    let context = shared_context()?;
-    match context.start_poseidon2_gate_quotient(
+    Some(PreparedPoseidonGateQuotient {
         wires,
         constants,
         quotient_rows,
@@ -1744,25 +1899,20 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
         gate_index,
         group,
         include_unused_selector,
-        &alpha_powers,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal Poseidon2 gate quotient unavailable; using CPU path: {error}");
-            None
-        }
-    }
+        alpha_powers,
+    })
 }
 
-/// Starts the no-lookup permutation partial-product evaluation over retained
-/// wire, sigma and Z/partial-product LDE columns. The two `L_0` rows remain on
+/// Validates and prepares the no-lookup permutation partial-product evaluation
+/// over retained wire, sigma and Z/partial-product LDE columns. The two `L_0`
+/// rows remain on
 /// the CPU; this job emits their successors at global alpha powers 2 onward.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn start_permutation_quotient<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants_sigmas: &MetalColumns<F>,
-    zs_partial_products: &MetalColumns<F>,
-    shifted_points: &[F],
+pub(crate) fn prepare_permutation_quotient<'a, F: RichField>(
+    wires: &'a MetalColumns<F>,
+    constants_sigmas: &'a MetalColumns<F>,
+    zs_partial_products: &'a MetalColumns<F>,
+    shifted_points: &'a [F],
     quotient_rows: usize,
     step: usize,
     next_step: usize,
@@ -1774,7 +1924,7 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
     gammas: &[F],
     beta_k_is: &[F],
     alphas: &[F],
-) -> Option<PermutationQuotientJob<F>> {
+) -> Option<PreparedPermutationQuotient<'a, F>> {
     const NUM_CHALLENGES: usize = 2;
     const MAX_INLINE_BYTES: usize = 4096;
 
@@ -1830,8 +1980,7 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
     challenges.extend(gammas.iter().map(|x| x.to_canonical_u64()));
     challenges.extend(beta_k_is.iter().map(|x| x.to_canonical_u64()));
 
-    let context = shared_context()?;
-    match context.start_permutation_quotient(
+    Some(PreparedPermutationQuotient {
         wires,
         constants_sigmas,
         zs_partial_products,
@@ -1843,32 +1992,26 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
         num_routed_wires,
         num_partial_products,
         chunk_size,
-        &alpha_powers,
+        alpha_powers,
         alpha_stride,
-        &challenges,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal permutation quotient unavailable; using CPU path: {error}");
-            None
-        }
-    }
+        challenges,
+    })
 }
 
-/// Starts one whole-domain kernel which evaluates every advertised RangeCheck,
+/// Validates and prepares one whole-domain kernel which evaluates every advertised RangeCheck,
 /// width-generic integer, byte, quintic, and audited random-access gate, applies
 /// each selector filter, and reduces the shared constraint rows with the same
 /// two alpha challenges as the CPU quotient.
-pub(crate) fn start_range_check_gate_quotient<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
+pub(crate) fn prepare_range_check_gate_quotient<'a, F: RichField>(
+    wires: &'a MetalColumns<F>,
+    constants: &'a MetalColumns<F>,
     quotient_rows: usize,
     step: usize,
     specs: &[RangeCheckQuotientSpec],
     u32_specs: &[U32QuotientSpec],
     alphas: &[F],
     alpha_offset: usize,
-) -> Option<RangeCheckGateQuotientJob<F>> {
+) -> Option<PreparedRangeCheckGateQuotient<'a, F>> {
     const SPEC_WORDS: usize = 10;
     const MAX_INLINE_BYTES: usize = 4096;
 
@@ -2159,24 +2302,35 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         }
     }
 
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient(
+    Some(PreparedRangeCheckGateQuotient {
         wires,
         constants,
         quotient_rows,
         step,
-        &metadata,
-        specs.len(),
-        u32_specs.len(),
-        &alpha_powers,
+        metadata,
+        range_count: specs.len(),
+        u32_count: u32_specs.len(),
+        alpha_powers,
         alpha_stride,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal RangeCheck gate quotient unavailable; using CPU path: {error}");
-            None
-        }
+    })
+}
+
+/// Encodes every successfully prepared quotient job, in P/R/Perm order, into
+/// one retained command buffer. Rejected preparations stay absent and are
+/// evaluated by the unchanged CPU quotient path.
+pub(crate) fn start_quotient_batch<F: RichField>(
+    poseidon: Option<PreparedPoseidonGateQuotient<'_, F>>,
+    range: Option<PreparedRangeCheckGateQuotient<'_, F>>,
+    permutation: Option<PreparedPermutationQuotient<'_, F>>,
+) -> QuotientBatchJobs<F> {
+    let mask = QuotientBatchMask::new(poseidon.is_some(), range.is_some(), permutation.is_some());
+    if mask.is_empty() {
+        return QuotientBatchJobs::empty();
     }
+    let Some(context) = shared_context() else {
+        return QuotientBatchJobs::empty();
+    };
+    context.start_quotient_batch(poseidon, range, permutation)
 }
 
 /// Allocates the final retained column store before the CPU LDE is computed,
@@ -2808,145 +2962,239 @@ impl MetalShared {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn start_poseidon2_gate_quotient<F: RichField>(
+    fn start_quotient_batch<F: RichField>(
         &self,
-        wires: &MetalColumns<F>,
-        constants: &MetalColumns<F>,
-        quotient_rows: usize,
-        step: usize,
-        selector_column: usize,
-        gate_index: usize,
-        group: core::ops::Range<usize>,
-        include_unused_selector: bool,
-        alpha_powers: &[u64],
-    ) -> Result<PoseidonGateQuotientJob<F>, String> {
-        let pipeline = poseidon_gate_quotient_pipeline()
-            .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
-        let len = quotient_rows
-            .checked_mul(2)
-            .ok_or("Poseidon2 gate quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("Poseidon2 gate quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            encoder.set_buffer(2, Some(&output), 0);
-            encoder.set_buffer(3, Some(&self.parameters), 0);
-            encoder.set_bytes(
-                4,
-                size_of_val(alpha_powers) as NSUInteger,
-                alpha_powers.as_ptr().cast::<c_void>(),
-            );
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            set_u32(encoder, 8, selector_column as u32);
-            set_u32(encoder, 9, gate_index as u32);
-            set_u32(encoder, 10, group.start as u32);
-            set_u32(encoder, 11, group.end as u32);
-            set_u32(encoder, 12, include_unused_selector as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "poseidon_quotient",
-                (quotient_rows * (group.end - group.start)) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
+        poseidon: Option<PreparedPoseidonGateQuotient<'_, F>>,
+        range: Option<PreparedRangeCheckGateQuotient<'_, F>>,
+        permutation: Option<PreparedPermutationQuotient<'_, F>>,
+    ) -> QuotientBatchJobs<F> {
+        let poseidon = poseidon.and_then(|request| {
+            let Some(pipeline) = poseidon_gate_quotient_pipeline() else {
+                log::warn!(
+                    "Metal Poseidon2 gate quotient unavailable; using CPU path: pipeline unavailable"
+                );
+                return None;
+            };
+            let len = request.quotient_rows * 2;
+            let output = self.acquire_quotient_output((len * size_of::<u64>()) as u64);
+            Some((request, pipeline, output, GpuJobGuard::begin(), len))
         });
-        Ok(PoseidonGateQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
-    }
 
-    #[allow(clippy::too_many_arguments)]
-    fn start_range_check_gate_quotient<F: RichField>(
-        &self,
-        wires: &MetalColumns<F>,
-        constants: &MetalColumns<F>,
-        quotient_rows: usize,
-        step: usize,
-        metadata: &[u32],
-        range_count: usize,
-        u32_count: usize,
-        alpha_powers: &[u64],
-        alpha_stride: usize,
-    ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        if metadata.len() != (range_count + u32_count) * 10
-            || alpha_powers.len() != alpha_stride * 2
-        {
-            return Err("invalid RangeCheck quotient metadata".to_string());
+        let range = range.and_then(|request| {
+            let Some(pipeline) = range_check_gate_quotient_pipeline() else {
+                log::warn!(
+                    "Metal RangeCheck gate quotient unavailable; using CPU path: pipeline unavailable"
+                );
+                return None;
+            };
+            if request.metadata.len() != (request.range_count + request.u32_count) * 10
+                || request.alpha_powers.len() != request.alpha_stride * 2
+            {
+                log::warn!(
+                    "Metal RangeCheck gate quotient unavailable; using CPU path: invalid metadata"
+                );
+                return None;
+            }
+            let len = request.quotient_rows * 2;
+            let output = self.acquire_quotient_output((len * size_of::<u64>()) as u64);
+            Some((request, pipeline, output, GpuJobGuard::begin(), len))
+        });
+
+        let permutation = permutation.and_then(|request| {
+            let Some(pipeline) = permutation_quotient_pipeline() else {
+                log::warn!(
+                    "Metal permutation quotient unavailable; using CPU path: pipeline unavailable"
+                );
+                return None;
+            };
+            let num_chunks = request.num_partial_products + 1;
+            if request.alpha_powers.len() != request.alpha_stride * 2
+                || request.alpha_stride != 2 * (1 + num_chunks)
+                || request.challenges.len() != 4 + 2 * request.num_routed_wires
+            {
+                log::warn!(
+                    "Metal permutation quotient unavailable; using CPU path: invalid metadata"
+                );
+                return None;
+            }
+            let points = match self.permutation_points_for(request.shifted_points) {
+                Ok(points) => points,
+                Err(error) => {
+                    log::warn!(
+                        "Metal permutation quotient unavailable; using CPU path: {error}"
+                    );
+                    return None;
+                }
+            };
+            let len = request.quotient_rows * 2;
+            let output = self.acquire_quotient_output((len * size_of::<u64>()) as u64);
+            Some((
+                request,
+                pipeline,
+                points,
+                output,
+                GpuJobGuard::begin(),
+                len,
+            ))
+        });
+
+        let mask = QuotientBatchMask::new(
+            poseidon.is_some(),
+            range.is_some(),
+            permutation.is_some(),
+        );
+        if mask.is_empty() {
+            return QuotientBatchJobs::empty();
         }
-        let len = quotient_rows
-            .checked_mul(2)
-            .ok_or("RangeCheck gate quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("RangeCheck gate quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
+        debug_assert_eq!(
+            mask.active_count(),
+            usize::from(poseidon.is_some())
+                + usize::from(range.is_some())
+                + usize::from(permutation.is_some())
+        );
+
+        #[cfg(feature = "diagnostic_profile")]
+        let work_items = poseidon
+            .as_ref()
+            .map_or(0, |(request, _, _, _, _)| {
+                request
+                    .quotient_rows
+                    .saturating_mul(request.group.end - request.group.start)
+            })
+            .saturating_add(range.as_ref().map_or(0, |(request, _, _, _, _)| {
+                request
+                    .quotient_rows
+                    .saturating_mul(request.range_count + request.u32_count)
+            }))
+            .saturating_add(
+                permutation
+                    .as_ref()
+                    .map_or(0, |(request, _, _, _, _, _)| {
+                        request
+                            .quotient_rows
+                            .saturating_mul(request.num_routed_wires)
+                            .saturating_mul(2)
+                    }),
+            );
+
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            encoder.set_buffer(2, Some(&output), 0);
-            encoder.set_bytes(
-                3,
-                size_of_val(alpha_powers) as NSUInteger,
-                alpha_powers.as_ptr().cast::<c_void>(),
-            );
-            encoder.set_bytes(
-                4,
-                size_of_val(metadata) as NSUInteger,
-                metadata.as_ptr().cast::<c_void>(),
-            );
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            set_u32(encoder, 8, alpha_stride as u32);
-            set_u32(encoder, 9, range_count as u32);
-            set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
+
+            if let Some((request, pipeline, output, _, _)) = &poseidon {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&request.wires.buffer), 0);
+                encoder.set_buffer(1, Some(&request.constants.buffer), 0);
+                encoder.set_buffer(2, Some(output), 0);
+                encoder.set_buffer(3, Some(&self.parameters), 0);
+                encoder.set_bytes(
+                    4,
+                    size_of_val(request.alpha_powers.as_slice()) as NSUInteger,
+                    request.alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 5, request.wires.rows as u32);
+                set_u32(encoder, 6, request.quotient_rows as u32);
+                set_u32(encoder, 7, request.step as u32);
+                set_u32(encoder, 8, request.selector_column as u32);
+                set_u32(encoder, 9, request.gate_index as u32);
+                set_u32(encoder, 10, request.group.start as u32);
+                set_u32(encoder, 11, request.group.end as u32);
+                set_u32(encoder, 12, request.include_unused_selector as u32);
+                dispatch(encoder, pipeline, request.quotient_rows);
+                encoder.end_encoding();
+            }
+
+            if let Some((request, pipeline, output, _, _)) = &range {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&request.wires.buffer), 0);
+                encoder.set_buffer(1, Some(&request.constants.buffer), 0);
+                encoder.set_buffer(2, Some(output), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of_val(request.alpha_powers.as_slice()) as NSUInteger,
+                    request.alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    4,
+                    size_of_val(request.metadata.as_slice()) as NSUInteger,
+                    request.metadata.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 5, request.wires.rows as u32);
+                set_u32(encoder, 6, request.quotient_rows as u32);
+                set_u32(encoder, 7, request.step as u32);
+                set_u32(encoder, 8, request.alpha_stride as u32);
+                set_u32(encoder, 9, request.range_count as u32);
+                set_u32(encoder, 10, request.u32_count as u32);
+                dispatch(encoder, pipeline, request.quotient_rows);
+                encoder.end_encoding();
+            }
+
+            if let Some((request, pipeline, points, output, _, _)) = &permutation {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&request.wires.buffer), 0);
+                encoder.set_buffer(1, Some(&request.constants_sigmas.buffer), 0);
+                encoder.set_buffer(2, Some(&request.zs_partial_products.buffer), 0);
+                encoder.set_buffer(3, Some(points), 0);
+                encoder.set_buffer(4, Some(output), 0);
+                encoder.set_bytes(
+                    5,
+                    size_of_val(request.alpha_powers.as_slice()) as NSUInteger,
+                    request.alpha_powers.as_ptr().cast::<c_void>(),
+                );
+                encoder.set_bytes(
+                    6,
+                    size_of_val(request.challenges.as_slice()) as NSUInteger,
+                    request.challenges.as_ptr().cast::<c_void>(),
+                );
+                set_u32(encoder, 7, request.wires.rows as u32);
+                set_u32(encoder, 8, request.quotient_rows as u32);
+                set_u32(encoder, 9, request.step as u32);
+                set_u32(encoder, 10, request.next_step as u32);
+                set_u32(encoder, 11, request.sigma_start as u32);
+                set_u32(encoder, 12, request.num_routed_wires as u32);
+                set_u32(encoder, 13, request.num_partial_products as u32);
+                set_u32(encoder, 14, request.chunk_size as u32);
+                set_u32(encoder, 15, request.alpha_stride as u32);
+                dispatch(encoder, pipeline, request.quotient_rows);
+                encoder.end_encoding();
+            }
+
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "range_u32_quotient",
-                (quotient_rows * (range_count + u32_count)) as u64,
-            );
+            profile_command_buffer(command_buffer, "quotient_batch", work_items as u64);
             command_buffer.commit();
             command_buffer.to_owned()
         });
+
         #[cfg(test)]
-        let failure_observer = FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
-            let observer = fault.borrow().clone();
-            if let Some(observer) = &observer {
+        let failure_observer = if range.is_some() {
+            FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
+                let observer = fault.borrow().clone();
+                if let Some(observer) = &observer {
+                    observer
+                        .captured
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                }
                 observer
-                    .captured
-                    .store(true, core::sync::atomic::Ordering::Relaxed);
+            })
+        } else {
+            None
+        };
+
+        let fence = Arc::new(QuotientBatchFence { command_buffer });
+        let poseidon = poseidon.map(|(_, _, output, job_guard, len)| {
+            PoseidonGateQuotientJob {
+                fence: Arc::clone(&fence),
+                output: Some(output),
+                output_pool: Arc::clone(&self.quotient_output_pool),
+                len,
+                _job: job_guard,
+                _phantom: PhantomData,
             }
-            observer
         });
-        Ok(RangeCheckGateQuotientJob {
-            command_buffer,
+        let range = range.map(|(_, _, output, job_guard, len)| RangeCheckGateQuotientJob {
+            fence: Arc::clone(&fence),
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
@@ -2954,92 +3202,25 @@ impl MetalShared {
             failure_observer,
             _job: job_guard,
             _phantom: PhantomData,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn start_permutation_quotient<F: RichField>(
-        &self,
-        wires: &MetalColumns<F>,
-        constants_sigmas: &MetalColumns<F>,
-        zs_partial_products: &MetalColumns<F>,
-        shifted_points: &[F],
-        quotient_rows: usize,
-        step: usize,
-        next_step: usize,
-        sigma_start: usize,
-        num_routed_wires: usize,
-        num_partial_products: usize,
-        chunk_size: usize,
-        alpha_powers: &[u64],
-        alpha_stride: usize,
-        challenges: &[u64],
-    ) -> Result<PermutationQuotientJob<F>, String> {
-        let pipeline = permutation_quotient_pipeline()
-            .ok_or("permutation quotient pipeline unavailable")?;
-        let num_chunks = num_partial_products + 1;
-        if alpha_powers.len() != alpha_stride * 2
-            || alpha_stride != 2 * (1 + num_chunks)
-            || challenges.len() != 4 + 2 * num_routed_wires
-        {
-            return Err("invalid permutation quotient metadata".to_string());
-        }
-        let points = self.permutation_points_for(shifted_points)?;
-        let len = quotient_rows
-            .checked_mul(2)
-            .ok_or("permutation quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("permutation quotient output size overflow")?;
-        let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants_sigmas.buffer), 0);
-            encoder.set_buffer(2, Some(&zs_partial_products.buffer), 0);
-            encoder.set_buffer(3, Some(&points), 0);
-            encoder.set_buffer(4, Some(&output), 0);
-            encoder.set_bytes(
-                5,
-                size_of_val(alpha_powers) as NSUInteger,
-                alpha_powers.as_ptr().cast::<c_void>(),
-            );
-            encoder.set_bytes(
-                6,
-                size_of_val(challenges) as NSUInteger,
-                challenges.as_ptr().cast::<c_void>(),
-            );
-            set_u32(encoder, 7, wires.rows as u32);
-            set_u32(encoder, 8, quotient_rows as u32);
-            set_u32(encoder, 9, step as u32);
-            set_u32(encoder, 10, next_step as u32);
-            set_u32(encoder, 11, sigma_start as u32);
-            set_u32(encoder, 12, num_routed_wires as u32);
-            set_u32(encoder, 13, num_partial_products as u32);
-            set_u32(encoder, 14, chunk_size as u32);
-            set_u32(encoder, 15, alpha_stride as u32);
-            dispatch(encoder, pipeline, quotient_rows);
-            encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "permutation_quotient",
-                (quotient_rows * num_routed_wires * 2) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
         });
-        Ok(PermutationQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
+        let permutation = permutation.map(
+            |(_, _, _, output, job_guard, len)| PermutationQuotientJob {
+                fence: Arc::clone(&fence),
+                output: Some(output),
+                output_pool: Arc::clone(&self.quotient_output_pool),
+                len,
+                _job: job_guard,
+                _phantom: PhantomData,
+            },
+        );
+        QuotientBatchJobs {
+            poseidon,
+            range,
+            permutation,
+            fence: Some(fence),
+            #[cfg(test)]
+            mask,
+        }
     }
 
     fn acquire_set(&self) -> Result<BufferSet, String> {
@@ -4192,6 +4373,47 @@ mod tests {
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
+    #[test]
+    fn quotient_batch_all_masks_preserve_encoder_order() {
+        for bits in 0u8..8 {
+            let mask = QuotientBatchMask::new(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let expected = [
+                (1, QuotientEncoderKind::Poseidon),
+                (2, QuotientEncoderKind::Range),
+                (4, QuotientEncoderKind::Permutation),
+            ]
+            .into_iter()
+            .filter_map(|(bit, kind)| (bits & bit != 0).then_some(kind))
+            .collect::<Vec<_>>();
+            assert_eq!(mask.encoder_order().collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test]
+    fn quotient_batch_mask_counts_one_fence_and_one_guard_per_job() {
+        for bits in 0u8..8 {
+            let mask = QuotientBatchMask::new(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            assert_eq!(mask.active_count(), bits.count_ones() as usize);
+            assert_eq!(mask.command_buffer_count(), usize::from(bits != 0));
+        }
+    }
+
+    #[test]
+    fn quotient_batch_output_recycling_is_fail_closed() {
+        for status in [
+            MTLCommandBufferStatus::NotEnqueued,
+            MTLCommandBufferStatus::Enqueued,
+            MTLCommandBufferStatus::Committed,
+            MTLCommandBufferStatus::Scheduled,
+            MTLCommandBufferStatus::Error,
+        ] {
+            assert!(!quotient_output_recyclable(status));
+        }
+        assert!(quotient_output_recyclable(
+            MTLCommandBufferStatus::Completed
+        ));
+    }
+
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
     /// this pins the source bytes: edit `poseidon2.metal` without regenerating
@@ -4390,7 +4612,9 @@ mod tests {
 
         let not_enqueued = queue.new_command_buffer().to_owned();
         drop(PoseidonGateQuotientJob::<F> {
-            command_buffer: not_enqueued,
+            fence: Arc::new(QuotientBatchFence {
+                command_buffer: not_enqueued,
+            }),
             output: Some(output()),
             output_pool: Arc::clone(&pool),
             len: 8,
@@ -4409,7 +4633,9 @@ mod tests {
         let completed_output = output();
         let completed_output_ptr = completed_output.contents();
         drop(PoseidonGateQuotientJob::<F> {
-            command_buffer: completed,
+            fence: Arc::new(QuotientBatchFence {
+                command_buffer: completed,
+            }),
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
@@ -4433,7 +4659,9 @@ mod tests {
         let completed_output = output();
         let completed_output_ptr = completed_output.contents();
         drop(RangeCheckGateQuotientJob::<F> {
-            command_buffer: completed,
+            fence: Arc::new(QuotientBatchFence {
+                command_buffer: completed,
+            }),
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
@@ -4660,7 +4888,7 @@ mod tests {
                 }
             }
 
-            let job = start_poseidon2_gate_quotient(
+            let prepared = prepare_poseidon2_gate_quotient(
                 &wires,
                 &constants,
                 QUOTIENT_ROWS,
@@ -4672,8 +4900,17 @@ mod tests {
                 &alphas,
                 ALPHA_OFFSET,
             )
-            .expect("Metal quotient job must start");
-            let actual = job.finish().expect("Metal quotient job must finish");
+            .expect("Metal quotient job must prepare");
+            let jobs = start_quotient_batch(Some(prepared), None, None);
+            let completion = jobs
+                .wait_until_completed()
+                .expect("Metal quotient batch must finish");
+            let actual = jobs
+                .poseidon
+                .as_ref()
+                .expect("Metal quotient job must start")
+                .finish_after_fence(&completion)
+                .expect("Metal quotient output must be readable");
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
@@ -4777,7 +5014,7 @@ mod tests {
                 }
             }
 
-            let job = start_permutation_quotient(
+            let prepared = prepare_permutation_quotient(
                 &wires,
                 &constants,
                 &zs,
@@ -4794,8 +5031,17 @@ mod tests {
                 &beta_k_is,
                 &alphas,
             )
-            .expect("Metal permutation job must start");
-            let actual = job.finish().expect("Metal permutation job must finish");
+            .expect("Metal permutation job must prepare");
+            let jobs = start_quotient_batch(None, None, Some(prepared));
+            let completion = jobs
+                .wait_until_completed()
+                .expect("Metal permutation batch must finish");
+            let actual = jobs
+                .permutation
+                .as_ref()
+                .expect("Metal permutation job must start")
+                .finish_after_fence(&completion)
+                .expect("Metal permutation output must be readable");
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
                     actual.to_canonical_u64(),
@@ -4931,7 +5177,7 @@ mod tests {
                 }
             }
 
-            let job = start_range_check_gate_quotient(
+            let prepared = prepare_range_check_gate_quotient(
                 &wires,
                 &constants,
                 QUOTIENT_ROWS,
@@ -4941,8 +5187,17 @@ mod tests {
                 &alphas,
                 ALPHA_OFFSET,
             )
-            .expect("Metal RangeCheck quotient job must start");
-            let actual = job.finish().expect("Metal RangeCheck quotient job must finish");
+            .expect("Metal RangeCheck quotient job must prepare");
+            let jobs = start_quotient_batch(None, Some(prepared), None);
+            let completion = jobs
+                .wait_until_completed()
+                .expect("Metal RangeCheck batch must finish");
+            let actual = jobs
+                .range
+                .as_ref()
+                .expect("Metal RangeCheck quotient job must start")
+                .finish_after_fence(&completion)
+                .expect("Metal RangeCheck quotient output must be readable");
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
@@ -5293,7 +5548,7 @@ mod tests {
                 }
             }
 
-            let job = start_range_check_gate_quotient(
+            let prepared = prepare_range_check_gate_quotient(
                 &wires,
                 &constants,
                 QUOTIENT_ROWS,
@@ -5303,8 +5558,17 @@ mod tests {
                 &alphas,
                 ALPHA_OFFSET,
             )
-            .expect("Metal U32 quotient job must start");
-            let actual = job.finish().expect("Metal U32 quotient job must finish");
+            .expect("Metal U32 quotient job must prepare");
+            let jobs = start_quotient_batch(None, Some(prepared), None);
+            let completion = jobs
+                .wait_until_completed()
+                .expect("Metal U32 quotient batch must finish");
+            let actual = jobs
+                .range
+                .as_ref()
+                .expect("Metal U32 quotient job must start")
+                .finish_after_fence(&completion)
+                .expect("Metal U32 quotient output must be readable");
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
@@ -5909,7 +6173,7 @@ mod tests {
                 }
             }
 
-            let job = start_range_check_gate_quotient(
+            let prepared = prepare_range_check_gate_quotient(
                 &wires,
                 &constants,
                 QUOTIENT_ROWS,
@@ -5919,10 +6183,17 @@ mod tests {
                 &alphas,
                 ALPHA_OFFSET,
             )
-            .expect("Metal byte/quintic quotient job must start");
-            let actual = job
-                .finish()
-                .expect("Metal byte/quintic quotient job must finish");
+            .expect("Metal byte/quintic quotient job must prepare");
+            let jobs = start_quotient_batch(None, Some(prepared), None);
+            let completion = jobs
+                .wait_until_completed()
+                .expect("Metal byte/quintic quotient batch must finish");
+            let actual = jobs
+                .range
+                .as_ref()
+                .expect("Metal byte/quintic quotient job must start")
+                .finish_after_fence(&completion)
+                .expect("Metal byte/quintic quotient output must be readable");
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
