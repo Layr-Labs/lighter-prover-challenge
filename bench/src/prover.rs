@@ -735,29 +735,10 @@ fn prove_path(
     // This path has produced its last proof. Retiring it here — after the scope,
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
+    // (The final-block column-store prewarm is now started at the top of
+    // `prove_block_after_pre` so it overlaps the whole tx/chain pipeline; a
+    // second spawn here would double-walk ~2 GiB in parallel.)
     active_paths.fetch_sub(1, Ordering::Release);
-    if path == TxPath::Heavy {
-        // The heavy path retires far ahead of the light path; use the slack
-        // to pre-fault the final block's wires column store (larger than the
-        // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
-        // run's most serial window). Detached: only populates a stash the
-        // block's allocation consults; a size miss falls through unchanged.
-        std::thread::Builder::new()
-            .name("block-store-prewarm".to_owned())
-            .spawn(|| {
-                // Page-walking ~2 GiB at default QoS competes with the light
-                // pipeline for P-cores; utility class prefers the E-cores,
-                // whose memory-bound fault service is nearly as fast.
-                mark_thread_utility();
-                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
-                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
-                // num_wires; a drift just misses the stash harmlessly.
-                const BLOCK_WIRES_STORE_BYTES: u64 =
-                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
-                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
-            })
-            .ok();
-    }
     chain_proof
 }
 
@@ -843,6 +824,41 @@ pub(crate) fn prove_block_after_pre(
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
+    // BLOCK-TAIL COLD-BUFFER PREWARM (host overlap, gradual - item C).
+    //
+    // The final block's LDE wire-column store is ~2 GiB (num_wires cols x 2^21
+    // LDE rows x 8 bytes), larger than the Metal column-store pool cap, so
+    // without this `take_or_new_column_buffer` freshly zero-faults it right
+    // inside the run's most serial window - the block-tail cold-buffer stall
+    // (~230-330 ms) that otherwise keeps the multiply-bound GPU idle. Store
+    // contents are fully overwritten by the LDE fill before any kernel read and
+    // the stash is published only after the page walk, so the contract is
+    // identical to a fresh allocation (publish-after-walk repair retained).
+    //
+    // Previously this walk started only when the heavy path retired deep inside
+    // `prove_path`, so it overlapped just the light-phase slack. Starting it at
+    // the very start of the pipeline instead makes it overlap the ENTIRE
+    // tx/chain phase regardless of how the heavy/light tails balance, so the
+    // store is guaranteed to be published well before the final serial tail's
+    // LDE fill asks for it. Detached + utility QoS keeps it off the P-cores the
+    // pipeline saturates; a size miss (circuit-shape drift) falls through to a
+    // fresh allocation, unchanged.
+    std::thread::Builder::new()
+        .name("block-store-prewarm".to_owned())
+        .spawn(|| {
+            // Page-walking ~2 GiB at default QoS competes with the pipeline for
+            // P-cores; utility class prefers the E-cores, whose memory-bound
+            // fault service is nearly as fast.
+            mark_thread_utility();
+            // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one u64 per
+            // wire column. Kept in sync with CIRCUIT_CONFIG's num_wires; a drift
+            // just misses the stash harmlessly.
+            const BLOCK_WIRES_STORE_BYTES: u64 =
+                (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
+            plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+        })
+        .ok();
+
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
     let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
     let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
@@ -905,7 +921,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -938,12 +953,21 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                pre_proof_ref,
+                                &pre_proof,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
+                    // Early pre-proof release (exp41 port): the pre-execution
+                    // proof's buffers are large and are consumed only by the
+                    // early witness feed above. Every remaining stage of this
+                    // lane and of the light path uses `pre_output`, `pending`
+                    // and the finished proofs — never this proof. Dropping it
+                    // now relieves that memory before the heavy/extensions
+                    // release and the late final-block witness, instead of
+                    // holding it across the rest of the pipeline.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
@@ -1655,3 +1679,127 @@ mod tests {
             .expect("final chain step proof must verify");
     }
 }
+
+// exp41port-fire-joelcrypto21-1786878871918
+
+// exp41port-fire-heathcliffeth7-1786878946066
+
+// exp41port-fire-joelchristianai3-jpg-1786879192868
+
+// exp41port-fire-basingamarket-ctrl-1786879842149
+
+// exp41port-fire-joelcrypto21-1786879939720
+
+// exp41port-fire-barangunay0-1786880008426
+
+// exp41port-fire-heathcliffeth7-1786880071964
+
+// exp41port-fire-joelchristianai3-jpg-1786880139349
+
+// exp41port-fire-basingamarket-ctrl-1786880596788
+
+// exp41port-fire-joelcrypto21-1786880756525
+
+// exp41port-fire-barangunay0-1786881076364
+
+// exp41port-fire-heathcliffeth7-1786881237829
+
+// exp41port-fire-joelchristianai3-jpg-1786881376048
+
+// exp41port-fire-basingamarket-ctrl-1786881692642
+
+// exp41port-fire-joelcrypto21-1786882017860
+
+// exp41port-fire-barangunay0-1786882162417
+
+// exp41port-fire-joelchristianai3-jpg-1786882328229
+
+// exp41port-fire-heathcliffeth7-1786882465930
+
+// exp41port-fire-basingamarket-ctrl-1786883116681
+
+// exp41port-fire-joelcrypto21-1786883486814
+
+// exp41port-fire-joelchristianai3-jpg-1786883638304
+
+// exp41port-fire-barangunay0-1786883709897
+
+// exp41port-fire-heathcliffeth7-1786883802862
+
+// exp41port-fire-basingamarket-ctrl-1786884750112
+
+// exp41port-fire-joelcrypto21-1786885094779
+
+// exp41port-fire-barangunay0-1786885318349
+
+// exp41port-fire-joelchristianai3-jpg-1786885606720
+
+// exp41port-fire-heathcliffeth7-1786885903842
+
+// exp41port-fire-basingamarket-ctrl-1786886457121
+
+// exp41port-fire-barangunay0-1786886830193
+
+// exp41port-fire-joelchristianai3-jpg-1786887156582
+
+// exp41port-fire-heathcliffeth7-1786887533518
+
+// exp41port-fire-joelcrypto21-1786887835002
+
+// exp41port-fire-basingamarket-ctrl-1786888018917
+
+// exp41port-fire-barangunay0-1786888323339
+
+// exp41port-fire-heathcliffeth7-1786889330242
+
+// exp41port-fire-joelcrypto21-1786890320117
+
+// exp41port-fire-basingamarket-ctrl-1786890917804
+
+// exp41port-fire-barangunay0-1786891942923
+
+// exp41port-fire-joelchristianai3-jpg-1786892756484
+
+// exp41port-fire-heathcliffeth7-1786892820697
+
+// exp41port-fire-joelcrypto21-1786892839042
+
+// exp41port-fire-basingamarket-ctrl-1786892857463
+
+// exp41port-fire-barangunay0-1786892875782
+
+// exp41port-fire-joelchristianai3-jpg-1786892894097
+
+// exp41port-fire-heathcliffeth7-1786892955854
+
+// exp41port-fire-joelcrypto21-1786892984602
+
+// exp41port-fire-basingamarket-ctrl-1786893029591
+
+// exp41port-fire-barangunay0-1786893061026
+
+// exp41port-fire-joelchristianai3-jpg-1786893097570
+
+// exp41port-fire-heathcliffeth7-1786893239486
+
+// exp41port-fire-joelcrypto21-1786893947758
+
+// exp41port-fire-barangunay0-1786896543159
+
+// exp41port-fire-joelchristianai3-jpg-1786896689237
+
+// exp41port-fire-nathanethx-1786896976552
+
+// exp41port-fire-twentyonevc-1786897054540
+
+// exp41port-fire-heathcliffeth7-1786897137851
+
+// exp41port-fire-joelcrypto21-1786897775253
+
+// exp41port-fire-basingamarket-ctrl-1786897917233
+
+// exp41port-fire-barangunay0-1786898470821
+
+// exp41port-fire-joelchristianai3-jpg-1786898610728
+
+// exp41port-fire-nathanethx-1786898736855
