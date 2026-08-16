@@ -117,6 +117,19 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         (Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))
     }
 
+    /// Hash eight equal-length inputs, allowing implementations to interleave
+    /// the eight computations. Must return exactly the eight individual
+    /// `Self::hash_or_noop` results.
+    fn hash_or_noop_oct(inputs: [&[F]; 8]) -> [Self::Hash; 8] {
+        core::array::from_fn(|i| Self::hash_or_noop(inputs[i]))
+    }
+
+    /// Eight `two_to_one` calls, allowing implementations to interleave them.
+    /// Must return exactly the eight individual `Self::two_to_one` results.
+    fn two_to_one_oct(inputs: [(Self::Hash, Self::Hash); 8]) -> [Self::Hash; 8] {
+        core::array::from_fn(|i| Self::two_to_one(inputs[i].0, inputs[i].1))
+    }
+
     /// Four independent `two_to_one` compressions, allowing implementations
     /// to interleave them. Must return exactly the four individual
     /// `Self::two_to_one` results, in order.
