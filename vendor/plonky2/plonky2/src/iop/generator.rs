@@ -41,9 +41,44 @@ pub fn generate_partial_witness<
 /// the sequential loop, so thin dependency chains keep their single-threaded latency.
 const PARALLEL_WORKLIST_THRESHOLD: usize = 64;
 
-/// Generators per parallel-round task. Chunking amortizes per-task scheduling and buffer
-/// overhead across cheap generators while leaving enough tasks for load balancing.
-const PARALLEL_WORKLIST_CHUNK: usize = 64;
+/// Lower and upper bounds for a parallel generator task. The actual grain is selected per round
+/// from the ready-set size and pool width, with a small pseudo-random jitter so generator types
+/// that happen to cluster by index do not repeatedly land on the same chunk boundaries.
+const PARALLEL_WORKLIST_MIN_CHUNK: usize = 8;
+const PARALLEL_WORKLIST_MAX_CHUNK: usize = 64;
+
+/// Chooses a cache-sized, lightly randomized task grain for a parallel worklist round.
+///
+/// Four target tasks per worker leaves Rayon enough stealable work when generator costs are
+/// uneven. A xorshift-derived 3/4..3/2 jitter changes only chunk boundaries; `par_chunks` remains
+/// indexed and `collect` therefore preserves generator order. Proof semantics and contradiction
+/// behavior stay unchanged even though different processes explore different schedules.
+#[cfg(all(feature = "parallel", feature = "std"))]
+#[inline]
+fn parallel_worklist_chunk_len(ready: usize, schedule_state: &mut u64) -> usize {
+    let workers = rayon::current_num_threads().max(1);
+    let target_tasks = workers.saturating_mul(4).max(1);
+    let base = ready
+        .div_ceil(target_tasks)
+        .clamp(PARALLEL_WORKLIST_MIN_CHUNK, PARALLEL_WORKLIST_MAX_CHUNK);
+
+    let mut x = *schedule_state;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *schedule_state = x;
+
+    let (numerator, denominator) = match x & 3 {
+        0 => (3, 4),
+        1 => (1, 1),
+        2 => (5, 4),
+        _ => (3, 2),
+    };
+    base.saturating_mul(numerator)
+        .div_ceil(denominator)
+        .clamp(PARALLEL_WORKLIST_MIN_CHUNK, PARALLEL_WORKLIST_MAX_CHUNK)
+        .min(ready.max(1))
+}
 
 #[cfg(all(feature = "parallel", feature = "std"))]
 mod parallel_witness_context {
@@ -141,6 +176,14 @@ fn run_generator_worklist<
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
 
+    // ASLR supplies free per-process entropy without a syscall or an RNG dependency. This state
+    // influences task grain only; generated values are still collected and merged in ascending
+    // generator-index order, so proof semantics and contradiction behavior do not depend on it.
+    #[cfg(all(feature = "parallel", feature = "std"))]
+    let mut schedule_state = (witness as *mut PartitionWitness<F> as usize as u64)
+        ^ (generators.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ (pending_generator_indices.len() as u64).rotate_left(29);
+
     // The two round queues are swapped rather than reallocated. Every round used
     // to start from a fresh `Vec::new()` and end by *moving* it over the old
     // queue, which freed the old buffer and forced the new one to grow from zero
@@ -175,12 +218,19 @@ fn run_generator_worklist<
             let round_witness: &PartitionWitness<F> = witness;
             let round_unresolved_watches: &[usize] = unresolved_watches;
             let round_generator_is_expired: &[bool] = generator_is_expired;
+            #[cfg(all(feature = "parallel", feature = "std"))]
+            let parallel_chunk_len = parallel_worklist_chunk_len(
+                pending_generator_indices.len(),
+                &mut schedule_state,
+            );
+            #[cfg(not(all(feature = "parallel", feature = "std")))]
+            let parallel_chunk_len = PARALLEL_WORKLIST_MAX_CHUNK;
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
                 Vec<(Target, F, Option<&[u32]>)>,
             )> = pending_generator_indices
-                .par_chunks(PARALLEL_WORKLIST_CHUNK)
+                .par_chunks(parallel_chunk_len)
                 .map(|chunk| {
                     let mut entries = Vec::with_capacity(chunk.len());
                     let mut annotated_values = Vec::new();
