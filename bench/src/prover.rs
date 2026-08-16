@@ -871,7 +871,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -904,12 +903,21 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                pre_proof_ref,
+                                &pre_proof,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
+                    // Early pre-proof release (exp41 port): the pre-execution
+                    // proof's buffers are large and are consumed only by the
+                    // early witness feed above. Every remaining stage of this
+                    // lane and of the light path uses `pre_output`, `pending`
+                    // and the finished proofs — never this proof. Dropping it
+                    // now relieves that memory before the heavy/extensions
+                    // release and the late final-block witness, instead of
+                    // holding it across the rest of the pipeline.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
@@ -1620,3 +1628,159 @@ mod tests {
             .expect("final chain step proof must verify");
     }
 }
+
+// exp41port-fire-D-17868393193N
+
+// exp41port-fire-D-17868393723N
+
+// exp41port-fire-heathcliffeth7-1786840039161
+
+// exp41port-fire-joelcrypto21-1786840075540
+
+// exp41port-fire-basingamarket-ctrl-1786840108924
+
+// exp41port-fire-barangunay0-1786840140138
+
+// exp41port-fire-joelchristianai3-jpg-1786840174421
+
+// exp41port-fire-heathcliffeth7-1786840308654
+
+// exp41port-fire-joelcrypto21-1786840344542
+
+// exp41port-fire-basingamarket-ctrl-1786840378933
+
+// exp41port-fire-barangunay0-1786840412723
+
+// exp41port-fire-joelchristianai3-jpg-1786840444673
+
+// exp41port-fire-heathcliffeth7-1786840582809
+
+// exp41port-fire-joelcrypto21-1786840618119
+
+// exp41port-fire-basingamarket-ctrl-1786840653590
+
+// exp41port-fire-barangunay0-1786840688627
+
+// exp41port-fire-joelchristianai3-jpg-1786840722760
+
+// exp41port-fire-heathcliffeth7-1786840870728
+
+// exp41port-fire-joelcrypto21-1786840904034
+
+// exp41port-fire-basingamarket-ctrl-1786840938894
+
+// exp41port-fire-barangunay0-1786840972275
+
+// exp41port-fire-joelchristianai3-jpg-1786841007480
+
+// exp41port-fire-heathcliffeth7-1786841304103
+
+// exp41port-fire-joelcrypto21-1786841338257
+
+// exp41port-fire-basingamarket-ctrl-1786841370541
+
+// exp41port-fire-barangunay0-1786841402379
+
+// exp41port-fire-heathcliffeth7-1786841824349
+
+// exp41port-fire-joelcrypto21-1786841857087
+
+// exp41port-fire-basingamarket-ctrl-1786841889626
+
+// exp41port-fire-barangunay0-1786841919058
+
+// exp41port-fire-joelchristianai3-jpg-1786841944500
+
+// exp41port-fire-heathcliffeth7-1786842036627
+
+// exp41port-fire-joelcrypto21-1786842049046
+
+// exp41port-fire-basingamarket-ctrl-1786842061552
+
+// exp41port-fire-barangunay0-1786842073978
+
+// exp41port-fire-joelchristianai3-jpg-1786842086370
+
+// exp41port-fire-heathcliffeth7-1786842247698
+
+// exp41port-fire-joelcrypto21-1786842283282
+
+// exp41port-fire-basingamarket-ctrl-1786842330830
+
+// exp41port-fire-barangunay0-1786842363551
+
+// exp41port-fire-joelchristianai3-jpg-1786842409123
+
+// exp41port-fire-heathcliffeth7-1786842575974
+
+// exp41port-fire-joelcrypto21-1786842615409
+
+// exp41port-fire-basingamarket-ctrl-1786842660976
+
+// exp41port-fire-barangunay0-1786842700238
+
+// exp41port-fire-joelchristianai3-jpg-1786842771948
+
+// exp41port-fire-heathcliffeth7-1786842863926
+
+// exp41port-fire-joelcrypto21-1786842902102
+
+// exp41port-fire-basingamarket-ctrl-1786842950662
+
+// exp41port-fire-barangunay0-1786842990417
+
+// exp41port-fire-joelchristianai3-jpg-1786843036405
+
+// exp41port-fire-heathcliffeth7-1786843223596
+
+// exp41port-fire-joelcrypto21-1786843261941
+
+// exp41port-fire-basingamarket-ctrl-1786843352882
+
+// exp41port-fire-barangunay0-1786843406604
+
+// exp41port-fire-joelchristianai3-jpg-1786843444534
+
+// exp41port-fire-heathcliffeth7-1786843613908
+
+// exp41port-fire-joelcrypto21-1786843652013
+
+// exp41port-fire-basingamarket-ctrl-1786843692183
+
+// exp41port-fire-barangunay0-1786843729688
+
+// exp41port-fire-joelchristianai3-jpg-1786843771900
+
+// exp41port-fire-heathcliffeth7-1786843941071
+
+// exp41port-fire-joelcrypto21-1786843980727
+
+// exp41port-fire-basingamarket-ctrl-1786844016620
+
+// exp41port-fire-barangunay0-1786844051353
+
+// exp41port-fire-joelchristianai3-jpg-1786844097220
+
+// exp41port-fire-heathcliffeth7-1786844252890
+
+// exp41port-fire-joelcrypto21-1786844285390
+
+// exp41port-fire-basingamarket-ctrl-1786844320004
+
+// exp41port-fire-barangunay0-1786844351091
+
+// exp41port-fire-joelchristianai3-jpg-1786844388049
+
+// exp41port-fire-heathcliffeth7-1786844620049
+
+// exp41port-fire-joelcrypto21-1786844660454
+
+// exp41port-fire-basingamarket-ctrl-1786844709683
+
+// exp41port-fire-barangunay0-1786844741751
+
+// exp41port-fire-joelchristianai3-jpg-1786844784554
+
+// exp41port-fire-heathcliffeth7-1786844955562
+
+// exp41port-fire-joelcrypto21-1786844988854
