@@ -227,7 +227,7 @@ where
             .collect()
     );
 
-    let wires_commitment = timed!(
+    let mut wires_commitment = timed!(
         timing,
         "compute wires commitment",
         PolynomialBatch::<F, C, D>::from_coeffs(
@@ -319,7 +319,7 @@ where
         zs_partial_products.extend(lookup_polys);
     }
 
-    let partial_products_zs_and_lookup_commitment = timed!(
+    let mut partial_products_zs_and_lookup_commitment = timed!(
         timing,
         "commit to partial products, Z's and, if any, lookup polynomials",
         PolynomialBatch::from_values(
@@ -443,7 +443,7 @@ where
             .collect()
     );
 
-    let quotient_polys_commitment = timed!(
+    let mut quotient_polys_commitment = timed!(
         timing,
         "commit to quotient polys",
         PolynomialBatch::<F, C, D>::from_coeffs(
@@ -484,10 +484,29 @@ where
     challenger.observe_openings(&openings.to_fri_openings());
     let instance = common_data.get_fri_instance(zeta);
 
+    // Clone the small caps for the proof body, then move the three per-proof
+    // Merkle trees into the opening proof: FRI is their last consumer, and
+    // ownership lets it drop them — returning Metal leaf stores to the column
+    // pool while other proofs are in flight — once every challenged initial
+    // leaf and path has been copied out, instead of holding all three full
+    // LDE stores through the FRI-step query rounds. Constants/sigmas stay
+    // borrowed: they belong to the reusable circuit prover data.
+    let wires_cap = wires_commitment.merkle_tree.cap.clone();
+    let plonk_zs_partial_products_cap =
+        partial_products_zs_and_lookup_commitment.merkle_tree.cap.clone();
+    let quotient_polys_cap = quotient_polys_commitment.merkle_tree.cap.clone();
+    let owned_trees = vec![
+        None,
+        Some(core::mem::take(&mut wires_commitment.merkle_tree)),
+        Some(core::mem::take(
+            &mut partial_products_zs_and_lookup_commitment.merkle_tree,
+        )),
+        Some(core::mem::take(&mut quotient_polys_commitment.merkle_tree)),
+    ];
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        PolynomialBatch::<F, C, D>::prove_openings_retiring(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
@@ -495,6 +514,7 @@ where
                 &partial_products_zs_and_lookup_commitment,
                 &quotient_polys_commitment,
             ],
+            owned_trees,
             &mut challenger,
             &common_data.fri_params,
             None,
@@ -504,9 +524,9 @@ where
     );
 
     let proof = Proof::<F, C, D> {
-        wires_cap: wires_commitment.merkle_tree.cap,
-        plonk_zs_partial_products_cap: partial_products_zs_and_lookup_commitment.merkle_tree.cap,
-        quotient_polys_cap: quotient_polys_commitment.merkle_tree.cap,
+        wires_cap,
+        plonk_zs_partial_products_cap,
+        quotient_polys_cap,
         openings,
         opening_proof,
     };
@@ -2581,6 +2601,30 @@ fn compute_quotient_polys<
 /// returns, computed once, so every lookup is bit-identical to computing in
 /// place. (Kept here rather than in `plonky2_field` so the file set stays
 /// disjoint from pending `fft.rs` work.)
+/// Warms the process-global per-size domain tables a proof of shape
+/// `(degree_bits, quotient_degree_bits)` consults on its critical path: the
+/// quotient-domain two-adic subgroup and its coset shift (read at the head of
+/// `compute_quotient_polys`, *before* the Metal quotient jobs are submitted),
+/// and the forward / inverse coset-shift power chains (`PolynomialBatch` LDE
+/// fills and the quotient coset IFFT). Every one of these is a serial
+/// dependent multiply chain, cached once per process by size — but the final
+/// block proof is the run's only proof of its size, so without this call each
+/// table's first touch lands on the run's most serial window. Value-exact:
+/// each getter computes and caches exactly what the in-place consumer would,
+/// and a consumer racing this warm either shares the cached table or computes
+/// an identical one (first insert wins). Scheduling-only; runs serially on
+/// the calling thread and spawns nothing.
+#[cfg(feature = "std")]
+pub fn prewarm_domain_tables<F: Field>(degree_bits: usize, quotient_degree_bits: usize) {
+    let _ = precomputed::two_adic_subgroup::<F>(degree_bits);
+    let _ = precomputed::two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
+    let _ = precomputed::shifted_two_adic_subgroup::<F>(degree_bits + quotient_degree_bits);
+    let _ = precomputed::coset_shift_powers::<F>(1 << degree_bits);
+    let _ = precomputed::inverse_coset_shift_powers_scaled::<F>(
+        1 << (degree_bits + quotient_degree_bits),
+    );
+}
+
 pub(crate) mod precomputed {
     #[cfg(feature = "std")]
     mod imp {
