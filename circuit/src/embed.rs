@@ -8,10 +8,11 @@
 //! untimed), and [`deserialize_embedded`] reconstitutes the exact same
 //! `CircuitData` at runtime far faster than re-running circuit construction.
 //!
-//! The blob deliberately omits everything that is cheap to recompute and
-//! expensive to store, keeping the binary small enough that macOS's per-exec
-//! code-signature validation (~7.5 ms/MB on every fresh inode) does not eat
-//! the startup win:
+//! The blob omits components whose storage cost outweighs their reconstruction,
+//! while preserving compact circuit-fixed topology whose reconstruction is
+//! expensive. This keeps the binary small enough that macOS's per-exec
+//! code-signature validation (~7.5 ms/MB on every fresh inode) does not eat the
+//! startup win:
 //!
 //! * the 80 sigma coefficient polynomials (~40 MiB/tx circuit) are **not**
 //!   stored — sigma *values* are re-derived from the representative map with
@@ -23,6 +24,8 @@
 //!   identity permutation (mostly zeros) instead of 8-byte usizes;
 //! * the generator watch index is stored in its CSR form (varint-delta
 //!   offsets + `u32` watcher ids);
+//! * the fixed routed-wire bitmap is stored as a compressed, verifier-identity-
+//!   bound v2 section instead of re-running two whole routed-grid passes;
 //! * constant polynomials are stored as *values* (step-function selectors,
 //!   long constant runs) rather than incompressible coefficients;
 //! * every bulky section is independently zstd-compressed, keeping parallel
@@ -41,12 +44,13 @@ use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 
 use crate::circuit_serializer::{BlockGateSerializer, BlockGeneratorSerializer};
 use crate::ecdsa::curve::secp256k1::Secp256K1;
@@ -66,7 +70,8 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
+const FIXED_ROUTED_MASK_DOMAIN: &[u8] = b"lighter-embedded-fixed-routed-mask-v2";
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -163,6 +168,118 @@ fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
+fn read_embed_header(bytes: &[u8]) -> Result<usize> {
+    ensure!(bytes.len() >= 8, "embedded circuit blob too short");
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+    ensure!(magic == EMBED_MAGIC, "embedded circuit blob magic mismatch");
+    ensure!(
+        version == EMBED_VERSION,
+        "embedded circuit blob version {version} unsupported"
+    );
+    Ok(8)
+}
+
+fn fixed_routed_mask_len(degree: usize, num_routed_wires: usize) -> Result<usize> {
+    let routed_positions = degree
+        .checked_mul(num_routed_wires)
+        .context("embedded fixed-routed mask shape overflows usize")?;
+    Ok(routed_positions.div_ceil(8))
+}
+
+fn fixed_routed_mask_digest(
+    mask: &[u8],
+    verifier_identity: &[u8],
+    degree: usize,
+    num_wires: usize,
+    num_routed_wires: usize,
+    representative_map_len: usize,
+) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    hasher.update(FIXED_ROUTED_MASK_DOMAIN);
+    hasher.update(EMBED_MAGIC.to_le_bytes());
+    hasher.update(EMBED_VERSION.to_le_bytes());
+    for (name, value) in [
+        ("degree", degree),
+        ("wire count", num_wires),
+        ("routed wire count", num_routed_wires),
+        ("representative map length", representative_map_len),
+    ] {
+        let value = u64::try_from(value)
+            .with_context(|| format!("embedded fixed-routed mask {name} exceeds u64"))?;
+        hasher.update(value.to_le_bytes());
+    }
+    hasher.update(verifier_identity);
+    hasher.update(mask);
+    Ok(hasher.finalize().into())
+}
+
+fn write_fixed_routed_mask_section(
+    out: &mut Vec<u8>,
+    mask: &[u8],
+    verifier_identity: &[u8],
+    degree: usize,
+    num_wires: usize,
+    num_routed_wires: usize,
+    representative_map_len: usize,
+) -> Result<()> {
+    let expected_len = fixed_routed_mask_len(degree, num_routed_wires)?;
+    ensure!(
+        mask.len() == expected_len,
+        "embedded fixed-routed mask has {} bytes, expected {expected_len}",
+        mask.len()
+    );
+    write_compressed_section(out, mask);
+    let digest = fixed_routed_mask_digest(
+        mask,
+        verifier_identity,
+        degree,
+        num_wires,
+        num_routed_wires,
+        representative_map_len,
+    )?;
+    write_section(out, &digest);
+    Ok(())
+}
+
+fn read_fixed_routed_mask_section(
+    bytes: &[u8],
+    pos: &mut usize,
+    verifier_identity: &[u8],
+    degree: usize,
+    num_wires: usize,
+    num_routed_wires: usize,
+    representative_map_len: usize,
+) -> Result<Vec<u8>> {
+    let mask = read_compressed_section(bytes, pos)
+        .context("deserializing embedded fixed-routed mask")?;
+    let expected_len = fixed_routed_mask_len(degree, num_routed_wires)?;
+    ensure!(
+        mask.len() == expected_len,
+        "embedded fixed-routed mask has {} bytes, expected {expected_len}",
+        mask.len()
+    );
+    let stored_digest = read_section(bytes, pos)?;
+    ensure!(
+        stored_digest.len() == 32,
+        "embedded fixed-routed mask digest has {} bytes, expected 32",
+        stored_digest.len()
+    );
+    let actual_digest = fixed_routed_mask_digest(
+        &mask,
+        verifier_identity,
+        degree,
+        num_wires,
+        num_routed_wires,
+        representative_map_len,
+    )?;
+    ensure!(
+        stored_digest == &actual_digest[..],
+        "embedded fixed-routed mask digest mismatch"
+    );
+    Ok(mask)
+}
+
 // ---------------------------------------------------------------------------
 // Write side (build script)
 // ---------------------------------------------------------------------------
@@ -201,6 +318,7 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     let mut buf = Vec::new();
     buf.write_verifier_only_circuit_data(&data.verifier_only)
         .map_err(|e| anyhow::anyhow!("serializing verifier-only circuit data: {e:?}"))?;
+    let verifier_identity = buf.clone();
     write_section(&mut out, &buf);
 
     // target struct
@@ -286,6 +404,21 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // The fixed routed-wire topology is already derived by the untimed circuit
+    // builder. Preserve it in the v2 blob instead of rebuilding it from the
+    // representative map on every worker start. Its digest binds it to the
+    // exact serialized verifier identity and circuit shape; any stale or
+    // corrupt section fails closed into the existing build-from-scratch path.
+    write_fixed_routed_mask_section(
+        &mut out,
+        &prover.fixed_routed_wires,
+        &verifier_identity,
+        degree,
+        common.config.num_wires,
+        num_routed,
+        prover.representative_map.len(),
+    )?;
+
     Ok(out)
 }
 
@@ -318,15 +451,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         bytes
     };
 
-    ensure!(bytes.len() >= 8, "embedded circuit blob too short");
-    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-    ensure!(magic == EMBED_MAGIC, "embedded circuit blob magic mismatch");
-    ensure!(
-        version == EMBED_VERSION,
-        "embedded circuit blob version {version} unsupported"
-    );
-    let mut pos = 8usize;
+    let mut pos = read_embed_header(bytes)?;
 
     // common
     let section = read_section(bytes, &mut pos)?;
@@ -337,6 +462,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 
     // verifier_only
     let section = read_section(bytes, &mut pos)?;
+    let verifier_identity = section;
     let mut reader = Buffer::new(section);
     let verifier_only: VerifierOnlyCircuitData<C, D> = reader
         .read_verifier_only_circuit_data()
@@ -467,6 +593,15 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+    let fixed_routed_wires = read_fixed_routed_mask_section(
+        bytes,
+        &mut pos,
+        verifier_identity,
+        degree,
+        common.config.num_wires,
+        common.config.num_routed_wires,
+        repmap_len,
+    )?;
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -495,9 +630,6 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let wire_partition = forest.wire_partition();
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
-    let fixed_routed_wires =
-        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
-            .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
@@ -664,5 +796,110 @@ mod tests {
         let decoded = read_compressed_section(&framed, &mut pos).unwrap();
         assert_eq!(decoded, input);
         assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn fixed_routed_mask_section_round_trips_and_fails_closed() {
+        let verifier_identity = b"serialized verifier identity";
+        let degree = 17usize;
+        let num_wires = 9usize;
+        let num_routed_wires = 5usize;
+        let representative_map_len = 211usize;
+        let mask = (0..fixed_routed_mask_len(degree, num_routed_wires).unwrap())
+            .map(|i| (i.wrapping_mul(37) ^ 0x5a) as u8)
+            .collect::<Vec<_>>();
+
+        let mut framed = Vec::new();
+        write_fixed_routed_mask_section(
+            &mut framed,
+            &mask,
+            verifier_identity,
+            degree,
+            num_wires,
+            num_routed_wires,
+            representative_map_len,
+        )
+        .unwrap();
+
+        let mut pos = 0;
+        let decoded = read_fixed_routed_mask_section(
+            &framed,
+            &mut pos,
+            verifier_identity,
+            degree,
+            num_wires,
+            num_routed_wires,
+            representative_map_len,
+        )
+        .unwrap();
+        assert_eq!(decoded, mask);
+        assert_eq!(pos, framed.len());
+
+        // Flip one bit inside the compressed mask payload. Either zstd rejects
+        // the frame or the topology digest rejects the changed output.
+        let compressed_len =
+            usize::try_from(u64::from_le_bytes(framed[8..16].try_into().unwrap())).unwrap();
+        assert!(compressed_len > 0);
+        let mut corrupt = framed.clone();
+        corrupt[16 + compressed_len / 2] ^= 1;
+        let mut pos = 0;
+        assert!(
+            read_fixed_routed_mask_section(
+                &corrupt,
+                &mut pos,
+                verifier_identity,
+                degree,
+                num_wires,
+                num_routed_wires,
+                representative_map_len,
+            )
+            .is_err()
+        );
+
+        // A same-length but different shape must fail the identity binding,
+        // rather than accepting a mask from another circuit.
+        let mut pos = 0;
+        assert!(
+            read_fixed_routed_mask_section(
+                &framed,
+                &mut pos,
+                verifier_identity,
+                degree,
+                num_wires + 1,
+                num_routed_wires,
+                representative_map_len,
+            )
+            .is_err()
+        );
+
+        // A shape whose ceil-divided output length changes is rejected before
+        // the digest comparison.
+        let mut pos = 0;
+        assert!(
+            read_fixed_routed_mask_section(
+                &framed,
+                &mut pos,
+                verifier_identity,
+                degree + 1,
+                num_wires,
+                num_routed_wires,
+                representative_map_len,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn embedded_header_rejects_stale_and_future_versions() {
+        let header = |version: u32| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&EMBED_MAGIC.to_le_bytes());
+            bytes.extend_from_slice(&version.to_le_bytes());
+            bytes
+        };
+
+        assert_eq!(read_embed_header(&header(EMBED_VERSION)).unwrap(), 8);
+        assert!(read_embed_header(&header(EMBED_VERSION - 1)).is_err());
+        assert!(read_embed_header(&header(EMBED_VERSION + 1)).is_err());
     }
 }

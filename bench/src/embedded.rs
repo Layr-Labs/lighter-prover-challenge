@@ -159,6 +159,7 @@ impl Circuits {
 mod tests {
     use circuit::circuit_serializer::BlockGateSerializer;
     use circuit::embed::EmbedGeneratorSerializer;
+    use plonky2::hash::merkle_tree::MerkleLeaves;
     use plonky2::util::serialization::Write as _;
 
     use super::*;
@@ -192,6 +193,40 @@ mod tests {
                 .expect("generator must serialize");
         }
         bytes
+    }
+
+    fn canonical_prover_only_bytes(data: &CircuitData<F, C, D>) -> Vec<u8> {
+        let serializer = EmbedGeneratorSerializer {
+            _phantom: Default::default(),
+            _phantom2: Default::default(),
+        };
+        data.prover_only
+            .to_bytes(&serializer, &data.common)
+            .expect("prover-only circuit data must serialize")
+    }
+
+    fn print_merkle_storage_census(name: &str, data: &CircuitData<F, C, D>, raw_eq: bool) {
+        let tree = &data.prover_only.constants_sigmas_commitment.merkle_tree;
+        let leaves = match &tree.leaves {
+            MerkleLeaves::Rows { .. } => "rows",
+            MerkleLeaves::Columns { .. } => "columns",
+        };
+        let level_nodes = tree
+            .level_digests
+            .as_ref()
+            .map_or(0, |levels| levels.nodes.len());
+        let level_offsets = tree
+            .level_digests
+            .as_ref()
+            .map_or(0, |levels| levels.level_offsets.len());
+        eprintln!(
+            "[embedded-identity] {name} raw_eq={raw_eq} leaves={leaves} \
+             digests={} levels={} level_nodes={level_nodes} \
+             level_offsets={level_offsets} cap={}",
+            tree.digests.len(),
+            tree.level_digests.is_some(),
+            tree.cap.len(),
+        );
     }
 
     fn assert_circuit_pair_identical<T: serde::Serialize>(
@@ -262,12 +297,70 @@ mod tests {
             "{name}: common circuit data diverges"
         );
 
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
+        // The v2 blob materializes this runtime-only topology instead of
+        // rebuilding it from the representative map. Pin both its exact shape
+        // and every bit before the semantic prover-only oracle below.
+        let expected_fixed_mask_len = rebuilt_data
+            .common
+            .degree()
+            .checked_mul(rebuilt_data.common.config.num_routed_wires)
+            .expect("fixed-routed mask shape must fit usize")
+            .div_ceil(8);
+        assert_eq!(
+            rebuilt_data.prover_only.fixed_routed_wires.len(),
+            expected_fixed_mask_len,
+            "{name}: rebuilt fixed-routed mask length diverges"
+        );
+        assert_eq!(
+            embedded_data.prover_only.fixed_routed_wires,
+            rebuilt_data.prover_only.fixed_routed_wires,
+            "{name}: embedded fixed-routed mask diverges"
+        );
+
+        // Raw equality includes the Merkle tree's runtime storage layout
+        // (rows/columns and interleaved/level-order digests). Those layouts are
+        // proof-equivalent and can differ depending on whether Metal retained
+        // a tree, so report the representation without making it the oracle.
+        let raw_prover_eq = rebuilt_data.prover_only == embedded_data.prover_only;
+        print_merkle_storage_census(&format!("{name}/rebuilt"), rebuilt_data, raw_prover_eq);
+        print_merkle_storage_census(&format!("{name}/embedded"), embedded_data, raw_prover_eq);
+
+        // The standard writer canonicalizes every logical Merkle leaf and
+        // converts level-order digests to the interleaved wire representation.
+        // Exact bytes therefore cover all serialized prover semantics while
+        // remaining independent of the in-memory Merkle layout.
         assert!(
-            rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
+            canonical_prover_only_bytes(rebuilt_data)
+                == canonical_prover_only_bytes(embedded_data),
+            "{name}: canonical prover-only circuit data diverges"
+        );
+
+        // Runtime-only fields are intentionally omitted by the standard writer
+        // and must be pinned separately.
+        assert!(
+            rebuilt_data.prover_only.generator_watch_counts
+                == embedded_data.prover_only.generator_watch_counts,
+            "{name}: generator watch counts diverge"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.generators_defer_until_ready,
+            embedded_data.prover_only.generators_defer_until_ready,
+            "{name}: generator defer flag diverges"
+        );
+        assert!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_cache
+                == embedded_data.prover_only.constants_sigmas_quotient_cache,
+            "{name}: constants/sigmas quotient cache diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_step,
+            embedded_data.prover_only.constants_sigmas_quotient_step,
+            "{name}: constants/sigmas quotient step diverges"
+        );
+        assert_eq!(
+            rebuilt_data.prover_only.constants_sigmas_quotient_domain,
+            embedded_data.prover_only.constants_sigmas_quotient_domain,
+            "{name}: constants/sigmas quotient domain diverges"
         );
     }
 
