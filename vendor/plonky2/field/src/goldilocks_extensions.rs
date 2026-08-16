@@ -570,6 +570,215 @@ pub fn ext2_mul_add(
     QuadraticExtension([c0, c1])
 }
 
+/// Fused filtered `MulExtensionGate` constraint accumulation for the
+/// Goldilocks quadratic extension (`W = 7`), one column batch at a time.
+///
+/// For every point `p` in `0..n` this computes, in GF(p^2) split into its two
+/// base-field coefficient columns,
+///
+/// ```text
+/// combined0[p] += filters[p] * out0[p] + neg_filter_const[p] * (m0_0*m1_0 + 7*m0_1*m1_1)
+/// combined1[p] += filters[p] * out1[p] + neg_filter_const[p] * (m0_0*m1_1 + m0_1*m1_0)
+/// ```
+///
+/// where `neg_filter_const[p]` must be congruent to `-filters[p] * const_0[p]`
+/// mod p. Since `neg_filter_const * prod ≡ -filter * const_0 * prod`, each
+/// output is field-equal to the unfused
+/// `combined_j += filter * (out_j - const_0 * (m0 * m1)_j)` — the
+/// `MulExtensionGate` constraint scaled by its selector filter — while
+/// spending exactly two `reduce160` calls per coefficient (one for the
+/// product `prod_j`, one for the whole accumulator) instead of the unfused
+/// path's eight-plus reductions (delayed ext2 multiply: 2, scalar_mul: 2,
+/// canonicalizing sub: 2, and `batch_multiply_add_inplace`'s mul + add: 2).
+///
+/// Field-exact, not representative-exact: like `ext2_mul_add` above, the raw
+/// u64 written back may be a different representative of the same field
+/// element than the unfused spelling produces (which itself emits
+/// noncanonical representatives via `Add`/`Sub`). Every consumer of the
+/// combined-constraint buffer is congruence-preserving field arithmetic
+/// (alpha-Horner reduction, Z_H division, IFFT), so only the field value
+/// matters.
+///
+/// Overflow bounds (all raw limbs, canonical or not, are `< 2^64`, so each
+/// 64x64 product is at most `(2^64 - 1)^2 < 2^128`):
+///
+/// - `prod0` bank: `m0_0*m1_0` contributes `< 2^128`; `u160_times_7` of the
+///   single-product `m0_1*m1_1` bank contributes `< 7 * 2^128`. Total
+///   `< 2^131`, high limb `<= 8`.
+/// - `prod1` bank: two products, `< 2^129`, high limb `<= 2`.
+/// - each accumulator: the old combined value `< 2^64` plus two products
+///   (`filters[p]*out_j` and `neg_filter_const[p]*prod_j`), total
+///   `< 2^64 + 2 * (2^64 - 1)^2 < 2^129`, high limb `<= 2`.
+///
+/// All are far below `reduce160`'s `2^160 - 2^128 + 2^96` precondition, and
+/// no `u160_add_product` high-limb increment can overflow its `u32`.
+pub fn ext2_scaled_mul_constraint_accumulate(
+    m0: (&[GoldilocksField], &[GoldilocksField]),
+    m1: (&[GoldilocksField], &[GoldilocksField]),
+    out: (&[GoldilocksField], &[GoldilocksField]),
+    filters: &[GoldilocksField],
+    neg_filter_const: &[GoldilocksField],
+    combined: (&mut [GoldilocksField], &mut [GoldilocksField]),
+) {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+    let n = filters.len();
+    assert_eq!(neg_filter_const.len(), n);
+    assert_eq!(m0.0.len(), n);
+    assert_eq!(m0.1.len(), n);
+    assert_eq!(m1.0.len(), n);
+    assert_eq!(m1.1.len(), n);
+    assert_eq!(out.0.len(), n);
+    assert_eq!(out.1.len(), n);
+    assert_eq!(combined.0.len(), n);
+    assert_eq!(combined.1.len(), n);
+
+    for p in 0..n {
+        let a0 = m0.0[p].0;
+        let a1 = m0.1[p].0;
+        let b0 = m1.0[p].0;
+        let b1 = m1.1[p].0;
+        let f = filters[p].0;
+        let nfc = neg_filter_const[p].0;
+
+        // prod0 = a0*b0 + 7*a1*b1 (one reduction).
+        let (mut p0_lo, mut p0_hi) = (0u128, 0u32);
+        u160_add_product(&mut p0_lo, &mut p0_hi, a0, b0);
+        let (mut w_lo, mut w_hi) = (0u128, 0u32);
+        u160_add_product(&mut w_lo, &mut w_hi, a1, b1);
+        let (w_lo, w_hi) = u160_times_7(w_lo, w_hi);
+        let (p0_lo, carry) = p0_lo.overflowing_add(w_lo);
+        let p0_hi = p0_hi + w_hi + carry as u32;
+        // SAFETY: `< 2^131` per the bound above.
+        let prod0 = unsafe { reduce160(p0_lo, p0_hi) };
+
+        // prod1 = a0*b1 + a1*b0 (one reduction).
+        let (mut p1_lo, mut p1_hi) = (0u128, 0u32);
+        u160_add_product(&mut p1_lo, &mut p1_hi, a0, b1);
+        u160_add_product(&mut p1_lo, &mut p1_hi, a1, b0);
+        // SAFETY: `< 2^129` per the bound above.
+        let prod1 = unsafe { reduce160(p1_lo, p1_hi) };
+
+        // combined_j += f*out_j + nfc*prod_j, one reduction per coefficient.
+        let (mut lo, mut hi) = (combined.0[p].0 as u128, 0u32);
+        u160_add_product(&mut lo, &mut hi, f, out.0[p].0);
+        u160_add_product(&mut lo, &mut hi, nfc, prod0.0);
+        // SAFETY: `< 2^129` per the bound above.
+        combined.0[p] = unsafe { reduce160(lo, hi) };
+
+        let (mut lo, mut hi) = (combined.1[p].0 as u128, 0u32);
+        u160_add_product(&mut lo, &mut hi, f, out.1[p].0);
+        u160_add_product(&mut lo, &mut hi, nfc, prod1.0);
+        // SAFETY: `< 2^129` per the bound above.
+        combined.1[p] = unsafe { reduce160(lo, hi) };
+    }
+}
+
+/// Fused filtered `ArithmeticExtensionGate` constraint accumulation for the
+/// Goldilocks quadratic extension (`W = 7`), one column batch at a time.
+///
+/// For every point `p` in `0..n` this computes, split into the two base-field
+/// coefficient columns of GF(p^2),
+///
+/// ```text
+/// combined0[p] += f*out0 + nfc0*(m0_0*m1_0 + 7*m0_1*m1_1) + nfc1*add0
+/// combined1[p] += f*out1 + nfc0*(m0_0*m1_1 + m0_1*m1_0)   + nfc1*add1
+/// ```
+///
+/// where `f = filters[p]`, `nfc0[p] ≡ -f*const_0[p]` and `nfc1[p] ≡
+/// -f*const_1[p]` mod p. Since `nfc0*prod + nfc1*add ≡ -f*(const_0*prod +
+/// const_1*add)`, each output is field-equal to the unfused
+/// `combined_j += f * (out_j - (const_0*(m0*m1) + const_1*addend)_j)` — the
+/// `ArithmeticExtensionGate` constraint scaled by its selector filter — while
+/// spending exactly two `reduce160` calls per coefficient (one for `prod_j`,
+/// one for the whole accumulator).
+///
+/// Field-exact, not representative-exact: see
+/// `ext2_scaled_mul_constraint_accumulate` above; the same argument applies
+/// (all downstream consumers of the combined-constraint buffer are
+/// congruence-preserving).
+///
+/// Overflow bounds (all raw limbs, canonical or not, are `< 2^64`, so each
+/// 64x64 product is at most `(2^64 - 1)^2 < 2^128`):
+///
+/// - `prod0` bank: one product `< 2^128` plus `u160_times_7` of a
+///   single-product bank `< 7 * 2^128`; total `< 2^131`, high limb `<= 8`.
+/// - `prod1` bank: two products, `< 2^129`, high limb `<= 2`.
+/// - each accumulator: old value `< 2^64` plus three products
+///   (`f*out_j`, `nfc0*prod_j`, `nfc1*add_j`), total
+///   `< 2^64 + 3 * (2^64 - 1)^2 < 2^130`, high limb `<= 3`.
+///
+/// All are far below `reduce160`'s `2^160 - 2^128 + 2^96` precondition, and
+/// no `u160_add_product` high-limb increment can overflow its `u32`.
+pub fn ext2_scaled_mul_add_constraint_accumulate(
+    m0: (&[GoldilocksField], &[GoldilocksField]),
+    m1: (&[GoldilocksField], &[GoldilocksField]),
+    addend: (&[GoldilocksField], &[GoldilocksField]),
+    out: (&[GoldilocksField], &[GoldilocksField]),
+    filters: &[GoldilocksField],
+    neg_filter_const_0: &[GoldilocksField],
+    neg_filter_const_1: &[GoldilocksField],
+    combined: (&mut [GoldilocksField], &mut [GoldilocksField]),
+) {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+    let n = filters.len();
+    assert_eq!(neg_filter_const_0.len(), n);
+    assert_eq!(neg_filter_const_1.len(), n);
+    assert_eq!(m0.0.len(), n);
+    assert_eq!(m0.1.len(), n);
+    assert_eq!(m1.0.len(), n);
+    assert_eq!(m1.1.len(), n);
+    assert_eq!(addend.0.len(), n);
+    assert_eq!(addend.1.len(), n);
+    assert_eq!(out.0.len(), n);
+    assert_eq!(out.1.len(), n);
+    assert_eq!(combined.0.len(), n);
+    assert_eq!(combined.1.len(), n);
+
+    for p in 0..n {
+        let a0 = m0.0[p].0;
+        let a1 = m0.1[p].0;
+        let b0 = m1.0[p].0;
+        let b1 = m1.1[p].0;
+        let f = filters[p].0;
+        let nfc0 = neg_filter_const_0[p].0;
+        let nfc1 = neg_filter_const_1[p].0;
+
+        // prod0 = a0*b0 + 7*a1*b1 (one reduction).
+        let (mut p0_lo, mut p0_hi) = (0u128, 0u32);
+        u160_add_product(&mut p0_lo, &mut p0_hi, a0, b0);
+        let (mut w_lo, mut w_hi) = (0u128, 0u32);
+        u160_add_product(&mut w_lo, &mut w_hi, a1, b1);
+        let (w_lo, w_hi) = u160_times_7(w_lo, w_hi);
+        let (p0_lo, carry) = p0_lo.overflowing_add(w_lo);
+        let p0_hi = p0_hi + w_hi + carry as u32;
+        // SAFETY: `< 2^131` per the bound above.
+        let prod0 = unsafe { reduce160(p0_lo, p0_hi) };
+
+        // prod1 = a0*b1 + a1*b0 (one reduction).
+        let (mut p1_lo, mut p1_hi) = (0u128, 0u32);
+        u160_add_product(&mut p1_lo, &mut p1_hi, a0, b1);
+        u160_add_product(&mut p1_lo, &mut p1_hi, a1, b0);
+        // SAFETY: `< 2^129` per the bound above.
+        let prod1 = unsafe { reduce160(p1_lo, p1_hi) };
+
+        // combined_j += f*out_j + nfc0*prod_j + nfc1*add_j, one reduction per
+        // coefficient.
+        let (mut lo, mut hi) = (combined.0[p].0 as u128, 0u32);
+        u160_add_product(&mut lo, &mut hi, f, out.0[p].0);
+        u160_add_product(&mut lo, &mut hi, nfc0, prod0.0);
+        u160_add_product(&mut lo, &mut hi, nfc1, addend.0[p].0);
+        // SAFETY: `< 2^130` per the bound above.
+        combined.0[p] = unsafe { reduce160(lo, hi) };
+
+        let (mut lo, mut hi) = (combined.1[p].0 as u128, 0u32);
+        u160_add_product(&mut lo, &mut hi, f, out.1[p].0);
+        u160_add_product(&mut lo, &mut hi, nfc0, prod1.0);
+        u160_add_product(&mut lo, &mut hi, nfc1, addend.1[p].0);
+        // SAFETY: `< 2^130` per the bound above.
+        combined.1[p] = unsafe { reduce160(lo, hi) };
+    }
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///
