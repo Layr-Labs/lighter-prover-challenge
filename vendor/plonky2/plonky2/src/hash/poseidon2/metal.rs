@@ -309,13 +309,15 @@ fn build_pipeline(
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 12] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
     "poseidon2_absorb_pass",
     "ntt_prepare",
+    "ntt_prepare_pair",
     "ntt_stage",
+    "ntt_stage_pair",
     "ifft_finalize",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
@@ -375,7 +377,9 @@ struct MetalShared {
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
     ntt_prepare_pipeline: ComputePipelineState,
+    ntt_prepare_pair_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
+    ntt_stage_pair_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
@@ -2217,6 +2221,221 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// single grow-on-demand pair suffices; holding the lock for the whole build
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+static HYBRID_LDE_INPUT_BUFFER: Mutex<Option<Buffer>> = Mutex::new(None);
+
+fn requested_hybrid_lde_groups() -> usize {
+    std::env::var("PLONKY2_HYBRID_LDE_GROUPS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|groups| matches!(*groups, 0 | 6 | 14))
+        .unwrap_or(14)
+}
+
+fn requested_hybrid_ntt_stage_pair() -> bool {
+    !std::env::var_os("PLONKY2_HYBRID_NTT_STAGE_PAIR").is_some_and(|value| value == "0")
+}
+
+fn requested_hybrid_ntt_prepare_pair() -> bool {
+    !std::env::var_os("PLONKY2_HYBRID_NTT_PREPARE_PAIR").is_some_and(|value| value == "0")
+}
+
+impl MetalShared {
+    fn submit_lde_columns_into<F: RichField>(
+        &self,
+        columns: &MetalColumns<F>,
+        coeff_columns: &[&[F]],
+        col_start: usize,
+        rate_bits: usize,
+        input_buffer: &Buffer,
+    ) -> Result<CommandBuffer, String> {
+        self.submit_lde_columns_into_with_stage_pair(
+            columns,
+            coeff_columns,
+            col_start,
+            rate_bits,
+            input_buffer,
+            requested_hybrid_ntt_stage_pair(),
+            requested_hybrid_ntt_prepare_pair(),
+        )
+    }
+
+    fn submit_lde_columns_into_with_stage_pair<F: RichField>(
+        &self,
+        columns: &MetalColumns<F>,
+        coeff_columns: &[&[F]],
+        col_start: usize,
+        rate_bits: usize,
+        input_buffer: &Buffer,
+        pair_stages: bool,
+        pair_prepare: bool,
+    ) -> Result<CommandBuffer, String> {
+        let cols = coeff_columns.len();
+        let degree = coeff_columns.first().map_or(0, |column| column.len());
+        let lde_size = degree
+            .checked_shl(rate_bits as u32)
+            .ok_or("hybrid LDE size overflow")?;
+        if F::ORDER != 0xffff_ffff_0000_0001
+            || size_of::<F>() != size_of::<u64>()
+            || cols == 0
+            || degree == 0
+            || !degree.is_power_of_two()
+            || rate_bits == 0
+            || coeff_columns.iter().any(|column| column.len() != degree)
+            || columns.rows != lde_size
+            || col_start.checked_add(cols).is_none_or(|end| end > columns.cols)
+        {
+            return Err("unsupported hybrid LDE shape".to_owned());
+        }
+
+        let coeff_len = degree
+            .checked_mul(cols)
+            .ok_or("hybrid LDE coefficient length overflow")?;
+        let coeff_bytes = coeff_len
+            .checked_mul(size_of::<u64>())
+            .ok_or("hybrid LDE coefficient size overflow")?;
+        if input_buffer.length() < coeff_bytes as u64 {
+            return Err("hybrid LDE input buffer is too small".to_owned());
+        }
+        {
+            let destination = unsafe {
+                slice::from_raw_parts_mut(input_buffer.contents().cast::<u64>(), coeff_len)
+            };
+            destination
+                .par_chunks_mut(degree)
+                .zip(coeff_columns.par_iter())
+                .for_each(|(destination, column)| {
+                    let source = unsafe {
+                        slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree)
+                    };
+                    destination.copy_from_slice(source);
+                });
+        }
+
+        let log_lde = lde_size.ilog2();
+        let (roots_buffer, roots_offsets) = self.roots_for(log_lde)?;
+        let shift_buffer = self.shift_powers_for(degree)?;
+        let output_offset = col_start
+            .checked_mul(lde_size)
+            .and_then(|elements| elements.checked_mul(size_of::<u64>()))
+            .ok_or("hybrid LDE output offset overflow")?;
+
+        Ok(autoreleasepool(|| {
+            let degree_u32 = degree as u32;
+            let lde_size_u32 = lde_size as u32;
+            let log_degree_u32 = degree.ilog2();
+            let rate_bits_u32 = rate_bits as u32;
+            let command_buffer = self.queue.new_command_buffer();
+
+            let mut stage = rate_bits as u32;
+            let prepare = command_buffer.new_compute_command_encoder();
+            if pair_stages && pair_prepare && stage + 1 < log_lde {
+                prepare.set_compute_pipeline_state(&self.ntt_prepare_pair_pipeline);
+                prepare.set_buffer(0, Some(input_buffer), 0);
+                prepare.set_buffer(1, Some(&shift_buffer), 0);
+                prepare.set_buffer(
+                    2,
+                    Some(&roots_buffer),
+                    (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                );
+                prepare.set_buffer(
+                    3,
+                    Some(&roots_buffer),
+                    (roots_offsets[stage as usize + 1] * size_of::<u64>()) as NSUInteger,
+                );
+                prepare.set_buffer(
+                    4,
+                    Some(&columns.buffer),
+                    output_offset as NSUInteger,
+                );
+                set_u32(prepare, 5, degree_u32);
+                set_u32(prepare, 6, lde_size_u32);
+                set_u32(prepare, 7, log_degree_u32);
+                set_u32(prepare, 8, rate_bits_u32);
+                dispatch2d(
+                    prepare,
+                    &self.ntt_prepare_pair_pipeline,
+                    lde_size / 4,
+                    cols,
+                );
+                stage += 2;
+            } else {
+                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_buffer(0, Some(input_buffer), 0);
+                prepare.set_buffer(1, Some(&shift_buffer), 0);
+                prepare.set_buffer(
+                    2,
+                    Some(&columns.buffer),
+                    output_offset as NSUInteger,
+                );
+                set_u32(prepare, 3, degree_u32);
+                set_u32(prepare, 4, lde_size_u32);
+                set_u32(prepare, 5, log_degree_u32);
+                set_u32(prepare, 6, rate_bits_u32);
+                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+            }
+            prepare.end_encoding();
+
+            while stage < log_lde {
+                let encoder = command_buffer.new_compute_command_encoder();
+                if pair_stages && stage + 1 < log_lde {
+                    encoder.set_compute_pipeline_state(&self.ntt_stage_pair_pipeline);
+                    encoder.set_buffer(
+                        0,
+                        Some(&columns.buffer),
+                        output_offset as NSUInteger,
+                    );
+                    encoder.set_buffer(
+                        1,
+                        Some(&roots_buffer),
+                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    encoder.set_buffer(
+                        2,
+                        Some(&roots_buffer),
+                        (roots_offsets[stage as usize + 1] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(encoder, 3, lde_size_u32);
+                    set_u32(encoder, 4, stage);
+                    set_u32(encoder, 5, u32::from(stage + 1 == log_lde - 1));
+                    dispatch2d(
+                        encoder,
+                        &self.ntt_stage_pair_pipeline,
+                        lde_size / 4,
+                        cols,
+                    );
+                    stage += 2;
+                } else {
+                    encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    encoder.set_buffer(
+                        0,
+                        Some(&columns.buffer),
+                        output_offset as NSUInteger,
+                    );
+                    encoder.set_buffer(
+                        1,
+                        Some(&roots_buffer),
+                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(encoder, 2, lde_size_u32);
+                    set_u32(encoder, 3, stage);
+                    set_u32(encoder, 4, u32::from(stage == log_lde - 1));
+                    dispatch2d(encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    stage += 1;
+                }
+                encoder.end_encoding();
+            }
+
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(
+                command_buffer,
+                "hybrid_lde_ntt",
+                (lde_size * cols) as u64,
+            );
+            command_buffer.commit();
+            command_buffer.to_owned()
+        }))
+    }
+}
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
@@ -2237,11 +2456,13 @@ static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     columns: &MetalColumns<F>,
     cap_height: usize,
+    coeff_columns: &[&[F]],
+    rate_bits: usize,
     fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
-    // Exclusive phases stream the 2^20+ trees as before. Outside them, the
+    // Exclusive phases stream the 2^17+ trees. Outside them, the
     // pipelined 2^19 commitments also stream: streaming converts the proof's
     // serial CPU-fill-then-GPU-hash into max(fill, hash), and it runs out of
     // this function's own retained buffers rather than the pooled buffer set.
@@ -2253,7 +2474,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // moving all of them costs the pipeline more latency than the serial path
     // gains. See the note in `gpu_worthwhile`: these two rules are one change.
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
-        leaf_count >= 1 << 20
+        leaf_count >= 1 << 17
     } else {
         leaf_count >= 1 << 19
             && (leaf_width > 64
@@ -2279,6 +2500,26 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let output_len = total_node_count.checked_mul(4)?;
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
+    let degree = leaf_count.checked_shr(rate_bits as u32).unwrap_or(0);
+    let requested_hybrid_groups = requested_hybrid_lde_groups();
+    let hybrid_groups = if requested_hybrid_groups != 0
+        && leaf_width == 136
+        && leaf_count == 1 << 19
+        && rate_bits == 3
+        && degree == 1 << 16
+        && coeff_columns.len() == leaf_width
+        && coeff_columns.iter().all(|column| column.len() == degree)
+    {
+        requested_hybrid_groups
+    } else {
+        0
+    };
+    let hybrid_start_group = leaf_width.div_ceil(8).saturating_sub(hybrid_groups);
+    let hybrid_col_start = hybrid_start_group * 8;
+    let hybrid_cols = leaf_width.saturating_sub(hybrid_col_start);
+    let hybrid_input_bytes = hybrid_cols
+        .checked_mul(degree)?
+        .checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
     let mut buffers = STREAMED_BUFFERS.lock().ok()?;
@@ -2300,6 +2541,23 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         }));
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
+    let mut hybrid_input = if hybrid_groups == 0 {
+        None
+    } else {
+        let mut input = HYBRID_LDE_INPUT_BUFFER.lock().ok()?;
+        if input
+            .as_ref()
+            .is_none_or(|buffer| buffer.length() < hybrid_input_bytes as u64)
+        {
+            *input = Some(autoreleasepool(|| {
+                context.device.new_buffer(
+                    hybrid_input_bytes as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }));
+        }
+        Some(input)
+    };
 
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
@@ -2307,13 +2565,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
+    let mut hybrid_command: Option<CommandBuffer> = None;
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
-        {
+        if group < hybrid_start_group {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
             // whose pass was already committed, after their fill completed.
@@ -2394,12 +2653,38 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             command_buffer.to_owned()
         });
         absorb_commands.push(command_buffer);
+        if group == 0 && hybrid_groups != 0 {
+            let input_buffer = hybrid_input.as_ref()?.as_ref()?;
+            match context.submit_lde_columns_into(
+                columns,
+                &coeff_columns[hybrid_col_start..],
+                hybrid_col_start,
+                rate_bits,
+                input_buffer,
+            ) {
+                Ok(command_buffer) => hybrid_command = Some(command_buffer),
+                Err(error) => {
+                    for command_buffer in &absorb_commands {
+                        command_buffer.wait_until_completed();
+                    }
+                    drop(job);
+                    log::warn!("hybrid Metal LDE failed; using the classic path: {error}");
+                    return None;
+                }
+            }
+        }
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
+    let hybrid_ok = hybrid_command.as_ref().is_none_or(|command_buffer| {
         command_buffer.wait_until_completed();
         command_buffer.status() == MTLCommandBufferStatus::Completed
     });
+    let absorb_ok = absorb_commands.iter().fold(true, |all_ok, command_buffer| {
+        command_buffer.wait_until_completed();
+        all_ok && command_buffer.status() == MTLCommandBufferStatus::Completed
+    });
+    let all_ok = hybrid_ok && absorb_ok;
+    drop(hybrid_input.take());
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
@@ -2670,16 +2955,16 @@ impl MetalShared {
             //
             //     range_check_gate_quotient   679 ms
             //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
+            //     the required kernels        491 ms and below
             //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
+            // Lowering all kernels in parallel takes 886 ms against 474 ms for the
+            // required set, because the two extra kernels both raise the
             // maximum and add contention on MTLCompilerService. Building them
             // off the blocking path instead leaves the context ready in 838 ms
             // rather than 1270 ms, and they land shortly after, long before the
             // first quotient evaluation of a proof asks for them.
             //
-            // Started below, once the required six have finished, so they do not
+            // Started below, once the required set has finished, so they do not
             // simply move their MTLCompilerService contention onto the path they
             // are being taken off.
             let (
@@ -2687,7 +2972,9 @@ impl MetalShared {
                 leaf_colmajor_pipeline,
                 parent_pipeline,
                 ntt_prepare_pipeline,
+                ntt_prepare_pair_pipeline,
                 ntt_stage_pipeline,
+                ntt_stage_pair_pipeline,
                 ifft_finalize_pipeline,
             ) = std::thread::scope(|scope| {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
@@ -2695,7 +2982,11 @@ impl MetalShared {
                     scope.spawn(required("poseidon2_hash_leaves_colmajor", "col-major leaf"));
                 let parent = scope.spawn(required("poseidon2_hash_parents", "parent"));
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
+                let ntt_prepare_pair =
+                    scope.spawn(required("ntt_prepare_pair", "ntt prepare pair"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
+                let ntt_stage_pair =
+                    scope.spawn(required("ntt_stage_pair", "ntt stage pair"));
                 let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
@@ -2708,9 +2999,15 @@ impl MetalShared {
                     ntt_prepare
                         .join()
                         .expect("ntt prepare pipeline thread panicked"),
+                    ntt_prepare_pair
+                        .join()
+                        .expect("ntt prepare pair pipeline thread panicked"),
                     ntt_stage
                         .join()
                         .expect("ntt stage pipeline thread panicked"),
+                    ntt_stage_pair
+                        .join()
+                        .expect("ntt stage pair pipeline thread panicked"),
                     ifft_finalize
                         .join()
                         .expect("ifft finalize pipeline thread panicked"),
@@ -2734,7 +3031,9 @@ impl MetalShared {
             let leaf_colmajor_pipeline = leaf_colmajor_pipeline?;
             let parent_pipeline = parent_pipeline?;
             let ntt_prepare_pipeline = ntt_prepare_pipeline?;
+            let ntt_prepare_pair_pipeline = ntt_prepare_pair_pipeline?;
             let ntt_stage_pipeline = ntt_stage_pipeline?;
+            let ntt_stage_pair_pipeline = ntt_stage_pair_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
             spawn_optional_pipelines(&device, &library, archive.as_ref());
@@ -2757,7 +3056,9 @@ impl MetalShared {
                 leaf_colmajor_pipeline,
                 parent_pipeline,
                 ntt_prepare_pipeline,
+                ntt_prepare_pair_pipeline,
                 ntt_stage_pipeline,
+                ntt_stage_pair_pipeline,
                 ifft_finalize_pipeline,
                 parameters,
                 pool: Mutex::new(BufferPool {
@@ -3714,35 +4015,87 @@ impl MetalShared {
             let cols_u32 = cols as u32;
             let command_buffer = self.queue.new_command_buffer();
 
+            let pair_stages = requested_hybrid_ntt_stage_pair();
+            let pair_prepare = requested_hybrid_ntt_prepare_pair();
+            let mut stage = rate_bits as u32;
             let prepare = command_buffer.new_compute_command_encoder();
-            prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
-            prepare.set_buffer(0, Some(input_buffer), 0);
-            prepare.set_buffer(1, Some(shift_buffer), 0);
-            prepare.set_buffer(2, Some(column_buffer), 0);
-            set_u32(prepare, 3, degree_u32);
-            set_u32(prepare, 4, lde_size_u32);
-            set_u32(prepare, 5, log_degree_u32);
-            set_u32(prepare, 6, rate_bits_u32);
-            dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
-            prepare.end_encoding();
-
-            for stage in rate_bits as u32..log_lde {
-                let stage_encoder = command_buffer.new_compute_command_encoder();
-                stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
-                stage_encoder.set_buffer(0, Some(column_buffer), 0);
-                stage_encoder.set_buffer(
-                    1,
+            if pair_stages && pair_prepare && stage + 1 < log_lde {
+                prepare.set_compute_pipeline_state(&self.ntt_prepare_pair_pipeline);
+                prepare.set_buffer(0, Some(input_buffer), 0);
+                prepare.set_buffer(1, Some(shift_buffer), 0);
+                prepare.set_buffer(
+                    2,
                     Some(roots_buffer),
                     (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
                 );
-                set_u32(stage_encoder, 2, lde_size_u32);
-                set_u32(stage_encoder, 3, stage);
-                set_u32(
-                    stage_encoder,
-                    4,
-                    u32::from(stage == log_lde - 1),
+                prepare.set_buffer(
+                    3,
+                    Some(roots_buffer),
+                    (roots_offsets[stage as usize + 1] * size_of::<u64>()) as NSUInteger,
                 );
-                dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                prepare.set_buffer(4, Some(column_buffer), 0);
+                set_u32(prepare, 5, degree_u32);
+                set_u32(prepare, 6, lde_size_u32);
+                set_u32(prepare, 7, log_degree_u32);
+                set_u32(prepare, 8, rate_bits_u32);
+                dispatch2d(prepare, &self.ntt_prepare_pair_pipeline, lde_size / 4, cols);
+                stage += 2;
+            } else {
+                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_buffer(0, Some(input_buffer), 0);
+                prepare.set_buffer(1, Some(shift_buffer), 0);
+                prepare.set_buffer(2, Some(column_buffer), 0);
+                set_u32(prepare, 3, degree_u32);
+                set_u32(prepare, 4, lde_size_u32);
+                set_u32(prepare, 5, log_degree_u32);
+                set_u32(prepare, 6, rate_bits_u32);
+                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, cols);
+            }
+            prepare.end_encoding();
+
+            while stage < log_lde {
+                let stage_encoder = command_buffer.new_compute_command_encoder();
+                if pair_stages && stage + 1 < log_lde {
+                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pair_pipeline);
+                    stage_encoder.set_buffer(0, Some(column_buffer), 0);
+                    stage_encoder.set_buffer(
+                        1,
+                        Some(roots_buffer),
+                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    stage_encoder.set_buffer(
+                        2,
+                        Some(roots_buffer),
+                        (roots_offsets[stage as usize + 1] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(stage_encoder, 3, lde_size_u32);
+                    set_u32(stage_encoder, 4, stage);
+                    set_u32(
+                        stage_encoder,
+                        5,
+                        u32::from(stage + 1 == log_lde - 1),
+                    );
+                    dispatch2d(
+                        stage_encoder,
+                        &self.ntt_stage_pair_pipeline,
+                        lde_size / 4,
+                        cols,
+                    );
+                    stage += 2;
+                } else {
+                    stage_encoder.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage_encoder.set_buffer(0, Some(column_buffer), 0);
+                    stage_encoder.set_buffer(
+                        1,
+                        Some(roots_buffer),
+                        (roots_offsets[stage as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(stage_encoder, 2, lde_size_u32);
+                    set_u32(stage_encoder, 3, stage);
+                    set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
+                    dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
+                    stage += 1;
+                }
                 stage_encoder.end_encoding();
             }
 
@@ -6597,6 +6950,100 @@ kernel void goldilocks_mul_bench_native(
     }
 
     #[test]
+    fn hybrid_lde_offset_columns_match_cpu() {
+        use crate::field::polynomial::PolynomialCoeffs;
+
+        const LOG_DEGREE: usize = 8;
+        const RATE_BITS: usize = 3;
+        const TOTAL_COLS: usize = 136;
+        const OFFLOAD_COLS: usize = 48;
+        const COL_START: usize = TOTAL_COLS - OFFLOAD_COLS;
+        const SENTINEL: u64 = 0x1234_5678_9abc_def0;
+
+        let degree = 1usize << LOG_DEGREE;
+        let lde_size = degree << RATE_BITS;
+        let mut rng = StdRng::seed_from_u64(0x4859_4252_4944_4c44);
+        let coeffs: Vec<Vec<GoldilocksField>> = (0..OFFLOAD_COLS)
+            .map(|col| {
+                let mut values: Vec<_> = (0..degree)
+                    .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
+                    .collect();
+                values[0] = GoldilocksField(GoldilocksField::ORDER + (col as u64 & 1));
+                values[1] = GoldilocksField(u64::MAX);
+                values[2] = GoldilocksField(GoldilocksField::ORDER);
+                values
+            })
+            .collect();
+        let cpu_columns: Vec<Vec<GoldilocksField>> = coeffs
+            .iter()
+            .map(|column| {
+                PolynomialCoeffs::new(column.clone())
+                    .lde(RATE_BITS)
+                    .coset_fft_with_options(
+                        GoldilocksField::coset_shift(),
+                        Some(RATE_BITS),
+                        None,
+                    )
+                    .values
+            })
+            .collect();
+
+        let context = CONTEXT
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{error}"));
+        let output = autoreleasepool(|| {
+            context.device.new_buffer(
+                (TOTAL_COLS * lde_size * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let output_values = unsafe {
+            slice::from_raw_parts_mut(
+                output.contents().cast::<u64>(),
+                TOTAL_COLS * lde_size,
+            )
+        };
+        output_values.fill(SENTINEL);
+        let columns = MetalColumns::<GoldilocksField>::with_buffer(
+            output,
+            lde_size,
+            TOTAL_COLS,
+        );
+        let input = autoreleasepool(|| {
+            context.device.new_buffer(
+                (OFFLOAD_COLS * degree * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let coeff_refs: Vec<&[GoldilocksField]> =
+            coeffs.iter().map(Vec::as_slice).collect();
+        let command = context
+            .submit_lde_columns_into(
+                &columns,
+                &coeff_refs,
+                COL_START,
+                RATE_BITS,
+                &input,
+            )
+            .unwrap();
+        command.wait_until_completed();
+        assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
+
+        for col in 0..COL_START {
+            assert!(
+                columns.col(col).iter().all(|value| value.0 == SENTINEL),
+                "hybrid LDE overwrote preceding column {col}"
+            );
+        }
+        for (offset, expected) in cpu_columns.iter().enumerate() {
+            let actual = columns.col(COL_START + offset);
+            for row in 0..lde_size {
+                assert_eq!(actual[row].0, expected[row].0, "offloaded column {offset} row {row}");
+            }
+        }
+    }
+
+    #[test]
     fn metal_values_commitment_matches_cpu() {
         use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
         use crate::util::transpose_to_bitrev_flat;
@@ -6842,6 +7289,8 @@ kernel void goldilocks_mul_bench_native(
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
+            &[],
+            0,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
                     destination.fill(F::from_canonical_usize(group * 8 + index + 1));

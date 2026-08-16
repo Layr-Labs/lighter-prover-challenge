@@ -3056,7 +3056,7 @@ mod quotient_layout_tests {
         let (data, _) = small_circuit();
         let commitment = &data.prover_only.constants_sigmas_commitment;
         let range = data.common.sigmas_range();
-        let indices = [3usize, 4, 5, 6, 7, 8, 9];
+        let indices = (0usize..32).collect::<Vec<_>>();
         let mut indexed = Vec::new();
         let mut contiguous = Vec::new();
 

@@ -1006,6 +1006,8 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     fn try_build_merkle_tree_column_store_streamed(
         columns: &crate::hash::merkle_tree::ColumnStore<F>,
         cap_height: usize,
+        coeff_columns: &[&[F]],
+        rate_bits: usize,
         fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
     ) -> Option<(
         crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
@@ -1014,7 +1016,13 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         match columns {
             crate::hash::merkle_tree::ColumnStore::Owned(_) => None,
             crate::hash::merkle_tree::ColumnStore::Shared(columns) => {
-                super::metal::build_merkle_tree_shared_streamed(columns, cap_height, fill_group)
+                super::metal::build_merkle_tree_shared_streamed(
+                    columns,
+                    cap_height,
+                    coeff_columns,
+                    rate_bits,
+                    fill_group,
+                )
             }
         }
     }

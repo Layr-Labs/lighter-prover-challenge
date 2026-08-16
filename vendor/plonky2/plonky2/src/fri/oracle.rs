@@ -32,13 +32,36 @@ use crate::util::{log2_strict, reverse_bits};
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
-/// Route the whole commitment (NTT + hashing) through the GPU backend.
-/// Official ranked A/B: submission 644c4257 (this on, over the 8.0011
-/// frontier) scored 6.2323 despite a +4.6% controlled local win — the NTT
-/// stages extend each tree's exclusive occupancy of the serialized GPU
-/// stream, which is the ranked critical path. Keep off; hashing-only GPU
-/// trees (`new_columns`) remain on.
-const GPU_NTT_COMMITMENTS: bool = false;
+/// Value commitments still use the established CPU-IFFT path. The historical
+/// all-shape GPU route extended serialized GPU occupancy and lost officially.
+const GPU_NTT_VALUE_COMMITMENTS: bool = false;
+
+/// The fused paired-stage kernels change the degree-14 coefficient route's
+/// economics without reopening the failed all-shape policy. These three widths
+/// are the fixed exclusive production commitments; the environment selector
+/// exists solely for same-binary production A/B.
+fn use_exclusive_degree14_gpu_ntt(
+    degree: usize,
+    rate_bits: usize,
+    cols: usize,
+    blinding: bool,
+) -> bool {
+    #[cfg(feature = "std")]
+    {
+        !blinding
+            && degree == 1 << 14
+            && rate_bits == 3
+            && matches!(cols, 16 | 20 | 136)
+            && crate::hash::poseidon2::is_exclusive_gpu_phase()
+            && !std::env::var_os("PLONKY2_EXCLUSIVE_D14_GPU_NTT")
+                .is_some_and(|value| value == "0")
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        let _ = (degree, rate_bits, cols, blinding);
+        false
+    }
+}
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +70,44 @@ pub(crate) enum BatchLayout {
     PointMajor,
     /// `out[column * num_points + point]`
     PolyMajor,
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn copy_256_bytes_neon(source: *const u8, destination: *mut u8) {
+    use core::arch::aarch64::{vld1q_u8, vst1q_u8};
+
+    macro_rules! copy_sixteen {
+        ($offset:expr) => {{
+            let value = unsafe { vld1q_u8(source.add($offset)) };
+            unsafe { vst1q_u8(destination.add($offset), value) };
+        }};
+    }
+    copy_sixteen!(0);
+    copy_sixteen!(16);
+    copy_sixteen!(32);
+    copy_sixteen!(48);
+    copy_sixteen!(64);
+    copy_sixteen!(80);
+    copy_sixteen!(96);
+    copy_sixteen!(112);
+    copy_sixteen!(128);
+    copy_sixteen!(144);
+    copy_sixteen!(160);
+    copy_sixteen!(176);
+    copy_sixteen!(192);
+    copy_sixteen!(208);
+    copy_sixteen!(224);
+    copy_sixteen!(240);
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn use_inline_quotient_copy_32() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("PLONKY2_QUOTIENT_COPY32_NEON")
+            .is_some_and(|value| value == "0")
+    })
 }
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
@@ -86,7 +147,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if GPU_NTT_VALUE_COMMITMENTS && !blinding {
             let value_columns: Vec<&[F]> =
                 values.iter().map(|v| v.values.as_slice()).collect();
             if let Some((columns, digests, cap, coeff_columns)) = timed!(
@@ -140,7 +201,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) -> Self {
         let degree = polynomials[0].len();
 
-        if GPU_NTT_COMMITMENTS && !blinding {
+        if use_exclusive_degree14_gpu_ntt(
+            degree,
+            rate_bits,
+            polynomials.len(),
+            blinding,
+        ) {
             let coeff_columns: Vec<&[F]> = polynomials
                 .iter()
                 .map(|p| p.coeffs.as_slice())
@@ -184,9 +250,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
                     let polys = &polynomials;
+                    let coeff_columns = polys
+                        .iter()
+                        .map(|polynomial| polynomial.coeffs.as_slice())
+                        .collect_vec();
                     C::Hasher::try_build_merkle_tree_column_store_streamed(
                         &columns,
                         cap_height,
+                        &coeff_columns,
+                        rate_bits,
                         &|group, destinations: &mut [&mut [F]]| {
                             destinations.par_iter_mut().enumerate().for_each(
                                 |(k, destination)| {
@@ -497,9 +569,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let index_end = index_start
                     .checked_add(n)
                     .expect("contiguous LDE batch range overflow");
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let copy_32_inline = n == 32
+                    && core::mem::size_of::<F>() == 8
+                    && use_inline_quotient_copy_32();
                 for (ci, c) in col_range.enumerate() {
-                    out[ci * n..(ci + 1) * n]
-                        .copy_from_slice(&columns.col(c)[index_start..index_end]);
+                    let destination = &mut out[ci * n..(ci + 1) * n];
+                    let source = &columns.col(c)[index_start..index_end];
+                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                    if copy_32_inline {
+                        debug_assert_eq!(source.len() * core::mem::size_of::<F>(), 256);
+                        debug_assert_eq!(destination.len() * core::mem::size_of::<F>(), 256);
+                        unsafe {
+                            copy_256_bytes_neon(
+                                source.as_ptr().cast::<u8>(),
+                                destination.as_mut_ptr().cast::<u8>(),
+                            )
+                        };
+                        continue;
+                    }
+                    destination.copy_from_slice(source);
                 }
             }
             MerkleLeaves::Rows { .. } => {
@@ -987,6 +1076,161 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn quotient_copy_32_neon_preserves_raw_words() {
+        use crate::field::types::{Field64, PrimeField64};
+
+        const WORDS: usize = 32;
+        let mut source = [GoldilocksField::ZERO; WORDS];
+        source.iter_mut().enumerate().for_each(|(index, value)| {
+            *value = GoldilocksField(
+                (index as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .rotate_left((index & 63) as u32),
+            );
+        });
+        let aliases = [
+            0,
+            1,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u64::MAX,
+        ];
+        for (index, raw) in aliases.into_iter().enumerate() {
+            source[index] = GoldilocksField(raw);
+        }
+
+        let mut actual = [GoldilocksField::ZERO; WORDS];
+        unsafe {
+            copy_256_bytes_neon(
+                source.as_ptr().cast::<u8>(),
+                actual.as_mut_ptr().cast::<u8>(),
+            )
+        };
+        assert!(
+            source
+                .iter()
+                .zip(&actual)
+                .all(|(expected, actual)| expected.to_noncanonical_u64()
+                    == actual.to_noncanonical_u64()),
+            "raw 32-word copy mismatch",
+        );
+    }
+
+    #[test]
+    #[ignore = "manual exact exclusive degree-14 GPU NTT differential"]
+    fn exclusive_degree14_gpu_ntt_matches_streamed_cpu_commitment() {
+        use crate::field::types::Field64;
+
+        const D: usize = 2;
+        const DEGREE: usize = 1 << 14;
+        const RATE_BITS: usize = 3;
+        const CAP_HEIGHT: usize = 4;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                std::env::remove_var("PLONKY2_EXCLUSIVE_D14_GPU_NTT");
+                crate::hash::poseidon2::set_exclusive_gpu_phase(false);
+            }
+        }
+
+        fn build(coefficients: &[PolynomialCoeffs<F>], gpu_ntt: bool) -> PolynomialBatch<F, C, D> {
+            std::env::set_var(
+                "PLONKY2_EXCLUSIVE_D14_GPU_NTT",
+                if gpu_ntt { "1" } else { "0" },
+            );
+            PolynomialBatch::<F, C, D>::from_coeffs(
+                coefficients.to_vec(),
+                RATE_BITS,
+                false,
+                CAP_HEIGHT,
+                &mut TimingTree::default(),
+                None,
+            )
+        }
+
+        crate::hash::poseidon2::metal::force_context_for_tests();
+        crate::hash::poseidon2::set_exclusive_gpu_phase(true);
+        let _reset = Reset;
+
+        for width in [16usize, 20, 136] {
+            let coefficients = (0..width)
+                .map(|column| {
+                    let mut values = (0..DEGREE)
+                        .map(|row| {
+                            GoldilocksField(
+                                (column as u64)
+                                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                    .wrapping_add(row as u64)
+                                    .rotate_left(((column + row) & 63) as u32)
+                                    % F::ORDER,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if column < 4 {
+                        values[0] = GoldilocksField(F::ORDER + (column as u64 & 1));
+                        values[1] = GoldilocksField(u64::MAX);
+                        values[2] = GoldilocksField(F::ORDER);
+                        values[3] = GoldilocksField(F::ORDER + 1);
+                    }
+                    PolynomialCoeffs::new(values)
+                })
+                .collect::<Vec<_>>();
+
+            let control = build(&coefficients, false);
+            let candidate = build(&coefficients, true);
+            assert_eq!(control.polynomials, candidate.polynomials);
+            assert_eq!(control.merkle_tree.cap, candidate.merkle_tree.cap);
+            match (&control.merkle_tree.leaves, &candidate.merkle_tree.leaves) {
+                (
+                    MerkleLeaves::Columns {
+                        columns: control,
+                        log_rows: control_log,
+                    },
+                    MerkleLeaves::Columns {
+                        columns: candidate,
+                        log_rows: candidate_log,
+                    },
+                ) => {
+                    assert_eq!(control_log, candidate_log);
+                    assert_eq!(control.num_cols(), candidate.num_cols());
+                    assert_eq!(control.num_rows(), candidate.num_rows());
+                    for column in 0..control.num_cols() {
+                        assert!(
+                            control
+                                .col(column)
+                                .iter()
+                                .zip(candidate.col(column))
+                                .all(|(control, candidate)| control.0 == candidate.0),
+                            "raw LDE mismatch at width {width}, column {column}",
+                        );
+                    }
+                }
+                _ => panic!("both routes must retain column-major leaves"),
+            }
+            for leaf in [
+                0usize,
+                1,
+                17,
+                (1 << 16) - 1,
+                1 << 16,
+                (1 << 17) - 2,
+                (1 << 17) - 1,
+            ] {
+                assert_eq!(
+                    control.merkle_tree.prove(leaf),
+                    candidate.merkle_tree.prove(leaf),
+                    "Merkle path mismatch at width {width}, leaf {leaf}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
