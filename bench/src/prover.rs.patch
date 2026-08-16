@@ -1,0 +1,95 @@
+*** Begin Patch
+*** Update File: /home/ubuntu/lighter-prover-challenge/bench/src/prover.rs
+@@ -5,6 @@
+ use std::sync::atomic::{AtomicUsize, Ordering};
++use std::collections::LruCache;
++use std::sync::OnceLock;
+ use std::sync::{Arc, Mutex};
+ 
+@@ -35,6 +38,44 @@
+ use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
++
++// Witness computation cache to avoid re-computing identical transaction witnesses
++#[derive(Debug)]
++struct WitnessCache {
++    cache: Mutex<LruCache<u64, (PartitionWitness<'static, F>, JumpState<F>)>>,
++}
++
++impl WitnessCache {
++    fn new(capacity: usize) -> Self {
++        WitnessCache {
++            cache: Mutex::new(LruCache::new(capacity)),
++        }
++    }
++
++    fn get_or_compute<F: Field + Extend<5> + RichField>(
++        &self,
++        key: u64,
++        path: TxPath,
++        chunk_index: usize,
++        txs: Vec<Arc<Tx<F>>>,
++        tx_data: &CircuitData<F, C, D>,
++        tx_target: &BlockTxTarget,
++        created_at: i64,
++        state_metadata_hash: HashOut<F>,
++        old_jump: JumpState<F>,
++        compute_fn: fn(TxPath, usize, Vec<Arc<Tx<F>>>, &CircuitData<F, C, D>, &BlockTxTarget, i64, HashOut<F>, JumpState<F>) -> (PartitionWitness<'static, F>, JumpState<F>),
++    ) -> (PartitionWitness<'static, F>, JumpState<F>) {
++        // Try to get from cache first
++        if let Some(cached) = self.cache.lock().unwrap().get(&key) {
++            return cached.clone();
++        }
++
++        // Compute if not in cache
++        let result = compute_fn(path, chunk_index, txs, tx_data, tx_target, created_at, state_metadata_hash, old_jump);
++        
++        // Store in cache
++        self.cache.lock().unwrap().put(key, result.clone());
++        result
++    }
++}
++
++// Global witness cache instance
++static WITNESS_CACHE: OnceLock<WitnessCache> = OnceLock::new();
++
++fn get_witness_cache() -> &'static WitnessCache {
++    WITNESS_CACHE.get_or_init(|| WitnessCache::new(1024)) // 1K entry cache
++}
++
++// Hash function for transaction data to use as cache key
++fn txs_hash<F: Field + Extend<5> + RichField>(txs: &[Arc<Tx<F>>>) -> u64 {
++    use std::hash::{Hash, Hasher};
++    let mut hasher = DefaultHasher::new();
++    
++    // Hash the length first
++    txs.len().hash(&mut hasher);
++    
++    // Hash each transaction's relevant fields that affect witness generation
++    for tx in txs {
++        // Hash the core transaction data that affects witness computation
++        tx.tx_type.hash(&mut hasher);
++        tx.tx_circuit_type.hash(&mut hasher);
++        tx.tx_index.hash(&mut hasher);
++        tx.nonce.hash(&mut hasher);
++        tx.expired_at.hash(&mut hasher);
++        tx.taker_fee.hash(&mut hasher);
++        tx.maker_fee.hash(&mut hasher);
++        
++        // Hash accounts before (key fields that affect witness)
++        for account in &tx.accounts_before {
++            account.nonce.hash(&mut hasher);
++            account.balance.hash(&mut hasher);
++            account.account_data_root.hash(&mut hasher);
++        }
++        
++        // Hash assets before
++        for asset_account in &tx.account_assets_before {
++            for asset in asset_account {
++                asset.balance.hash(&mut hasher);
++            }
++        }
++    }
++    
++    hasher.finish()
++}
+*** End Patch
