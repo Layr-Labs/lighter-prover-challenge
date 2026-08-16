@@ -1,4 +1,4 @@
-// Redraw marker 501
+// exact live frontier control resample after staged bracket
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
