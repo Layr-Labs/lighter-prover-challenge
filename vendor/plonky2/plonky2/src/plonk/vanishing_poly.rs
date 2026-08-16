@@ -1532,8 +1532,19 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
-                filters.clear();
-                filters.resize(3 * vars_batch.len(), F::ZERO);
+                // Size the buffer without re-zeroing it. `clear()` then
+                // `resize()` memset all three sub-slices on every batch, but
+                // each is fully assigned before it is read: the two
+                // `fill_interleave_gate_filter` calls below write every point of
+                // `interleave_filter` and `uninterleave_filter`, and the loop
+                // writes every point of `summed_filter`. `filters` is scratch
+                // reused across batches, so after the first batch of a worker
+                // thread this resize is a no-op and the memset is gone
+                // entirely — 3 * batch * 8 B per batch, ~12 MiB per d16 tx
+                // proof. Value-exact: no slot's read can observe the difference.
+                if filters.len() != 3 * vars_batch.len() {
+                    filters.resize(3 * vars_batch.len(), F::ZERO);
+                }
                 let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
                 let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
                 fill_interleave_gate_filter(
