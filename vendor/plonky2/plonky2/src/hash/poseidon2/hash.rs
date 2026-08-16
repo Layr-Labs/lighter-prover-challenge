@@ -40,8 +40,7 @@ pub trait Poseidon2: PrimeField64 {
         let mut a = input_a;
         let mut b = input_b;
 
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
+        Self::external_linear_layer_x2(&mut a, &mut b);
 
         Self::full_rounds_x2(&mut a, &mut b, 0);
         Self::partial_rounds_x2(&mut a, &mut b);
@@ -58,8 +57,7 @@ pub trait Poseidon2: PrimeField64 {
             Self::add_rc(b, r);
             Self::sbox(a);
             Self::sbox(b);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
+            Self::external_linear_layer_x2(a, b);
         }
     }
 
@@ -88,10 +86,7 @@ pub trait Poseidon2: PrimeField64 {
         let mut c = input_c;
         let mut d = input_d;
 
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
-        Self::external_linear_layer(&mut c);
-        Self::external_linear_layer(&mut d);
+        Self::external_linear_layer_x4(&mut a, &mut b, &mut c, &mut d);
 
         Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, 0);
         Self::partial_rounds_x4(&mut a, &mut b, &mut c, &mut d);
@@ -118,10 +113,7 @@ pub trait Poseidon2: PrimeField64 {
             Self::sbox(b);
             Self::sbox(c);
             Self::sbox(d);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
-            Self::external_linear_layer(c);
-            Self::external_linear_layer(d);
+            Self::external_linear_layer_x4(a, b, c, d);
         }
     }
 
@@ -181,6 +173,26 @@ pub trait Poseidon2: PrimeField64 {
 
     #[inline]
     #[unroll::unroll_for_loops]
+    /// Apply the external linear layer to two independent states. Default is
+    /// two sequential calls; Goldilocks overrides with an interleaved u128 form.
+    #[inline]
+    fn external_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        Self::external_linear_layer(a);
+        Self::external_linear_layer(b);
+    }
+
+    /// Four-state variant of `external_linear_layer_x2`.
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        Self::external_linear_layer_x2(a, b);
+        Self::external_linear_layer_x2(c, d);
+    }
+
     fn external_linear_layer_extension<F: FieldExtension<D, BaseField = Self>, const D: usize>(
         state: &mut [F; WIDTH],
     ) {
@@ -483,26 +495,80 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
     }
 }
 
+/// Interleaved two-state form of [`external_linear_layer_u128`]: the two
+/// independent u128 M4/circulant passes are interleaved so the compiler and CPU
+/// overlap the two reduction chains. Bit-identical to two sequential calls.
+#[inline]
+#[unroll::unroll_for_loops]
+fn external_linear_layer_u128_x2(a: &mut [u128; WIDTH], b: &mut [u128; WIDTH]) {
+    for i in (0..WIDTH).step_by(4) {
+        let a01 = a[i] + a[i + 1];
+        let b01 = b[i] + b[i + 1];
+        let a23 = a[i + 2] + a[i + 3];
+        let b23 = b[i + 2] + b[i + 3];
+        let a0123 = a01 + a23;
+        let b0123 = b01 + b23;
+        let ax0 = a[i];
+        let ax2 = a[i + 2];
+        let bx0 = b[i];
+        let bx2 = b[i + 2];
+        a[i] = a0123 + a01 + a[i + 1];
+        b[i] = b0123 + b01 + b[i + 1];
+        a[i + 1] = a0123 + a[i + 1] + ax2 + ax2;
+        b[i + 1] = b0123 + b[i + 1] + bx2 + bx2;
+        a[i + 2] = a0123 + a23 + a[i + 3];
+        b[i + 2] = b0123 + b23 + b[i + 3];
+        a[i + 3] = a0123 + a[i + 3] + ax0 + ax0;
+        b[i + 3] = b0123 + b[i + 3] + bx0 + bx0;
+    }
+    let mut sa = [0u128; 4];
+    let mut sb = [0u128; 4];
+    for i in 0..4 {
+        sa[i] = a[i] + a[i + 4] + a[i + 8];
+        sb[i] = b[i] + b[i + 4] + b[i + 8];
+    }
+    for i in 0..WIDTH {
+        a[i] += sa[i % 4];
+        b[i] += sb[i % 4];
+    }
+}
+
+/// Four-state variant of [`external_linear_layer_u128_x2`]; same bit-identity.
+#[inline]
+#[unroll::unroll_for_loops]
+fn external_linear_layer_u128_x4(
+    a: &mut [u128; WIDTH],
+    b: &mut [u128; WIDTH],
+    c: &mut [u128; WIDTH],
+    d: &mut [u128; WIDTH],
+) {
+    external_linear_layer_u128_x2(a, b);
+    external_linear_layer_u128_x2(c, d);
+}
+
 impl Poseidon2 for F {
     #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
         // AArch64 NEON has no native widening 64x64 multiply. The packed
         // Goldilocks path therefore expands each four-lane product, while the
         // scalar backend lowers each fixed product directly to `mul`/`umulh`.
-        // Keep the exact historical multiply-then-add order in every lane.
+        // `multiply_accumulate` fuses the sum into the reduction
+        // (`reduce128(sum + a*b)`, `mul_acc_reduce` on AArch64); it is
+        // bit-identical to the separate mul-then-add form (differentially
+        // tested) and shares the same diagonal immediates across the lanes.
         let sum = sum_12(state);
-        state[0] = sum + state[0] * F(0xc3b6c08e23ba9300);
-        state[1] = sum + state[1] * F(0xd84b5de94a324fb6);
-        state[2] = sum + state[2] * F(0x0d0c371c5b35b84f);
-        state[3] = sum + state[3] * F(0x7964f570e7188037);
-        state[4] = sum + state[4] * F(0x5daf18bbd996604b);
-        state[5] = sum + state[5] * F(0x6743bc47b9595257);
-        state[6] = sum + state[6] * F(0x5528b9362c59bb70);
-        state[7] = sum + state[7] * F(0xac45e25b7127b68b);
-        state[8] = sum + state[8] * F(0xa2077d7dfbb606b5);
-        state[9] = sum + state[9] * F(0xf3faac6faee378ae);
-        state[10] = sum + state[10] * F(0x0c6388b51545e883);
-        state[11] = sum + state[11] * F(0xd27dbb6944917b60);
+        state[0] = sum.multiply_accumulate(state[0], F(0xc3b6c08e23ba9300));
+        state[1] = sum.multiply_accumulate(state[1], F(0xd84b5de94a324fb6));
+        state[2] = sum.multiply_accumulate(state[2], F(0x0d0c371c5b35b84f));
+        state[3] = sum.multiply_accumulate(state[3], F(0x7964f570e7188037));
+        state[4] = sum.multiply_accumulate(state[4], F(0x5daf18bbd996604b));
+        state[5] = sum.multiply_accumulate(state[5], F(0x6743bc47b9595257));
+        state[6] = sum.multiply_accumulate(state[6], F(0x5528b9362c59bb70));
+        state[7] = sum.multiply_accumulate(state[7], F(0xac45e25b7127b68b));
+        state[8] = sum.multiply_accumulate(state[8], F(0xa2077d7dfbb606b5));
+        state[9] = sum.multiply_accumulate(state[9], F(0xf3faac6faee378ae));
+        state[10] = sum.multiply_accumulate(state[10], F(0x0c6388b51545e883));
+        state[11] = sum.multiply_accumulate(state[11], F(0xd27dbb6944917b60));
     }
 
     /// Grouped x2 internal layer: sum both states first, then interleave the
@@ -513,30 +579,30 @@ impl Poseidon2 for F {
     fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
         let sum_a = sum_12(a);
         let sum_b = sum_12(b);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
+        a[0] = sum_a.multiply_accumulate(a[0], F(0xc3b6c08e23ba9300));
+        b[0] = sum_b.multiply_accumulate(b[0], F(0xc3b6c08e23ba9300));
+        a[1] = sum_a.multiply_accumulate(a[1], F(0xd84b5de94a324fb6));
+        b[1] = sum_b.multiply_accumulate(b[1], F(0xd84b5de94a324fb6));
+        a[2] = sum_a.multiply_accumulate(a[2], F(0x0d0c371c5b35b84f));
+        b[2] = sum_b.multiply_accumulate(b[2], F(0x0d0c371c5b35b84f));
+        a[3] = sum_a.multiply_accumulate(a[3], F(0x7964f570e7188037));
+        b[3] = sum_b.multiply_accumulate(b[3], F(0x7964f570e7188037));
+        a[4] = sum_a.multiply_accumulate(a[4], F(0x5daf18bbd996604b));
+        b[4] = sum_b.multiply_accumulate(b[4], F(0x5daf18bbd996604b));
+        a[5] = sum_a.multiply_accumulate(a[5], F(0x6743bc47b9595257));
+        b[5] = sum_b.multiply_accumulate(b[5], F(0x6743bc47b9595257));
+        a[6] = sum_a.multiply_accumulate(a[6], F(0x5528b9362c59bb70));
+        b[6] = sum_b.multiply_accumulate(b[6], F(0x5528b9362c59bb70));
+        a[7] = sum_a.multiply_accumulate(a[7], F(0xac45e25b7127b68b));
+        b[7] = sum_b.multiply_accumulate(b[7], F(0xac45e25b7127b68b));
+        a[8] = sum_a.multiply_accumulate(a[8], F(0xa2077d7dfbb606b5));
+        b[8] = sum_b.multiply_accumulate(b[8], F(0xa2077d7dfbb606b5));
+        a[9] = sum_a.multiply_accumulate(a[9], F(0xf3faac6faee378ae));
+        b[9] = sum_b.multiply_accumulate(b[9], F(0xf3faac6faee378ae));
+        a[10] = sum_a.multiply_accumulate(a[10], F(0x0c6388b51545e883));
+        b[10] = sum_b.multiply_accumulate(b[10], F(0x0c6388b51545e883));
+        a[11] = sum_a.multiply_accumulate(a[11], F(0xd27dbb6944917b60));
+        b[11] = sum_b.multiply_accumulate(b[11], F(0xd27dbb6944917b60));
     }
 
     /// Grouped x4 internal layer: four independent sums first, then interleaved
@@ -553,57 +619,98 @@ impl Poseidon2 for F {
         let sum_b = sum_12(b);
         let sum_c = sum_12(c);
         let sum_d = sum_12(d);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        c[0] = sum_c + c[0] * F(0xc3b6c08e23ba9300);
-        d[0] = sum_d + d[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        c[1] = sum_c + c[1] * F(0xd84b5de94a324fb6);
-        d[1] = sum_d + d[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        c[2] = sum_c + c[2] * F(0x0d0c371c5b35b84f);
-        d[2] = sum_d + d[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        c[3] = sum_c + c[3] * F(0x7964f570e7188037);
-        d[3] = sum_d + d[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        c[4] = sum_c + c[4] * F(0x5daf18bbd996604b);
-        d[4] = sum_d + d[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        c[5] = sum_c + c[5] * F(0x6743bc47b9595257);
-        d[5] = sum_d + d[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        c[6] = sum_c + c[6] * F(0x5528b9362c59bb70);
-        d[6] = sum_d + d[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        c[7] = sum_c + c[7] * F(0xac45e25b7127b68b);
-        d[7] = sum_d + d[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        c[8] = sum_c + c[8] * F(0xa2077d7dfbb606b5);
-        d[8] = sum_d + d[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        c[9] = sum_c + c[9] * F(0xf3faac6faee378ae);
-        d[9] = sum_d + d[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        c[10] = sum_c + c[10] * F(0x0c6388b51545e883);
-        d[10] = sum_d + d[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
-        c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
-        d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
+        a[0] = sum_a.multiply_accumulate(a[0], F(0xc3b6c08e23ba9300));
+        b[0] = sum_b.multiply_accumulate(b[0], F(0xc3b6c08e23ba9300));
+        c[0] = sum_c.multiply_accumulate(c[0], F(0xc3b6c08e23ba9300));
+        d[0] = sum_d.multiply_accumulate(d[0], F(0xc3b6c08e23ba9300));
+        a[1] = sum_a.multiply_accumulate(a[1], F(0xd84b5de94a324fb6));
+        b[1] = sum_b.multiply_accumulate(b[1], F(0xd84b5de94a324fb6));
+        c[1] = sum_c.multiply_accumulate(c[1], F(0xd84b5de94a324fb6));
+        d[1] = sum_d.multiply_accumulate(d[1], F(0xd84b5de94a324fb6));
+        a[2] = sum_a.multiply_accumulate(a[2], F(0x0d0c371c5b35b84f));
+        b[2] = sum_b.multiply_accumulate(b[2], F(0x0d0c371c5b35b84f));
+        c[2] = sum_c.multiply_accumulate(c[2], F(0x0d0c371c5b35b84f));
+        d[2] = sum_d.multiply_accumulate(d[2], F(0x0d0c371c5b35b84f));
+        a[3] = sum_a.multiply_accumulate(a[3], F(0x7964f570e7188037));
+        b[3] = sum_b.multiply_accumulate(b[3], F(0x7964f570e7188037));
+        c[3] = sum_c.multiply_accumulate(c[3], F(0x7964f570e7188037));
+        d[3] = sum_d.multiply_accumulate(d[3], F(0x7964f570e7188037));
+        a[4] = sum_a.multiply_accumulate(a[4], F(0x5daf18bbd996604b));
+        b[4] = sum_b.multiply_accumulate(b[4], F(0x5daf18bbd996604b));
+        c[4] = sum_c.multiply_accumulate(c[4], F(0x5daf18bbd996604b));
+        d[4] = sum_d.multiply_accumulate(d[4], F(0x5daf18bbd996604b));
+        a[5] = sum_a.multiply_accumulate(a[5], F(0x6743bc47b9595257));
+        b[5] = sum_b.multiply_accumulate(b[5], F(0x6743bc47b9595257));
+        c[5] = sum_c.multiply_accumulate(c[5], F(0x6743bc47b9595257));
+        d[5] = sum_d.multiply_accumulate(d[5], F(0x6743bc47b9595257));
+        a[6] = sum_a.multiply_accumulate(a[6], F(0x5528b9362c59bb70));
+        b[6] = sum_b.multiply_accumulate(b[6], F(0x5528b9362c59bb70));
+        c[6] = sum_c.multiply_accumulate(c[6], F(0x5528b9362c59bb70));
+        d[6] = sum_d.multiply_accumulate(d[6], F(0x5528b9362c59bb70));
+        a[7] = sum_a.multiply_accumulate(a[7], F(0xac45e25b7127b68b));
+        b[7] = sum_b.multiply_accumulate(b[7], F(0xac45e25b7127b68b));
+        c[7] = sum_c.multiply_accumulate(c[7], F(0xac45e25b7127b68b));
+        d[7] = sum_d.multiply_accumulate(d[7], F(0xac45e25b7127b68b));
+        a[8] = sum_a.multiply_accumulate(a[8], F(0xa2077d7dfbb606b5));
+        b[8] = sum_b.multiply_accumulate(b[8], F(0xa2077d7dfbb606b5));
+        c[8] = sum_c.multiply_accumulate(c[8], F(0xa2077d7dfbb606b5));
+        d[8] = sum_d.multiply_accumulate(d[8], F(0xa2077d7dfbb606b5));
+        a[9] = sum_a.multiply_accumulate(a[9], F(0xf3faac6faee378ae));
+        b[9] = sum_b.multiply_accumulate(b[9], F(0xf3faac6faee378ae));
+        c[9] = sum_c.multiply_accumulate(c[9], F(0xf3faac6faee378ae));
+        d[9] = sum_d.multiply_accumulate(d[9], F(0xf3faac6faee378ae));
+        a[10] = sum_a.multiply_accumulate(a[10], F(0x0c6388b51545e883));
+        b[10] = sum_b.multiply_accumulate(b[10], F(0x0c6388b51545e883));
+        c[10] = sum_c.multiply_accumulate(c[10], F(0x0c6388b51545e883));
+        d[10] = sum_d.multiply_accumulate(d[10], F(0x0c6388b51545e883));
+        a[11] = sum_a.multiply_accumulate(a[11], F(0xd27dbb6944917b60));
+        b[11] = sum_b.multiply_accumulate(b[11], F(0xd27dbb6944917b60));
+        c[11] = sum_c.multiply_accumulate(c[11], F(0xd27dbb6944917b60));
+        d[11] = sum_d.multiply_accumulate(d[11], F(0xd27dbb6944917b60));
     }
 
     #[inline]
+    #[inline]
+    fn external_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
+        let mut a_u128 = [0u128; WIDTH];
+        let mut b_u128 = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            a_u128[i] = a[i].to_noncanonical_u64() as u128;
+            b_u128[i] = b[i].to_noncanonical_u64() as u128;
+        }
+        external_linear_layer_u128_x2(&mut a_u128, &mut b_u128);
+        for i in 0..WIDTH {
+            a[i] = Self::from_noncanonical_u128_with_96_bits(a_u128[i]);
+            b[i] = Self::from_noncanonical_u128_with_96_bits(b_u128[i]);
+        }
+    }
+
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        let mut a_u128 = [0u128; WIDTH];
+        let mut b_u128 = [0u128; WIDTH];
+        let mut c_u128 = [0u128; WIDTH];
+        let mut d_u128 = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            a_u128[i] = a[i].to_noncanonical_u64() as u128;
+            b_u128[i] = b[i].to_noncanonical_u64() as u128;
+            c_u128[i] = c[i].to_noncanonical_u64() as u128;
+            d_u128[i] = d[i].to_noncanonical_u64() as u128;
+        }
+        external_linear_layer_u128_x4(&mut a_u128, &mut b_u128, &mut c_u128, &mut d_u128);
+        for i in 0..WIDTH {
+            a[i] = Self::from_noncanonical_u128_with_96_bits(a_u128[i]);
+            b[i] = Self::from_noncanonical_u128_with_96_bits(b_u128[i]);
+            c[i] = Self::from_noncanonical_u128_with_96_bits(c_u128[i]);
+            d[i] = Self::from_noncanonical_u128_with_96_bits(d_u128[i]);
+        }
+    }
+
     fn sbox_p(a: &Self) -> Self {
         let a2 = a.square();
         let a4 = a2.square();
@@ -680,23 +787,11 @@ impl<T> AsRef<[T]> for Poseidon2Permutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH];
-
-    #[inline]
-    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
-        inputs.map(Self::permute)
-    }
 }
 
 impl<F: Poseidon2> Permuter for F {
     fn permute(input: [Self; WIDTH]) -> [Self; WIDTH] {
         <F as Poseidon2>::poseidon2(input)
-    }
-
-    #[inline]
-    fn permute_quad(inputs: [[Self; WIDTH]; 4]) -> [[Self; WIDTH]; 4] {
-        let [a, b, c, d] = inputs;
-        let (a, b, c, d) = <F as Poseidon2>::poseidon2_x4(a, b, c, d);
-        [a, b, c, d]
     }
 }
 
@@ -738,15 +833,6 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
 
     fn permute(&mut self) {
         self.state = T::permute(self.state);
-    }
-
-    #[inline]
-    fn permute_quad(states: &mut [Self; 4]) {
-        let inputs = (*states).map(|permutation| permutation.state);
-        let outputs = T::permute_quad(inputs);
-        for (state, output) in states.iter_mut().zip(outputs) {
-            state.state = output;
-        }
     }
 
     fn squeeze(&self) -> &[T] {
@@ -1236,32 +1322,6 @@ mod pair_hash_tests {
     use super::*;
     use crate::plonk::config::Hasher;
 
-    #[test]
-    fn permutation_quad_matches_scalar_in_all_four_lanes() {
-        let base =
-            Poseidon2Permutation::<F>::new((0..WIDTH).map(|i| F::from_canonical_usize(10_000 + i)));
-        let candidates = [17_u64, 29, 41, 53];
-        let witness_input_pos = 6;
-        let mut quad = [base; 4];
-        for (state, candidate) in quad.iter_mut().zip(candidates) {
-            state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-        }
-
-        let mut scalar = quad;
-        for state in &mut scalar {
-            state.permute();
-        }
-        Poseidon2Permutation::<F>::permute_quad(&mut quad);
-
-        for lane in 0..4 {
-            assert_eq!(
-                quad[lane].as_ref(),
-                scalar[lane].as_ref(),
-                "quad permutation changed lane {lane}"
-            );
-        }
-    }
-
     /// `add_rc` calls `add_canonical_u64`, whose safety and single-correction
     /// argument both require canonical round constants.
     #[test]
@@ -1326,3 +1386,4 @@ mod pair_hash_tests {
         );
     }
 }
+// content marker: retry of fused-multiply-accumulate change (prior run hit runner comms loss)
