@@ -49,7 +49,7 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use crate::plonk::permutation_argument::Forest;
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
@@ -1039,7 +1039,11 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
+    fn sigma_vecs(
+        &self,
+        k_is: &[F],
+        subgroup: &[F],
+    ) -> (Vec<PolynomialValues<F>>, Forest, Vec<u8>) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1070,10 +1074,9 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         forest.compress_paths();
 
         let wire_partition = forest.wire_partition();
-        (
-            wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
-            forest,
-        )
+        let sigma_vecs = wire_partition.get_sigma_polys(degree_log, k_is, subgroup);
+        let fixed_routed_wires = wire_partition.into_fixed_routed_wires();
+        (sigma_vecs, forest, fixed_routed_wires)
     }
 
     pub fn print_gate_counts(&self, min_delta: usize) {
@@ -1266,7 +1269,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest) = timed!(
+        let (sigma_vecs, forest, fixed_routed_wires) = timed!(
             timing,
             "generate sigma polynomials",
             self.sigma_vecs(&k_is, &subgroup)
@@ -1453,14 +1456,6 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
                 (None, step, domain)
             }
         };
-
-        let fixed_routed_wires = fixed_routed_wire_mask(
-            &forest.parents,
-            common.config.num_wires,
-            common.config.num_routed_wires,
-            subgroup.len(),
-        )
-        .expect("builder produced an invalid compressed representative map");
 
         let generators_defer_until_ready = self
             .generators
