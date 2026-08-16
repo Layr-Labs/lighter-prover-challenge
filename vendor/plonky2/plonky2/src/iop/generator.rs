@@ -105,6 +105,159 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+/// Witness-private unresolved-watch storage. Serialized/source circuit data remains `Vec<usize>`;
+/// only a live witness narrows counters when every count is representable by `u8`.
+#[derive(Debug)]
+enum UnresolvedWatchCounters {
+    Compact(Vec<u8>),
+    Wide(Vec<usize>),
+}
+
+impl UnresolvedWatchCounters {
+    fn from_counts(counts: &[usize]) -> Self {
+        if counts.iter().all(|&count| u8::try_from(count).is_ok()) {
+            Self::Compact(
+                counts
+                    .iter()
+                    .map(|&count| u8::try_from(count).expect("checked compact watch count"))
+                    .collect(),
+            )
+        } else {
+            Self::Wide(counts.to_vec())
+        }
+    }
+
+    #[cfg(test)]
+    fn is_compact(&self) -> bool {
+        matches!(self, Self::Compact(_))
+    }
+
+    #[cfg(test)]
+    fn to_usize_vec(&self) -> Vec<usize> {
+        match self {
+            Self::Compact(counters) => counters.iter().map(|&counter| counter as usize).collect(),
+            Self::Wide(counters) => counters.clone(),
+        }
+    }
+}
+
+/// Statically dispatched operations keep watcher-edge loops monomorphic. The enum is matched only
+/// at phase boundaries, never once per watcher edge.
+trait UnresolvedWatchCounter: Copy + Send + Sync {
+    fn is_zero(self) -> bool;
+    fn counter_usize(self) -> usize;
+    fn decrement(&mut self);
+    fn checked_decrement_by(&mut self, amount: usize) -> bool;
+}
+
+macro_rules! impl_unresolved_watch_counter {
+    ($counter:ty) => {
+        impl UnresolvedWatchCounter for $counter {
+            #[inline(always)]
+            fn is_zero(self) -> bool {
+                self == 0
+            }
+
+            #[inline(always)]
+            fn counter_usize(self) -> usize {
+                self as usize
+            }
+
+            #[inline(always)]
+            fn decrement(&mut self) {
+                debug_assert_ne!(*self, 0);
+                *self -= 1;
+            }
+
+            #[inline(always)]
+            fn checked_decrement_by(&mut self, amount: usize) -> bool {
+                if self.counter_usize() < amount {
+                    false
+                } else {
+                    *self -= amount as $counter;
+                    true
+                }
+            }
+        }
+    };
+}
+
+impl_unresolved_watch_counter!(u8);
+impl_unresolved_watch_counter!(usize);
+
+/// Witness-private worklist storage. Queue elements use `u32` exactly when the checked generator
+/// cardinality fits, otherwise they retain native width for the full fallback.
+enum PendingGeneratorIndices {
+    Compact(Vec<u32>),
+    Wide(Vec<usize>),
+}
+
+impl PendingGeneratorIndices {
+    fn empty_for_generator_count(generator_count: usize) -> Self {
+        if u32::try_from(generator_count).is_ok() {
+            Self::Compact(Vec::new())
+        } else {
+            Self::Wide(Vec::new())
+        }
+    }
+
+    fn all(generator_count: usize) -> Self {
+        if u32::try_from(generator_count).is_ok() {
+            Self::Compact(
+                (0..generator_count)
+                    .map(|index| u32::try_from(index).expect("generator count checked for u32"))
+                    .collect(),
+            )
+        } else {
+            Self::Wide((0..generator_count).collect())
+        }
+    }
+
+    #[cfg(test)]
+    fn is_compact(&self) -> bool {
+        matches!(self, Self::Compact(_))
+    }
+
+    #[cfg(test)]
+    fn to_usize_vec(&self) -> Vec<usize> {
+        match self {
+            Self::Compact(indices) => indices.iter().map(|&index| index as usize).collect(),
+            Self::Wide(indices) => indices.clone(),
+        }
+    }
+}
+
+/// Watcher IDs already have u32 storage and flow directly into compact queues; widening happens
+/// only when an ID is used for native indexing or the checked native-width fallback is selected.
+trait PendingGeneratorIndex: Copy + Ord + Send + Sync {
+    fn from_watcher(index: u32) -> Self;
+    fn to_usize(self) -> usize;
+}
+
+impl PendingGeneratorIndex for u32 {
+    #[inline(always)]
+    fn from_watcher(index: u32) -> Self {
+        index
+    }
+
+    #[inline(always)]
+    fn to_usize(self) -> usize {
+        self as usize
+    }
+}
+
+impl PendingGeneratorIndex for usize {
+    #[inline(always)]
+    fn from_watcher(index: u32) -> Self {
+        index as usize
+    }
+
+    #[inline(always)]
+    fn to_usize(self) -> usize {
+        self
+    }
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -114,17 +267,19 @@ fn parallel_rounds_enabled() -> bool {
 /// values and only merged values mutate the witness, so every schedule (sequential, parallel at
 /// any thread count) reaches the same fixpoint, and the deterministic merge order keeps
 /// contradiction detection (`set_target_returning_rep`) behavior identical across runs.
-fn run_generator_worklist<
+fn run_generator_worklist_with<
+    W: UnresolvedWatchCounter,
+    Q: PendingGeneratorIndex,
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
     witness: &mut PartitionWitness<F>,
     prover_data: &ProverOnlyCircuitData<F, C, D>,
-    unresolved_watches: &mut [usize],
+    unresolved_watches: &mut [W],
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
-    mut pending_generator_indices: Vec<usize>,
+    mut pending_generator_indices: Vec<Q>,
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
@@ -173,7 +328,7 @@ fn run_generator_worklist<
             // records its generators in ready-set order, so the merge below observes ascending
             // generator-index order regardless of thread count.
             let round_witness: &PartitionWitness<F> = witness;
-            let round_unresolved_watches: &[usize] = unresolved_watches;
+            let round_unresolved_watches: &[W] = unresolved_watches;
             let round_generator_is_expired: &[bool] = generator_is_expired;
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
@@ -185,11 +340,12 @@ fn run_generator_worklist<
                     let mut entries = Vec::with_capacity(chunk.len());
                     let mut annotated_values = Vec::new();
                     let mut round_buffer = GeneratedValues::empty();
-                    for &generator_idx in chunk {
+                    for &generator_index in chunk {
+                        let generator_idx = generator_index.to_usize();
                         if round_generator_is_expired[generator_idx] {
                             continue;
                         }
-                        let ready = round_unresolved_watches[generator_idx] == 0;
+                        let ready = round_unresolved_watches[generator_idx].is_zero();
                         if skip_unready && !ready {
                             continue;
                         }
@@ -233,11 +389,11 @@ fn run_generator_worklist<
                         }
                         if let Some(watchers) = watchers {
                             for &watching_generator_idx in watchers {
-                                let watching_generator_idx = watching_generator_idx as usize;
+                                let watching_generator_index = Q::from_watcher(watching_generator_idx);
+                                let watching_generator_idx = watching_generator_index.to_usize();
                                 if !generator_is_expired[watching_generator_idx] {
-                                    debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                    unresolved_watches[watching_generator_idx] -= 1;
-                                    next_pending_generator_indices.push(watching_generator_idx);
+                                    unresolved_watches[watching_generator_idx].decrement();
+                                    next_pending_generator_indices.push(watching_generator_index);
                                 }
                             }
                         }
@@ -252,11 +408,12 @@ fn run_generator_worklist<
             continue;
         }
 
-        for &generator_idx in &pending_generator_indices {
+        for &generator_index in &pending_generator_indices {
+            let generator_idx = generator_index.to_usize();
             if generator_is_expired[generator_idx] {
                 continue;
             }
-            let ready = unresolved_watches[generator_idx] == 0;
+            let ready = unresolved_watches[generator_idx].is_zero();
             if skip_unready && !ready {
                 continue;
             }
@@ -281,11 +438,11 @@ fn run_generator_worklist<
                 if let Some(watch) = witness.set_target_returning_rep(t, v)? {
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
-                            let watching_generator_idx = watching_generator_idx as usize;
+                            let watching_generator_index = Q::from_watcher(watching_generator_idx);
+                            let watching_generator_idx = watching_generator_index.to_usize();
                             if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
+                                unresolved_watches[watching_generator_idx].decrement();
+                                next_pending_generator_indices.push(watching_generator_index);
                             }
                         }
                     }
@@ -302,39 +459,72 @@ fn run_generator_worklist<
     Ok(())
 }
 
+
+fn run_generator_worklist<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    unresolved_watches: &mut UnresolvedWatchCounters,
+    generator_is_expired: &mut [bool],
+    remaining_generators: &mut usize,
+    pending_generator_indices: PendingGeneratorIndices,
+    parallel_threshold: usize,
+) -> Result<()> {
+    match (unresolved_watches, pending_generator_indices) {
+        (UnresolvedWatchCounters::Compact(counters), PendingGeneratorIndices::Compact(pending)) =>
+            run_generator_worklist_with(witness, prover_data, counters, generator_is_expired,
+                remaining_generators, pending, parallel_threshold),
+        (UnresolvedWatchCounters::Compact(counters), PendingGeneratorIndices::Wide(pending)) =>
+            run_generator_worklist_with(witness, prover_data, counters, generator_is_expired,
+                remaining_generators, pending, parallel_threshold),
+        (UnresolvedWatchCounters::Wide(counters), PendingGeneratorIndices::Compact(pending)) =>
+            run_generator_worklist_with(witness, prover_data, counters, generator_is_expired,
+                remaining_generators, pending, parallel_threshold),
+        (UnresolvedWatchCounters::Wide(counters), PendingGeneratorIndices::Wide(pending)) =>
+            run_generator_worklist_with(witness, prover_data, counters, generator_is_expired,
+                remaining_generators, pending, parallel_threshold),
+    }
+}
+
 /// Seeds `inputs` into `witness` and returns, per generator, the number of distinct
-/// representatives it watches that are still unpopulated.
-///
-/// A generator can run once every distinct representative it watches has a value. The count is
-/// therefore `(total distinct representatives watched) - (those already populated)`. The first
-/// term is `generator_watch_counts`, derived once at circuit-build time; the second is accumulated
-/// here by decrementing each watcher of a representative at the moment that representative is
-/// *first* populated. `set_target_returning_rep` returns the representative only on first
-/// population, so aliased or duplicated inputs decrement at most once and no counter can
-/// underflow. This is the exact complement of the previous initialization, which instead walked
-/// the entire representative-keyed watcher map on every proof and counted the unpopulated
-/// entries — an O(total watch edges) traversal of prover data that is identical for every proof of
-/// a given circuit, repeated once per proof.
+/// representatives it watches that are still unpopulated. Compact storage is selected only when
+/// every immutable source count fits; all watcher-edge updates are monomorphic.
+fn seed_inputs_and_unresolved_watches_with<F: Field, W: UnresolvedWatchCounter>(
+    witness: &mut PartitionWitness<F>,
+    inputs: PartialWitness<F>,
+    unresolved_watches: &mut [W],
+    generator_indices_by_watches: &GeneratorWatchIndex,
+) -> Result<()> {
+    for (target, value) in inputs.target_values.into_iter() {
+        if let Some(watch) = witness.set_target_returning_rep(target, value)? {
+            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                for &generator_idx in watchers {
+                    unresolved_watches[generator_idx as usize].decrement();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn seed_inputs_and_unresolved_watches<F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
     generator_watch_counts: &[usize],
     generator_indices_by_watches: &GeneratorWatchIndex,
-) -> Result<Vec<usize>> {
-    let mut unresolved_watches = generator_watch_counts.to_vec();
-
-    for (t, v) in inputs.target_values.into_iter() {
-        if let Some(watch) = witness.set_target_returning_rep(t, v)? {
-            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
-                for &generator_idx in watchers {
-                    let generator_idx = generator_idx as usize;
-                    debug_assert_ne!(unresolved_watches[generator_idx], 0);
-                    unresolved_watches[generator_idx] -= 1;
-                }
-            }
-        }
+) -> Result<UnresolvedWatchCounters> {
+    let mut unresolved_watches = UnresolvedWatchCounters::from_counts(generator_watch_counts);
+    match &mut unresolved_watches {
+        UnresolvedWatchCounters::Compact(counters) => seed_inputs_and_unresolved_watches_with(
+            witness, inputs, counters, generator_indices_by_watches,
+        )?,
+        UnresolvedWatchCounters::Wide(counters) => seed_inputs_and_unresolved_watches_with(
+            witness, inputs, counters, generator_indices_by_watches,
+        )?,
     }
-
     Ok(unresolved_watches)
 }
 
@@ -347,8 +537,10 @@ fn seed_inputs_and_unresolved_watches<F: Field>(
 /// inputs decrement at most once and no counter can underflow.
 pub struct PartitionSeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
-    generator_indices_by_watches: &'b GeneratorWatchIndex,
+    /// First-populated representatives in exact target insertion order. Counter updates are
+    /// replayed after the callback behind one compact/wide dispatch. Replay mode deliberately
+    /// leaves this empty and applies its checked sparse aggregate instead.
+    populated_representatives: &'b mut Vec<usize>,
     layout: SeedLayoutMode<'b>,
 }
 
@@ -510,18 +702,9 @@ impl<F: Field> WitnessWrite<F> for PartitionSeeder<'_, '_, F> {
             }
         };
 
-        if matches!(&self.layout, SeedLayoutMode::Replay { .. }) {
-            // Watcher decrements are applied once, in aggregate, after the
-            // checked replay.
-            return Ok(());
-        }
-        if let Some(watch) = newly_set {
-            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
-                for &generator_idx in watchers {
-                    let generator_idx = generator_idx as usize;
-                    debug_assert_ne!(self.unresolved_watches[generator_idx], 0);
-                    self.unresolved_watches[generator_idx] -= 1;
-                }
+        if !matches!(&self.layout, SeedLayoutMode::Replay { .. }) {
+            if let Some(representative) = newly_set {
+                self.populated_representatives.push(representative);
             }
         }
         Ok(())
@@ -534,17 +717,99 @@ impl<F: Field> Witness<F> for PartitionSeeder<'_, '_, F> {
     }
 }
 
-/// Direct-feeding adapter: the [`PendingPartitionWitness::feed`] analog of
-/// [`PartitionSeeder`]. Writes values straight into the partition while
-/// applying `feed`'s exact bookkeeping: each first-populated representative
-/// decrements its unfinished watchers and queues them for the resume
-/// worklist; expired generators are skipped.
+/// Apply first-population watcher effects in their original representative and CSR order. The
+/// outer enum dispatch keeps every productive watcher loop monomorphic.
+fn decrement_populated_representatives_with<W: UnresolvedWatchCounter>(
+    populated_representatives: &[usize],
+    unresolved_watches: &mut [W],
+    generator_indices_by_watches: &GeneratorWatchIndex,
+) {
+    for watch in populated_representatives {
+        if let Some(watchers) = generator_indices_by_watches.get(watch) {
+            for &generator_idx in watchers {
+                unresolved_watches[generator_idx as usize].decrement();
+            }
+        }
+    }
+}
+
+fn decrement_populated_representatives(
+    populated_representatives: &[usize],
+    unresolved_watches: &mut UnresolvedWatchCounters,
+    generator_indices_by_watches: &GeneratorWatchIndex,
+) {
+    match unresolved_watches {
+        UnresolvedWatchCounters::Compact(counters) => decrement_populated_representatives_with(
+            populated_representatives, counters, generator_indices_by_watches,
+        ),
+        UnresolvedWatchCounters::Wide(counters) => decrement_populated_representatives_with(
+            populated_representatives, counters, generator_indices_by_watches,
+        ),
+    }
+}
+
+fn collect_seeded_watch_decrements_with<W: UnresolvedWatchCounter>(
+    totals: &[usize],
+    unresolved: &[W],
+) -> Result<Vec<(u32, u32)>> {
+    totals
+        .iter()
+        .zip(unresolved)
+        .enumerate()
+        .filter_map(|(generator, (&total, &remaining))| {
+            let decrement = total - remaining.counter_usize();
+            (decrement != 0).then(|| {
+                Ok((
+                    u32::try_from(generator).map_err(|_| anyhow!("generator index exceeds u32"))?,
+                    u32::try_from(decrement)
+                        .map_err(|_| anyhow!("seed watcher decrement exceeds u32"))?,
+                ))
+            })
+        })
+        .collect()
+}
+
+fn collect_seeded_watch_decrements(
+    totals: &[usize],
+    unresolved: &UnresolvedWatchCounters,
+) -> Result<Vec<(u32, u32)>> {
+    match unresolved {
+        UnresolvedWatchCounters::Compact(counters) =>
+            collect_seeded_watch_decrements_with(totals, counters),
+        UnresolvedWatchCounters::Wide(counters) =>
+            collect_seeded_watch_decrements_with(totals, counters),
+    }
+}
+
+fn apply_seeded_watch_decrements_with<W: UnresolvedWatchCounter>(
+    unresolved: &mut [W],
+    seeded_watch_decrements: &[(u32, u32)],
+) -> Result<()> {
+    for &(generator, decrement) in seeded_watch_decrements {
+        if !unresolved[generator as usize].checked_decrement_by(decrement as usize) {
+            return Err(seed_layout_mismatch("seed layout watcher decrement underflow"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_seeded_watch_decrements(
+    unresolved: &mut UnresolvedWatchCounters,
+    seeded_watch_decrements: &[(u32, u32)],
+) -> Result<()> {
+    match unresolved {
+        UnresolvedWatchCounters::Compact(counters) =>
+            apply_seeded_watch_decrements_with(counters, seeded_watch_decrements),
+        UnresolvedWatchCounters::Wide(counters) =>
+            apply_seeded_watch_decrements_with(counters, seeded_watch_decrements),
+    }
+}
+
+/// Direct-feeding adapter. First-populated representatives are recorded in insertion order; the
+/// caller decrements and queues them behind one compact/wide outer dispatch before resuming.
 pub struct PartitionFeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
-    unresolved_watches: &'b mut [usize],
-    generator_is_expired: &'b [bool],
-    pending_generator_indices: &'b mut Vec<usize>,
-    generator_indices_by_watches: &'b GeneratorWatchIndex,
+    populated_representatives: &'b mut Vec<usize>,
 }
 
 impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
@@ -555,17 +820,8 @@ impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
 
 impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
-        if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
-            if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
-                for &watching_generator_idx in watchers {
-                    let watching_generator_idx = watching_generator_idx as usize;
-                    if !self.generator_is_expired[watching_generator_idx] {
-                        debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                        self.unresolved_watches[watching_generator_idx] -= 1;
-                        self.pending_generator_indices.push(watching_generator_idx);
-                    }
-                }
-            }
+        if let Some(representative) = self.witness.set_target_returning_rep(target, value)? {
+            self.populated_representatives.push(representative);
         }
         Ok(())
     }
@@ -575,6 +831,104 @@ impl<F: Field> Witness<F> for PartitionFeeder<'_, '_, F> {
     fn try_get_target(&self, target: Target) -> Option<F> {
         self.witness.try_get_target(target)
     }
+}
+
+fn enqueue_populated_representatives_with<
+    W: UnresolvedWatchCounter,
+    Q: PendingGeneratorIndex,
+>(
+    populated_representatives: &[usize],
+    unresolved_watches: &mut [W],
+    generator_is_expired: &[bool],
+    pending_generator_indices: &mut Vec<Q>,
+    generator_indices_by_watches: &GeneratorWatchIndex,
+) {
+    for watch in populated_representatives {
+        if let Some(watchers) = generator_indices_by_watches.get(watch) {
+            for &watching_generator_idx in watchers {
+                let watching_generator_index = Q::from_watcher(watching_generator_idx);
+                let watching_generator_idx = watching_generator_index.to_usize();
+                if !generator_is_expired[watching_generator_idx] {
+                    unresolved_watches[watching_generator_idx].decrement();
+                    pending_generator_indices.push(watching_generator_index);
+                }
+            }
+        }
+    }
+}
+
+fn enqueue_populated_representatives(
+    populated_representatives: &[usize],
+    unresolved_watches: &mut UnresolvedWatchCounters,
+    generator_is_expired: &[bool],
+    pending_generator_indices: &mut PendingGeneratorIndices,
+    generator_indices_by_watches: &GeneratorWatchIndex,
+) {
+    match (unresolved_watches, pending_generator_indices) {
+        (UnresolvedWatchCounters::Compact(counters), PendingGeneratorIndices::Compact(pending)) =>
+            enqueue_populated_representatives_with(populated_representatives, counters,
+                generator_is_expired, pending, generator_indices_by_watches),
+        (UnresolvedWatchCounters::Compact(counters), PendingGeneratorIndices::Wide(pending)) =>
+            enqueue_populated_representatives_with(populated_representatives, counters,
+                generator_is_expired, pending, generator_indices_by_watches),
+        (UnresolvedWatchCounters::Wide(counters), PendingGeneratorIndices::Compact(pending)) =>
+            enqueue_populated_representatives_with(populated_representatives, counters,
+                generator_is_expired, pending, generator_indices_by_watches),
+        (UnresolvedWatchCounters::Wide(counters), PendingGeneratorIndices::Wide(pending)) =>
+            enqueue_populated_representatives_with(populated_representatives, counters,
+                generator_is_expired, pending, generator_indices_by_watches),
+    }
+}
+
+fn feed_inputs_with<F: Field, W: UnresolvedWatchCounter, Q: PendingGeneratorIndex>(
+    witness: &mut PartitionWitness<F>,
+    inputs: PartialWitness<F>,
+    unresolved_watches: &mut [W],
+    generator_is_expired: &[bool],
+    pending_generator_indices: &mut Vec<Q>,
+    generator_indices_by_watches: &GeneratorWatchIndex,
+) -> Result<()> {
+    for (target, value) in inputs.target_values.into_iter() {
+        if let Some(watch) = witness.set_target_returning_rep(target, value)? {
+            if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                for &watching_generator_idx in watchers {
+                    let watching_generator_index = Q::from_watcher(watching_generator_idx);
+                    let watching_generator_idx = watching_generator_index.to_usize();
+                    if !generator_is_expired[watching_generator_idx] {
+                        unresolved_watches[watching_generator_idx].decrement();
+                        pending_generator_indices.push(watching_generator_index);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn feed_inputs<F: Field>(
+    witness: &mut PartitionWitness<F>,
+    inputs: PartialWitness<F>,
+    unresolved_watches: &mut UnresolvedWatchCounters,
+    generator_is_expired: &[bool],
+    generator_indices_by_watches: &GeneratorWatchIndex,
+    generator_count: usize,
+) -> Result<PendingGeneratorIndices> {
+    let mut pending = PendingGeneratorIndices::empty_for_generator_count(generator_count);
+    match (unresolved_watches, &mut pending) {
+        (UnresolvedWatchCounters::Compact(counters), PendingGeneratorIndices::Compact(queue)) =>
+            feed_inputs_with(witness, inputs, counters, generator_is_expired, queue,
+                generator_indices_by_watches)?,
+        (UnresolvedWatchCounters::Compact(counters), PendingGeneratorIndices::Wide(queue)) =>
+            feed_inputs_with(witness, inputs, counters, generator_is_expired, queue,
+                generator_indices_by_watches)?,
+        (UnresolvedWatchCounters::Wide(counters), PendingGeneratorIndices::Compact(queue)) =>
+            feed_inputs_with(witness, inputs, counters, generator_is_expired, queue,
+                generator_indices_by_watches)?,
+        (UnresolvedWatchCounters::Wide(counters), PendingGeneratorIndices::Wide(queue)) =>
+            feed_inputs_with(witness, inputs, counters, generator_is_expired, queue,
+                generator_indices_by_watches)?,
+    }
+    Ok(pending)
 }
 
 /// Resumable witness generation: [`Self::start`] seeds an initial set of inputs and runs every
@@ -591,7 +945,7 @@ pub struct PendingPartitionWitness<
     const D: usize,
 > {
     witness: PartitionWitness<'a, F>,
-    unresolved_watches: Vec<usize>,
+    unresolved_watches: UnresolvedWatchCounters,
     generator_is_expired: Vec<bool>,
     remaining_generators: usize,
     prover_data: &'a ProverOnlyCircuitData<F, C, D>,
@@ -658,7 +1012,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            PendingGeneratorIndices::all(generators.len()),
             parallel_threshold,
         )?;
 
@@ -690,13 +1044,19 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &prover_data.representative_map,
         );
 
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let mut unresolved_watches =
+            UnresolvedWatchCounters::from_counts(&prover_data.generator_watch_counts);
+        let mut populated_representatives = Vec::new();
         seed(&mut PartitionSeeder {
             witness: &mut witness,
-            unresolved_watches: &mut unresolved_watches,
-            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+            populated_representatives: &mut populated_representatives,
             layout: SeedLayoutMode::Plain,
         })?;
+        decrement_populated_representatives(
+            &populated_representatives,
+            &mut unresolved_watches,
+            &prover_data.generator_indices_by_watches,
+        );
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
@@ -708,7 +1068,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            PendingGeneratorIndices::all(generators.len()),
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
@@ -737,38 +1097,30 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             common_data.degree(),
             &prover_data.representative_map,
         );
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let mut unresolved_watches =
+            UnresolvedWatchCounters::from_counts(&prover_data.generator_watch_counts);
+        let mut populated_representatives = Vec::new();
         let mut representatives = Vec::new();
         let mut target_checksum = 0u64;
         seed(&mut PartitionSeeder {
             witness: &mut witness,
-            unresolved_watches: &mut unresolved_watches,
-            generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+            populated_representatives: &mut populated_representatives,
             layout: SeedLayoutMode::Record {
                 representatives: &mut representatives,
                 checksum: &mut target_checksum,
             },
         })?;
-        // The aggregate effect of the seed on every watch counter. A replay
-        // applies exactly this sparse list instead of walking a watcher slice
-        // per newly populated representative.
-        let seeded_watch_decrements = prover_data
-            .generator_watch_counts
-            .iter()
-            .zip(&unresolved_watches)
-            .enumerate()
-            .filter_map(|(generator, (&total, &unresolved))| {
-                let decrement = total - unresolved;
-                (decrement != 0).then(|| {
-                    Ok((
-                        u32::try_from(generator)
-                            .map_err(|_| anyhow!("generator index exceeds u32"))?,
-                        u32::try_from(decrement)
-                            .map_err(|_| anyhow!("seed watcher decrement exceeds u32"))?,
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+        decrement_populated_representatives(
+            &populated_representatives,
+            &mut unresolved_watches,
+            &prover_data.generator_indices_by_watches,
+        );
+        // Preserve the evolved replay path's sparse aggregate; only its live counter backing is
+        // selected compact/wide behind this phase boundary.
+        let seeded_watch_decrements = collect_seeded_watch_decrements(
+            &prover_data.generator_watch_counts,
+            &unresolved_watches,
+        )?;
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
@@ -778,7 +1130,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            PendingGeneratorIndices::all(generators.len()),
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
         Ok((
@@ -823,12 +1175,13 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             common_data.degree(),
             &prover_data.representative_map,
         );
-        let mut unresolved_watches = prover_data.generator_watch_counts.to_vec();
+        let mut unresolved_watches =
+            UnresolvedWatchCounters::from_counts(&prover_data.generator_watch_counts);
+        let mut populated_representatives = Vec::new();
         let (cursor, checksum) = {
             let mut seeder = PartitionSeeder {
                 witness: &mut witness,
-                unresolved_watches: &mut unresolved_watches,
-                generator_indices_by_watches: &prover_data.generator_indices_by_watches,
+                populated_representatives: &mut populated_representatives,
                 layout: SeedLayoutMode::Replay {
                     representatives: &layout.representatives,
                     cursor: 0,
@@ -858,14 +1211,10 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 "seed layout target sequence checksum mismatch",
             ));
         }
-        for &(generator, decrement) in &layout.seeded_watch_decrements {
-            let count = &mut unresolved_watches[generator as usize];
-            let decrement = decrement as usize;
-            if *count < decrement {
-                return Err(seed_layout_mismatch("seed layout watcher decrement underflow"));
-            }
-            *count -= decrement;
-        }
+        apply_seeded_watch_decrements(
+            &mut unresolved_watches,
+            &layout.seeded_watch_decrements,
+        )?;
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
@@ -875,7 +1224,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            PendingGeneratorIndices::all(generators.len()),
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
         Ok(Self {
@@ -892,23 +1241,14 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// newly populated representatives are queued; every other unfinished generator was already
     /// run to quiescence and cannot make progress without new values.
     pub fn feed(&mut self, inputs: PartialWitness<F>) -> Result<()> {
-        let generator_indices_by_watches = &self.prover_data.generator_indices_by_watches;
-
-        let mut pending_generator_indices = Vec::new();
-        for (t, v) in inputs.target_values.into_iter() {
-            if let Some(watch) = self.witness.set_target_returning_rep(t, v)? {
-                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
-                    for &watching_generator_idx in watchers {
-                        let watching_generator_idx = watching_generator_idx as usize;
-                        if !self.generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                            self.unresolved_watches[watching_generator_idx] -= 1;
-                            pending_generator_indices.push(watching_generator_idx);
-                        }
-                    }
-                }
-            }
-        }
+        let pending_generator_indices = feed_inputs(
+            &mut self.witness,
+            inputs,
+            &mut self.unresolved_watches,
+            &self.generator_is_expired,
+            &self.prover_data.generator_indices_by_watches,
+            self.prover_data.generators.len(),
+        )?;
 
         run_generator_worklist(
             &mut self.witness,
@@ -930,14 +1270,21 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         &mut self,
         seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
     ) -> Result<()> {
-        let mut pending_generator_indices = Vec::new();
+        let mut populated_representatives = Vec::new();
         seed(&mut PartitionFeeder {
             witness: &mut self.witness,
-            unresolved_watches: &mut self.unresolved_watches,
-            generator_is_expired: &self.generator_is_expired,
-            pending_generator_indices: &mut pending_generator_indices,
-            generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+            populated_representatives: &mut populated_representatives,
         })?;
+        let mut pending_generator_indices = PendingGeneratorIndices::empty_for_generator_count(
+            self.prover_data.generators.len(),
+        );
+        enqueue_populated_representatives(
+            &populated_representatives,
+            &mut self.unresolved_watches,
+            &self.generator_is_expired,
+            &mut pending_generator_indices,
+            &self.prover_data.generator_indices_by_watches,
+        );
 
         run_generator_worklist(
             &mut self.witness,
@@ -1470,6 +1817,178 @@ mod tests {
     }
 
     #[test]
+    fn pending_generator_index_storage_selects_checked_boundary_and_order() {
+        let all = PendingGeneratorIndices::all(4);
+        assert!(all.is_compact());
+        assert_eq!(all.to_usize_vec(), vec![0, 1, 2, 3]);
+
+        let compact_boundary =
+            PendingGeneratorIndices::empty_for_generator_count(u32::MAX as usize);
+        assert!(compact_boundary.is_compact());
+
+        #[cfg(target_pointer_width = "64")]
+        {
+            let wide = PendingGeneratorIndices::empty_for_generator_count(u32::MAX as usize + 1);
+            assert!(!wide.is_compact());
+            assert!(wide.to_usize_vec().is_empty());
+        }
+    }
+
+    #[test]
+    fn unresolved_watch_counter_storage_selects_checked_boundary() {
+        let mut compact = UnresolvedWatchCounters::from_counts(&[0, 1, 254, 255]);
+        assert!(compact.is_compact());
+        assert_eq!(compact.to_usize_vec(), vec![0, 1, 254, 255]);
+        let UnresolvedWatchCounters::Compact(compact_counters) = &mut compact else {
+            unreachable!()
+        };
+        for _ in 0..255 {
+            compact_counters[3].decrement();
+        }
+        assert_eq!(compact_counters[3], 0);
+
+        let mut wide = UnresolvedWatchCounters::from_counts(&[0, 1, 255, 256]);
+        assert!(!wide.is_compact());
+        assert_eq!(wide.to_usize_vec(), vec![0, 1, 255, 256]);
+        let UnresolvedWatchCounters::Wide(wide_counters) = &mut wide else {
+            unreachable!()
+        };
+        for _ in 0..256 {
+            wide_counters[3].decrement();
+        }
+        assert_eq!(wide_counters[3], 0);
+    }
+
+    fn wide_counter_fixture() -> (
+        crate::plonk::circuit_data::CircuitData<F, C, D>,
+        Vec<Target>,
+        Target,
+    ) {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let dependencies = (0..256)
+            .map(|_| builder.add_virtual_target())
+            .collect::<Vec<_>>();
+        let output = builder.add_virtual_target();
+        builder.add_simple_generator(CountingSimpleGenerator {
+            dependencies: dependencies.clone(),
+            output,
+            dependency_calls: Arc::new(AtomicUsize::new(0)),
+            run_calls: Arc::new(AtomicUsize::new(0)),
+        });
+        builder.register_public_input(output);
+        (builder.build::<C>(), dependencies, output)
+    }
+
+    fn wide_counter_inputs(dependencies: &[Target], len: usize) -> Result<PartialWitness<F>> {
+        let mut inputs = PartialWitness::new();
+        for (index, &target) in dependencies[..len].iter().enumerate() {
+            inputs.set_target(target, F::from_canonical_usize(index + 1))?;
+        }
+        Ok(inputs)
+    }
+
+    #[test]
+    fn wide_watch_counters_preserve_serial_parallel_record_replay_and_feed_paths() -> Result<()> {
+        let (circuit, dependencies, output) = wide_counter_fixture();
+        assert_eq!(
+            circuit.prover_only.generator_watch_counts.iter().copied().max(),
+            Some(256)
+        );
+        let early = wide_counter_inputs(&dependencies, 255)?;
+        let mut late = PartialWitness::new();
+        late.set_target(dependencies[255], F::from_canonical_usize(256))?;
+        let expected = (1..=256).map(F::from_canonical_usize).sum::<F>();
+
+        let mut sequential = PendingPartitionWitness::start_with_threshold(
+            early.clone(), &circuit.prover_only, &circuit.common, usize::MAX,
+        )?;
+        assert!(!sequential.unresolved_watches.is_compact());
+        assert!(sequential.witness.try_get_target(output).is_none());
+        sequential.feed(late.clone())?;
+        let sequential = sequential.finish()?;
+        assert_eq!(sequential.get_target(output), expected);
+
+        let parallel_guard = ParallelWitnessGuard::new();
+        let mut parallel = PendingPartitionWitness::start_with_threshold(
+            early.clone(), &circuit.prover_only, &circuit.common, 1,
+        )?;
+        assert!(!parallel.unresolved_watches.is_compact());
+        parallel.feed(late.clone())?;
+        let parallel = parallel.finish()?;
+        drop(parallel_guard);
+        assert_eq!(parallel.get_target(output), expected);
+
+        let seed_early = |seeder: &mut PartitionSeeder<'_, '_, F>| -> Result<()> {
+            for (index, &target) in dependencies[..255].iter().enumerate() {
+                seeder.set_target(target, F::from_canonical_usize(index + 1))?;
+            }
+            Ok(())
+        };
+        let (mut recorded, layout) = PendingPartitionWitness::start_seeded_recording(
+            &circuit.prover_only, &circuit.common, seed_early,
+        )?;
+        assert!(!recorded.unresolved_watches.is_compact());
+        recorded.feed_seeded(|feeder| {
+            feeder.set_target(dependencies[255], F::from_canonical_usize(256))
+        })?;
+        let recorded = recorded.finish()?;
+        assert_eq!(recorded.get_target(output), expected);
+
+        let mut replayed = PendingPartitionWitness::start_seeded_with_layout(
+            &circuit.prover_only, &circuit.common, &layout, seed_early,
+        )?;
+        assert!(!replayed.unresolved_watches.is_compact());
+        replayed.feed(late)?;
+        let replayed = replayed.finish()?;
+        assert_eq!(replayed.get_target(output), expected);
+
+        for position in 0..sequential.values.len() {
+            if sequential.is_set_by_rep_index(position) {
+                assert_eq!(sequential.values[position], parallel.values[position]);
+                assert_eq!(sequential.values[position], recorded.values[position]);
+                assert_eq!(sequential.values[position], replayed.values[position]);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_width_pending_queue_fallback_runs_exact_worklist() -> Result<()> {
+        let (circuit, dependencies, output) = wide_counter_fixture();
+        let inputs = wide_counter_inputs(&dependencies, dependencies.len())?;
+        let expected = (1..=256).map(F::from_canonical_usize).sum::<F>();
+        let mut witness = PartitionWitness::new(
+            circuit.common.config.num_wires,
+            circuit.common.degree(),
+            &circuit.prover_only.representative_map,
+        );
+        let mut unresolved_watches = seed_inputs_and_unresolved_watches(
+            &mut witness,
+            inputs,
+            &circuit.prover_only.generator_watch_counts,
+            &circuit.prover_only.generator_indices_by_watches,
+        )?;
+        assert!(!unresolved_watches.is_compact());
+        let mut generator_is_expired = vec![false; circuit.prover_only.generators.len()];
+        let mut remaining_generators = circuit.prover_only.generators.len();
+        let pending = PendingGeneratorIndices::Wide(
+            (0..circuit.prover_only.generators.len()).collect(),
+        );
+        run_generator_worklist(
+            &mut witness,
+            &circuit.prover_only,
+            &mut unresolved_watches,
+            &mut generator_is_expired,
+            &mut remaining_generators,
+            pending,
+            usize::MAX,
+        )?;
+        assert_eq!(remaining_generators, 0);
+        assert_eq!(witness.get_target(output), expected);
+        Ok(())
+    }
+
+    #[test]
     fn simple_generator_uses_representative_readiness_without_rescanning_dependencies() {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let initial = builder.add_virtual_target();
@@ -1829,7 +2348,7 @@ mod tests {
             )?;
 
             assert_eq!(
-                new_counts, legacy_counts,
+                new_counts.to_usize_vec(), legacy_counts,
                 "unresolved-watch counts diverge from the legacy map scan"
             );
             assert_eq!(new_witness.set_bitmap, legacy_witness.set_bitmap);
