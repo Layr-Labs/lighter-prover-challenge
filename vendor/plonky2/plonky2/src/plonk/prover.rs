@@ -2101,6 +2101,25 @@ fn compute_quotient_polys<
     // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
+    // When at least one Metal quotient job is in flight, every producer's
+    // values are numerators on the same quotient domain and the completed
+    // quotient is assembled by the challenge-column scatter below. Leave the
+    // CPU batch unscaled in that case and let the scatter apply the common
+    // `Z_H(i)^-1` exactly once per written slot. Without any Metal job the
+    // established CPU-only schedule is kept unchanged (the denominator
+    // multiplication stays inside the hot 32-point batch, exactly as before).
+    //
+    // This flag, not `has_gpu_values` below, also selects the scatter: the
+    // two are provably equal (a failed `job.finish()` returns out of this
+    // function through a full CPU recompute, so a job that was started and
+    // not returned from always yields values), and gating both decisions on
+    // one flag means no reachable state can leave the CPU batch unscaled
+    // while skipping the scatter that scales it.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let any_gpu_quotient =
+        gpu_poseidon.is_some() || gpu_range.is_some() || gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let any_gpu_quotient = false;
     let quotient_len = points.len() * num_challenges;
     let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
     // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
@@ -2357,14 +2376,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if !any_gpu_quotient {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2506,12 +2527,22 @@ fn compute_quotient_polys<
         || gpu_permutation_values.is_some();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let has_gpu_values = false;
+    // Invariant, not an assumption: every started Metal quotient job either
+    // yields values or returns out of this function through a full CPU
+    // recompute, so the two flags agree on every reachable path.
+    debug_assert_eq!(has_gpu_values, any_gpu_quotient);
 
-    if has_gpu_values {
+    if any_gpu_quotient {
         // The per-challenge columns are the next (IFFT) consumer, so write
         // the completed quotient directly into them. This folds the former
         // GPU accumulation pass and point-major scatter pass into one walk:
         // CPU quotient pages are now read once and never dirtied again.
+        // Every producer contributed a numerator on the same quotient domain
+        // (the CPU batch left its own unscaled above), so the common
+        // `Z_H(i)^-1` is applied exactly once to the finished sum as it is
+        // written. Congruent to the per-producer scaling it replaces by
+        // distributivity; see the `fused_last_gpu_point` differential in the
+        // test module below for the raw-representative statement.
         // validator population; this comment changes no executable behavior.
         quotient_values
             .par_chunks_exact(num_challenges)
@@ -2526,15 +2557,16 @@ fn compute_quotient_polys<
                     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                     {
                         if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge] * denominator_inv;
+                            value += values[start + challenge];
                         }
                         if let Some(values) = gpu_range_values {
-                            value += values[start + challenge] * denominator_inv;
+                            value += values[start + challenge];
                         }
                         if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge] * denominator_inv;
+                            value += values[start + challenge];
                         }
                     }
+                    let value = value * denominator_inv;
                     // SAFETY: point `i` is owned by this parallel iteration,
                     // and every (challenge, point) destination is written once.
                     unsafe { *column.0.add(i) = value };
@@ -3899,5 +3931,165 @@ mod permutation_pairing_tests {
                 assert_eq!(paired[challenge][column].values, reference[column]);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fused_last_gpu_point_tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::types::{Field, Field64, PrimeField64};
+
+    type F = GoldilocksField;
+
+    /// The spelling `fused_last_gpu_point` replaces: the CPU batch is scaled by
+    /// `Z_H(i)^-1` inside the 32-point batch loop, then every GPU numerator is
+    /// scaled again as it is accumulated into the challenge column.
+    fn per_producer(cpu: F, gpu: &[F], d: F) -> F {
+        let mut value = cpu * d;
+        for &g in gpu {
+            value += g * d;
+        }
+        value
+    }
+
+    /// `fused_last_gpu_point`: the CPU batch is left unscaled, the numerators
+    /// are summed, and the common `Z_H(i)^-1` is applied once per written slot.
+    fn fused(cpu: F, gpu: &[F], d: F) -> F {
+        let mut value = cpu;
+        for &g in gpu {
+            value += g;
+        }
+        value * d
+    }
+
+    /// Deterministic splitmix64, so the differential is reproducible.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn field(&mut self) -> F {
+            F::from_canonical_u64(self.next() % F::ORDER)
+        }
+    }
+
+    /// Over the real scatter shape — three GPU producers (Poseidon2 gate,
+    /// RangeCheck gate, permutation) and `num_challenges == 2` — the two
+    /// spellings agree as FIELD ELEMENTS on every slot.
+    #[test]
+    fn fused_point_is_canonically_equal_over_the_real_shapes() {
+        const NUM_CHALLENGES: usize = 2;
+        const POINTS: usize = 50_000;
+        let mut rng = Rng(0xB24_0000);
+        for producers in 1..=3usize {
+            for _ in 0..POINTS {
+                let d = rng.field();
+                for _ in 0..NUM_CHALLENGES {
+                    let cpu = rng.field();
+                    let gpu: Vec<F> = (0..producers).map(|_| rng.field()).collect();
+                    assert_eq!(per_producer(cpu, &gpu, d), fused(cpu, &gpu, d));
+                }
+            }
+        }
+    }
+
+    /// The two spellings are congruent, never bit-identical by construction.
+    /// Both raw representatives live in `[0, 2^64)` and are congruent mod
+    /// `ORDER`, so they are either equal or differ by exactly `ORDER` — and the
+    /// latter forces the shared canonical value below `2^32 - 1`, because
+    /// `v + ORDER` must still fit in a `u64`. Asserted on every draw, so any
+    /// future divergence outside that window fails the suite.
+    #[test]
+    fn fused_point_raw_divergence_is_confined_to_the_epsilon_window() {
+        const EPSILON: u64 = u32::MAX as u64;
+        let mut rng = Rng(0xB24_0001);
+        let mut divergences = 0u64;
+        for _ in 0..200_000 {
+            let d = rng.field();
+            let cpu = rng.field();
+            let gpu: Vec<F> = (0..3).map(|_| rng.field()).collect();
+            let old = per_producer(cpu, &gpu, d);
+            let new = fused(cpu, &gpu, d);
+            assert_eq!(old.to_canonical_u64(), new.to_canonical_u64());
+            let (a, b) = (old.to_noncanonical_u64(), new.to_noncanonical_u64());
+            if a != b {
+                divergences += 1;
+                assert_eq!(a.abs_diff(b), F::ORDER, "congruent values differ by ORDER");
+                assert!(old.to_canonical_u64() < EPSILON);
+            }
+        }
+        // Reachability, recorded rather than assumed: a raw divergence needs the
+        // finished quotient slot to land below 2^32-1, which random field data
+        // does not do in this many draws.
+        assert_eq!(divergences, 0);
+    }
+
+    /// `fused_last_gpu_point` is NOT raw-u64 bit-identical. This is the
+    /// constructed witness: all three inputs are canonical, the two spellings
+    /// are congruent, and their raw `u64` representatives differ by exactly
+    /// `ORDER`. Ships as an assertion so nobody can later re-label this
+    /// mechanism raw-exact without the suite objecting.
+    #[test]
+    fn fused_point_is_canonical_only_not_raw_identical() {
+        let cpu = GoldilocksField(1);
+        let gpu = [GoldilocksField(F::ORDER - 1)];
+        let d = GoldilocksField((1u64 << 32) + 1);
+        assert!(cpu.to_noncanonical_u64() < F::ORDER);
+        assert!(gpu[0].to_noncanonical_u64() < F::ORDER);
+        assert!(d.to_noncanonical_u64() < F::ORDER);
+
+        let old = per_producer(cpu, &gpu, d);
+        let new = fused(cpu, &gpu, d);
+        assert_eq!(old, new, "congruent as field elements");
+        assert_eq!(old.to_canonical_u64(), new.to_canonical_u64());
+        assert_eq!(old.to_noncanonical_u64(), 0xffff_ffff_0000_0001);
+        assert_eq!(new.to_noncanonical_u64(), 0x0000_0000_0000_0000);
+        assert_ne!(
+            old.to_noncanonical_u64(),
+            new.to_noncanonical_u64(),
+            "canonical-only: raw representatives differ"
+        );
+    }
+
+    /// Sabotage control. The differential above must be able to FAIL: dropping
+    /// one numerator from the fused sum, or scaling one producer twice, has to
+    /// break canonical equality on real data.
+    #[test]
+    fn sabotage_controls_trip() {
+        let mut rng = Rng(0xB24_0002);
+        let mut dropped_trips = 0u64;
+        let mut double_scaled_trips = 0u64;
+        const TRIALS: u64 = 20_000;
+        for _ in 0..TRIALS {
+            let d = rng.field();
+            let cpu = rng.field();
+            let gpu: Vec<F> = (0..3).map(|_| rng.field()).collect();
+            let reference = per_producer(cpu, &gpu, d);
+
+            // Sabotage 1: fuse only two of the three numerators.
+            let dropped = fused(cpu, &gpu[..2], d);
+            if dropped != reference {
+                dropped_trips += 1;
+            }
+
+            // Sabotage 2: fuse, but leave the CPU batch scaled as well, i.e.
+            // forget hunk B. This is the exact failure the `any_gpu_quotient`
+            // gate exists to prevent.
+            let double_scaled = fused(cpu * d, &gpu, d);
+            if double_scaled != reference {
+                double_scaled_trips += 1;
+            }
+        }
+        assert_eq!(dropped_trips, TRIALS, "dropped-numerator sabotage must trip");
+        assert_eq!(
+            double_scaled_trips, TRIALS,
+            "double-scaled-CPU sabotage must trip"
+        );
     }
 }
