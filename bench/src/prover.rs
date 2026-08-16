@@ -95,7 +95,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // leaner build (window + dead-stores, reorder dropped): 30.6542 and 30.7417,
 // mean 30.698 against same-window fast peers ~30.30 = +1.3% on both, and the
 // second lands 0.158 under the 30.8996 bar.
-const LIGHT_TX_PROOF_WINDOW: usize = 4;
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
