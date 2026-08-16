@@ -1043,6 +1043,22 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+/// Grow or shrink `out` to `len` without a zero fill. Callers overwrite every
+/// slot (here: per-column `copy_from_slice` of the constants/sigmas cache)
+/// before any read. `F` is a plain field wrapper.
+fn resize_overwritten<F: Field>(out: &mut Vec<F>, len: usize) {
+    if out.len() == len {
+        return;
+    }
+    if out.capacity() < len {
+        out.reserve(len - out.len());
+    }
+    // SAFETY: callers write every slot before any read.
+    unsafe {
+        out.set_len(len);
+    }
+}
+
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
 /// lookups, two challenges, the 135-wire/123-constraint Poseidon2 gate, and
@@ -2166,7 +2182,7 @@ fn compute_quotient_polys<
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
+                    resize_overwritten(&mut scratch.local_constants, cc * n);
                     for ci in 0..cc {
                         scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
                             &cache[ci * q + cache_start..ci * q + cache_start + n],
@@ -2176,7 +2192,7 @@ fn compute_quotient_polys<
                         scratch.s_sigmas_flat.clear();
                     } else {
                         let sc = common_data.sigmas_range().len();
-                        scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
+                        resize_overwritten(&mut scratch.s_sigmas_flat, sc * n);
                         for ci in 0..sc {
                             scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
                                 &cache[(cc + ci) * q + cache_start
