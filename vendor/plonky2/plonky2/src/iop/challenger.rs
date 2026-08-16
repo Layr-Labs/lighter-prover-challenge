@@ -1,5 +1,5 @@
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use core::marker::PhantomData;
 
 use crate::field::extension::{Extendable, FieldExtension};
@@ -15,8 +15,8 @@ use crate::plonk::config::{AlgebraicHasher, GenericHashOut, Hasher};
 #[derive(Clone, Debug)]
 pub struct Challenger<F: RichField, H: Hasher<F>> {
     pub(crate) sponge_state: H::Permutation,
-    pub(crate) input_buffer: Vec<F>,
-    output_buffer: Vec<F>,
+    buffer: Vec<F>,
+    buffer_is_output: bool,
 }
 
 /// Observes prover messages, and generates verifier challenges based on the transcript.
@@ -31,18 +31,21 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     pub fn new() -> Challenger<F, H> {
         Challenger {
             sponge_state: H::Permutation::new(core::iter::repeat(F::ZERO)),
-            input_buffer: Vec::with_capacity(H::Permutation::RATE),
-            output_buffer: Vec::with_capacity(H::Permutation::RATE),
+            buffer: Vec::with_capacity(H::Permutation::RATE),
+            buffer_is_output: false,
         }
     }
 
     pub fn observe_element(&mut self, element: F) {
         // Any buffered outputs are now invalid, since they wouldn't reflect this input.
-        self.output_buffer.clear();
+        if self.buffer_is_output {
+            self.buffer.clear();
+            self.buffer_is_output = false;
+        }
 
-        self.input_buffer.push(element);
+        self.buffer.push(element);
 
-        if self.input_buffer.len() == H::Permutation::RATE {
+        if self.buffer.len() == H::Permutation::RATE {
             self.duplexing();
         }
     }
@@ -84,11 +87,11 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     pub fn get_challenge(&mut self) -> F {
         // If we have buffered inputs, we must perform a duplexing so that the challenge will
         // reflect them. Or if we've run out of outputs, we must perform a duplexing to get more.
-        if !self.input_buffer.is_empty() || self.output_buffer.is_empty() {
+        if !self.buffer_is_output || self.buffer.is_empty() {
             self.duplexing();
         }
 
-        self.output_buffer
+        self.buffer
             .pop()
             .expect("Output buffer should be non-empty")
     }
@@ -133,28 +136,40 @@ impl<F: RichField, H: Hasher<F>> Challenger<F, H> {
     /// Absorb any buffered inputs. After calling this, the input buffer will be empty, and the
     /// output buffer will be full.
     fn duplexing(&mut self) {
-        assert!(self.input_buffer.len() <= H::Permutation::RATE);
+        assert!(self.buffer.len() <= H::Permutation::RATE);
 
         // Overwrite the first r elements with the inputs. This differs from a standard sponge,
         // where we would xor or add in the inputs. This is a well-known variant, though,
         // sometimes called "overwrite mode".
-        self.sponge_state
-            .set_from_iter(self.input_buffer.drain(..), 0);
+        if !self.buffer_is_output {
+            self.sponge_state.set_from_iter(self.buffer.drain(..), 0);
+        } else {
+            debug_assert!(self.buffer.is_empty());
+        }
 
         // Apply the permutation.
         self.sponge_state.permute();
 
-        self.output_buffer.clear();
-        self.output_buffer
-            .extend_from_slice(self.sponge_state.squeeze());
+        self.buffer.clear();
+        self.buffer.extend_from_slice(self.sponge_state.squeeze());
+        self.buffer_is_output = true;
     }
 
     pub fn compact(&mut self) -> H::Permutation {
-        if !self.input_buffer.is_empty() {
+        if !self.buffer_is_output && !self.buffer.is_empty() {
             self.duplexing();
         }
-        self.output_buffer.clear();
+        self.buffer.clear();
+        self.buffer_is_output = true;
         self.sponge_state
+    }
+
+    pub(crate) fn buffered_inputs(&self) -> &[F] {
+        if self.buffer_is_output {
+            &[]
+        } else {
+            &self.buffer
+        }
     }
 }
 
@@ -171,8 +186,8 @@ impl<F: RichField, H: AlgebraicHasher<F>> Default for Challenger<F, H> {
 pub struct RecursiveChallenger<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
 {
     sponge_state: H::AlgebraicPermutation,
-    input_buffer: Vec<Target>,
-    output_buffer: Vec<Target>,
+    buffer: Vec<Target>,
+    buffer_is_output: bool,
     __: PhantomData<(F, H)>,
 }
 
@@ -183,8 +198,8 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
         let zero = builder.zero();
         Self {
             sponge_state: H::AlgebraicPermutation::new(core::iter::repeat(zero)),
-            input_buffer: Vec::new(),
-            output_buffer: Vec::new(),
+            buffer: Vec::with_capacity(H::AlgebraicPermutation::RATE),
+            buffer_is_output: false,
             __: PhantomData,
         }
     }
@@ -192,17 +207,20 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
     pub fn from_state(sponge_state: H::AlgebraicPermutation) -> Self {
         Self {
             sponge_state,
-            input_buffer: vec![],
-            output_buffer: vec![],
+            buffer: Vec::with_capacity(H::AlgebraicPermutation::RATE),
+            buffer_is_output: false,
             __: PhantomData,
         }
     }
 
     pub fn observe_element(&mut self, target: Target) {
         // Any buffered outputs are now invalid, since they wouldn't reflect this input.
-        self.output_buffer.clear();
+        if self.buffer_is_output {
+            self.buffer.clear();
+            self.buffer_is_output = false;
+        }
 
-        self.input_buffer.push(target);
+        self.buffer.push(target);
     }
 
     pub fn observe_elements(&mut self, targets: &[Target]) {
@@ -234,13 +252,15 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
     pub fn get_challenge(&mut self, builder: &mut CircuitBuilder<F, D>) -> Target {
         self.absorb_buffered_inputs(builder);
 
-        if self.output_buffer.is_empty() {
+        if !self.buffer_is_output || self.buffer.is_empty() {
             // Evaluate the permutation to produce `r` new outputs.
             self.sponge_state = builder.permute::<H>(self.sponge_state);
-            self.output_buffer = self.sponge_state.squeeze().to_vec();
+            self.buffer.clear();
+            self.buffer.extend_from_slice(self.sponge_state.squeeze());
+            self.buffer_is_output = true;
         }
 
-        self.output_buffer
+        self.buffer
             .pop()
             .expect("Output buffer should be non-empty")
     }
@@ -284,11 +304,11 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
     /// Absorb any buffered inputs. After calling this, the input buffer will be empty, and the
     /// output buffer will be full.
     fn absorb_buffered_inputs(&mut self, builder: &mut CircuitBuilder<F, D>) {
-        if self.input_buffer.is_empty() {
+        if self.buffer_is_output || self.buffer.is_empty() {
             return;
         }
 
-        for input_chunk in self.input_buffer.chunks(H::AlgebraicPermutation::RATE) {
+        for input_chunk in self.buffer.chunks(H::AlgebraicPermutation::RATE) {
             // Overwrite the first r elements with the inputs. This differs from a standard sponge,
             // where we would xor or add in the inputs. This is a well-known variant, though,
             // sometimes called "overwrite mode".
@@ -296,14 +316,15 @@ impl<F: RichField + Extendable<D>, H: AlgebraicHasher<F>, const D: usize>
             self.sponge_state = builder.permute::<H>(self.sponge_state);
         }
 
-        self.output_buffer = self.sponge_state.squeeze().to_vec();
-
-        self.input_buffer.clear();
+        self.buffer.clear();
+        self.buffer.extend_from_slice(self.sponge_state.squeeze());
+        self.buffer_is_output = true;
     }
 
     pub fn compact(&mut self, builder: &mut CircuitBuilder<F, D>) -> H::AlgebraicPermutation {
         self.absorb_buffered_inputs(builder);
-        self.output_buffer.clear();
+        self.buffer.clear();
+        self.buffer_is_output = true;
         self.sponge_state
     }
 }
