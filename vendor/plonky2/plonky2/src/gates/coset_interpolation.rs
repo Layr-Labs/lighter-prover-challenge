@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -322,6 +323,107 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
+
+        // The ranked CPU shape is exactly D=2, subgroup_bits=4, degree=6,
+        // two intermediates and a 32-point batch. Its values and constraint
+        // buffers are overwritten completely before either is read, so keep
+        // their uninitialized storage on the stack. Every other shape retains
+        // the established heap-backed implementation below.
+        if D == 2
+            && self.subgroup_bits == 4
+            && self.degree == 6
+            && self.num_intermediates() == 2
+            && n == 32
+            && num_constraints == 12
+        {
+            let mut values_storage = [MaybeUninit::<F::Extension>::uninit(); 16];
+            let mut scratch_storage = [MaybeUninit::<F>::uninit(); 12 * 32];
+
+            for (p, vars) in vars_base.iter().enumerate() {
+                let shift = vars.local_wires[self.wire_shift()];
+                let evaluation_point = vars.get_local_ext(self.wires_evaluation_point());
+                let shifted_evaluation_point =
+                    vars.get_local_ext(self.wires_shifted_evaluation_point());
+                let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
+                    .to_basefield_array();
+                for (d, a) in arr.iter().enumerate() {
+                    scratch_storage[d * n + p].write(*a);
+                }
+
+                for (i, value) in values_storage.iter_mut().enumerate() {
+                    value.write(vars.get_local_ext(self.wires_value(i)));
+                }
+                // SAFETY: the loop immediately above initialized all 16 slots;
+                // `MaybeUninit<T>` has the same layout and alignment as `T`.
+                let values = unsafe {
+                    core::slice::from_raw_parts(
+                        values_storage.as_ptr().cast::<F::Extension>(),
+                        values_storage.len(),
+                    )
+                };
+
+                let (mut computed_eval, mut computed_prod) = partial_interpolate(
+                    &domain[..self.degree()],
+                    &values[..self.degree()],
+                    &weights[..self.degree()],
+                    shifted_evaluation_point,
+                    F::Extension::ZERO,
+                    F::Extension::ONE,
+                );
+
+                let mut row = D;
+                for i in 0..self.num_intermediates() {
+                    let intermediate_eval = vars.get_local_ext(self.wires_intermediate_eval(i));
+                    let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
+                    let arr = (intermediate_eval - computed_eval).to_basefield_array();
+                    for (d, a) in arr.iter().enumerate() {
+                        scratch_storage[(row + d) * n + p].write(*a);
+                    }
+                    row += D;
+                    let arr = (intermediate_prod - computed_prod).to_basefield_array();
+                    for (d, a) in arr.iter().enumerate() {
+                        scratch_storage[(row + d) * n + p].write(*a);
+                    }
+                    row += D;
+
+                    let start_index = 1 + (self.degree() - 1) * (i + 1);
+                    let end_index = (start_index + self.degree() - 1).min(self.num_points());
+                    (computed_eval, computed_prod) = partial_interpolate(
+                        &domain[start_index..end_index],
+                        &values[start_index..end_index],
+                        &weights[start_index..end_index],
+                        shifted_evaluation_point,
+                        intermediate_eval,
+                        intermediate_prod,
+                    );
+                }
+
+                let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
+                let arr = (evaluation_value - computed_eval).to_basefield_array();
+                for (d, a) in arr.iter().enumerate() {
+                    scratch_storage[(row + d) * n + p].write(*a);
+                }
+                debug_assert_eq!(row + D, num_constraints);
+            }
+
+            // SAFETY: every point wrote all 12 constraint rows above before
+            // this slice is constructed; layout/alignment match `F`.
+            let scratch = unsafe {
+                core::slice::from_raw_parts(
+                    scratch_storage.as_ptr().cast::<F>(),
+                    scratch_storage.len(),
+                )
+            };
+            for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[j * n..][..n],
+                    row_slice,
+                    filters,
+                );
+            }
+            return;
+        }
+
         let mut values = vec![F::Extension::ZERO; self.num_points()];
         let mut scratch = vec![F::ZERO; num_constraints * n];
 
@@ -745,8 +847,9 @@ mod tests {
     use plonky2_util::log2_strict;
 
     use super::*;
+    use crate::field::batch_util::batch_multiply_add_inplace;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -761,31 +864,57 @@ mod tests {
         const D: usize = 2;
         type F = GoldilocksField;
 
-        let n = 32;
-        for max_degree in [2, 3, 6, 16] {
-            let gate = <CosetInterpolationGate<F, D>>::with_max_degree(4, max_degree);
-            let num_wires = <CosetInterpolationGate<F, D> as Gate<F, D>>::num_wires(&gate);
-            let num_constraints =
-                <CosetInterpolationGate<F, D> as Gate<F, D>>::num_constraints(&gate);
+        fn value(i: usize) -> F {
+            let small = ((i as u64).wrapping_mul(0x9e37_79b9) ^ 0x5a5a_a5a5) & 0xffff;
+            if i % 3 == 0 {
+                GoldilocksField(F::ORDER + small)
+            } else {
+                F::from_canonical_u64(small)
+            }
+        }
 
-            let wires_batch: Vec<F> = (0..num_wires * n).map(|_| F::rand()).collect();
-            let filters: Vec<F> = (0..n).map(|_| F::rand()).collect();
-            let initial: Vec<F> = (0..num_constraints * n).map(|_| F::rand()).collect();
-            let public_inputs_hash = HashOut::<F>::ZERO;
-            let vars_batch =
-                EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+        // n=31/33 straddle the exact n=32 admission. The other shapes
+        // independently sabotage subgroup_bits or degree while preserving D=2.
+        for n in [31, 32, 33] {
+            for (subgroup_bits, max_degree) in [(4, 2), (4, 3), (4, 6), (4, 16), (3, 6)] {
+                let gate =
+                    <CosetInterpolationGate<F, D>>::with_max_degree(subgroup_bits, max_degree);
+                let num_wires = <CosetInterpolationGate<F, D> as Gate<F, D>>::num_wires(&gate);
+                let num_constraints =
+                    <CosetInterpolationGate<F, D> as Gate<F, D>>::num_constraints(&gate);
 
-            let reference = gate.eval_unfiltered_base_batch(vars_batch);
-            let mut expected = initial.clone();
-            for (combined, row) in expected.chunks_exact_mut(n).zip(reference.chunks_exact(n)) {
-                for p in 0..n {
-                    combined[p] += row[p] * filters[p];
+                let wires_batch = (0..num_wires * n).map(|i| value(i + 1)).collect::<Vec<_>>();
+                let filters = (0..n)
+                    .map(|i| match i % 7 {
+                        0 => F::ZERO,
+                        1 => GoldilocksField(F::ORDER),
+                        _ => value(i + 20_001),
+                    })
+                    .collect::<Vec<_>>();
+                let initial = (0..num_constraints * n)
+                    .map(|i| value(i + 30_001))
+                    .collect::<Vec<_>>();
+                let public_inputs_hash = HashOut::<F>::ZERO;
+                let vars_batch =
+                    EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+
+                // The materialized per-point evaluator is the unchanged oracle.
+                let reference = gate.eval_unfiltered_base_batch(vars_batch);
+                let mut expected = initial.clone();
+                for (combined, row) in expected.chunks_exact_mut(n).zip(reference.chunks_exact(n)) {
+                    batch_multiply_add_inplace(combined, row, &filters);
+                }
+
+                let mut actual = initial;
+                gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
+                for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                    assert_eq!(
+                        actual.to_noncanonical_u64(),
+                        expected.to_noncanonical_u64(),
+                        "shape=({subgroup_bits},{max_degree},{n}) output={i}"
+                    );
                 }
             }
-
-            let mut actual = initial;
-            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
-            assert_eq!(actual, expected, "max_degree {max_degree}");
         }
     }
 
@@ -798,8 +927,6 @@ mod tests {
     fn coset_interpolation_accumulate_microbench() {
         use core::time::Duration;
         use std::time::Instant;
-
-        use crate::field::batch_util::batch_multiply_add_inplace;
 
         const D: usize = 2;
         type F = GoldilocksField;
