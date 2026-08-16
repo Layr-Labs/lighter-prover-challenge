@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -322,8 +323,30 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        // Ranked shape (subgroup_bits = 4): sixteen extension values and the
+        // num_constraints x n constraint scratch fit on the stack. Every slot
+        // is written before any read -- the value array is refilled for every
+        // point before `partial_interpolate` consumes it, and the row writes
+        // below cover exactly `num_constraints` rows per point
+        // (D + 2*D*num_intermediates + D), so no zero-fill is required. Larger
+        // generic shapes retain heap storage.
+        let mut values_stack = [MaybeUninit::<F::Extension>::uninit(); 16];
+        let mut values_heap;
+        let values_uninit: &mut [MaybeUninit<F::Extension>] =
+            if self.num_points() <= values_stack.len() {
+                &mut values_stack[..self.num_points()]
+            } else {
+                values_heap = vec![MaybeUninit::uninit(); self.num_points()];
+                &mut values_heap
+            };
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); 12 * 32];
+        let mut scratch_heap;
+        let scratch_uninit: &mut [MaybeUninit<F>] = if num_constraints * n <= scratch_stack.len() {
+            &mut scratch_stack[..num_constraints * n]
+        } else {
+            scratch_heap = vec![MaybeUninit::uninit(); num_constraints * n];
+            &mut scratch_heap
+        };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];
@@ -333,12 +356,21 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
             let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
                 .to_basefield_array();
             for (d, a) in arr.iter().enumerate() {
-                scratch[d * n + p] = *a;
+                scratch_uninit[d * n + p].write(*a);
             }
 
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = vars.get_local_ext(self.wires_value(i));
+            for (i, value) in values_uninit.iter_mut().enumerate() {
+                value.write(vars.get_local_ext(self.wires_value(i)));
             }
+            // SAFETY: every one of the `num_points` slots was written above;
+            // `MaybeUninit<F::Extension>` has the same layout and alignment as
+            // `F::Extension`.
+            let values = unsafe {
+                core::slice::from_raw_parts(
+                    values_uninit.as_mut_ptr().cast::<F::Extension>(),
+                    self.num_points(),
+                )
+            };
 
             let (mut computed_eval, mut computed_prod) = partial_interpolate(
                 &domain[..self.degree()],
@@ -355,12 +387,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
                 let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
                 let arr = (intermediate_eval - computed_eval).to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
+                    scratch_uninit[(row + d) * n + p].write(*a);
                 }
                 row += D;
                 let arr = (intermediate_prod - computed_prod).to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
+                    scratch_uninit[(row + d) * n + p].write(*a);
                 }
                 row += D;
 
@@ -379,10 +411,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
             let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
             let arr = (evaluation_value - computed_eval).to_basefield_array();
             for (d, a) in arr.iter().enumerate() {
-                scratch[(row + d) * n + p] = *a;
+                scratch_uninit[(row + d) * n + p].write(*a);
             }
+            debug_assert_eq!(row + D, num_constraints);
         }
 
+        // SAFETY: every (row, point) slot of `scratch_uninit` was written
+        // exactly once above; `MaybeUninit<F>` has the same layout and
+        // alignment as `F`.
+        let scratch = unsafe {
+            core::slice::from_raw_parts(
+                scratch_uninit.as_mut_ptr().cast::<F>(),
+                num_constraints * n,
+            )
+        };
         for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
             batch_multiply_add_inplace(
                 &mut combined_gate_constraints[j * n..][..n],
