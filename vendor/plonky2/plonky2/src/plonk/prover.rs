@@ -1634,36 +1634,17 @@ fn start_gpu_range_check_gate_quotient<
                 equality.num_ops.checked_mul(6)?,
                 equality.num_ops.checked_mul(4)?,
             ))
-        } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingGate<D>>() {
-            // The kernel's extension arithmetic is specialised to the
-            // quadratic Goldilocks extension.
-            if D != 2 {
-                None
-            } else {
-                Some((
-                    U32QuotientKind::Reducing {
-                        extension_coeffs: false,
-                    },
-                    reducing.num_coeffs,
-                    reducing.num_coeffs.checked_mul(3)?.checked_add(4)?,
-                    reducing.num_coeffs.checked_mul(2)?,
-                ))
-            }
-        } else if let Some(reducing) =
-            gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
+        } else if gate.0.as_any().is::<ReducingGate<D>>()
+            || gate.0.as_any().is::<ReducingExtensionGate<D>>()
         {
-            if D != 2 {
-                None
-            } else {
-                Some((
-                    U32QuotientKind::Reducing {
-                        extension_coeffs: true,
-                    },
-                    reducing.num_coeffs,
-                    reducing.num_coeffs.checked_mul(4)?.checked_add(4)?,
-                    reducing.num_coeffs.checked_mul(2)?,
-                ))
-            }
+            // SHRINK (offload union): keep ReducingGate/ReducingExtensionGate
+            // on the CPU reference quotient path instead of the GPU range/U32
+            // command. Their per-row quadratic-extension arithmetic is the
+            // heaviest native branch in the shared kernel; returning `None`
+            // leaves them in the generic CPU quotient pass (the oracle), so
+            // the serialized GPU stream shrinks at the cost of parallel CPU
+            // extension-field evaluation.
+            None
         } else {
             None
         };
@@ -2101,6 +2082,18 @@ fn compute_quotient_polys<
     // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
+    // When at least one Metal quotient job is in flight, every producer's
+    // values are numerators on the same quotient domain and the completed
+    // quotient is assembled by the challenge-column scatter below. Leave the
+    // CPU batch unscaled in that case and let the scatter apply the common
+    // `Z_H(i)^-1` exactly once per written slot. Without any Metal job the
+    // established CPU-only schedule is kept unchanged (the denominator
+    // multiplication stays inside the hot 32-point batch, exactly as before).
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let any_gpu_quotient =
+        gpu_poseidon.is_some() || gpu_range.is_some() || gpu_permutation.is_some();
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let any_gpu_quotient = false;
     let quotient_len = points.len() * num_challenges;
     let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
     // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
@@ -2357,14 +2350,16 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                if !any_gpu_quotient {
+                    for (&i, quotient_values) in indices_batch
+                        .iter()
+                        .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                    {
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        quotient_values
+                            .iter_mut()
+                            .for_each(|v| *v *= denominator_inv);
+                    }
                 }
             },
         );
@@ -2507,12 +2502,18 @@ fn compute_quotient_polys<
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let has_gpu_values = false;
 
+    debug_assert_eq!(has_gpu_values, any_gpu_quotient);
     if has_gpu_values {
         // The per-challenge columns are the next (IFFT) consumer, so write
         // the completed quotient directly into them. This folds the former
         // GPU accumulation pass and point-major scatter pass into one walk:
         // CPU quotient pages are now read once and never dirtied again.
-        // validator population; this comment changes no executable behavior.
+        // Every producer contributed a numerator on the same quotient domain
+        // (the CPU batch left its own unscaled above), so the common
+        // `Z_H(i)^-1` is applied exactly once to the finished sum as it is
+        // written. Value-exact against the per-producer scaling it replaces:
+        // both spellings are canonical representatives of the same field
+        // element.
         quotient_values
             .par_chunks_exact(num_challenges)
             .enumerate()
@@ -2526,15 +2527,16 @@ fn compute_quotient_polys<
                     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                     {
                         if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge] * denominator_inv;
+                            value += values[start + challenge];
                         }
                         if let Some(values) = gpu_range_values {
-                            value += values[start + challenge] * denominator_inv;
+                            value += values[start + challenge];
                         }
                         if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge] * denominator_inv;
+                            value += values[start + challenge];
                         }
                     }
+                    let value = value * denominator_inv;
                     // SAFETY: point `i` is owned by this parallel iteration,
                     // and every (challenge, point) destination is written once.
                     unsafe { *column.0.add(i) = value };
