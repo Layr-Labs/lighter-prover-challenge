@@ -1503,7 +1503,27 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// the deferred chunk trees stretched the light path — this backlog gate is
 /// the balance point.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
+/// Lowered 3 -> 1 (any runnable chain step makes the spine urgent). The note
+/// above compared a *plain unconditional* priority against this gate and picked
+/// 3 as the balance point, but that balance was struck under the same
+/// five-concurrent-workers premise as the light-window retune, where five
+/// processes shared one physical GPU. The harness runs fixtures strictly
+/// sequentially, so the only contention on the queue is this process's own
+/// chunk trees — and that internal contention is precisely what the measured
+/// 200-320 ms fold commits (against 10-50 ms alone) are made of, so it is
+/// present on the ranked host too. With a single process on the queue, giving
+/// the strictly serial spine priority costs a deferred chunk tree much less
+/// than it saves on the chain's critical path.
+///
+/// Local same-binary interleaved ABBA, 8 pairs, direct worker, public fixture,
+/// busy host: gate 3 mean 9.313 s / min 8.959; gate 1 mean 9.154 s / min 9.044
+/// — paired mean -1.70%, gate 1 winning 6/8 pairs, gate 3 keeping the single
+/// fastest run. The paired mean is the estimator this design supports; the min
+/// of eight runs is a high-variance order statistic and is reported only for
+/// completeness. Local timing cannot settle a scheduling knob on a contended
+/// host, so this rests on the causal argument above and is submitted to be
+/// tested by the ranked draw.
+const SPINE_URGENT_BACKLOG: isize = 1;
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
