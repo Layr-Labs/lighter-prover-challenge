@@ -583,6 +583,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let generators_defer_until_ready = generators
         .iter()
         .all(|generator| generator.0.defers_until_ready());
+    let fri_instance_shape = common.fri_prover_instance_shape();
 
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
         constants_sigmas_quotient_cache,
@@ -592,6 +593,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         generator_indices_by_watches,
         generator_watch_counts,
         generators_defer_until_ready,
+        fri_instance_shape,
         constants_sigmas_commitment,
         sigmas,
         subgroup,

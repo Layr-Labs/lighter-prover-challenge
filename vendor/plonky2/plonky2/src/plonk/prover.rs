@@ -482,13 +482,20 @@ where
         )
     );
     challenger.observe_openings(&openings.to_fri_openings());
-    let instance = common_data.get_fri_instance(zeta);
+    let fri_instance_shape = &prover_data.fri_instance_shape;
+    let fri_batches = [
+        (zeta, fri_instance_shape.zeta_polynomials.as_slice()),
+        (
+            g * zeta,
+            fri_instance_shape.zeta_next_polynomials.as_slice(),
+        ),
+    ];
 
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
-            &instance,
+        PolynomialBatch::<F, C, D>::prove_openings_with_borrowed_batches(
+            fri_batches,
             &[
                 &prover_data.constants_sigmas_commitment,
                 &wires_commitment,

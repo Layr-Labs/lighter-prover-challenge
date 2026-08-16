@@ -47,12 +47,24 @@ pub struct FriBatchInfoTarget<const D: usize> {
     pub polynomials: Vec<FriPolynomialInfo>,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct FriPolynomialInfo {
     /// Index into `FriInstanceInfo`'s `oracles` list.
     pub oracle_index: usize,
     /// Index of the polynomial within the oracle.
     pub polynomial_index: usize,
+}
+
+/// The proof-independent polynomial descriptor lists for a PLONK FRI opening.
+///
+/// A PLONK proof always opens the same circuit-defined polynomials at two
+/// points; only the points themselves change with the transcript. Keeping the
+/// two lists in prover data lets repeated proofs borrow them instead of
+/// rebuilding and flattening the same `Vec` graph for every proof.
+#[derive(Debug, Eq, PartialEq)]
+pub struct FriProverInstanceShape {
+    pub zeta_polynomials: Vec<FriPolynomialInfo>,
+    pub zeta_next_polynomials: Vec<FriPolynomialInfo>,
 }
 
 impl FriPolynomialInfo {

@@ -1466,12 +1466,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .generators
             .iter()
             .all(|generator| generator.0.defers_until_ready());
+        let fri_instance_shape = common.fri_prover_instance_shape();
 
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
             generator_indices_by_watches,
             generator_watch_counts,
             generators_defer_until_ready,
+            fri_instance_shape,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

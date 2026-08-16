@@ -951,12 +951,14 @@ pub trait Read {
         let generators_defer_until_ready = generators
             .iter()
             .all(|generator| generator.0.defers_until_ready());
+        let fri_instance_shape = common_data.fri_prover_instance_shape();
 
         Ok(ProverOnlyCircuitData {
             generators,
             generator_indices_by_watches,
             generator_watch_counts,
             generators_defer_until_ready,
+            fri_instance_shape,
             constants_sigmas_commitment,
             sigmas,
             subgroup,
@@ -1938,6 +1940,8 @@ pub trait Write {
             generator_watch_counts: _,
             // Runtime-only: re-derived from `generators` on read; contributes no bytes.
             generators_defer_until_ready: _,
+            // Runtime-only: re-derived from common circuit data on read; contributes no bytes.
+            fri_instance_shape: _,
             // Runtime-only: contributes no bytes; the serialized format is unchanged.
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
@@ -2345,6 +2349,7 @@ mod tests {
     use crate::gates::noop::NoopGate;
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
+    use crate::fri::structure::FriProverInstanceShape;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData, ProverOnlyCircuitData};
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::util::timing::TimingTree;
@@ -2425,13 +2430,29 @@ mod tests {
     /// the decoded data still proves and verifies.
     #[test]
     fn prover_only_data_round_trip_preserves_rep_map_and_watch_counts() -> Result<()> {
-        let (circuit, x, y) = small_circuit();
+        let (mut circuit, x, y) = small_circuit();
         let generator_serializer = DefaultGeneratorSerializer::<C, D>::default();
 
         let bytes = circuit
             .prover_only
             .to_bytes(&generator_serializer, &circuit.common)
             .unwrap();
+        let shape = core::mem::replace(
+            &mut circuit.prover_only.fri_instance_shape,
+            FriProverInstanceShape {
+                zeta_polynomials: vec![],
+                zeta_next_polynomials: vec![],
+            },
+        );
+        let bytes_without_runtime_shape = circuit
+            .prover_only
+            .to_bytes(&generator_serializer, &circuit.common)
+            .unwrap();
+        circuit.prover_only.fri_instance_shape = shape;
+        assert_eq!(
+            bytes, bytes_without_runtime_shape,
+            "runtime FRI shape changed prover-only wire bytes"
+        );
         let decoded = ProverOnlyCircuitData::<F, C, D>::from_bytes(
             &bytes,
             &generator_serializer,
@@ -2455,6 +2476,10 @@ mod tests {
             decoded.generator_watch_counts,
             circuit.prover_only.generator_watch_counts,
             "reconstructed watch counts differ from the builder-derived ones"
+        );
+        assert_eq!(
+            decoded.fri_instance_shape, circuit.prover_only.fri_instance_shape,
+            "runtime FRI shape was not reconstructed from common data"
         );
         assert_eq!(
             decoded.generators.len(),

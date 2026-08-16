@@ -19,7 +19,7 @@ use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
 use crate::fri::prover::fri_proof;
-use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
+use crate::fri::structure::{FriInstanceInfo, FriPolynomialInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
 use crate::iop::challenger::Challenger;
@@ -624,6 +624,52 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         max_num_query_steps: Option<usize>,
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
+        Self::prove_openings_with_batch_iter(
+            instance
+                .batches
+                .iter()
+                .map(|batch| (batch.point, batch.polynomials.as_slice())),
+            oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    /// PLONK's fixed two-batch opening path. The transcript-derived points live
+    /// in this stack array while both polynomial descriptor slices borrow the
+    /// circuit-owned runtime shape.
+    pub(crate) fn prove_openings_with_borrowed_batches(
+        batches: [(F::Extension, &[FriPolynomialInfo]); 2],
+        oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
+        Self::prove_openings_with_batch_iter(
+            batches,
+            oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+        )
+    }
+
+    fn prove_openings_with_batch_iter<'a>(
+        batches: impl IntoIterator<Item = (F::Extension, &'a [FriPolynomialInfo])>,
+        oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+    ) -> FriProof<F, C::Hasher, D> {
         assert!(D > 1, "Not implemented for D=1.");
         let alpha = challenger.get_extension_challenge::<D>();
         let mut alpha = ReducingFactor::new(alpha);
@@ -638,9 +684,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for (batch_index, FriBatchInfo { point, polynomials }) in
-            instance.batches.iter().enumerate()
-        {
+        for (batch_index, (point, polynomials)) in batches.into_iter().enumerate() {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -663,7 +707,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     alpha.accumulate_small_polys_base_linear_quotient(
                         polys_coeff,
                         &mut final_poly,
-                        *point,
+                        point,
                     )
                 );
                 continue;
@@ -688,10 +732,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // the reducing factor also avoids exponentiating alpha for a
                 // factor that would only multiply the empty accumulator.
                 alpha.reset();
-                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
+                final_poly = composition_poly.divide_by_linear_padded_in_place(point);
             } else {
                 let shift = alpha.shift_factor();
-                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
+                accumulate_linear_quotient(&mut final_poly, &composition_poly, point, shift);
             }
         }
 

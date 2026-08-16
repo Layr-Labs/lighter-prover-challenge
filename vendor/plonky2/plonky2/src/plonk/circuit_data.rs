@@ -29,7 +29,7 @@ use crate::fri::oracle::PolynomialBatch;
 use crate::fri::reduction_strategies::FriReductionStrategy;
 use crate::fri::structure::{
     FriBatchInfo, FriBatchInfoTarget, FriInstanceInfo, FriInstanceInfoTarget, FriOracleInfo,
-    FriPolynomialInfo,
+    FriPolynomialInfo, FriProverInstanceShape,
 };
 use crate::fri::{FriConfig, FriParams};
 use crate::gates::gate::GateRef;
@@ -660,6 +660,14 @@ pub struct ProverOnlyCircuitData<
     /// Runtime-only: a pure function of `generators`, re-derived wherever they are, so the
     /// serialized format is unchanged.
     pub generators_defer_until_ready: bool,
+    /// Polynomial descriptor lists for the two PLONK FRI opening batches.
+    ///
+    /// Only the opening points are transcript-dependent. This runtime-only
+    /// shape is derived once from [`CommonCircuitData`] at circuit build/load
+    /// time and borrowed by every proof, instead of reconstructing nine heap
+    /// allocations' worth of identical descriptors per proof. It is omitted
+    /// from serialization and deterministically reconstructed on read.
+    pub fri_instance_shape: FriProverInstanceShape,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -888,6 +896,19 @@ impl<F: RichField + Extendable<D>, const D: usize> CommonCircuitData<F, D> {
         FriInstanceInfo {
             oracles: self.fri_oracles(),
             batches: openings,
+        }
+    }
+
+    /// Materializes the proof-independent part of [`Self::get_fri_instance`].
+    ///
+    /// This deliberately reuses the owned-instance builders below so the
+    /// borrowed prover path has exactly the same descriptor order, including
+    /// lookup-enabled circuits. The native verifier and recursive APIs keep
+    /// using the existing owned instance.
+    pub fn fri_prover_instance_shape(&self) -> FriProverInstanceShape {
+        FriProverInstanceShape {
+            zeta_polynomials: self.fri_all_polys(),
+            zeta_next_polynomials: self.fri_next_batch_polys(),
         }
     }
 
@@ -1175,5 +1196,75 @@ mod generator_watch_index_tests {
             "sabotage control did not trip: the differential cannot detect a truncated watcher"
         );
         assert_eq!(actual, vec![65_536u64, 3]);
+    }
+}
+
+#[cfg(test)]
+mod fri_prover_instance_shape_tests {
+    use super::{CircuitConfig, CommonCircuitData};
+    use crate::field::extension::{Extendable, FieldExtension};
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Field;
+    use crate::gates::selectors::SelectorsInfo;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+
+    fn common_data(num_lookup_polys: usize) -> CommonCircuitData<F, D> {
+        let config = CircuitConfig::standard_recursion_config();
+        let fri_params = config.fri_config.fri_params(8, false);
+        CommonCircuitData {
+            config,
+            fri_params,
+            gates: vec![],
+            selectors_info: SelectorsInfo {
+                selector_indices: vec![],
+                groups: vec![],
+            },
+            quotient_degree_factor: 8,
+            num_gate_constraints: 0,
+            num_constants: 6,
+            num_public_inputs: 0,
+            k_is: vec![],
+            num_partial_products: 9,
+            num_lookup_polys,
+            num_lookup_selectors: 0,
+            luts: vec![],
+        }
+    }
+
+    fn assert_shape_matches_owned(common: &CommonCircuitData<F, D>) {
+        let zeta = <<F as Extendable<D>>::Extension as FieldExtension<D>>::from_basefield(
+            F::from_canonical_u64(0x1234_5678),
+        );
+        let owned = common.get_fri_instance(zeta);
+        let shape = common.fri_prover_instance_shape();
+
+        assert_eq!(owned.batches.len(), 2);
+        assert_eq!(owned.batches[0].point, zeta);
+        assert_eq!(owned.batches[0].polynomials, shape.zeta_polynomials);
+        assert_eq!(
+            owned.batches[1].polynomials,
+            shape.zeta_next_polynomials
+        );
+        assert_eq!(
+            owned.batches[1].point,
+            <F as Extendable<D>>::Extension::primitive_root_of_unity(common.degree_bits()) * zeta
+        );
+    }
+
+    #[test]
+    fn prover_shape_matches_owned_instance_without_lookups() {
+        assert_shape_matches_owned(&common_data(0));
+    }
+
+    #[test]
+    fn prover_shape_matches_owned_instance_with_lookups() {
+        let common = common_data(3);
+        assert_shape_matches_owned(&common);
+        assert_eq!(
+            common.fri_prover_instance_shape().zeta_next_polynomials.len(),
+            common.config.num_challenges + common.num_all_lookup_polys()
+        );
     }
 }
