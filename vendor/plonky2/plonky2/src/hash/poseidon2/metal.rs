@@ -507,12 +507,21 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
     }
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
+    pub(crate) fn wait_until_completed(&self) {
         self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+    }
+
+    pub(crate) fn completion_status(&self) -> MTLCommandBufferStatus {
+        self.command_buffer.status()
+    }
+
+    pub(crate) fn finish_after_fence(
+        &self,
+        status: MTLCommandBufferStatus,
+    ) -> Result<&[F], String> {
+        if status != MTLCommandBufferStatus::Completed {
             return Err(format!(
-                "Poseidon2 gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
+                "Poseidon2 gate quotient command buffer ended with status {status:?}"
             ));
         }
         // SAFETY: construction is restricted to an 8-byte Goldilocks field,
@@ -520,15 +529,29 @@ impl<F: RichField> PoseidonGateQuotientJob<F> {
         let output = self.output.as_ref().expect("quotient output present");
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
     }
+
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.wait_until_completed();
+        self.finish_after_fence(self.completion_status())
+    }
 }
 
 impl<F: RichField> RangeCheckGateQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
+    pub(crate) fn wait_until_completed(&self) {
         self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+    }
+
+    pub(crate) fn completion_status(&self) -> MTLCommandBufferStatus {
+        self.command_buffer.status()
+    }
+
+    pub(crate) fn finish_after_fence(
+        &self,
+        status: MTLCommandBufferStatus,
+    ) -> Result<&[F], String> {
+        if status != MTLCommandBufferStatus::Completed {
             return Err(format!(
-                "RangeCheck gate quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
+                "RangeCheck gate quotient command buffer ended with status {status:?}"
             ));
         }
         #[cfg(test)]
@@ -544,6 +567,11 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
     }
 
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.wait_until_completed();
+        self.finish_after_fence(self.completion_status())
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_cpu_recompute_completed_for_tests(&self) {
         if let Some(observer) = &self.failure_observer {
@@ -555,18 +583,32 @@ impl<F: RichField> RangeCheckGateQuotientJob<F> {
 }
 
 impl<F: RichField> PermutationQuotientJob<F> {
-    pub(crate) fn finish(&self) -> Result<&[F], String> {
+    pub(crate) fn wait_until_completed(&self) {
         self.command_buffer.wait_until_completed();
-        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+    }
+
+    pub(crate) fn completion_status(&self) -> MTLCommandBufferStatus {
+        self.command_buffer.status()
+    }
+
+    pub(crate) fn finish_after_fence(
+        &self,
+        status: MTLCommandBufferStatus,
+    ) -> Result<&[F], String> {
+        if status != MTLCommandBufferStatus::Completed {
             return Err(format!(
-                "Permutation quotient command buffer ended with status {:?}",
-                self.command_buffer.status()
+                "Permutation quotient command buffer ended with status {status:?}"
             ));
         }
         // SAFETY: construction is restricted to an 8-byte Goldilocks field,
         // and the completed kernel canonicalized every output word.
         let output = self.output.as_ref().expect("quotient output present");
         Ok(unsafe { slice::from_raw_parts(output.contents().cast::<F>(), self.len) })
+    }
+
+    pub(crate) fn finish(&self) -> Result<&[F], String> {
+        self.wait_until_completed();
+        self.finish_after_fence(self.completion_status())
     }
 }
 

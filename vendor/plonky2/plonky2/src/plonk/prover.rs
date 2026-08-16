@@ -1824,6 +1824,47 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+#[cfg(any(
+    test,
+    all(feature = "std", target_arch = "aarch64", target_os = "macos")
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QuotientJobSlot {
+    Poseidon,
+    Range,
+    Permutation,
+}
+
+#[cfg(any(
+    test,
+    all(feature = "std", target_arch = "aarch64", target_os = "macos")
+))]
+const fn latest_quotient_job(
+    poseidon: bool,
+    range: bool,
+    permutation: bool,
+) -> Option<QuotientJobSlot> {
+    if permutation {
+        Some(QuotientJobSlot::Permutation)
+    } else if range {
+        Some(QuotientJobSlot::Range)
+    } else if poseidon {
+        Some(QuotientJobSlot::Poseidon)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn all_quotient_statuses_completed<T: PartialEq>(
+    statuses: &[Option<T>; 3],
+    completed: &T,
+) -> bool {
+    statuses
+        .iter()
+        .all(|status| status.as_ref().is_none_or(|status| status == completed))
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2370,8 +2411,48 @@ fn compute_quotient_polys<
         );
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    match latest_quotient_job(
+        gpu_poseidon.is_some(),
+        gpu_range.is_some(),
+        gpu_permutation.is_some(),
+    ) {
+        Some(QuotientJobSlot::Permutation) => gpu_permutation
+            .as_ref()
+            .expect("active permutation quotient job")
+            .wait_until_completed(),
+        Some(QuotientJobSlot::Range) => gpu_range
+            .as_ref()
+            .expect("active RangeCheck quotient job")
+            .1
+            .wait_until_completed(),
+        Some(QuotientJobSlot::Poseidon) => gpu_poseidon
+            .as_ref()
+            .expect("active Poseidon2 quotient job")
+            .1
+            .wait_until_completed(),
+        None => {}
+    }
+    // Snapshot every retained status before processing any result. The last
+    // active command is a completion fence for the earlier commands committed
+    // to the same queue; retaining all three statuses preserves each job's own
+    // fail-closed error and the existing Poseidon -> Range -> permutation
+    // fallback priority without issuing another wait.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let quotient_batch_statuses = [
+        gpu_poseidon
+            .as_ref()
+            .map(|(_, job)| job.completion_status()),
+        gpu_range
+            .as_ref()
+            .map(|(_, job)| job.completion_status()),
+        gpu_permutation.as_ref().map(|job| job.completion_status()),
+    ];
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
-        let values = match job.finish() {
+        let values = match job.finish_after_fence(
+            quotient_batch_statuses[0].expect("active Poseidon2 quotient status"),
+        ) {
             Ok(values) => {
                 GPU_POSEIDON_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2410,7 +2491,9 @@ fn compute_quotient_polys<
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_range_values = if let Some((_, job)) = &gpu_range {
-        let values = match job.finish() {
+        let values = match job.finish_after_fence(
+            quotient_batch_statuses[1].expect("active RangeCheck quotient status"),
+        ) {
             Ok(values) => {
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 values
@@ -2452,7 +2535,9 @@ fn compute_quotient_polys<
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_permutation_values = if let Some(job) = &gpu_permutation {
-        let values = match job.finish() {
+        let values = match job.finish_after_fence(
+            quotient_batch_statuses[2].expect("active permutation quotient status"),
+        ) {
             Ok(values) => values,
             Err(error) => {
                 log::warn!(
@@ -2766,6 +2851,65 @@ pub(crate) mod precomputed {
         coset_shift_powers, inverse_coset_shift_powers_scaled, shift_powers,
         shifted_two_adic_subgroup, two_adic_subgroup,
     };
+}
+
+#[cfg(test)]
+mod quotient_batch_tests {
+    use super::{all_quotient_statuses_completed, latest_quotient_job, QuotientJobSlot};
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestStatus {
+        Completed,
+        Error,
+        Nonterminal,
+    }
+
+    #[test]
+    fn quotient_batch_latest_active_covers_every_mask() {
+        use QuotientJobSlot::{Permutation, Poseidon, Range};
+
+        for (poseidon, range, permutation, expected) in [
+            (false, false, false, None),
+            (true, false, false, Some(Poseidon)),
+            (false, true, false, Some(Range)),
+            (true, true, false, Some(Range)),
+            (false, false, true, Some(Permutation)),
+            (true, false, true, Some(Permutation)),
+            (false, true, true, Some(Permutation)),
+            (true, true, true, Some(Permutation)),
+        ] {
+            assert_eq!(
+                latest_quotient_job(poseidon, range, permutation),
+                expected,
+                "mask poseidon={poseidon} range={range} permutation={permutation}"
+            );
+        }
+    }
+
+    #[test]
+    fn quotient_batch_statuses_fail_closed_at_every_position() {
+        let completed = [Some(TestStatus::Completed); 3];
+        assert!(all_quotient_statuses_completed(
+            &completed,
+            &TestStatus::Completed
+        ));
+        assert!(all_quotient_statuses_completed(
+            &[None::<TestStatus>; 3],
+            &TestStatus::Completed
+        ));
+
+        for bad in [TestStatus::Error, TestStatus::Nonterminal] {
+            for position in 0..3 {
+                let mut statuses = [TestStatus::Completed; 3];
+                statuses[position] = bad;
+                let batch = statuses.map(Some);
+                assert!(
+                    !all_quotient_statuses_completed(&batch, &TestStatus::Completed),
+                    "{bad:?} at position {position} must fail closed"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
