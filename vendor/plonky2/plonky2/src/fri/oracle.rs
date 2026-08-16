@@ -49,6 +49,22 @@ pub(crate) enum BatchLayout {
     PolyMajor,
 }
 
+/// Grow or shrink `out` to `len` without a zero fill. Every caller overwrites
+/// all `len` slots before any is read; `F` is a plain field wrapper (any bit
+/// pattern is a valid `F`). Same idiom as `extract_lde_batch_columns`.
+fn resize_overwritten<F: Field>(out: &mut Vec<F>, len: usize) {
+    if out.len() == len {
+        return;
+    }
+    if out.capacity() < len {
+        out.reserve(len - out.len());
+    }
+    // SAFETY: callers write every slot before any read.
+    unsafe {
+        out.set_len(len);
+    }
+}
+
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -435,10 +451,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         //     `out[k * w..(k + 1) * w]`;
         //   - Rows/PolyMajor: each `k` writes `ci * n + k` for every `ci` in
         //     `0..w` (`row.len() == w`).
-        // So the zero-fill of a correctly sized buffer is a dead store: adjust
-        // the length only (`resize` is a no-op when it already matches, and
-        // still zero-initializes any newly created or grown scratch).
-        out.resize(n * w, F::ZERO);
+        // So the zero-fill is a dead store. Skip it: reused scratch already
+        // has the right length (no-op), and a first/grown buffer is written
+        // in full by every arm below before any read. Same idiom as
+        // `extract_lde_batch_columns`.
+        resize_overwritten(out, n * w);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
@@ -490,7 +507,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) {
         let start = col_range.start;
         let w = col_range.len();
-        out.resize(n * w, F::ZERO);
+        resize_overwritten(out, n * w);
 
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
