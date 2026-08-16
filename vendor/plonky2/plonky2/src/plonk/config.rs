@@ -117,6 +117,19 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         (Self::two_to_one(x0, y0), Self::two_to_one(x1, y1))
     }
 
+    /// Hash eight equal-length inputs, allowing implementations to interleave
+    /// the eight computations. Must return exactly the eight individual
+    /// `Self::hash_or_noop` results.
+    fn hash_or_noop_oct(inputs: [&[F]; 8]) -> [Self::Hash; 8] {
+        core::array::from_fn(|i| Self::hash_or_noop(inputs[i]))
+    }
+
+    /// Eight `two_to_one` calls, allowing implementations to interleave them.
+    /// Must return exactly the eight individual `Self::two_to_one` results.
+    fn two_to_one_oct(inputs: [(Self::Hash, Self::Hash); 8]) -> [Self::Hash; 8] {
+        core::array::from_fn(|i| Self::two_to_one(inputs[i].0, inputs[i].1))
+    }
+
     /// Four independent `two_to_one` compressions, allowing implementations
     /// to interleave them. Must return exactly the four individual
     /// `Self::two_to_one` results, in order.
@@ -184,6 +197,41 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
             crate::hash::merkle_tree::ColumnStore::Shared(_) => None,
         }
+    }
+
+    /// Whether a tree the backend declined should instead be built as a
+    /// concurrent CPU/backend split over its cap subtrees.
+    fn hybrid_gather_admitted(
+        _leaf_width: usize,
+        _num_leaves: usize,
+        _cap_height: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Scratch arm: walk the cap subtrees sequentially with no backend worker,
+    /// so the loop restructuring can be priced on its own.
+    fn hybrid_sequential_only(
+        _leaf_width: usize,
+        _num_leaves: usize,
+        _cap_height: usize,
+    ) -> bool {
+        false
+    }
+
+    /// Queues for the backend's exclusive resources on behalf of a tree the
+    /// caller is already building on the CPU; once granted, calls `claim` for
+    /// an aligned dyadic block of cap subtrees and returns that block's
+    /// interleaved digest chunk and cap entries. `cancel` aborts the wait.
+    #[allow(clippy::type_complexity)]
+    fn try_build_merkle_block_gather(
+        _columns: &[&[F]],
+        _log_rows: usize,
+        _cap_height: usize,
+        _cancel: &core::sync::atomic::AtomicBool,
+        _claim: &(dyn Fn() -> Option<(usize, usize)> + Sync),
+    ) -> Option<(usize, Vec<Self::Hash>, Vec<Self::Hash>)> {
+        None
     }
 
     /// Streamed variant of [`Hasher::try_build_merkle_tree_column_store`]:

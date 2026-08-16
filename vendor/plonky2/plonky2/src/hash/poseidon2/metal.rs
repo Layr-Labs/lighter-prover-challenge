@@ -762,16 +762,26 @@ impl ColumnStorePool {
 /// mismatch simply misses and falls through to a fresh allocation.
 static PREWARMED_LARGE_STORE: Mutex<Option<Buffer>> = Mutex::new(None);
 
-/// Allocates a `bytes`-sized shared buffer, touches one word per page so the
-/// kernel's zero-fill happens here (off the critical path) rather than under
-/// the final block's LDE fill, and stashes it for the next oversized
-/// [`take_or_new_column_buffer`] request. Scheduling-only: buffer contents
-/// are fully written by the fill before any read, exactly as a fresh
-/// allocation's would be.
-pub fn prewarm_large_column_store(bytes: u64) {
-    let Some(context) = shared_context() else {
-        return;
-    };
+/// One-off final-block buffer stashes. The final degree-2^18 proof's three
+/// streamed Merkle builds each need a ~128 MiB digest output and the first
+/// one also allocates the ~192 MiB streamed sponge state; the three GPU
+/// quotient jobs each need a ~32 MiB output. All of those sizes exceed the
+/// corresponding pool caps by design (`MAX_CACHED_DIGEST_OUTPUT_BYTES`,
+/// `MAX_CACHED_QUOTIENT_OUTPUT_BYTES`), so every one is a fresh
+/// kernel-zeroed allocation in the run's most serial window. The prewarm
+/// thread allocates and page-walks them while the light pipeline is still
+/// running, then hands them only to requests above the pool caps so smaller
+/// recurring shapes cannot consume them.
+static PREWARMED_FINAL_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+static PREWARMED_FINAL_QUOTIENTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+static PREWARMED_FINAL_STREAMED_STATE: Mutex<Option<Buffer>> = Mutex::new(None);
+
+/// Allocates a `bytes`-sized shared buffer and touches one word per page so
+/// the kernel's zero-fill happens off the critical path. Scheduling-only:
+/// buffer contents are fully written by the consumer before any read, exactly
+/// as a fresh allocation's would be.
+fn prewarm_device_buffer(bytes: u64) -> Option<Buffer> {
+    let context = shared_context()?;
     let buffer = autoreleasepool(|| {
         context
             .device
@@ -779,7 +789,7 @@ pub fn prewarm_large_column_store(bytes: u64) {
     });
     let base = buffer.contents().cast::<u8>();
     if base.is_null() {
-        return;
+        return None;
     }
     const PAGE: isize = 16 * 1024;
     let mut offset: isize = 0;
@@ -788,6 +798,19 @@ pub fn prewarm_large_column_store(bytes: u64) {
         unsafe { base.offset(offset).write_volatile(0) };
         offset += PAGE;
     }
+    Some(buffer)
+}
+
+/// Allocates a `bytes`-sized shared buffer, touches one word per page so the
+/// kernel's zero-fill happens here (off the critical path) rather than under
+/// the final block's LDE fill, and stashes it for the next oversized
+/// [`take_or_new_column_buffer`] request. Scheduling-only: buffer contents
+/// are fully written by the fill before any read, exactly as a fresh
+/// allocation's would be.
+pub fn prewarm_large_column_store(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
     // Publish AFTER walking: the walk writes zeros through this buffer, so a
     // final block that takes it mid-walk would race the LDE fill (the walk
     // would re-zero pages the fill had already written). Publishing after the
@@ -796,6 +819,56 @@ pub fn prewarm_large_column_store(bytes: u64) {
     if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
         *slot = Some(buffer);
     }
+}
+
+/// Pre-faults one final-block digest output and reserves it for requests
+/// above [`MAX_CACHED_DIGEST_OUTPUT_BYTES`].
+pub fn prewarm_final_digest_output(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_DIGESTS.lock() {
+        stash.push(buffer);
+    }
+}
+
+/// Pre-faults one final-block GPU quotient output and reserves it for
+/// requests above [`MAX_CACHED_QUOTIENT_OUTPUT_BYTES`].
+pub fn prewarm_final_quotient_output(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_QUOTIENTS.lock() {
+        stash.push(buffer);
+    }
+}
+
+/// Pre-faults the final block's streamed sponge state buffer and reserves it
+/// for the oversized first streamed build.
+pub fn prewarm_final_streamed_state(bytes: u64) {
+    let Some(buffer) = prewarm_device_buffer(bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_STREAMED_STATE.lock() {
+        *stash = Some(buffer);
+    }
+}
+
+fn take_prewarmed_final_digest(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_DIGESTS.try_lock().ok()?;
+    let index = stash.iter().position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+fn take_prewarmed_final_quotient(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_QUOTIENTS.try_lock().ok()?;
+    let index = stash.iter().position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+fn take_prewarmed_final_streamed_state(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_STREAMED_STATE.try_lock().ok()?;
+    stash.take().filter(|buffer| buffer.length() >= bytes)
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
@@ -1625,6 +1698,182 @@ fn probe_declines(cols: usize, rows: usize, latch: &core::sync::atomic::AtomicBo
         && !latch.swap(true, core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Scratch arm selector; absent (the shipped default) is `0`.
+fn hybrid_mode() -> usize {
+    static MODE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        std::env::var("LIGHTER_HYBRID")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+fn hybrid_shape(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
+    cap_height >= 2
+        && leaf_count == 1 << 17
+        && leaf_width > 4
+        && leaf_width <= 64
+        && !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+        && GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// Whether a declined tree should be built as a concurrent CPU/GPU split
+/// rather than entirely on the CPU.
+///
+/// Only the serial-critical 2^17 narrow commitment trees qualify, and only
+/// when they were declined for *occupancy*: if the stream were free
+/// `gpu_worthwhile` would already have routed the whole tree to the GPU and a
+/// split would have nothing to recover.
+pub(crate) fn hybrid_gather_admitted(
+    leaf_width: usize,
+    leaf_count: usize,
+    cap_height: usize,
+) -> bool {
+    hybrid_mode() == 1 && hybrid_shape(leaf_width, leaf_count, cap_height) && context_ready()
+}
+
+/// Scratch arm: walk the cap subtrees sequentially with no GPU worker, so the
+/// loop restructuring can be priced on its own.
+pub(crate) fn hybrid_sequential_only(
+    leaf_width: usize,
+    leaf_count: usize,
+    cap_height: usize,
+) -> bool {
+    hybrid_mode() == 2 && hybrid_shape(leaf_width, leaf_count, cap_height)
+}
+
+/// A held GPU buffer set, released on drop.
+pub(crate) struct GpuBuildSlot {
+    context: &'static MetalShared,
+    set: Option<BufferSet>,
+    job: Option<GpuJobGuard>,
+}
+
+impl Drop for GpuBuildSlot {
+    fn drop(&mut self) {
+        if let Some(set) = self.set.take() {
+            self.context.release_set(set);
+        }
+        drop(self.job.take());
+    }
+}
+
+impl GpuBuildSlot {
+    /// Hashes one aligned dyadic block of cap subtrees, staged from the
+    /// strided natural-row window that block occupies.
+    fn build_block<F: RichField>(
+        &mut self,
+        columns: &[&[F]],
+        stride: usize,
+        offset: usize,
+        leaf_count: usize,
+        cap_height: usize,
+    ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+        if F::ORDER != 0xffff_ffff_0000_0001 || size_of::<F>() != size_of::<u64>() {
+            return None;
+        }
+        let context = self.context;
+        let set = self.set.as_mut()?;
+        let leaf_width = columns.len();
+        let cap_count = 1usize << cap_height;
+        let total_node_count = 2 * leaf_count - cap_count;
+        let input_len = leaf_count.checked_mul(leaf_width)?;
+        let input_bytes = input_len.checked_mul(size_of::<u64>())?;
+        let output_len = total_node_count.checked_mul(4)?;
+        let output_bytes = output_len.checked_mul(size_of::<u64>())?;
+        match context.build_with_set(
+            set,
+            LeafSource::Strided {
+                columns,
+                stride,
+                offset,
+            },
+            leaf_width,
+            leaf_count,
+            cap_height,
+            input_len,
+            input_bytes,
+            output_len,
+            output_bytes,
+        ) {
+            Ok(readback) => Some(readback.finish()),
+            Err(error) => {
+                log::warn!("Metal hybrid block build failed; the CPU completes it: {error}");
+                None
+            }
+        }
+    }
+}
+
+/// Queues for the GPU buffer set on behalf of a tree the caller is already
+/// building on the CPU, and when granted hashes whatever range `claim` hands
+/// back.
+///
+/// `claim` returns `(start_subtree, count)` with `count` a power of two and
+/// `start_subtree` a multiple of it; the caller's cursor guarantees the CPU
+/// has not started any subtree in that range.
+pub(crate) fn build_merkle_block_gather<F: RichField>(
+    columns: &[&[F]],
+    log_rows: usize,
+    cap_height: usize,
+    cancel: &core::sync::atomic::AtomicBool,
+    claim: &(dyn Fn() -> Option<(usize, usize)> + Sync),
+) -> Option<(usize, Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+    if !context_ready() {
+        return None;
+    }
+    let context = shared_context()?;
+    let set = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _wait = crate::util::profile::span("hybrid", "gpu_wait");
+        context.acquire_set_cancellable(true, cancel)?
+    };
+    let mut slot = GpuBuildSlot {
+        context,
+        set: Some(set),
+        job: Some(GpuJobGuard::begin()),
+    };
+    let (start_subtree, count) = claim()?;
+    #[cfg(feature = "diagnostic_profile")]
+    let build_span = crate::util::profile::span(
+        "hybrid",
+        &format!("gpu_block_c{count}_w{}", columns.len()),
+    );
+    let block_cap_height = count.ilog2() as usize;
+    let block_leaves = count << (log_rows - cap_height);
+    let fixed_bits = cap_height - block_cap_height;
+    let stride = 1usize << fixed_bits;
+    let offset = crate::util::reverse_bits(start_subtree >> block_cap_height, fixed_bits);
+    let (levels, cap) = slot.build_block(columns, stride, offset, block_leaves, block_cap_height)?;
+    let digests = levels.to_interleaved_par();
+    #[cfg(feature = "diagnostic_profile")]
+    drop(build_span);
+    Some((start_subtree, digests, cap))
+}
+
+/// [`build_merkle_block_gather`] with the strided window supplied verbatim,
+/// so a differential can drive it with a deliberately wrong one.
+#[cfg(test)]
+pub(crate) fn build_merkle_block_window_for_tests<F: RichField>(
+    columns: &[&[F]],
+    stride: usize,
+    offset: usize,
+    block_leaves: usize,
+    block_cap_height: usize,
+) -> Option<(Vec<HashOut<F>>, Vec<HashOut<F>>)> {
+    let context = shared_context()?;
+    let cancel = core::sync::atomic::AtomicBool::new(false);
+    let mut slot = GpuBuildSlot {
+        context,
+        set: Some(context.acquire_set_cancellable(false, &cancel)?),
+        job: Some(GpuJobGuard::begin()),
+    };
+    let (levels, cap) =
+        slot.build_block(columns, stride, offset, block_leaves, block_cap_height)?;
+    Some((levels.to_interleaved_par(), cap))
+}
+
 pub(crate) fn build_merkle_tree<F: RichField>(
     leaves: &[F],
     leaf_width: usize,
@@ -2288,14 +2537,35 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     if needs_new {
         *buffers = Some(autoreleasepool(|| {
             (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
+                // Only the degree-2^18 final proof's streamed state (2^21 rows
+                // x 12 lanes x 8 B) exceeds 64 MiB; every earlier streamed
+                // shape is at most 2^19 x 12 x 8 B = 48 MiB. Reserving the
+                // prewarmed buffer for the final size prevents a mid-pipeline
+                // build from consuming it.
+                if state_bytes > 64 << 20 {
+                    take_prewarmed_final_streamed_state(state_bytes as u64).unwrap_or_else(|| {
+                        context
+                            .device
+                            .new_buffer(state_bytes as u64, MTLResourceOptions::StorageModeShared)
+                    })
+                } else {
+                    context.device.new_buffer(
+                        state_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                },
+                if output_bytes as u64 > MAX_CACHED_DIGEST_OUTPUT_BYTES {
+                    take_prewarmed_final_digest(output_bytes as u64).unwrap_or_else(|| {
+                        context
+                            .device
+                            .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
+                    })
+                } else {
+                    context.device.new_buffer(
+                        output_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                },
             )
         }));
     }
@@ -2406,18 +2676,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         return None;
     }
 
-    let replacement = context
-        .digest_output_pool
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take_best_fit(output_bytes as u64)
-        .unwrap_or_else(|| {
-            autoreleasepool(|| {
-                context
-                    .device
-                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-            })
-        });
+    let replacement = context.acquire_digest_output(output_bytes as u64);
     let completed = core::mem::replace(output_buffer, replacement);
     drop(buffers);
     let nodes = MetalDigests::with_buffer(
@@ -2558,6 +2817,16 @@ pub(crate) fn build_commitment_from_values<F: RichField>(
 enum LeafSource<'a, F> {
     /// Flat row-major rows, already in tree-leaf order.
     Rows(&'a [F]),
+    /// A strided window of natural-order poly-major columns: row `x` of the
+    /// staged block is `columns[j][x * stride + offset]`. That is exactly the
+    /// natural-row set covered by one aligned dyadic block of cap subtrees, so
+    /// the col-major kernel run over it with `log_leaf_count = log2(block
+    /// leaves)` produces that block's leaf digests unchanged.
+    Strided {
+        columns: &'a [&'a [F]],
+        stride: usize,
+        offset: usize,
+    },
     /// Natural-order poly-major columns; tree leaf `i` is
     /// `columns[j][reverse_bits(i)]`, handled by the col-major kernel.
     Columns(&'a [Vec<F>]),
@@ -2794,7 +3063,36 @@ impl MetalShared {
         Ok(MetalColumns::with_buffer(buffer, rows, cols))
     }
 
+    /// Digest-output acquisition shared by the streamed build's replacement
+    /// swap and the buffer-set readback path. Requests above the pool's
+    /// per-buffer cap (the final block's one-off ~128 MiB outputs, which the
+    /// pool refuses to recycle) first consult the prewarmed final-block stash.
+    fn acquire_digest_output(&self, bytes: u64) -> Buffer {
+        if bytes > MAX_CACHED_DIGEST_OUTPUT_BYTES {
+            if let Some(buffer) = take_prewarmed_final_digest(bytes) {
+                return buffer;
+            }
+        }
+        if let Some(buffer) = self
+            .digest_output_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_best_fit(bytes)
+        {
+            return buffer;
+        }
+        autoreleasepool(|| {
+            self.device
+                .new_buffer(bytes, MTLResourceOptions::StorageModeShared)
+        })
+    }
+
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
+        if bytes > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
+            if let Some(buffer) = take_prewarmed_final_quotient(bytes) {
+                return buffer;
+            }
+        }
         if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
             if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
                 if let Some(buffer) = pool.take_best_fit(bytes) {
@@ -3087,6 +3385,64 @@ impl MetalShared {
         }
     }
 
+    /// [`Self::acquire_set_priority`] that can give up.
+    ///
+    /// The hybrid split's GPU worker queues for the set *while the CPU is
+    /// already building the same tree*, so it must be able to stop waiting the
+    /// instant the CPU runs out of work; otherwise the tree would end up gated
+    /// on a set it no longer needs, which is the blocking behaviour that made
+    /// the all-or-nothing GPU route lose. The timeout only bounds how long a
+    /// cancellation goes unnoticed: a released set still wakes this waiter
+    /// through the same `notify_all` the priority path already performs.
+    fn acquire_set_cancellable(
+        &self,
+        spine: bool,
+        cancel: &core::sync::atomic::AtomicBool,
+    ) -> Option<BufferSet> {
+        let mut pool = self.pool.lock().ok()?;
+        loop {
+            if spine || pool.spine_waiters == 0 {
+                if let Some(set) = pool.free.pop() {
+                    return Some(set);
+                }
+                if pool.created < MAX_BUFFER_SETS {
+                    pool.created += 1;
+                    return Some(BufferSet {
+                        input: None,
+                        output: None,
+                    });
+                }
+            }
+            if cancel.load(core::sync::atomic::Ordering::Acquire) {
+                return None;
+            }
+            pool.waiters += 1;
+            if spine {
+                pool.spine_waiters += 1;
+            }
+            match self
+                .available
+                .wait_timeout(pool, core::time::Duration::from_millis(4))
+            {
+                Ok((mut next, _)) => {
+                    next.waiters -= 1;
+                    if spine {
+                        next.spine_waiters -= 1;
+                    }
+                    pool = next;
+                }
+                Err(poisoned) => {
+                    let (mut next, _) = poisoned.into_inner();
+                    next.waiters -= 1;
+                    if spine {
+                        next.spine_waiters -= 1;
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
     fn release_set(&self, set: BufferSet) {
         let mut pool = self
             .pool
@@ -3128,18 +3484,7 @@ impl MetalShared {
             .position(|buffer| buffer.length() >= output_bytes as u64);
         let replacement = spare_index
             .map(|index| pool.spare_outputs.swap_remove(index))
-            .or_else(|| {
-                self.digest_output_pool
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take_best_fit(output_bytes as u64)
-            })
-            .unwrap_or_else(|| {
-                autoreleasepool(|| {
-                    self.device
-                        .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
-                })
-            });
+            .unwrap_or_else(|| self.acquire_digest_output(output_bytes as u64));
         let completed = set
             .output
             .replace(replacement)
@@ -3921,11 +4266,36 @@ impl MetalShared {
                             destination.copy_from_slice(source);
                         });
                 }
+                LeafSource::Strided {
+                    columns,
+                    stride,
+                    offset,
+                } => {
+                    destination
+                        .par_chunks_mut(leaf_count)
+                        .zip(columns.par_iter())
+                        .for_each(|(destination, column)| {
+                            // `F` is the 8-byte Goldilocks field whose in-memory
+                            // representation is its (possibly noncanonical) u64,
+                            // exactly as the two arms above rely on.
+                            let source = unsafe {
+                                slice::from_raw_parts(
+                                    column.as_ptr().cast::<u64>(),
+                                    column.len(),
+                                )
+                            };
+                            for (row, slot) in destination.iter_mut().enumerate() {
+                                *slot = source[row * stride + offset];
+                            }
+                        });
+                }
                 LeafSource::Shared(_) => unreachable!("shared columns do not use staging"),
             }
         }
         let input_buffer = match &source {
-            LeafSource::Rows(_) | LeafSource::Columns(_) => set.input.as_ref().unwrap(),
+            LeafSource::Rows(_) | LeafSource::Columns(_) | LeafSource::Strided { .. } => {
+                set.input.as_ref().unwrap()
+            }
             LeafSource::Shared(columns) => &columns.buffer,
         };
 
@@ -3948,7 +4318,9 @@ impl MetalShared {
             let log_leaf_count_u32 = leaf_count.ilog2();
             let leaf_pipeline = match &source {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
-                LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
+                LeafSource::Columns(_)
+                | LeafSource::Shared(_)
+                | LeafSource::Strided { .. } => &self.leaf_colmajor_pipeline,
             };
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -3966,7 +4338,10 @@ impl MetalShared {
                 size_of::<u32>() as NSUInteger,
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
-            if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
+            if matches!(
+                &source,
+                LeafSource::Columns(_) | LeafSource::Shared(_) | LeafSource::Strided { .. }
+            ) {
                 encoder.set_bytes(
                     5,
                     size_of::<u32>() as NSUInteger,
