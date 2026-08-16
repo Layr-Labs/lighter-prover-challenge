@@ -1,4 +1,4 @@
-// Redraw marker 573
+// exact ca62aa9 live-frontier resample 2026-08-16
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
