@@ -5,6 +5,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -153,24 +154,55 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingGate<D
             F::Extension::from_basefield_array(arr)
         };
 
-        let alphas: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
-        let mut accs: Vec<F::Extension> = (0..n)
-            .map(|p| ext(Self::wires_old_acc().start, p))
-            .collect();
-
-        let mut scratch = vec![F::ZERO; D * n];
+        // Quotient batches are small (32 points in the production path), but
+        // this evaluator is invoked for every batch of every proof. The prior
+        // implementation allocated `alphas`, `accs`, and a zeroed scratch row
+        // per invocation. Each accumulator's predecessor is already a wire
+        // column, and every scratch slot is assigned before it is read, so the
+        // common path needs neither of the first two buffers nor a memset.
+        const STACK_SCRATCH: usize = 128;
+        let scratch_len = D * n;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap = if scratch_len <= STACK_SCRATCH {
+            None
+        } else {
+            Some(vec![F::ZERO; scratch_len])
+        };
         for i in 0..self.num_coeffs {
             let coeff = &wires[(Self::START_COEFFS + i) * n..][..n];
             let acc_start = self.wires_accs(i).start;
+            let previous_acc_start = if i == 0 {
+                Self::wires_old_acc().start
+            } else {
+                self.wires_accs(i - 1).start
+            };
             for p in 0..n {
                 let next_acc = ext(acc_start, p);
-                let constraint = accs[p] * alphas[p] + coeff[p].into() - next_acc;
+                let constraint = ext(previous_acc_start, p)
+                    * ext(Self::wires_alpha().start, p)
+                    + coeff[p].into()
+                    - next_acc;
                 let arr = constraint.to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
+                    let index = d * n + p;
+                    if let Some(scratch) = scratch_heap.as_mut() {
+                        scratch[index] = *a;
+                    } else {
+                        scratch_stack[index].write(*a);
+                    }
                 }
-                accs[p] = next_acc;
             }
+            let scratch: &[F] = if let Some(scratch) = scratch_heap.as_ref() {
+                scratch
+            } else {
+                // SAFETY: the point loop assigned every `(d, p)` slot.
+                unsafe {
+                    core::slice::from_raw_parts(
+                        scratch_stack[..scratch_len].as_ptr().cast::<F>(),
+                        scratch_len,
+                    )
+                }
+            };
             for d in 0..D {
                 batch_multiply_add_inplace(
                     &mut combined_gate_constraints[(i * D + d) * n..][..n],
