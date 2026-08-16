@@ -175,6 +175,41 @@ impl<T: Copy> LevelOrderDigests<T> {
             .collect()
     }
 
+    /// [`Self::to_interleaved`] with the independent cap subtrees filled in
+    /// parallel. The subtree chunks are disjoint and each is written by the
+    /// same `fill_interleaved_subtree` recursion reading the same nodes, so
+    /// every element is bit-identical to the serial version.
+    pub fn to_interleaved_par(&self) -> Vec<T>
+    where
+        T: Send + Sync,
+    {
+        let num_layers = self.level_offsets.len() - 1;
+        if num_layers == 0 {
+            return Vec::new();
+        }
+        let num_leaves = self.level_offsets[1] - self.level_offsets[0];
+        let cap_count = num_leaves >> num_layers;
+        let subtree_leaf_count = num_leaves / cap_count;
+        let num_digests = 2 * (num_leaves - cap_count);
+        let mut digests = Vec::with_capacity(num_digests);
+        let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
+        digests_buf
+            .par_chunks_exact_mut(2 * (subtree_leaf_count - 1))
+            .enumerate()
+            .for_each(|(cap_index, subtree)| {
+                self.fill_interleaved_subtree(
+                    subtree,
+                    cap_index * subtree_leaf_count,
+                    subtree_leaf_count,
+                );
+            });
+        unsafe {
+            // SAFETY: as in `to_interleaved`.
+            digests.set_len(num_digests);
+        }
+        digests
+    }
+
     /// Materializes the interleaved recursive-subtree layout documented on
     /// [`MerkleTree::digests`]. Cold path; only serialization needs it.
     pub fn to_interleaved(&self) -> Vec<T> {
@@ -426,29 +461,36 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
             return H::two_to_one(left_digest, right_digest);
         }
 
-        // Whole synchronous 16-leaf subtree, level order: four leaf quads,
-        // two quads then one quad of level-1/2 compressions, one level-3 pair.
+        // Whole synchronous 16-leaf subtree, level order: two leaf eights,
+        // one eight of level-1 compressions, one quad of level-2, one level-3
+        // pair.
         if num_leaves == 16 {
-            let mut leaf_digests = [core::mem::MaybeUninit::<H::Hash>::uninit(); 16];
-            for q in 0..4 {
-                let base = q * 4 * leaf_width;
-                let quad_leaves = if q < 2 { left_leaves } else { right_leaves };
-                let base = base - if q < 2 { 0 } else { 8 * leaf_width };
-                let (leaf_a, rest) = quad_leaves[base..base + 4 * leaf_width].split_at(leaf_width);
-                let (leaf_b, rest2) = rest.split_at(leaf_width);
-                let (leaf_c, leaf_d) = rest2.split_at(leaf_width);
-                let (ha, hb, hc, hd) = H::hash_or_noop_quad(leaf_a, leaf_b, leaf_c, leaf_d);
-                leaf_digests[4 * q].write(ha);
-                leaf_digests[4 * q + 1].write(hb);
-                leaf_digests[4 * q + 2].write(hc);
-                leaf_digests[4 * q + 3].write(hd);
-            }
-            // SAFETY: all 16 entries were initialized above.
-            let h: [H::Hash; 16] = unsafe { core::mem::transmute_copy(&leaf_digests) };
+            // Sixteen independent leaf sponges and eight independent level-1
+            // compressions, batched eight-wide instead of four-wide: the batch
+            // primitives are per-input bit-identical to the scalar ones, so the
+            // grouping cannot move a digest, and eight interleaved permutations
+            // expose more of the round's independent work than four do.
+            let leaf_at = |k: usize| -> &[F] {
+                let src = if k < 8 { left_leaves } else { right_leaves };
+                let b = (k % 8) * leaf_width;
+                &src[b..b + leaf_width]
+            };
+            let lo = H::hash_or_noop_oct(core::array::from_fn(|k| leaf_at(k)));
+            let hi = H::hash_or_noop_oct(core::array::from_fn(|k| leaf_at(8 + k)));
+            let h: [H::Hash; 16] = core::array::from_fn(|k| if k < 8 { lo[k] } else { hi[k - 8] });
 
-            let n_a = H::two_to_one_quad([(h[0], h[1]), (h[2], h[3]), (h[4], h[5]), (h[6], h[7])]);
-            let n_b =
-                H::two_to_one_quad([(h[8], h[9]), (h[10], h[11]), (h[12], h[13]), (h[14], h[15])]);
+            let n = H::two_to_one_oct([
+                (h[0], h[1]),
+                (h[2], h[3]),
+                (h[4], h[5]),
+                (h[6], h[7]),
+                (h[8], h[9]),
+                (h[10], h[11]),
+                (h[12], h[13]),
+                (h[14], h[15]),
+            ]);
+            let n_a = [n[0], n[1], n[2], n[3]];
+            let n_b = [n[4], n[5], n[6], n[7]];
             let m = H::two_to_one_quad([
                 (n_a[0], n_a[1]),
                 (n_a[2], n_a[3]),
@@ -830,7 +872,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         if num_columns <= GATHER_MAX_WIDTH {
             let (digests, cap) = {
                 let borrowed: Vec<&[F]> = (0..num_columns).map(|j| columns.col(j)).collect();
-                Self::cpu_digests_gather(&borrowed, log_rows, num_leaves, cap_height)
+                Self::gather_digests_routed(&borrowed, log_rows, num_leaves, cap_height)
             };
             return Self {
                 leaves: MerkleLeaves::Columns { columns, log_rows },
@@ -939,6 +981,184 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             // `len_cap` cap slots before returning.
             digests.set_len(num_digests);
             cap.set_len(len_cap);
+        }
+        (digests, cap)
+    }
+
+    /// Routes the declined-tree CPU build: whole-tree gather, or the
+    /// concurrent CPU/GPU split when the backend says a split can recover
+    /// something.
+    #[cfg(feature = "std")]
+    fn gather_digests_routed(
+        columns: &[&[F]],
+        log_rows: usize,
+        num_leaves: usize,
+        cap_height: usize,
+    ) -> (Vec<H::Hash>, Vec<H::Hash>) {
+        let width = columns.len();
+        if H::hybrid_gather_admitted(width, num_leaves, cap_height) {
+            Self::cpu_digests_gather_hybrid(columns, log_rows, num_leaves, cap_height, true)
+        } else if H::hybrid_sequential_only(width, num_leaves, cap_height) {
+            Self::cpu_digests_gather_hybrid(columns, log_rows, num_leaves, cap_height, false)
+        } else {
+            Self::cpu_digests_gather(columns, log_rows, num_leaves, cap_height)
+        }
+    }
+
+    #[cfg(not(feature = "std"))]
+    fn gather_digests_routed(
+        columns: &[&[F]],
+        log_rows: usize,
+        num_leaves: usize,
+        cap_height: usize,
+    ) -> (Vec<H::Hash>, Vec<H::Hash>) {
+        Self::cpu_digests_gather(columns, log_rows, num_leaves, cap_height)
+    }
+
+    /// Concurrent CPU + GPU build of one tree, split at cap-subtree
+    /// boundaries with the split point discovered at run time.
+    ///
+    /// The `1 << cap_height` cap subtrees are totally independent -- there is
+    /// no parent chain above them -- so a split on that boundary needs no
+    /// merge and the digests are those of [`Self::cpu_digests_gather`] element
+    /// for element. The CPU walks subtrees front to back; a separate
+    /// (non-rayon) thread queues for the backend's exclusive resource and,
+    /// once granted, claims the largest aligned dyadic suffix of the subtrees
+    /// the CPU has not started. Whichever side is ahead ends up with more of
+    /// the tree, and if the backend never becomes available the CPU simply
+    /// builds all of it: the queued acquisition is cancelled, never waited on.
+    #[cfg(feature = "std")]
+    fn cpu_digests_gather_hybrid(
+        columns: &[&[F]],
+        log_rows: usize,
+        num_leaves: usize,
+        cap_height: usize,
+        use_gpu: bool,
+    ) -> (Vec<H::Hash>, Vec<H::Hash>) {
+        use core::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let subtree_count = 1usize << cap_height;
+        let subtree_leaves = num_leaves >> cap_height;
+        let subtree_digests = 2 * (subtree_leaves - 1);
+        let num_digests = 2 * (num_leaves - subtree_count);
+
+        let mut digests: Vec<H::Hash> = Vec::with_capacity(num_digests);
+        let mut cap: Vec<H::Hash> = Vec::with_capacity(subtree_count);
+
+        // (next subtree the CPU will start, first subtree claimed by the GPU).
+        let cursor = Mutex::new((0usize, subtree_count));
+        let cancel = AtomicBool::new(false);
+
+        {
+            let digests_buf = capacity_up_to_mut(&mut digests, num_digests);
+            let cap_buf = capacity_up_to_mut(&mut cap, subtree_count);
+
+            let fill = |index: usize, buf: &mut [MaybeUninit<H::Hash>],
+                            caps: &mut [MaybeUninit<H::Hash>]| {
+                let base = index * subtree_digests;
+                let digest = fill_subtree_gather::<F, H>(
+                    &mut buf[base..base + subtree_digests],
+                    columns,
+                    log_rows,
+                    index * subtree_leaves,
+                    subtree_leaves,
+                );
+                caps[index].write(digest);
+            };
+
+            let built = std::thread::scope(|scope| {
+                let worker = if use_gpu {
+                    Some(scope.spawn(|| {
+                        H::try_build_merkle_block_gather(
+                            columns,
+                            log_rows,
+                            cap_height,
+                            &cancel,
+                            &|| {
+                                let mut cursor = cursor
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                let (cpu_next, gpu_start) = *cursor;
+                                if gpu_start <= cpu_next {
+                                    return None;
+                                }
+                                // Largest aligned dyadic suffix of the
+                                // unclaimed range. `gpu_start` starts at the
+                                // power of two `subtree_count`, so
+                                // `gpu_start - count` stays a multiple of
+                                // `count`.
+                                let count = 1usize << (gpu_start - cpu_next).ilog2();
+                                let start = gpu_start - count;
+                                debug_assert_eq!(start % count, 0);
+                                debug_assert!(start >= cpu_next);
+                                cursor.1 = start;
+                                Some((start, count))
+                            },
+                        )
+                    }))
+                } else {
+                    None
+                };
+
+                loop {
+                    let index = {
+                        let mut cursor = cursor
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if cursor.0 >= cursor.1 {
+                            break;
+                        }
+                        let index = cursor.0;
+                        cursor.0 += 1;
+                        index
+                    };
+                    fill(index, digests_buf, cap_buf);
+                }
+                cancel.store(true, Ordering::Release);
+                worker.and_then(|worker| worker.join().ok().flatten())
+            });
+
+            let gpu_start = cursor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .1;
+            let delivered = match built {
+                Some((start, block_digests, block_cap))
+                    if start == gpu_start
+                        && block_cap.len() == subtree_count - start
+                        && block_digests.len() == (subtree_count - start) * subtree_digests =>
+                {
+                    let base = start * subtree_digests;
+                    for (slot, digest) in
+                        digests_buf[base..].iter_mut().zip(block_digests)
+                    {
+                        slot.write(digest);
+                    }
+                    for (slot, digest) in cap_buf[start..].iter_mut().zip(block_cap) {
+                        slot.write(digest);
+                    }
+                    true
+                }
+                _ => false,
+            };
+            // The backend claimed a range and then declined it (context loss,
+            // command-buffer failure): the CPU still owes those subtrees.
+            if !delivered {
+                for index in gpu_start..subtree_count {
+                    fill(index, digests_buf, cap_buf);
+                }
+            }
+        }
+
+        unsafe {
+            // SAFETY: every one of the `subtree_count` subtrees is written
+            // exactly once -- by the CPU loop over `[0, gpu_start)` and then
+            // either by the spliced backend block or by the fallback loop over
+            // `[gpu_start, subtree_count)` -- and the subtree chunks partition
+            // both buffers exactly.
+            digests.set_len(num_digests);
+            cap.set_len(subtree_count);
         }
         (digests, cap)
     }
@@ -1221,6 +1441,167 @@ pub(crate) mod tests {
             for i in (0..n).step_by(((n / 8) + 1).max(1)) {
                 let proof = tree.prove(i);
                 verify_merkle_proof_to_cap(tree.leaf_vec(i), i, &tree.cap, &proof).unwrap();
+            }
+        }
+    }
+
+    /// Differential: every aligned dyadic block of cap subtrees, hashed on the
+    /// GPU through the strided window the hybrid split uses, must reproduce
+    /// the corresponding slice of the whole-tree CPU gather bit for bit --
+    /// raw `to_noncanonical_u64` limbs, not `HashOut`'s canonicalising
+    /// `PartialEq`.
+    ///
+    /// The sabotage control drives the same build with the *unreversed* block
+    /// index as the window offset. That is the one step of the derivation
+    /// that is not forced by anything else (leaf `i` of the tree is natural
+    /// row `reverse_bits(i, log_rows)`, so a block whose top `t` index bits
+    /// are `p` occupies the natural rows congruent to `reverse_bits(p, t)`,
+    /// not to `p`), and the control asserts the differential notices.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn hybrid_block_matches_whole_tree_gather() {
+        use crate::hash::poseidon2::metal;
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let raw = |digests: &[<H as Hasher<F>>::Hash]| -> Vec<u64> {
+            digests
+                .iter()
+                .flat_map(|hash| hash.elements.iter().map(|e| e.to_noncanonical_u64()))
+                .collect()
+        };
+
+        let mut sabotage_ran = false;
+        // The two real chain shapes are width 20 and 16; the rest span the
+        // `hash_or_noop` boundary, one and three sponge chunks, a non-power
+        // width, and cap heights either side of the shipped 4.
+        for &(width, log_n, cap_height) in &[
+            (4usize, 9usize, 4usize),
+            (7, 8, 3),
+            (16, 11, 4),
+            (20, 12, 4),
+            (33, 9, 2),
+            (64, 10, 4),
+        ] {
+            let n = 1usize << log_n;
+            let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
+            let borrowed: Vec<&[F]> = columns.iter().map(Vec::as_slice).collect();
+            let (want_digests, want_cap) =
+                MerkleTree::<F, H>::cpu_digests_gather(&borrowed, log_n, n, cap_height);
+
+            let subtree_count = 1usize << cap_height;
+            let subtree_leaves = n >> cap_height;
+            let subtree_digests = 2 * (subtree_leaves - 1);
+
+            for block_cap_height in 0..=cap_height {
+                let count = 1usize << block_cap_height;
+                let block_leaves = count * subtree_leaves;
+                let fixed_bits = cap_height - block_cap_height;
+                let stride = 1usize << fixed_bits;
+                for block in 0..(subtree_count / count) {
+                    let start = block * count;
+                    let offset = crate::util::reverse_bits(start >> block_cap_height, fixed_bits);
+                    let Some((got_digests, got_cap)) =
+                        metal::build_merkle_block_window_for_tests::<F>(
+                            &borrowed,
+                            stride,
+                            offset,
+                            block_leaves,
+                            block_cap_height,
+                        )
+                    else {
+                        // No Metal device on this host.
+                        return;
+                    };
+                    assert_eq!(
+                        raw(&got_cap),
+                        raw(&want_cap[start..start + count]),
+                        "cap: width={width} n={n} cap_height={cap_height}                          block={start}+{count}"
+                    );
+                    assert_eq!(
+                        raw(&got_digests),
+                        raw(&want_digests
+                            [start * subtree_digests..(start + count) * subtree_digests]),
+                        "digests: width={width} n={n} cap_height={cap_height}                          block={start}+{count}"
+                    );
+
+                    // Sabotage: the unreversed block index as the window
+                    // offset. Only meaningful where it names a different
+                    // window, i.e. where `reverse_bits` is not the identity.
+                    let naive = start >> block_cap_height;
+                    if naive != offset && naive < stride {
+                        let (bad_digests, bad_cap) =
+                            metal::build_merkle_block_window_for_tests::<F>(
+                                &borrowed,
+                                stride,
+                                naive,
+                                block_leaves,
+                                block_cap_height,
+                            )
+                            .expect("the device answered a moment ago");
+                        assert_ne!(
+                            (raw(&bad_digests), raw(&bad_cap)),
+                            (raw(&got_digests), raw(&got_cap)),
+                            "sabotage control did not trip: width={width} n={n}                              block={start}+{count}"
+                        );
+                        sabotage_ran = true;
+                    }
+                }
+            }
+        }
+        assert!(sabotage_ran, "the sabotage control never executed");
+    }
+
+    /// End-to-end differential for the split driver itself: the concurrent
+    /// build, and the sequential-subtree walk with no GPU worker, must both
+    /// reproduce the whole-tree gather exactly. Repeated so the runtime split
+    /// point lands in more than one place.
+    #[cfg(feature = "std")]
+    #[test]
+    fn hybrid_driver_matches_whole_tree_gather() {
+        use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let raw = |digests: &[<H as Hasher<F>>::Hash]| -> Vec<u64> {
+            digests
+                .iter()
+                .flat_map(|hash| hash.elements.iter().map(|e| e.to_noncanonical_u64()))
+                .collect()
+        };
+
+        for &(width, log_n, cap_height) in &[
+            (16usize, 12usize, 4usize),
+            (20, 13, 4),
+            (7, 9, 2),
+        ] {
+            let n = 1usize << log_n;
+            let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
+            let borrowed: Vec<&[F]> = columns.iter().map(Vec::as_slice).collect();
+            let (want_digests, want_cap) =
+                MerkleTree::<F, H>::cpu_digests_gather(&borrowed, log_n, n, cap_height);
+
+            for use_gpu in [false, true, true, true] {
+                let (got_digests, got_cap) = MerkleTree::<F, H>::cpu_digests_gather_hybrid(
+                    &borrowed, log_n, n, cap_height, use_gpu,
+                );
+                assert_eq!(
+                    raw(&got_cap),
+                    raw(&want_cap),
+                    "cap: width={width} n={n} cap_height={cap_height} use_gpu={use_gpu}"
+                );
+                assert_eq!(
+                    raw(&got_digests),
+                    raw(&want_digests),
+                    "digests: width={width} n={n} cap_height={cap_height} use_gpu={use_gpu}"
+                );
             }
         }
     }
