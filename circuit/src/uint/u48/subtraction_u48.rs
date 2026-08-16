@@ -485,7 +485,17 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         out_buffer.set_wire(output_result_wire, output_result)?;
         out_buffer.set_wire(output_borrow_wire, output_borrow)?;
 
-        let output_result_u64 = output_result.to_canonical_u64();
+        // In the no-borrow branch `base * output_borrow` reduces to zero and
+        // Goldilocks `Add(x, 0)` returns `x` bitwise, so `output_result` is
+        // `result_initial` and this reduction recomputes a value already in
+        // hand. Only the borrow branch needs it — and it cannot be folded into
+        // `result_initial_u64 + base`, because there `result_initial` is near
+        // the modulus and the addition wraps.
+        let output_result_u64 = if output_borrow == F::ZERO {
+            result_initial_u64
+        } else {
+            output_result.to_canonical_u64()
+        };
 
         let num_limbs = U48SubtractionGate::<F, D>::num_limbs();
         let limb_base = 1 << U48SubtractionGate::<F, D>::limb_bits();
