@@ -88,10 +88,7 @@ pub trait Poseidon2: PrimeField64 {
         let mut c = input_c;
         let mut d = input_d;
 
-        Self::external_linear_layer(&mut a);
-        Self::external_linear_layer(&mut b);
-        Self::external_linear_layer(&mut c);
-        Self::external_linear_layer(&mut d);
+        Self::external_linear_layer_x4(&mut a, &mut b, &mut c, &mut d);
 
         Self::full_rounds_x4(&mut a, &mut b, &mut c, &mut d, 0);
         Self::partial_rounds_x4(&mut a, &mut b, &mut c, &mut d);
@@ -118,10 +115,7 @@ pub trait Poseidon2: PrimeField64 {
             Self::sbox(b);
             Self::sbox(c);
             Self::sbox(d);
-            Self::external_linear_layer(a);
-            Self::external_linear_layer(b);
-            Self::external_linear_layer(c);
-            Self::external_linear_layer(d);
+            Self::external_linear_layer_x4(a, b, c, d);
         }
     }
 
@@ -236,6 +230,23 @@ pub trait Poseidon2: PrimeField64 {
     ) {
         Self::internal_linear_layer_x2(a, b);
         Self::internal_linear_layer_x2(c, d);
+    }
+
+    /// Four-state variant of `external_linear_layer`; the default is four
+    /// sequential calls. Goldilocks overrides with a fused form that
+    /// converts all four states once and interleaves the independent u128
+    /// chains. Bit-identical to four `external_linear_layer` calls.
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        Self::external_linear_layer(a);
+        Self::external_linear_layer(b);
+        Self::external_linear_layer(c);
+        Self::external_linear_layer(d);
     }
 
     #[inline]
@@ -471,10 +482,7 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
     // Now, we apply the outer circulant matrix (to compute the y_i values).
 
     // We first precompute the four sums of every four elements.
-    let mut sums = [0u128; 4];
-    for i in 0..4 {
-        sums[i] = state[i] + state[i + 4] + state[i + 8];
-    }
+    let sums: [u128; 4] = core::array::from_fn(|i| state[i] + state[i + 4] + state[i + 8]);
 
     // The formula for each y_i involves 2x_i' term and x_j' terms for each j that equals i mod 4.
     // In other words, we can add a single copy of x_i' to the appropriate one of our precomputed sums
@@ -601,6 +609,34 @@ impl Poseidon2 for F {
         b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
         c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
         d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
+    }
+
+    /// Fused x4 external layer: converts all four states to u128 once,
+    /// applies the M4-block + circulant layer to each state (the four
+    /// independent chains interleave in the u128 region), and converts
+    /// back once. Bit-identical to four sequential `external_linear_layer`
+    /// calls: per-state operand order is unchanged.
+    #[inline]
+    fn external_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        let mut au = core::array::from_fn(|i| a[i].to_noncanonical_u64() as u128);
+        let mut bu = core::array::from_fn(|i| b[i].to_noncanonical_u64() as u128);
+        let mut cu = core::array::from_fn(|i| c[i].to_noncanonical_u64() as u128);
+        let mut du = core::array::from_fn(|i| d[i].to_noncanonical_u64() as u128);
+        external_linear_layer_u128(&mut au);
+        external_linear_layer_u128(&mut bu);
+        external_linear_layer_u128(&mut cu);
+        external_linear_layer_u128(&mut du);
+        for i in 0..WIDTH {
+            a[i] = Self::from_noncanonical_u128_with_96_bits(au[i]);
+            b[i] = Self::from_noncanonical_u128_with_96_bits(bu[i]);
+            c[i] = Self::from_noncanonical_u128_with_96_bits(cu[i]);
+            d[i] = Self::from_noncanonical_u128_with_96_bits(du[i]);
+        }
     }
 
     #[inline]
