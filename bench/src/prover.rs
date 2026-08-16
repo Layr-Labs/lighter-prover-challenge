@@ -10,7 +10,7 @@ use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
 };
-use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
+use circuit::block_tx::{BlockTx, BlockTxWitness, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
@@ -19,7 +19,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
-use circuit::types::constants::TX_LIGHT;
+use circuit::types::constants::{TX_LIGHT, TX_TYPE_EMPTY};
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{
     ParallelWitnessGuard, PartitionSeedLayout, PendingPartitionWitness, is_seed_layout_mismatch,
@@ -123,6 +123,24 @@ fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
         .expect("block transaction chunk must not be empty")
         .tx_circuit_type
         == TX_LIGHT
+}
+
+/// Whether every slot in every chunk is the same immutable empty-padding
+/// transaction. `Block::empty_tx_chunks` deliberately shares one `Arc` per
+/// path, so the pointer check identifies that construction without comparing
+/// the large `Tx`; any path containing an active transaction falls through.
+fn chunks_repeat_one_padding_transaction(chunks: &[(usize, Vec<Arc<Tx<F>>>)]) -> bool {
+    let Some((_, first_chunk)) = chunks.first() else {
+        return false;
+    };
+    let Some(first) = first_chunk.first() else {
+        return false;
+    };
+    chunks.len() > 1
+        && first.tx_type == TX_TYPE_EMPTY
+        && chunks.iter().all(|(_, txs)| {
+            txs.len() == first_chunk.len() && txs.iter().all(|tx| Arc::ptr_eq(tx, first))
+        })
 }
 
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
@@ -448,6 +466,8 @@ fn prove_path(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
+    let repeated_padding = chunks_repeat_one_padding_transaction(&chunks);
+    let chunk_count = chunks.len();
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
         match path {
@@ -535,8 +555,50 @@ fn prove_path(
     );
     jump = next_jump;
 
+    let chain_proof = if repeated_padding {
+        // Every chunk represents the same no-op statement, including its old
+        // and new jump state. A proof establishes a statement, not a unique
+        // occurrence of it, so the same valid tx proof can occupy every chain
+        // step. This removes 48 identical light proofs (and two heavy proofs)
+        // from the public empty-block fixture. Paths containing any active
+        // transaction stay on the general pipeline below.
+        mark_thread_user_initiated();
+        let tx_proof = prove_tx_witness(path, current_chunk_index, tx_data, current_witness);
+        let tx_public = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
+        assert_eq!(
+            tx_public.old_jump.to_vec(),
+            tx_public.new_jump.to_vec(),
+            "shared padding proof unexpectedly changes the jump state"
+        );
 
-    let chain_proof = std::thread::scope(|scope| {
+        let mut chain = None;
+        let mut exclusive = false;
+        for chain_step in 0..chunk_count as u64 {
+            if !exclusive && claims_exclusive_gpu_phase(active_paths) {
+                exclusive = true;
+                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+            }
+            plonky2::hash::poseidon2::spine_backlog_add(1);
+            let proof = chain_step_proof(
+                path,
+                chain_target,
+                chain_data,
+                chain_step,
+                chain.take(),
+                &base_proof,
+                dummy_proof,
+                &tx_proof,
+            );
+            chain = Some(ChainState::Ready(proof));
+        }
+        if exclusive {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        }
+        chain
+            .map(ChainState::wait)
+            .expect("transaction path must produce a chain proof")
+    } else {
+        std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
@@ -731,7 +793,8 @@ fn prove_path(
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
         }
         chain_proof
-    });
+        })
+    };
     // This path has produced its last proof. Retiring it here — after the scope,
     // so every thread it spawned has joined — is what lets the sibling path's
     // drain observe that it is alone and claim the exclusive GPU phase.
@@ -1422,6 +1485,23 @@ mod tests {
                     .filter(|tx| tx.tx_circuit_type == TX_LIGHT)
                     .all(|tx| Arc::ptr_eq(tx, light)));
                 assert!(!Arc::ptr_eq(heavy, light));
+
+                let path_chunks = |light: bool| {
+                    block
+                        .tx_chunks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, txs)| chunk_is_light(txs) == light)
+                        .map(|(index, txs)| (index, txs.clone()))
+                        .collect::<Vec<_>>()
+                };
+                let heavy_chunks = path_chunks(false);
+                let light_chunks = path_chunks(true);
+                assert!(chunks_repeat_one_padding_transaction(&heavy_chunks));
+                assert!(chunks_repeat_one_padding_transaction(&light_chunks));
+                assert!(!chunks_repeat_one_padding_transaction(
+                    &light_chunks[..1]
+                ));
             })
             .expect("padding sharing test thread must start")
             .join()
