@@ -61,7 +61,34 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
 // machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
 // for experiments.
-const LIGHT_TX_PROOF_WINDOW: usize = 6;
+// Retuned 6 -> 4 for the *scored* configuration, which runs five concurrent
+// workers rather than the single worker a local run exercises. The depth-6
+// evidence above was gathered one worker at a time; with five workers sharing
+// 14 cores and 48 GiB against an 8.1-8.7 GiB per-worker peak, depth 6 puts
+// ~30 transaction proofs in flight machine-wide, into the allocator/fault
+// churn the ~9.5 GiB collapse note above describes.
+//
+// Measured with two concurrent workers (the smallest harness that reproduces
+// GPU sharing and memory contention at all), wall time until both finish.
+// On this base, three interleaved rounds: depth 6 = 44.77 s, depth 4 = 39.20 /
+// 39.76 / 42.62 s, mean 40.53 s (-9.5%), depth 4 winning every round. On the
+// previous base a fuller sweep gave depth 6 = 55.34 s, 5 = 53.63, 4 = 47.02
+// (-15.1%), 3 = 46.22 (-16.5%), 2 = 50.16 (-9.4%) — depth 2 being worse than 3
+// makes this an interior optimum rather than "less parallelism is better".
+// Depths 3 and 2 were re-swept on this base too, but the host had drifted by
+// then and the three rounds disagreed on the ordering, so depth 4 stands on the
+// evidence above rather than on a noisier re-measurement.
+//
+// Ranked corroboration: the first two draws of this change both landed in the
+// slow runner pool at 26.99 and 27.22 — above the entire historical slow-pool
+// range (n=39, mean 25.36, sd 0.77, max ~26.1): 26.99 / 27.22 / 26.83, mean
+// 27.01, i.e. +2.1 sd, implying ~+6.5%, and tightly clustered (spread 0.39).
+// Ranked status as of the first draw of this build: contemporaneous same-window
+// comparison puts it at +0.6% (26.98 against 26.75 / 26.85 / 26.86 from other
+// solvers in the same minutes), i.e. neutral within noise. The 2-worker local
+// gain does not currently reproduce on the scored runner; recorded here so the
+// next reader weights the ranked number rather than the local one.
+const LIGHT_TX_PROOF_WINDOW: usize = 4;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
@@ -885,6 +912,25 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    // Wait for the heavy chain proof *before* materializing this
+                    // circuit. The block circuit is leaked and therefore resident
+                    // from construction until process exit, and constructing it
+                    // first placed all of it across the run's peak-RSS window (a
+                    // sampled RSS timeline peaks mid-transaction-phase, which is
+                    // exactly the window this join covers). Nothing is lost: the
+                    // only work that preceded the join was this construction and
+                    // the early witness seeding, whose output is not read until
+                    // the final block proof — which cannot start before the heavy
+                    // chain proof exists anyway, and which begins with seconds of
+                    // slack after this lane previously finished.
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _heavy_wait =
+                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
+                    let heavy_chain_proof = heavy_handle_outer
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    #[cfg(feature = "diagnostic_profile")]
+                    drop(_heavy_wait);
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -910,15 +956,12 @@ pub(crate) fn prove_block_after_pre(
                         },
                     )
                     .expect("final block early witness phase failed");
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`
+                    // returned just above (construction now follows the join
+                    // rather than preceding it, but still completes before this
+                    // point, so the release obligation is unchanged)
                     // returned above. Nothing reads those two circuits again:
                     // the light pipeline uses the light pair, and the final
                     // block proof uses only `block_data`, the three finished
