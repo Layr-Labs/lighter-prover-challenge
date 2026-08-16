@@ -156,68 +156,10 @@ pub fn set_pipeline_archive_dir(dir: &std::path::Path) {
     let _ = PIPELINE_ARCHIVE_DIR.set(dir.to_path_buf());
 }
 
-/// What the archive did on this process, for the one-line startup self-report.
-/// A ranked draw is otherwise uninformative about the mechanism: the archive is
-/// GPU- and OS-build-keyed and misses are silent, so without this line a flat
-/// score cannot be told apart from an archive that never served.
-const ARCHIVE_STATE_OFF: u8 = 0;
-const ARCHIVE_STATE_UNUSABLE: u8 = 1;
-const ARCHIVE_STATE_MISS: u8 = 2;
-const ARCHIVE_STATE_SERVES: u8 = 3;
-static ARCHIVE_STATE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(ARCHIVE_STATE_OFF);
-/// Pipelines that resolved out of the archive, and pipelines whose archive
-/// lookup missed and fell back to an AIR lowering.
-static ARCHIVE_HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static ARCHIVE_MISSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Pipelines that have settled (built or given up on), so the last one out can
-/// emit the report.
-static PIPELINES_SETTLED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Wall time of the blocking part of the pipeline-creation phase, in
-/// microseconds: archive load through the join of the required kernels. This is
-/// the span the first GPU-wanting proving step actually waits on.
-static PIPELINE_BLOCKING_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Start of the whole pipeline-creation phase.
-static PIPELINE_PHASE_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-
-/// Records one settled pipeline and, when the last of them lands, writes the
-/// single startup self-report line to stderr.
-///
-/// One `write(2)` of well under a hundred bytes, once per process, off the
-/// proving path. Unconditional on purpose: the ranked host is the only machine
-/// whose answer matters and it is the one machine we cannot attach to.
-fn note_pipeline_settled() {
-    use std::sync::atomic::Ordering;
-
-    let settled = PIPELINES_SETTLED.fetch_add(1, Ordering::AcqRel) + 1;
-    if settled as usize != METALLIB_REQUIRED_KERNELS.len() {
-        return;
-    }
-    let lowering_us = PIPELINE_PHASE_START
-        .get()
-        .map_or(0, |start| start.elapsed().as_micros() as u64);
-    let state = match ARCHIVE_STATE.load(Ordering::Acquire) {
-        ARCHIVE_STATE_SERVES => "serves",
-        ARCHIVE_STATE_MISS => "miss",
-        ARCHIVE_STATE_UNUSABLE => "unusable",
-        _ => "off",
-    };
-    eprintln!(
-        "[metal-archive] archive={state} pipelines={settled} hits={} misses={} \
-         blocking_ms={:.3} lowering_ms={:.3}",
-        ARCHIVE_HITS.load(Ordering::Acquire),
-        ARCHIVE_MISSES.load(Ordering::Acquire),
-        PIPELINE_BLOCKING_US.load(Ordering::Acquire) as f64 / 1000.0,
-        lowering_us as f64 / 1000.0,
-    );
-}
-
 /// Stages the embedded archive to disk and opens it. Any failure — no
 /// registered directory, an unwritable directory, or a Metal load error —
 /// yields `None`, and pipeline creation proceeds exactly as without an archive.
 fn load_pipeline_archive(device: &Device) -> Option<BinaryArchive> {
-    use std::sync::atomic::Ordering;
-
     let dir = PIPELINE_ARCHIVE_DIR.get()?;
     let path = dir.join("poseidon2-pipelines.metalarchive");
     if !path.is_file() && std::fs::write(&path, PIPELINE_ARCHIVE).is_err() {
@@ -234,7 +176,6 @@ fn load_pipeline_archive(device: &Device) -> Option<BinaryArchive> {
     match device.new_binary_archive_with_descriptor(&descriptor) {
         Ok(archive) => Some(archive),
         Err(error) => {
-            ARCHIVE_STATE.store(ARCHIVE_STATE_UNUSABLE, Ordering::Release);
             log::debug!("pipeline archive unavailable ({error}); lowering AIR directly");
             None
         }
@@ -288,17 +229,13 @@ fn build_pipeline(
     archive: Option<&BinaryArchive>,
     name: &str,
 ) -> Result<ComputePipelineState, String> {
-    use std::sync::atomic::Ordering;
-
     let function = library
         .get_function(name, None)
         .map_err(|error| format!("{name} kernel unavailable: {error}"))?;
     if let Some(archive) = archive {
         if let Some(pipeline) = pipeline_from_archive(device, archive, &function) {
-            ARCHIVE_HITS.fetch_add(1, Ordering::AcqRel);
             return Ok(pipeline);
         }
-        ARCHIVE_MISSES.fetch_add(1, Ordering::AcqRel);
     }
     device
         .new_compute_pipeline_state_with_function(&function)
@@ -1338,7 +1275,6 @@ fn spawn_optional_pipelines(
                     log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
                 }
                 let _ = slot.built.set(pipeline);
-                note_pipeline_settled();
             });
         match spawned {
             Ok(handle) => {
@@ -1346,11 +1282,10 @@ fn spawn_optional_pipelines(
                     *builder = Some(handle);
                 }
             }
-            // No thread means nothing will ever populate the slot; settle it now
-            // so readers fall back instead of looking for a build in flight.
+            // No thread means nothing will ever populate the slot, so readers
+            // must see an explicit absence instead of waiting for a build.
             Err(_) => {
                 let _ = slot.built.set(None);
-                note_pipeline_settled();
             }
         }
     }
@@ -1500,10 +1435,15 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// chunk trees keep plain FIFO so the transaction pipeline is not slowed on
 /// the spine's behalf while the spine has slack. A plain unconditional
 /// priority measured both directions: the chain's predecessor waits fell but
-/// the deferred chunk trees stretched the light path — this backlog gate is
-/// the balance point.
+/// the deferred chunk trees stretched the light path. Two runnable serial
+/// steps are already a full predecessor plus successor behind: waiting for a
+/// third lets the early heavy-chain steps sit behind multiple wide chunk
+/// commitments, precisely when both paths create the most queue pressure.
+/// Triggering at two preserves plain FIFO while either path has only one step
+/// of slack, but rescues the serial spine one step earlier once it is truly
+///   behind.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
+const SPINE_URGENT_BACKLOG: isize = 2;
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
@@ -2635,19 +2575,8 @@ impl MetalShared {
             // `FailOnBinaryArchiveMiss` probe decides, because a foreign or stale
             // archive still loads and then misses silently; on a miss the archive
             // is dropped and every path below is exactly what it was.
-            let _ = PIPELINE_PHASE_START.set(std::time::Instant::now());
-            let archive = load_pipeline_archive(&device).filter(|archive| {
-                let serves = archive_serves(&device, &library, archive);
-                ARCHIVE_STATE.store(
-                    if serves {
-                        ARCHIVE_STATE_SERVES
-                    } else {
-                        ARCHIVE_STATE_MISS
-                    },
-                    core::sync::atomic::Ordering::Release,
-                );
-                serves
-            });
+            let archive = load_pipeline_archive(&device)
+                .filter(|archive| archive_serves(&device, &library, archive));
             let device_ref = &device;
             let library_ref = &library;
             let archive_ref = archive.as_ref();
@@ -2657,7 +2586,6 @@ impl MetalShared {
                         build_pipeline(device_ref, library_ref, archive_ref, name)
                             .map_err(|error| format!("{kind}: {error}"))
                     });
-                    note_pipeline_settled();
                     pipeline
                 }
             };
@@ -2716,14 +2644,6 @@ impl MetalShared {
                         .expect("ifft finalize pipeline thread panicked"),
                 )
             });
-            // Everything the context blocks on is now built; the four optional
-            // kernels below land on their own threads.
-            PIPELINE_BLOCKING_US.store(
-                PIPELINE_PHASE_START
-                    .get()
-                    .map_or(0, |start| start.elapsed().as_micros() as u64),
-                core::sync::atomic::Ordering::Release,
-            );
             // Surfaced in kernel order, so a single missing or unbuildable
             // kernel yields the same error string the sequential construction
             // produced. Only the tie-break between two simultaneous failures
