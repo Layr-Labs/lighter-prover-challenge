@@ -721,6 +721,12 @@ struct ColumnStorePool {
 
 const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
 const MAX_COLUMN_STORE_POOL_BYTES: u64 = 2560 << 20;
+/// Recurring tx-wires store: 136 × 2^19 × 8. Under the per-buffer cap, so
+/// `take_or_new_column_buffer` hits `COLUMN_STORE_POOL`. Two copies cover
+/// the overlapping chunk proofs (light ramp depth 2; later window 6 still
+/// recycles through the same shape).
+const TX_WIRES_STORE_BYTES: u64 = 136 * (1 << 19) * 8;
+const TX_WIRES_PREWARM_COPIES: usize = 2;
 
 static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
     free: Vec::new(),
@@ -1466,6 +1472,51 @@ pub fn prewarm() {
                 }
             }
             let _ = force_context();
+            // Recurring tx-wires store is 136 × 2^19 × 8 = 544 MiB, under
+            // MAX_CACHED_COLUMN_STORE_BYTES, so take_or_new_column_buffer
+            // hits COLUMN_STORE_POOL — not PREWARMED_LARGE_STORE. Walk
+            // TX_WIRES_PREWARM_COPIES of them here after the context is
+            // up, at UTILITY, so overlapping LDE fills do not zero-fault
+            // 544 MiB on the critical path. Compile QoS stays 0x19 above;
+            // only the walk drops. Recycle after each walk so the first
+            // copy is takeable while the second is still faulting.
+            if let Some(context) = shared_context() {
+                #[allow(non_camel_case_types)]
+                {
+                    type qos_class_t = u32;
+                    unsafe extern "C" {
+                        fn pthread_set_qos_class_self_np(
+                            qos_class: qos_class_t,
+                            relative_priority: i32,
+                        ) -> i32;
+                    }
+                    unsafe {
+                        let _ = pthread_set_qos_class_self_np(0x11, 0);
+                    }
+                }
+                for _ in 0..TX_WIRES_PREWARM_COPIES {
+                    let buffer = autoreleasepool(|| {
+                        context.device.new_buffer(
+                            TX_WIRES_STORE_BYTES,
+                            MTLResourceOptions::StorageModeShared,
+                        )
+                    });
+                    let base = buffer.contents().cast::<u8>();
+                    if base.is_null() {
+                        continue;
+                    }
+                    const PAGE: isize = 16 * 1024;
+                    let mut offset: isize = 0;
+                    while (offset as u64) < TX_WIRES_STORE_BYTES {
+                        // SAFETY: offset stays within the buffer's allocated length.
+                        unsafe { base.offset(offset).write_volatile(0) };
+                        offset += PAGE;
+                    }
+                    if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
+                        pool.recycle(buffer);
+                    }
+                }
+            }
         })
         .ok();
 }
@@ -1565,7 +1616,34 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     if serial_critical_shape {
         return true;
     }
-    leaf_permutations + parent_permutations >= min_permutations
+    // FRI fold trees (chunk circuits fold at 2^16 and below) sit under
+    // MIN_GPU_PERMUTATIONS, so they hashed on the CPU even when the stream
+    // was empty. Occupancy-gate them: GPU only while exclusive or idle,
+    // never behind a 2^19 chunk tree (FIFO wait measured 200-320 ms).
+    //
+    // Idle break-even is the measured 2^16 width-8 shape (131,056 perms,
+    // GPU/CPU 0.88). 2^15 width-8 (≈65k, GPU/CPU 1.37) stays on the CPU.
+    // Do not change the 2^17 serial admission above: on this tip it is
+    // paired with the streamed wide-commitment path.
+    let idle = GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    let perms = leaf_permutations + parent_permutations;
+    const IDLE_FOLD_MIN_PERMUTATIONS: usize = 131_056;
+    let fri_fold_shape = leaf_width > 4
+        && leaf_count.is_power_of_two()
+        && (1 << 14..=1 << 16).contains(&leaf_count);
+    if fri_fold_shape && (exclusive || idle) {
+        if perms >= IDLE_FOLD_MIN_PERMUTATIONS {
+            return true;
+        }
+        // Arity-16 fold leaves are width 32. At 2^14 that is ~82k perms,
+        // under the width-8 131k break-even. pepedesigner v19 admitted
+        // width 17..=64 in this leaf range without a 131k floor; width 8
+        // at 2^15 (~65k, GPU/CPU 1.37) stays CPU.
+        if (17..=64).contains(&leaf_width) {
+            return true;
+        }
+    }
+    perms >= min_permutations
 }
 
 fn shared_context() -> Option<&'static MetalShared> {
@@ -4191,6 +4269,61 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn gpu_worthwhile_admits_idle_fri_folds_above_break_even() {
+        let was_exclusive = EXCLUSIVE_GPU_PHASE.swap(false, core::sync::atomic::Ordering::Relaxed);
+        let jobs = GPU_JOBS_IN_FLIGHT.swap(0, core::sync::atomic::Ordering::Relaxed);
+        assert!(
+            gpu_worthwhile(8, 1 << 16, 4),
+            "2^16 width-8 idle is the measured 0.88 GPU win"
+        );
+        assert!(
+            !gpu_worthwhile(8, 1 << 15, 4),
+            "2^15 width-8 idle stays CPU (measured 1.37)"
+        );
+        assert!(
+            gpu_worthwhile(32, 1 << 15, 4),
+            "2^15 width-32 idle is above the 131k break-even"
+        );
+        assert!(
+            gpu_worthwhile(32, 1 << 14, 4),
+            "2^14 width-32 idle is the arity-16 fold under 131k"
+        );
+        assert!(
+            !gpu_worthwhile(8, 1 << 14, 4),
+            "2^14 width-8 idle stays CPU (well under 131k)"
+        );
+        assert!(
+            gpu_worthwhile(8, 1 << 17, 4),
+            "2^17 serial admission on this tip stays unconditional"
+        );
+        GPU_JOBS_IN_FLIGHT.store(1, core::sync::atomic::Ordering::Relaxed);
+        assert!(
+            !gpu_worthwhile(8, 1 << 16, 4),
+            "2^16 width-8 behind a chunk tree stays CPU"
+        );
+        assert!(
+            gpu_worthwhile(8, 1 << 17, 4),
+            "2^17 stays GPU even when a job is in flight"
+        );
+        assert!(
+            gpu_worthwhile(8, 1 << 19, 4),
+            "2^19 stays above MIN_GPU_PERMUTATIONS when busy"
+        );
+        GPU_JOBS_IN_FLIGHT.store(jobs, core::sync::atomic::Ordering::Relaxed);
+        EXCLUSIVE_GPU_PHASE.store(was_exclusive, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn tx_wires_prewarm_copies_fit_column_store_pool() {
+        assert!(TX_WIRES_STORE_BYTES <= MAX_CACHED_COLUMN_STORE_BYTES);
+        assert_eq!(TX_WIRES_PREWARM_COPIES, 2);
+        assert!(
+            TX_WIRES_STORE_BYTES * TX_WIRES_PREWARM_COPIES as u64
+                <= MAX_COLUMN_STORE_POOL_BYTES
+        );
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
