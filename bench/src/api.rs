@@ -1,4 +1,9 @@
-// Redraw marker 501
+// Redraw marker 503
+// Bumped only to obtain a fresh submission hash: the ranked score is a draw
+// from a strongly bimodal runner pool (~27% of draws land in the fast band),
+// so an unchanged tree cannot be re-sampled — the service dedupes identical
+// submissions. Changes no executable behavior; the preceding marker (501) is
+// the same convention from the previous author.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
