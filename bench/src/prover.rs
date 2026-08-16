@@ -61,41 +61,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
 // machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
 // for experiments.
-// Retuned 6 -> 4 for the *scored* configuration, which runs five concurrent
-// workers rather than the single worker a local run exercises. The depth-6
-// evidence above was gathered one worker at a time; with five workers sharing
-// 14 cores and 48 GiB against an 8.1-8.7 GiB per-worker peak, depth 6 puts
-// ~30 transaction proofs in flight machine-wide, into the allocator/fault
-// churn the ~9.5 GiB collapse note above describes.
-//
-// Measured with two concurrent workers (the smallest harness that reproduces
-// GPU sharing and memory contention at all), wall time until both finish.
-// On this base, three interleaved rounds: depth 6 = 44.77 s, depth 4 = 39.20 /
-// 39.76 / 42.62 s, mean 40.53 s (-9.5%), depth 4 winning every round. On the
-// previous base a fuller sweep gave depth 6 = 55.34 s, 5 = 53.63, 4 = 47.02
-// (-15.1%), 3 = 46.22 (-16.5%), 2 = 50.16 (-9.4%) — depth 2 being worse than 3
-// makes this an interior optimum rather than "less parallelism is better".
-// Depths 3 and 2 were re-swept on this base too, but the host had drifted by
-// then and the three rounds disagreed on the ordering, so depth 4 stands on the
-// evidence above rather than on a noisier re-measurement.
-//
-// Ranked corroboration: the first two draws of this change both landed in the
-// slow runner pool at 26.99 and 27.22 — above the entire historical slow-pool
-// range (n=39, mean 25.36, sd 0.77, max ~26.1): 26.99 / 27.22 / 26.83, mean
-// 27.01, i.e. +2.1 sd, implying ~+6.5%, and tightly clustered (spread 0.39).
-// Ranked status as of the first draw of this build: contemporaneous same-window
-// comparison puts it at +0.6% (26.98 against 26.75 / 26.85 / 26.86 from other
-// solvers in the same minutes), i.e. neutral within noise. The 2-worker local
-// gain does not currently reproduce on the scored runner; recorded here so the
-// next reader weights the ranked number rather than the local one. Paired
-// same-window analysis over nine slow-pool draws now puts every build from this
-// session at +0.57% +- 0.50%. Separating the window builds from the earlier
-// reorder-only ones (which were genuinely -1.5%) gives window=4 alone
-// unresolved at slow-pool noise (sd ~1.6%/draw). First FAST-pool draw of this
-// leaner build (window + dead-stores, reorder dropped): 30.6542 and 30.7417,
-// mean 30.698 against same-window fast peers ~30.30 = +1.3% on both, and the
-// second lands 0.158 under the 30.8996 bar.
-const LIGHT_TX_PROOF_WINDOW: usize = 4;
+const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
@@ -620,7 +586,50 @@ fn prove_path(
                 } else {
                     1
                 };
-            if in_flight.len() >= max_in_flight {
+            if next_witness.is_none() {
+                // Drain has begun: this was the last tx proof this path will
+                // spawn. Join every already-retired in-flight proof and spawn
+                // its chain step now so Phase-1 (tx-proof-only) starts before
+                // the blocking drain, without waiting for the light window to
+                // fill. The pipelined branch below is unchanged on purpose:
+                // joining a finished proof while we still spawn replacements
+                // would shrink depth-6 overlap toward depth 4. Measured: 6
+                // beats 4 by ~4.6% on a quiet host and the ordering inverts
+                // under load (see `light_tx_proof_window`).
+                while in_flight
+                    .front()
+                    .is_some_and(|(_, handle)| handle.is_finished())
+                {
+                    let (proof_step, proof_handle) = in_flight
+                        .pop_front()
+                        .expect("finished drain prefix must not be empty");
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _join_wait =
+                        plonky2::util::profile::span("wait", "tx_proof_drain_early_join");
+                    let tx_proof = proof_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    let previous = chain.take();
+                    plonky2::hash::poseidon2::spine_backlog_add(1);
+                    let handle = std::thread::Builder::new()
+                        .name(format!("{path:?}-chain-drain-{proof_step}"))
+                        .stack_size(PROVER_THREAD_STACK_BYTES)
+                        .spawn_scoped(scope, move || {
+                            chain_step_proof(
+                                path,
+                                chain_target,
+                                chain_data,
+                                proof_step,
+                                previous,
+                                base,
+                                dummy_proof,
+                                &tx_proof,
+                            )
+                        })
+                        .expect("chain drain thread must start");
+                    chain = Some(ChainState::InFlight(handle));
+                }
+            } else if in_flight.len() >= max_in_flight {
                 let (proof_step, proof_handle) = in_flight
                     .pop_front()
                     .expect("transaction proof window must not be empty");
@@ -665,11 +674,13 @@ fn prove_path(
                 .expect("chain step pipeline thread must start");
             chain = Some(ChainState::InFlight(handle));
         }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases — but only once this path is the
-        // last one proving, since the switch is process-global (see
+        // Past this point the pipeline spawns no new chunk work. Any
+        // already-retired prefix was joined and spawned on the last spawn
+        // iteration; the loop below blocking-joins the remainder. The drain
+        // is the strictly sequential chain tail, so its mid-size commitment
+        // trees can use the mostly idle GPU exactly like the pre-execution
+        // and final block phases — but only once this path is the last one
+        // proving, since the switch is process-global (see
         // [`claims_exclusive_gpu_phase`]).
         let mut exclusive_drain = false;
         #[cfg(feature = "diagnostic_profile")]
@@ -953,7 +964,6 @@ pub(crate) fn prove_block_after_pre(
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`
-
                     // returned above. Nothing reads those two circuits again:
                     // the light pipeline uses the light pair, and the final
                     // block proof uses only `block_data`, the three finished
