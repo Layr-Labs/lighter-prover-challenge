@@ -49,6 +49,119 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // only syscall batching, never the serialized bytes.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
 
+/// Returns the top-level JSON object with its transaction array replaced by an empty array.
+///
+/// The pre-execution witness does not read transactions. Keeping the unchanged full serde parse
+/// as the transaction authority lets that expensive parse overlap the early pre-execution path.
+/// This scanner recognizes only the top-level `txs` value and skips strings (including escapes)
+/// and nested arrays without interpreting their contents.
+fn without_top_level_txs(json: &[u8]) -> Vec<u8> {
+    let mut i = 0;
+    let mut object_depth = 0usize;
+    let mut array_depth = 0usize;
+
+    while i < json.len() {
+        match json[i] {
+            b'"' => {
+                let string_start = i;
+                i += 1;
+                let mut terminated = false;
+                while i < json.len() {
+                    match json[i] {
+                        b'\\' => i = (i + 2).min(json.len()),
+                        b'"' => {
+                            i += 1;
+                            terminated = true;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                assert!(terminated, "unterminated string in prover fixture");
+
+                if object_depth == 1
+                    && array_depth == 0
+                    && &json[string_start + 1..i - 1] == b"txs"
+                {
+                    let mut value_start = i;
+                    while json.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                        value_start += 1;
+                    }
+                    assert_eq!(json.get(value_start), Some(&b':'), "txs must be an object key");
+                    value_start += 1;
+                    while json.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                        value_start += 1;
+                    }
+                    assert_eq!(json.get(value_start), Some(&b'['), "txs must be a JSON array");
+
+                    let mut value_end = value_start;
+                    let mut tx_array_depth = 0usize;
+                    while value_end < json.len() {
+                        match json[value_end] {
+                            b'"' => {
+                                value_end += 1;
+                                let mut terminated = false;
+                                while value_end < json.len() {
+                                    match json[value_end] {
+                                        b'\\' => value_end = (value_end + 2).min(json.len()),
+                                        b'"' => {
+                                            value_end += 1;
+                                            terminated = true;
+                                            break;
+                                        }
+                                        _ => value_end += 1,
+                                    }
+                                }
+                                assert!(terminated, "unterminated string in txs array");
+                            }
+                            b'[' => {
+                                tx_array_depth += 1;
+                                value_end += 1;
+                            }
+                            b']' => {
+                                assert_ne!(tx_array_depth, 0, "invalid txs array nesting");
+                                tx_array_depth -= 1;
+                                value_end += 1;
+                                if tx_array_depth == 0 {
+                                    let mut envelope = Vec::with_capacity(
+                                        json.len() - (value_end - value_start) + 2,
+                                    );
+                                    envelope.extend_from_slice(&json[..value_start]);
+                                    envelope.extend_from_slice(b"[]");
+                                    envelope.extend_from_slice(&json[value_end..]);
+                                    return envelope;
+                                }
+                            }
+                            _ => value_end += 1,
+                        }
+                    }
+                    panic!("unterminated txs array in prover fixture");
+                }
+            }
+            b'{' => {
+                object_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                object_depth = object_depth
+                    .checked_sub(1)
+                    .expect("invalid JSON object nesting");
+                i += 1;
+            }
+            b'[' => {
+                array_depth += 1;
+                i += 1;
+            }
+            b']' => {
+                array_depth = array_depth.checked_sub(1).expect("invalid JSON array nesting");
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    panic!("prover fixture is missing its top-level txs array");
+}
+
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
@@ -95,12 +208,26 @@ fn main() {
         rayon::current_num_threads() as u64,
     );
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
+    let json = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span = plonky2::util::profile::span("startup", "fixture_read");
+        fs::read(&fixture).expect("cannot read prover fixture")
+    };
+    let pre_json = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span =
+            plonky2::util::profile::span("startup", "fixture_split_transactions");
+        without_top_level_txs(&json)
+    };
+    // The unchanged authoritative parse starts immediately on its own thread. The much smaller
+    // transaction-free envelope is sufficient for the pre-execution witness and is parsed while
+    // the pre circuit loads; the transaction pipeline joins the authoritative block before use.
+    let block_handle = std::thread::Builder::new()
+        .name("fixture-full-parse".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
             Block::<F>::from_json_with_empty_txs(
                 &json,
                 HEAVY_TX_PER_PROOF,
@@ -109,6 +236,15 @@ fn main() {
                 PUBLIC_LIGHT_TX_COUNT,
             )
             .expect("invalid prover fixture")
+        })
+        .expect("cannot start full fixture parse");
+    let (pre_block, pre_circuits) = rayon::join(
+        || {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span =
+                plonky2::util::profile::span("startup", "fixture_envelope_parse");
+            serde_json::from_slice::<Block<F>>(&pre_json)
+                .expect("invalid prover fixture envelope")
         },
         || {
             #[cfg(feature = "diagnostic_profile")]
@@ -143,8 +279,10 @@ fn main() {
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
-            circuit::block_pre_execution::BlockPreExec::from_block(&block)
+            circuit::block_pre_execution::BlockPreExec::from_block(&pre_block)
         };
+        drop(pre_block);
+        drop(pre_json);
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -191,6 +329,9 @@ fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _pre_wait = plonky2::util::profile::span("wait", "pre_execution_join");
     let (pre_target, pre_data, pre_proof) = pre_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    let block = block_handle
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     #[cfg(feature = "diagnostic_profile")]
