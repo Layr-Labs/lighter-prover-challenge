@@ -184,9 +184,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
                     let polys = &polynomials;
+                    let coeff_columns = polys
+                        .iter()
+                        .map(|polynomial| polynomial.coeffs.as_slice())
+                        .collect_vec();
                     C::Hasher::try_build_merkle_tree_column_store_streamed(
                         &columns,
                         cap_height,
+                        &coeff_columns,
+                        rate_bits,
                         &|group, destinations: &mut [&mut [F]]| {
                             destinations.par_iter_mut().enumerate().for_each(
                                 |(k, destination)| {
