@@ -6,7 +6,7 @@ use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
-use crate::field::batch_util::batch_multiply_add_inplace;
+use crate::field::batch_util::{batch_multiply_add_inplace, batch_multiply_into};
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -353,6 +353,18 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
 /// the representative the multiply/add chain produces, including for the
 /// non-canonical `value + ORDER` representatives that arise when the chain's
 /// field value is below `2^32 - 1`.
+/// Write `terms * filter` into one constraint row. `assign` replaces the
+/// destination (field-exact `0 + x` → `x` when the buffer was a zero seed or
+/// uninitialized); otherwise this is the historical accumulate.
+#[inline(always)]
+fn fused_filter_mul<F: Field>(out: &mut [F], terms: &[F], filter: &[F], assign: bool) {
+    if assign {
+        batch_multiply_into(out, terms, filter);
+    } else {
+        batch_multiply_add_inplace(out, terms, filter);
+    }
+}
+
 fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     wires: &[F],
     batch_size: usize,
@@ -360,6 +372,7 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     uninterleave_filter: &[F],
     summed_filter: &[F],
     combined: &mut [F],
+    assign_first: bool,
 ) {
     debug_assert_eq!(interleave_filter.len(), batch_size);
     debug_assert_eq!(uninterleave_filter.len(), batch_size);
@@ -398,6 +411,25 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     let (wide_spread, wide_parity) = rest.split_at_mut(batch_size);
     wide_parity.fill(0);
 
+    // First write to each of the 136 rows assigns `term * filter` instead of
+    // `0 + term * filter`. Field-exact (Goldilocks `Add(0, x)` is `x` as a
+    // field element) but not raw-limb-identical, which the pinned verifier
+    // does not require. Later writes to the same row still accumulate.
+    let mut seen = [false; INTERLEAVE_PAIR_CONSTRAINTS];
+    let mut write_row = |combined: &mut [F], row: usize, terms: &[F], filter: &[F]| {
+        debug_assert!(row < INTERLEAVE_PAIR_CONSTRAINTS);
+        let first = assign_first && !seen[row];
+        if first {
+            seen[row] = true;
+        }
+        fused_filter_mul(
+            &mut combined[row * batch_size..(row + 1) * batch_size],
+            terms,
+            filter,
+            first,
+        );
+    };
+
     for operation in 0..INTERLEAVE_OPS {
         let interleave_row = operation * 34;
         let bit_offset = operation * 32;
@@ -428,15 +460,11 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
             }
 
             let row = interleave_row + 2 + bit_index;
-            let interleave_output = &mut combined[row * batch_size..(row + 1) * batch_size];
             if operation % 2 == 0 {
-                batch_multiply_add_inplace(interleave_output, range, interleave_filter);
-                let uninterleave_row = row + 2;
-                let uninterleave_output = &mut combined
-                    [uninterleave_row * batch_size..(uninterleave_row + 1) * batch_size];
-                batch_multiply_add_inplace(uninterleave_output, range, uninterleave_filter);
+                write_row(combined, row, range, interleave_filter);
+                write_row(combined, row + 2, range, uninterleave_filter);
             } else {
-                batch_multiply_add_inplace(interleave_output, range, summed_filter);
+                write_row(combined, row, range, summed_filter);
             }
         }
 
@@ -446,9 +474,7 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
             x[point] = F::from_noncanonical_u128(wide_x[point]);
             range[point] = x[point] - x_col[point];
         }
-        let output = &mut combined
-            [interleave_row * batch_size..(interleave_row + 1) * batch_size];
-        batch_multiply_add_inplace(output, range, interleave_filter);
+        write_row(combined, interleave_row, range, interleave_filter);
 
         let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
         for point in 0..batch_size {
@@ -456,9 +482,7 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
             base4_accumulator[point] = F::from_noncanonical_u128(wide_spread[point]);
             range[point] = base4_accumulator[point] - spread_col[point];
         }
-        let output = &mut combined
-            [(interleave_row + 1) * batch_size..(interleave_row + 2) * batch_size];
-        batch_multiply_add_inplace(output, range, interleave_filter);
+        write_row(combined, interleave_row + 1, range, interleave_filter);
     }
 
     for (accumulator, &lane) in parity_accumulators.iter_mut().zip(wide_parity.iter()) {
@@ -486,26 +510,22 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
             range[point] =
                 (inverse[point] * (u32_max - high[point]) - F::ONE) * low[point];
         }
-        let output = &mut combined[row * batch_size..(row + 1) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
+        write_row(combined, row, range, uninterleave_filter);
 
         for point in 0..batch_size {
             range[point] = high[point] * split + low[point] - interleaved[point];
         }
-        let output = &mut combined[(row + 1) * batch_size..(row + 2) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
+        write_row(combined, row + 1, range, uninterleave_filter);
 
         for point in 0..batch_size {
             range[point] = evens[point] - x_evens[point];
         }
-        let output = &mut combined[(row + 2) * batch_size..(row + 3) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
+        write_row(combined, row + 2, range, uninterleave_filter);
 
         for point in 0..batch_size {
             range[point] = odds[point] - x_odds[point];
         }
-        let output = &mut combined[(row + 3) * batch_size..(row + 4) * batch_size];
-        batch_multiply_add_inplace(output, range, uninterleave_filter);
+        write_row(combined, row + 3, range, uninterleave_filter);
     }
 }
 
@@ -1565,58 +1585,62 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     // ~16k batches per proof — and pays for it with stores to lines the
     // reduction has already pulled in and dirtied.
     let required = num_constraint_rows * vars_batch.len();
+    let fused_covers_all = interleave_pair.is_some()
+        && num_constraint_rows == INTERLEAVE_PAIR_CONSTRAINTS;
     if constraints_batch.len() != required {
         constraints_batch.clear();
-        constraints_batch.resize(required, F::ZERO);
+        if fused_covers_all {
+            // The fused pair writes every constraint row. First-touch assign
+            // (field-exact, not limb-identical) makes the zero fill dead.
+            constraints_batch.reserve(required);
+            // SAFETY: `eval_interleave_pair_dense_fused(..., assign_first=true)`
+            // assigns every slot of `0..required` before any read.
+            unsafe {
+                constraints_batch.set_len(required);
+            }
+        } else {
+            constraints_batch.resize(required, F::ZERO);
+        }
+    } else if !fused_covers_all {
+        debug_assert!(
+            constraints_batch.iter().all(|v| *v == F::ZERO),
+            "constraint scratch must be zero on entry; the consumer clears it as it reads"
+        );
     }
-    debug_assert!(
-        constraints_batch.iter().all(|v| *v == F::ZERO),
-        "constraint scratch must be zero on entry; the consumer clears it as it reads"
-    );
+    if let Some(plan) = interleave_pair {
+        if filters.len() != 3 * vars_batch.len() {
+            filters.resize(3 * vars_batch.len(), F::ZERO);
+        }
+        let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
+        let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
+        fill_interleave_gate_filter(
+            common_data,
+            vars_batch,
+            plan.interleave_index,
+            interleave_filter,
+        );
+        fill_interleave_gate_filter(
+            common_data,
+            vars_batch,
+            plan.uninterleave_index,
+            uninterleave_filter,
+        );
+        for point in 0..vars_batch.len() {
+            summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
+        }
+        eval_interleave_pair_dense_fused(
+            vars_batch.local_wires,
+            vars_batch.len(),
+            interleave_filter,
+            uninterleave_filter,
+            summed_filter,
+            constraints_batch,
+            fused_covers_all,
+        );
+    }
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
-            if i == plan.interleave_index {
-                // Size the buffer without re-zeroing it. `clear()` then
-                // `resize()` memset all three sub-slices on every batch, but
-                // each is fully assigned before it is read: the two
-                // `fill_interleave_gate_filter` calls below write every point of
-                // `interleave_filter` and `uninterleave_filter`, and the loop
-                // writes every point of `summed_filter`. `filters` is scratch
-                // reused across batches, so after the first batch of a worker
-                // thread this resize is a no-op and the memset is gone
-                // entirely — 3 * batch * 8 B per batch, ~12 MiB per d16 tx
-                // proof. Value-exact: no slot's read can observe the difference.
-                if filters.len() != 3 * vars_batch.len() {
-                    filters.resize(3 * vars_batch.len(), F::ZERO);
-                }
-                let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
-                let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.interleave_index,
-                    interleave_filter,
-                );
-                fill_interleave_gate_filter(
-                    common_data,
-                    vars_batch,
-                    plan.uninterleave_index,
-                    uninterleave_filter,
-                );
-                for point in 0..vars_batch.len() {
-                    summed_filter[point] = interleave_filter[point] + uninterleave_filter[point];
-                }
-                eval_interleave_pair_dense_fused(
-                    vars_batch.local_wires,
-                    vars_batch.len(),
-                    interleave_filter,
-                    uninterleave_filter,
-                    summed_filter,
-                    constraints_batch,
-                );
-                continue;
-            }
-            if i == plan.uninterleave_index {
+            if i == plan.interleave_index || i == plan.uninterleave_index {
                 continue;
             }
         }
@@ -2099,6 +2123,7 @@ mod tests {
                     &uninterleave_filter,
                     &summed_filter,
                     &mut actual,
+                    false,
                 );
 
                 for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
@@ -2209,6 +2234,7 @@ mod tests {
                 &uninterleave_filter,
                 &summed_filter,
                 &mut actual_rows,
+                false,
             );
 
             for (index, (&actual, &expected)) in
