@@ -111,7 +111,13 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // 500-active-tx ranked fixture, so a window-depth effect is structurally
 // understated locally. Per the file's own guidance the ranked draw, not the
 // local number, settles it.
-const LIGHT_TX_PROOF_WINDOW: usize = 6;
+// Sweep probe against the 4d7d8567 frontier (which shipped 6): 5 is the
+// untested midpoint between the two ranked-measured points (4 on ca62aa9b,
+// 6 on 4d7d8567). The frontier's own comment above says ranked external load
+// inverts the quiet-host depth ordering, so the ranked optimum may sit
+// shallower than the quiet optimum. This submission isolates exactly this
+// one variable against the current frontier.
+const LIGHT_TX_PROOF_WINDOW: usize = 5;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
