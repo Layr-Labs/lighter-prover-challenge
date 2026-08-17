@@ -6,9 +6,9 @@ pub(crate) mod metal;
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 pub use metal::{
-    is_exclusive_gpu_phase, prewarm as prewarm_gpu, prewarm_large_column_store,
-    prewarm_streamed_buffers, set_exclusive_gpu_phase, set_pipeline_archive_dir,
-    spine_backlog_add,
+    hideable_tx_inflight_add, is_exclusive_gpu_phase, is_spine_urgent, prewarm as prewarm_gpu,
+    prewarm_large_column_store, prewarm_streamed_buffers, set_exclusive_gpu_phase,
+    set_pipeline_archive_dir, spine_backlog_add,
 };
 
 /// No-op fallback so callers can toggle the exclusive-phase GPU routing hint
@@ -27,10 +27,21 @@ pub fn is_exclusive_gpu_phase() -> bool {
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
 pub fn prewarm_gpu() {}
 
+/// No-op fallback for the hideable-tx occupancy hint on platforms without
+/// the Metal backend.
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+pub fn hideable_tx_inflight_add(_delta: isize) {}
+
 /// No-op fallback for the chain-backlog GPU priority hint on platforms
 /// without the Metal backend.
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
 pub fn spine_backlog_add(_delta: isize) {}
+
+/// False on platforms without the Metal-backed spine-backlog hint.
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+pub fn is_spine_urgent() -> bool {
+    false
+}
 
 /// No-op fallback for the large-store prewarm on platforms without the
 /// Metal backend.
