@@ -146,7 +146,6 @@ fn main() {
             circuit::block_pre_execution::BlockPreExec::from_block(&block)
         };
         let pre_handle = std::thread::Builder::new()
-            .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
             .spawn(move || {
                 let (pre_target, mut pre_data) = pre_circuits;
