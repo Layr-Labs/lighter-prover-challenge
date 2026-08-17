@@ -798,6 +798,118 @@ pub fn prewarm_large_column_store(bytes: u64) {
     }
 }
 
+/// Pre-sizes and pre-faults the streamed sponge's buffer pair at `leaf_count`.
+///
+/// Every streamed build before the final block is 2^19-leaf, so the pair is
+/// grown for the first time by the final block itself — 2^21 LDE rows, i.e. a
+/// 192 MiB state buffer and a ~128 MiB output buffer — and that growth lands
+/// inside the exclusive serial tail, where nothing else is running to hide the
+/// first-touch faults. This does the same job as
+/// [`prewarm_large_column_store`] for a different allocation.
+///
+/// Allocation and the page walk both happen *outside* the mutex: the lock
+/// serializes whole streamed builds, so walking hundreds of MiB under it would
+/// stall the light pipeline for the walk's duration. The lock is taken only to
+/// install, and only when the stashed pair is actually smaller, so a build that
+/// is mid-flight simply finishes first.
+///
+/// Writing zeros is semantics-preserving: a fresh `StorageModeShared` buffer is
+/// already zero-filled, and no build can observe this one until it is
+/// published, so the pair a later build takes holds exactly what a fresh
+/// allocation would have held.
+/// Pre-faulted digest-output buffers for the final block's streamed builds.
+///
+/// Each streamed build swaps a fresh output buffer in so the completed one can
+/// leave with the tree. At final-block dimensions that buffer is ~128 MiB,
+/// which is far above [`MAX_CACHED_DIGEST_OUTPUT_BYTES`], so `DigestOutputPool`
+/// will neither serve nor recycle it: all three of the block's commitments
+/// allocate and first-touch one, in the exclusive serial tail. This stash is
+/// consulted after the pool and before the allocator.
+static PREWARMED_STREAMED_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+
+/// Number of final-block streamed commitments: wires, Zs/partial-products, and
+/// quotient.
+const PREWARMED_STREAMED_DIGEST_COUNT: usize = 3;
+
+/// Takes a pre-faulted digest replacement of at least `bytes`, if one is stashed.
+fn take_prewarmed_streamed_digest(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_STREAMED_DIGESTS.lock().ok()?;
+    let index = stash.iter().position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+/// Allocates `bytes` and touches one byte per page so the faults are paid here.
+fn allocate_page_walked(device: &Device, bytes: u64) -> Option<Buffer> {
+    let buffer =
+        autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared));
+    let base = buffer.contents().cast::<u8>();
+    if base.is_null() {
+        return None;
+    }
+    const PAGE: isize = 16 * 1024;
+    let mut offset: isize = 0;
+    while (offset as u64) < bytes {
+        // SAFETY: offset stays within the buffer's allocated length.
+        unsafe { base.offset(offset).write_volatile(0) };
+        offset += PAGE;
+    }
+    Some(buffer)
+}
+
+pub fn prewarm_streamed_buffers(leaf_count: usize) {
+    let Some(context) = shared_context() else {
+        return;
+    };
+    // Size for the largest cap this leaf count can produce (`cap_count == 1`),
+    // so any real cap height leaves `needs_new` false rather than reallocating.
+    let Some(state_bytes) = leaf_count
+        .checked_mul(12)
+        .and_then(|v| v.checked_mul(size_of::<u64>()))
+    else {
+        return;
+    };
+    let Some(output_bytes) = leaf_count
+        .checked_mul(2)
+        .and_then(|v| v.checked_sub(1))
+        .and_then(|v| v.checked_mul(4))
+        .and_then(|v| v.checked_mul(size_of::<u64>()))
+    else {
+        return;
+    };
+    let (state_bytes, output_bytes) = (state_bytes as u64, output_bytes as u64);
+
+    let Some(state) = allocate_page_walked(&context.device, state_bytes) else {
+        return;
+    };
+    let Some(output) = allocate_page_walked(&context.device, output_bytes) else {
+        return;
+    };
+
+    if let Ok(mut slot) = STREAMED_BUFFERS.lock() {
+        let smaller = slot.as_ref().map_or(true, |(state, output)| {
+            state.length() < state_bytes || output.length() < output_bytes
+        });
+        if smaller {
+            *slot = Some((state, output));
+        }
+    }
+
+    // The block's three streamed commitments each swap in a fresh output
+    // buffer of this size, and the digest pool's cap rejects them, so without
+    // this they are three more first-touch allocations in the tail. Published
+    // one at a time so a block that arrives mid-walk takes whatever is ready
+    // rather than nothing.
+    for _ in 0..PREWARMED_STREAMED_DIGEST_COUNT {
+        let Some(buffer) = allocate_page_walked(&context.device, output_bytes) else {
+            return;
+        };
+        match PREWARMED_STREAMED_DIGESTS.lock() {
+            Ok(mut stash) => stash.push(buffer),
+            Err(_) => return,
+        }
+    }
+}
+
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
 /// device allocation. Misses (including lock contention) fall through to the
 /// allocator; the pool is a best-effort page-warm cache, never a correctness
@@ -1279,6 +1391,28 @@ impl LazyPipeline {
         }
         self.built.get()?.as_ref()
     }
+
+    /// Reports the kernel absent rather than waiting for its build.
+    ///
+    /// The reasoning in [`Self::get`] is specific to the gate-quotient
+    /// pipelines, where "absent" silently relocates gates onto the CPU
+    /// quotient. It does not hold for the streamed absorb pass, whose absence
+    /// has a complete and cheap fallback: the caller takes
+    /// `fill_lde_column_store` + `MerkleTree::new_column_store`, which is
+    /// exactly the pre-streaming behaviour and is asserted bit-identical by
+    /// this file's differentials.
+    ///
+    /// That difference matters at startup. The four optional lowerings only
+    /// start once the context is ready, and the first thing to reach the
+    /// streamed path afterwards is the embedded-blob load: both 2^19-leaf tx
+    /// blobs recompute `constants_sigmas_commitment`, and at 82 columns they
+    /// clear the `leaf_width > 64` stream admission unconditionally. Blocking
+    /// there put the slowest optional kernel's lowering directly on the
+    /// startup critical path that `bin/prove.rs` joins before proving can
+    /// begin, to save a hash the CPU can do meanwhile.
+    fn try_get(&self) -> Option<&ComputePipelineState> {
+        self.built.get()?.as_ref()
+    }
 }
 
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
@@ -1299,7 +1433,10 @@ fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 }
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
-    ABSORB_PASS_PIPELINE.get()
+    // Non-blocking on purpose; see `LazyPipeline::try_get`. Once the lowering
+    // has landed — which is every call in steady state — this is the same
+    // pointer `get` would return.
+    ABSORB_PASS_PIPELINE.try_get()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1503,7 +1640,27 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// the deferred chunk trees stretched the light path — this backlog gate is
 /// the balance point.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-const SPINE_URGENT_BACKLOG: isize = 3;
+/// Lowered 3 -> 1 (any runnable chain step makes the spine urgent). The note
+/// above compared a *plain unconditional* priority against this gate and picked
+/// 3 as the balance point, but that balance was struck under the same
+/// five-concurrent-workers premise as the light-window retune, where five
+/// processes shared one physical GPU. The harness runs fixtures strictly
+/// sequentially, so the only contention on the queue is this process's own
+/// chunk trees — and that internal contention is precisely what the measured
+/// 200-320 ms fold commits (against 10-50 ms alone) are made of, so it is
+/// present on the ranked host too. With a single process on the queue, giving
+/// the strictly serial spine priority costs a deferred chunk tree much less
+/// than it saves on the chain's critical path.
+///
+/// Local same-binary interleaved ABBA, 8 pairs, direct worker, public fixture,
+/// busy host: gate 3 mean 9.313 s / min 8.959; gate 1 mean 9.154 s / min 9.044
+/// — paired mean -1.70%, gate 1 winning 6/8 pairs, gate 3 keeping the single
+/// fastest run. The paired mean is the estimator this design supports; the min
+/// of eight runs is a high-variance order statistic and is reported only for
+/// completeness. Local timing cannot settle a scheduling knob on a contended
+/// host, so this rests on the causal argument above and is submitted to be
+/// tested by the ranked draw.
+const SPINE_URGENT_BACKLOG: isize = 1;
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
@@ -2325,6 +2482,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     )
                 })
                 .collect();
+            // Diagnostic only: the streamed CPU fill was the one large block of
+            // `compute wires commitment` not covered by any span, which left it
+            // ambiguous whether that time is CPU work or GPU queue wait.
+            #[cfg(feature = "diagnostic_profile")]
+            let _fill = crate::util::profile::span("streamed_fill", "fill_group");
             fill_group(group, &mut slices);
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
@@ -2411,6 +2573,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take_best_fit(output_bytes as u64)
+        // Then the pre-faulted stash, which exists precisely for the sizes the
+        // pool's cap refuses (see `PREWARMED_STREAMED_DIGESTS`).
+        .or_else(|| take_prewarmed_streamed_digest(output_bytes as u64))
         .unwrap_or_else(|| {
             autoreleasepool(|| {
                 context
@@ -7085,6 +7250,36 @@ kernel void goldilocks_mul_bench_native(
                     "Merkle path mismatch vs CPU at leaf {leaf}, level {level}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod occupancy_probe {
+    use super::*;
+
+    /// Diagnostic: reports per-kernel occupancy limits. `max_total_threads_per_threadgroup`
+    /// is the observable proxy for register pressure on Apple GPUs — a kernel that spills
+    /// or holds a large live set reports a lower ceiling than the 1024 an unconstrained
+    /// kernel gets. Ignored by default: device-specific, reports rather than asserts.
+    #[test]
+    #[ignore = "device-specific occupancy report"]
+    fn report_pipeline_occupancy() {
+        let device = Device::system_default().expect("metal device");
+        let library = device
+            .new_library_with_data(SHADER_METALLIB)
+            .expect("metallib loads");
+        for name in METALLIB_REQUIRED_KERNELS {
+            let function = library.get_function(name, None).expect(name);
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .expect("pipeline");
+            println!(
+                "{name}: max_threads={} exec_width={} tg_mem={}",
+                pipeline.max_total_threads_per_threadgroup(),
+                pipeline.thread_execution_width(),
+                pipeline.static_threadgroup_memory_length(),
+            );
         }
     }
 }
