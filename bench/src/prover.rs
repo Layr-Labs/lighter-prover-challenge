@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
-use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
+use circuit::block_pre_execution::BlockPreExec;
+#[cfg(test)]
+use circuit::block_pre_execution::BlockPreExecWitness;
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
 };
@@ -19,7 +21,10 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
-use circuit::types::constants::TX_LIGHT;
+use circuit::types::constants::{MARGINED_ASSET_LIST_SIZE, POSITION_LIST_SIZE, TX_LIGHT};
+use circuit::types::margined_asset::MARGINED_ASSET_SIZE;
+use circuit::types::market_details::PublicMarketDetails;
+use circuit::types::state_metadata::{STATE_METADATA_SIZE, StateMetadata};
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{
     ParallelWitnessGuard, PartitionSeedLayout, PendingPartitionWitness, is_seed_layout_mismatch,
@@ -37,6 +42,45 @@ use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 enum TxPath {
     Heavy,
     Light,
+}
+
+const PRE_ROOTS_PUBLIC_INPUT_OFFSET: usize = STATE_METADATA_SIZE
+    + POSITION_LIST_SIZE * PublicMarketDetails::PARTIAL_PUBLIC_INPUTS_SIZE
+    + MARGINED_ASSET_LIST_SIZE * MARGINED_ASSET_SIZE;
+const PRE_PUBLIC_INPUTS_LEN: usize = PRE_ROOTS_PUBLIC_INPUT_OFFSET + 3 * 4 + 2;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrePipelineOutput {
+    state_metadata_hash: HashOut<F>,
+    new_state_root: HashOut<F>,
+    new_validium_root: HashOut<F>,
+}
+
+impl PrePipelineOutput {
+    /// Project the locally-produced pre proof to the only values the native
+    /// transaction pipeline consumes. The final block circuit still verifies
+    /// the complete proof recursively.
+    fn from_public_inputs(public_inputs: &[F]) -> Self {
+        assert_eq!(
+            public_inputs.len(),
+            PRE_PUBLIC_INPUTS_LEN,
+            "pre-execution proof public-input shape changed"
+        );
+
+        let hash_at = |offset: usize| HashOut {
+            elements: public_inputs[offset..offset + 4]
+                .try_into()
+                .expect("four-element pre-execution root slice"),
+        };
+        let state_metadata =
+            StateMetadata::from_public_inputs(&public_inputs[..STATE_METADATA_SIZE]);
+
+        Self {
+            state_metadata_hash: state_metadata.hash(),
+            new_state_root: hash_at(PRE_ROOTS_PUBLIC_INPUT_OFFSET + 4),
+            new_validium_root: hash_at(PRE_ROOTS_PUBLIC_INPUT_OFFSET + 8),
+        }
+    }
 }
 
 #[cfg(feature = "diagnostic_profile")]
@@ -440,8 +484,7 @@ fn prove_path(
     block_number: u64,
     created_at: i64,
     old_account_delta_tree_root: HashOut<F>,
-    pre_output: &BlockPreExecWitness<F>,
-    state_metadata_hash: HashOut<F>,
+    pre_output: PrePipelineOutput,
     active_paths: &AtomicUsize,
 ) -> Proof {
     assert!(
@@ -529,7 +572,7 @@ fn prove_path(
         tx_data,
         tx_target,
         created_at,
-        state_metadata_hash,
+        pre_output.state_metadata_hash,
         jump,
         &mut tx_seed_layout,
     );
@@ -592,7 +635,7 @@ fn prove_path(
                     tx_data,
                     tx_target,
                     created_at,
-                    state_metadata_hash,
+                    pre_output.state_metadata_hash,
                     jump,
                     &mut tx_seed_layout,
                 );
@@ -840,8 +883,7 @@ pub(crate) fn prove_block_after_pre(
         plonky2::util::profile::enter_context("block_pipeline", block.block_number, &[]);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_block_after_pre");
-    let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
-    let state_metadata_hash = pre_output.new_state_metadata.hash();
+    let pre_output = PrePipelineOutput::from_public_inputs(&pre_proof.public_inputs);
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
     let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
@@ -898,8 +940,7 @@ pub(crate) fn prove_block_after_pre(
                         block.block_number,
                         block.created_at,
                         block.old_account_delta_tree_root,
-                        &pre_output,
-                        state_metadata_hash,
+                        pre_output,
                         active_paths,
                     )
                 })
@@ -986,8 +1027,7 @@ pub(crate) fn prove_block_after_pre(
                         block.block_number,
                         block.created_at,
                         block.old_account_delta_tree_root,
-                        &pre_output,
-                        state_metadata_hash,
+                        pre_output,
                         active_paths,
                     )
                 })
@@ -1079,6 +1119,103 @@ mod tests {
         CHAIN_ID, HEAVY_TX_MODE, HEAVY_TX_PER_PROOF, LIGHT_TX_MODE, LIGHT_TX_PER_PROOF,
         PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
     };
+    use plonky2::field::types::{Field, Field64};
+
+    fn projection_test_public_inputs() -> Vec<F> {
+        let mut public_inputs = vec![F::ZERO; PRE_PUBLIC_INPUTS_LEN];
+        public_inputs[0] = F::from_canonical_i64(-1);
+        public_inputs[1] = F::from_canonical_i64(-2);
+        public_inputs[2] = F::from_canonical_i64(42);
+        for (i, value) in (101u64..109).enumerate() {
+            public_inputs[PRE_ROOTS_PUBLIC_INPUT_OFFSET + 4 + i] =
+                F::from_canonical_u64(value);
+        }
+        public_inputs
+    }
+
+    #[test]
+    fn pre_pipeline_projection_is_length_strict_and_preserves_signed_metadata_and_roots() {
+        assert_eq!(PRE_PUBLIC_INPUTS_LEN, 1914);
+        let public_inputs = projection_test_public_inputs();
+        let projection = PrePipelineOutput::from_public_inputs(&public_inputs);
+        let legacy_metadata =
+            StateMetadata::from_public_inputs(&public_inputs[..STATE_METADATA_SIZE]);
+
+        assert_eq!(projection.state_metadata_hash, legacy_metadata.hash());
+        assert_eq!(
+            projection.new_state_root.elements.as_slice(),
+            &public_inputs[PRE_ROOTS_PUBLIC_INPUT_OFFSET + 4..PRE_ROOTS_PUBLIC_INPUT_OFFSET + 8]
+        );
+        assert_eq!(
+            projection.new_validium_root.elements.as_slice(),
+            &public_inputs[PRE_ROOTS_PUBLIC_INPUT_OFFSET + 8..PRE_ROOTS_PUBLIC_INPUT_OFFSET + 12]
+        );
+
+        for invalid_len in [PRE_PUBLIC_INPUTS_LEN - 1, PRE_PUBLIC_INPUTS_LEN + 1] {
+            let invalid = vec![F::ZERO; invalid_len];
+            assert!(
+                std::panic::catch_unwind(|| PrePipelineOutput::from_public_inputs(&invalid))
+                    .is_err(),
+                "projection must reject {invalid_len} public inputs"
+            );
+        }
+    }
+
+    #[test]
+    fn pre_pipeline_projection_is_not_an_external_malformed_proof_validator() {
+        let mut malformed = projection_test_public_inputs();
+        // The first market sign may only be 0, 1, or -1. The narrow ranked-worker
+        // projection intentionally skips this unused field; the retained full
+        // parser remains available to validate arbitrary external inputs.
+        malformed[STATE_METADATA_SIZE] = F::TWO;
+
+        let _ = PrePipelineOutput::from_public_inputs(&malformed);
+        assert!(
+            std::panic::catch_unwind(|| {
+                BlockPreExecWitness::<F>::from_public_inputs(&malformed)
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "builds and proves the production pre-execution circuit"]
+    fn actual_pre_proof_projection_matches_full_legacy_parser() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(actual_pre_proof_projection_matches_full_legacy_parser_impl)
+            .expect("pre projection oracle thread must start")
+            .join()
+            .expect("pre projection oracle thread must finish");
+    }
+
+    fn actual_pre_proof_projection_matches_full_legacy_parser_impl() {
+        use circuit::types::config::CIRCUIT_CONFIG;
+
+        let block = Block::<F>::from_json_with_empty_txs(
+            include_bytes!("../bench_test.json"),
+            HEAVY_TX_PER_PROOF,
+            LIGHT_TX_PER_PROOF,
+            PUBLIC_HEAVY_TX_COUNT,
+            PUBLIC_LIGHT_TX_COUNT,
+        )
+        .expect("public fixture must parse");
+        let pre = BlockPreExecutionCircuit::define(CIRCUIT_CONFIG);
+        let pre_target = pre.target;
+        let pre_data = pre.builder.build::<C>();
+        let pre_proof = prove_pre_execution_parallel(
+            &pre_data,
+            &pre_target,
+            &BlockPreExec::from_block(&block),
+        );
+
+        assert_eq!(pre_proof.public_inputs.len(), PRE_PUBLIC_INPUTS_LEN);
+        let legacy = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
+        let projection = PrePipelineOutput::from_public_inputs(&pre_proof.public_inputs);
+        assert_eq!(projection.state_metadata_hash, legacy.new_state_metadata.hash());
+        assert_eq!(projection.new_state_root, legacy.new_state_root);
+        assert_eq!(projection.new_validium_root, legacy.new_validium_root);
+    }
 
     /// Every set slot must hold the same value the generic seeded path
     /// produces, except at slots the circuit itself randomizes; the set bitmaps
