@@ -17,7 +17,10 @@ use crate::iop::target::{BoolTarget, Target};
 use crate::iop::wire::Wire;
 use crate::plonk::circuit_data::{VerifierCircuitTarget, VerifierOnlyCircuitData};
 use crate::plonk::config::{AlgebraicHasher, GenericConfig};
-use crate::plonk::proof::{Proof, ProofTarget, ProofWithPublicInputs, ProofWithPublicInputsTarget};
+use crate::plonk::proof::{
+    OpeningSet, OpeningSetTarget, Proof, ProofTarget, ProofWithPublicInputs,
+    ProofWithPublicInputsTarget,
+};
 
 pub trait WitnessWrite<F: Field> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()>;
@@ -129,10 +132,7 @@ pub trait WitnessWrite<F: Field> {
         )?;
         self.set_cap_target(&proof_target.quotient_polys_cap, &proof.quotient_polys_cap)?;
 
-        self.set_fri_openings(
-            &proof_target.openings.to_fri_openings(),
-            &proof.openings.to_fri_openings(),
-        )?;
+        set_opening_set_target(self, &proof_target.openings, &proof.openings)?;
 
         set_fri_proof_target(self, &proof_target.opening_proof, &proof.opening_proof)
     }
@@ -200,6 +200,72 @@ pub trait WitnessWrite<F: Field> {
 
         Ok(())
     }
+}
+
+/// Writes a structured PLONK opening set without materializing the two owned
+/// [`FriOpeningsTarget`] / [`FriOpenings`] transport graphs used by the generic
+/// FRI API. The component order is exactly the order of
+/// `OpeningSet{,Target}::to_fri_openings`: the zeta components first, followed
+/// by the next-point components.
+fn set_opening_set_target<W, F, const D: usize>(
+    writer: &mut W,
+    targets: &OpeningSetTarget<D>,
+    values: &OpeningSet<F, D>,
+) -> Result<()>
+where
+    W: WitnessWrite<F> + ?Sized,
+    F: RichField + Extendable<D>,
+{
+    // Validate the complete shape before mutating the witness. Besides making
+    // every component mismatch an error in release builds, this avoids a
+    // partially written witness when a later (next-point) component is wrong.
+    for (component, target_len, value_len) in [
+        ("constants", targets.constants.len(), values.constants.len()),
+        (
+            "plonk_sigmas",
+            targets.plonk_sigmas.len(),
+            values.plonk_sigmas.len(),
+        ),
+        ("wires", targets.wires.len(), values.wires.len()),
+        ("plonk_zs", targets.plonk_zs.len(), values.plonk_zs.len()),
+        (
+            "partial_products",
+            targets.partial_products.len(),
+            values.partial_products.len(),
+        ),
+        (
+            "quotient_polys",
+            targets.quotient_polys.len(),
+            values.quotient_polys.len(),
+        ),
+        ("lookup_zs", targets.lookup_zs.len(), values.lookup_zs.len()),
+        (
+            "plonk_zs_next",
+            targets.plonk_zs_next.len(),
+            values.plonk_zs_next.len(),
+        ),
+        (
+            "lookup_zs_next",
+            targets.next_lookup_zs.len(),
+            values.lookup_zs_next.len(),
+        ),
+    ] {
+        if target_len != value_len {
+            return Err(anyhow!(
+                "Opening set component {component} length mismatch: {target_len} targets != {value_len} values"
+            ));
+        }
+    }
+
+    writer.set_extension_targets(&targets.constants, &values.constants)?;
+    writer.set_extension_targets(&targets.plonk_sigmas, &values.plonk_sigmas)?;
+    writer.set_extension_targets(&targets.wires, &values.wires)?;
+    writer.set_extension_targets(&targets.plonk_zs, &values.plonk_zs)?;
+    writer.set_extension_targets(&targets.partial_products, &values.partial_products)?;
+    writer.set_extension_targets(&targets.quotient_polys, &values.quotient_polys)?;
+    writer.set_extension_targets(&targets.lookup_zs, &values.lookup_zs)?;
+    writer.set_extension_targets(&targets.plonk_zs_next, &values.plonk_zs_next)?;
+    writer.set_extension_targets(&targets.next_lookup_zs, &values.lookup_zs_next)
 }
 
 /// A witness holds information on the values of targets in a circuit.
@@ -547,6 +613,185 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
             Some(self.values[rep_index])
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    const D: usize = 2;
+    type F = GoldilocksField;
+
+    #[derive(Default)]
+    struct RecordingWitness {
+        writes: Vec<(Target, F)>,
+    }
+
+    impl WitnessWrite<F> for RecordingWitness {
+        fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+            self.writes.push((target, value));
+            Ok(())
+        }
+    }
+
+    fn extension_targets(next_index: &mut usize, len: usize) -> Vec<ExtensionTarget<D>> {
+        (0..len)
+            .map(|_| {
+                ExtensionTarget(core::array::from_fn(|_| {
+                    let target = Target::VirtualTarget { index: *next_index };
+                    *next_index += 1;
+                    target
+                }))
+            })
+            .collect()
+    }
+
+    fn extension_values(
+        next_value: &mut u64,
+        len: usize,
+    ) -> Vec<<F as Extendable<D>>::Extension> {
+        (0..len)
+            .map(|_| {
+                <<F as Extendable<D>>::Extension as FieldExtension<D>>::from_basefield_array(
+                    core::array::from_fn(|_| {
+                        let value = F::from_canonical_u64(*next_value);
+                        *next_value += 1;
+                        value
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    fn opening_fixture(with_lookup: bool) -> (OpeningSetTarget<D>, OpeningSet<F, D>) {
+        let lookup_len = usize::from(with_lookup) * 2;
+
+        // Construct in legacy FRI write order so monotonically increasing
+        // target/value IDs independently pin that order in the assertions.
+        let mut next_target = 0;
+        let constants = extension_targets(&mut next_target, 2);
+        let plonk_sigmas = extension_targets(&mut next_target, 3);
+        let wires = extension_targets(&mut next_target, 4);
+        let plonk_zs = extension_targets(&mut next_target, 2);
+        let partial_products = extension_targets(&mut next_target, 3);
+        let quotient_polys = extension_targets(&mut next_target, 2);
+        let lookup_zs = extension_targets(&mut next_target, lookup_len);
+        let plonk_zs_next = extension_targets(&mut next_target, 2);
+        let next_lookup_zs = extension_targets(&mut next_target, lookup_len);
+
+        let mut next_value = 1;
+        let constant_values = extension_values(&mut next_value, 2);
+        let plonk_sigma_values = extension_values(&mut next_value, 3);
+        let wire_values = extension_values(&mut next_value, 4);
+        let plonk_z_values = extension_values(&mut next_value, 2);
+        let partial_product_values = extension_values(&mut next_value, 3);
+        let quotient_poly_values = extension_values(&mut next_value, 2);
+        let lookup_z_values = extension_values(&mut next_value, lookup_len);
+        let plonk_z_next_values = extension_values(&mut next_value, 2);
+        let lookup_z_next_values = extension_values(&mut next_value, lookup_len);
+
+        (
+            OpeningSetTarget {
+                constants,
+                plonk_sigmas,
+                wires,
+                plonk_zs,
+                plonk_zs_next,
+                lookup_zs,
+                next_lookup_zs,
+                partial_products,
+                quotient_polys,
+            },
+            OpeningSet {
+                constants: constant_values,
+                plonk_sigmas: plonk_sigma_values,
+                wires: wire_values,
+                plonk_zs: plonk_z_values,
+                plonk_zs_next: plonk_z_next_values,
+                partial_products: partial_product_values,
+                quotient_polys: quotient_poly_values,
+                lookup_zs: lookup_z_values,
+                lookup_zs_next: lookup_z_next_values,
+            },
+        )
+    }
+
+    fn assert_direct_opening_writes_match_legacy(with_lookup: bool) -> Result<()> {
+        let (targets, values) = opening_fixture(with_lookup);
+        let mut direct = RecordingWitness::default();
+        set_opening_set_target(&mut direct, &targets, &values)?;
+
+        let mut legacy = RecordingWitness::default();
+        legacy.set_fri_openings(&targets.to_fri_openings(), &values.to_fri_openings())?;
+
+        assert_eq!(direct.writes, legacy.writes);
+        for (expected_index, &(target, value)) in direct.writes.iter().enumerate() {
+            assert_eq!(target, Target::VirtualTarget { index: expected_index });
+            assert_eq!(value, F::from_canonical_u64(expected_index as u64 + 1));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_opening_writes_match_legacy_without_lookups() -> Result<()> {
+        assert_direct_opening_writes_match_legacy(false)
+    }
+
+    #[test]
+    fn direct_opening_writes_match_legacy_with_lookups() -> Result<()> {
+        assert_direct_opening_writes_match_legacy(true)
+    }
+
+    #[test]
+    fn direct_opening_writes_reject_every_component_length_mismatch() {
+        let (targets, values) = opening_fixture(true);
+        let cases: [(&str, fn(&mut OpeningSetTarget<D>)); 9] = [
+            ("constants", |t| {
+                t.constants.pop();
+            }),
+            ("plonk_sigmas", |t| {
+                t.plonk_sigmas.pop();
+            }),
+            ("wires", |t| {
+                t.wires.pop();
+            }),
+            ("plonk_zs", |t| {
+                t.plonk_zs.pop();
+            }),
+            ("partial_products", |t| {
+                t.partial_products.pop();
+            }),
+            ("quotient_polys", |t| {
+                t.quotient_polys.pop();
+            }),
+            ("lookup_zs", |t| {
+                t.lookup_zs.pop();
+            }),
+            ("plonk_zs_next", |t| {
+                t.plonk_zs_next.pop();
+            }),
+            ("lookup_zs_next", |t| {
+                t.next_lookup_zs.pop();
+            }),
+        ];
+
+        for (component, mutate) in cases {
+            let mut malformed = targets.clone();
+            mutate(&mut malformed);
+            let mut writer = RecordingWitness::default();
+            let error = set_opening_set_target(&mut writer, &malformed, &values)
+                .expect_err("every component mismatch must fail closed");
+            assert!(
+                error.to_string().contains(component),
+                "wrong error for {component}: {error:#}"
+            );
+            assert!(
+                writer.writes.is_empty(),
+                "{component} mismatch wrote a partial witness before failing"
+            );
         }
     }
 }
