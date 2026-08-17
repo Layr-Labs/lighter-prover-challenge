@@ -128,7 +128,6 @@ where
     pub new_prefix_priority_operation_hash: [u8; KECCAK_HASH_OUT_BYTE_SIZE],
 
     #[serde(rename = "txs")]
-    #[serde(deserialize_with = "deserialize_txs_parallel")]
     txs: Vec<Tx<F>>,
     /// Chunk slots share immutable padding transactions instead of cloning the
     /// full transaction state and Merkle paths for every padded position.
@@ -147,46 +146,7 @@ where
     ) -> serde_json::Result<Self> {
         Self::from_json_with_empty_txs(data, tx_per_proof, light_tx_per_proof, 0, 0)
     }
-}
 
-/// Parses the `txs` array with one worker per transaction.
-///
-/// The array dominates a block witness — a single empty transaction serializes
-/// to ~107 KB because of its Merkle-path arrays, so a 500-transaction block is
-/// tens of megabytes — and the whole parse ran on one thread at the very front
-/// of the process, where only the (fast) pre-execution circuit load overlaps
-/// it. The pre-execution witness, its proof, and everything downstream wait on
-/// this.
-///
-/// Deferring each element as a `RawValue` costs one scan to find the element
-/// boundaries, then parses the bodies in parallel. Value-exact: every element
-/// is handed to the same `Tx` deserializer over the same bytes, and collecting
-/// into a `Vec` preserves order, so the block is identical. Errors stay errors;
-/// only the reported byte position changes, because an element is parsed
-/// standalone rather than at its offset in the enclosing document.
-///
-/// The borrow is sound for every caller: they all reach this through
-/// `from_json*` with a `&[u8]`, i.e. a borrowing deserializer.
-fn deserialize_txs_parallel<'de, D, F>(deserializer: D) -> Result<Vec<Tx<F>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    F: Field + Extendable<5> + RichField,
-{
-    use rayon::prelude::*;
-    use serde::de::Error as _;
-
-    let raw: Vec<&'de serde_json::value::RawValue> =
-        serde::Deserialize::deserialize(deserializer)?;
-    raw.into_par_iter()
-        .map(|element| serde_json::from_str::<Tx<F>>(element.get()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(D::Error::custom)
-}
-
-impl<F> Block<F>
-where
-    F: Field + Extendable<5> + RichField,
-{
     /// Like [`Self::from_json`], but when the block consists only of empty txs, appends
     /// `heavy_empty_tx_count` heavy and `light_empty_tx_count` light copies of the block's
     /// trailing empty tx before chunking. Blocks with active txs are parsed unchanged.
