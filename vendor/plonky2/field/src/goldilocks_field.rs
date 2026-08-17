@@ -507,7 +507,7 @@ fn mul_acc_reduce(acc: u64, a: u64, b: u64) -> u64 {
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
 #[inline]
-fn reduce128(x: u128) -> GoldilocksField {
+pub(crate) fn reduce128(x: u128) -> GoldilocksField {
     let (x_lo, x_hi) = split(x); // This is a no-op
     let x_hi_hi = x_hi >> 32;
     let x_hi_lo = x_hi & EPSILON;
