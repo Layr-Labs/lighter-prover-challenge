@@ -95,7 +95,23 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // leaner build (window + dead-stores, reorder dropped): 30.6542 and 30.7417,
 // mean 30.698 against same-window fast peers ~30.30 = +1.3% on both, and the
 // second lands 0.158 under the 30.8996 bar.
-const LIGHT_TX_PROOF_WINDOW: usize = 4;
+// Retuned 4 -> 6 on corrected execution-model evidence. The 6 -> 4 retune
+// above was premised on five concurrent workers, but the harness runs the
+// fixtures strictly sequentially (benchmark-tools/harness/src/main.rs
+// run_private_sequence: a plain for-loop that awaits each worker's exit before
+// spawning the next, single shared deadline), so exactly one worker owns the
+// ranked machine at a time — bin/prove.rs already records this and is right.
+// A sequential host is the quiet-host regime, where the ledger above records
+// depth 6 beating 4 by ~4.6%. Local corroboration on this base (8 interleaved
+// ABBA pairs, direct worker, public fixture, busy host): depth 6 mean 9.283 s
+// vs depth 4 mean 9.331 s (-0.5%), 6 winning 5/8 pairs, but depth 4 holds the
+// single fastest run (9.09 s vs 9.13 s), so 6 wins the mean and loses the min
+// — below local noise either way. The public fixture is also the all-empty
+// synthetic witness, where the light lane does far less per-chunk work than a
+// 500-active-tx ranked fixture, so a window-depth effect is structurally
+// understated locally. Per the file's own guidance the ranked draw, not the
+// local number, settles it.
+const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
@@ -755,6 +771,14 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // Same slack, same problem, different allocation: every streamed
+                // build before the final block is 2^19-leaf, so the streamed
+                // sponge's buffer pair is grown for the first time by the block
+                // itself (192 MiB state + ~128 MiB output) inside the exclusive
+                // serial tail. Pre-fault it here instead. Ordered after the
+                // wires store because that one is the larger fault set and the
+                // block reaches it first.
+                plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
             })
             .ok();
     }
