@@ -321,7 +321,7 @@ where
 /// materialize-then-multiply-add reference semantics, checked at an explicit
 /// batch size so callers can cover packing remainders and boundary widths.
 /// (The frontier's u32 interleave/uninterleave tests reference this helper but
-/// the composition that promoted them lost its definition; restored here.)
+/// the composition that promoted them lost its definition; restored here.) (hermes-c4-1786814133-95)
 pub fn assert_accumulate_matches_materialized_at_batch_size<G>(gate: &G, n: usize)
 where
     G: Gate<GoldilocksField, 2>,

@@ -1,19 +1,15 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};
 
-use core::any::TypeId;
 use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::batch_util::batch_multiply_into;
-use crate::field::extension::quadratic::QuadraticExtension;
-use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::batch_util::{batch_multiply_inplace, batch_multiply_into};
+use crate::field::extension::Extendable;
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
-use crate::field::goldilocks_extensions::ext2_mul_add;
-use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
@@ -37,7 +33,7 @@ pub const SALT_SIZE: usize = 4;
 /// frontier) scored 6.2323 despite a +4.6% controlled local win — the NTT
 /// stages extend each tree's exclusive occupancy of the serialized GPU
 /// stream, which is the ranked critical path. Keep off; hashing-only GPU
-/// trees (`new_columns`) remain on.
+/// trees (`new_columns`) remain on. (hermes-c4-1786814133-95)
 const GPU_NTT_COMMITMENTS: bool = false;
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
@@ -300,20 +296,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // with the packed batch multiply over the precomputed table.
                 let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
-                // SAFETY: capacity is exactly `lde_len >= degree` and `F` is
-                // `Copy`. The `degree` live slots are *assigned* by the
-                // `batch_multiply_into` immediately below, which never reads
-                // its destination.
-                unsafe { buffer.set_len(degree) };
-                // Fused copy-and-scale, the twin of the column-store path: the
-                // unscaled coefficient image the `extend_from_slice` used to
-                // materialize here is never observed (only the coset-scaled
-                // values reach the FFT), so writing the product directly deletes
-                // one read+write pass over `degree` words per polynomial.
-                // `batch_multiply_into` uses the same packed-prefix/scalar-tail
-                // schedule as the `batch_multiply_inplace` it replaces, over
-                // slices of equal length, so every word is bit-identical.
-                batch_multiply_into(&mut buffer[..degree], &p.coeffs, &coset_powers);
+                buffer.extend_from_slice(&p.coeffs);
                 if rate_bits == 0 || degree < 2 {
                     buffer.resize(lde_len, F::ZERO);
                 } else {
@@ -325,6 +308,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     // for a single live coefficient.
                     unsafe { buffer.set_len(lde_len) };
                 }
+                batch_multiply_inplace(&mut buffer[..degree], &coset_powers);
                 PolynomialCoeffs::new(buffer)
                     .fft_with_options(Some(rate_bits), fft_root_table)
                     .values
@@ -638,9 +622,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // where the `k_i`s are chosen such that each power of `alpha` appears only once in the final sum.
         // There are usually two batches for the openings at `zeta` and `g * zeta`.
         // The oracles used in Plonky2 are given in `FRI_ORACLES` in `plonky2/src/plonk/plonk_common.rs`.
-        for (batch_index, FriBatchInfo { point, polynomials }) in
-            instance.batches.iter().enumerate()
-        {
+        for FriBatchInfo { point, polynomials } in &instance.batches {
             // Collect the coefficients of all the polynomials in `polynomials`.
             let polys_coeff = polynomials.iter().map(|fri_poly| {
                 &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
@@ -650,24 +632,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // here — so the `String` is allocated, written and dropped without
             // ever being read. A static label costs nothing and reads the same
             // in a timing build.
-            // The first (and widest) batch can donate its composition buffer
-            // to the quotient without changing the wide reduction's schedule:
-            // there is no prior `final_poly` to preserve.
-            // Later tiny batches stream fixed-size cache blocks directly
-            // into the running quotient, avoiding another full-degree
-            // composition allocation and write/read pass.
-            if batch_index > 0 && polynomials.len() <= 16 {
-                timed!(
-                    timing,
-                    "reduce and accumulate small opening batch",
-                    alpha.accumulate_small_polys_base_linear_quotient(
-                        polys_coeff,
-                        &mut final_poly,
-                        *point,
-                    )
-                );
-                continue;
-            }
             let composition_poly = timed!(
                 timing,
                 "reduce batch of polynomials",
@@ -681,18 +645,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // Horner recurrence and leaves its top slot as the power-of-two
             // pad), writing straight into `final_poly`'s reusable buffer
             // instead of a division pass + shift pass + add pass.
-            if final_poly.coeffs.is_empty() {
-                // Multiplying the empty accumulator by `shift` is a no-op.
-                // Reuse the wide composition allocation as the quotient and
-                // remove the equally large zero-fill/output pass. Resetting
-                // the reducing factor also avoids exponentiating alpha for a
-                // factor that would only multiply the empty accumulator.
-                alpha.reset();
-                final_poly = composition_poly.divide_by_linear_padded_in_place(*point);
-            } else {
-                let shift = alpha.shift_factor();
-                accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
-            }
+            let shift = alpha.shift_factor();
+            accumulate_linear_quotient(&mut final_poly, &composition_poly, *point, shift);
         }
 
         // `final_poly` is dead after this point, so pad it in place instead of
@@ -730,9 +684,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            coset_fft_zero_tail_base::<F, D>(
+            coset_fft_zero_tail(
                 &lde_final_poly,
-                F::coset_shift(),
+                F::coset_shift().into(),
                 live_coeffs,
                 Some(fri_params.config.rate_bits),
                 None,
@@ -769,11 +723,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 /// would have computed there; the FFT input is therefore element-wise
 /// identical. With `rate_bits = 3` that deletes 7/8 of the extension-field
 /// multiplies *and* 7/8 of the serial `powers()` chain, at one memset.
-///
-/// Both production callers now pass a base-field shift and route through
-/// [`coset_fft_zero_tail_base`]; this generic form is retained as that
-/// function's differential oracle.
-#[allow(dead_code)]
 pub(crate) fn coset_fft_zero_tail<F: Field>(
     coeffs: &PolynomialCoeffs<F>,
     shift: F,
@@ -787,19 +736,11 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
     debug_assert!(zero_tail_is_unread || coeffs.coeffs[live..].iter().all(F::is_zero));
     let mut scaled = Vec::with_capacity(len);
-    // The FRI folding schedule reuses the same handful of shifts (`g`, then
-    // `g^arity` per reduction round) for every proof of a given circuit, so
-    // the successive-multiply power chain is built once per process and read
-    // back here. `shift_powers` returns the very sequence `shift.powers()`
-    // yields, so `powers[i]` is the same word `Powers` would have produced,
-    // and the scaling loop below performs the same `r * c` products in the
-    // same order. The loop stays serial.
-    let powers = crate::plonk::prover::precomputed::shift_powers::<F>(shift, live);
     scaled.extend(
-        powers[..live]
-            .iter()
+        shift
+            .powers()
             .zip(&coeffs.coeffs[..live])
-            .map(|(&r, &c)| r * c),
+            .map(|(r, &c)| r * c),
     );
     if zero_tail_is_unread {
         // SAFETY: capacity is exactly `len`. The zero-padded FFT reads only
@@ -809,88 +750,6 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
         unsafe { scaled.set_len(len) };
     } else {
         scaled.resize(len, F::ZERO);
-    }
-    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
-        fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
-    } else {
-        fft_in_place_with_options(&mut scaled, zero_factor, root_table);
-    }
-    PolynomialValues::new(scaled)
-}
-
-/// [`coset_fft_zero_tail`] for the case every production caller actually has:
-/// a coset shift that lives in the *base* field, embedded into the extension
-/// only to be multiplied back out again.
-///
-/// Both prover call sites pass `F::coset_shift().into()` or a base
-/// `MULTIPLICATIVE_GROUP_GENERATOR` power through `.into()`, so the power
-/// chain `shift^i` never leaves the base field. Building it there instead
-/// halves the table and replaces every step of the serial dependent multiply
-/// chain with one base multiply.
-///
-/// Raw-representative-exact, not merely field-equal. For
-/// `QuadraticExtension<GoldilocksField>` (which does not override
-/// `scalar_mul`):
-///  * `ext2_mul([r, 0], [c0, c1])` computes `c0` as `u160_times_7(0*c1) +
-///    r*c0`, i.e. `reduce160(r*c0, 0)`, and `c1` as `reduce160(r*c1 + 0, 0)`;
-///  * `reduce160(x, 0)` and `reduce128(x)` are the identical
-///    `t0`/`t1`/`add_no_canonicalize_trashing_input` sequence, and
-///    `GoldilocksField::mul` *is* `reduce128`;
-///  * so `[r,0] * c` and `c.scalar_mul(r)` produce the same two `u64` words,
-///    not merely congruent ones.
-/// The same argument makes the base power chain word-identical to the
-/// embedded one: every embedded power is `[x, 0]`, and the next step reduces
-/// exactly `x * shift` with a zero high accumulator.
-/// `base_scalar_mul_matches_embedded_extension_mul_raw_words` is the
-/// differential; `coset_fft_zero_tail` stays as the generic test oracle.
-pub(crate) fn coset_fft_zero_tail_base<F: Extendable<D>, const D: usize>(
-    coeffs: &PolynomialCoeffs<F::Extension>,
-    shift_base: F,
-    live: usize,
-    zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F::Extension>>,
-) -> PolynomialValues<F::Extension> {
-    let len = coeffs.len();
-    debug_assert!(live <= len);
-    let zero_tail_is_unread =
-        matches!(zero_factor, Some(r) if r > 0 && live >= 2 && live == len >> r);
-    debug_assert!(
-        zero_tail_is_unread
-            || coeffs.coeffs[live..]
-                .iter()
-                .all(<F::Extension as Field>::is_zero)
-    );
-    let mut scaled = Vec::with_capacity(len);
-    // The opening site's `live` is the circuit degree, so this is the very
-    // table the LDE coset scaling already warmed for this process; the FRI
-    // folding rounds reuse the arbitrary-shift cache exactly as before, only
-    // over the base field.
-    let powers = if shift_base == F::coset_shift() {
-        let table = crate::plonk::prover::precomputed::coset_shift_powers::<F>(live);
-        // A cache-key drift would hand back a shorter prefix and silently
-        // truncate the scaling.
-        assert_eq!(
-            table.len(),
-            live,
-            "cached coset shift power table must cover the live prefix"
-        );
-        table
-    } else {
-        crate::plonk::prover::precomputed::shift_powers::<F>(shift_base, live)
-    };
-    scaled.extend(
-        powers[..live]
-            .iter()
-            .zip(&coeffs.coeffs[..live])
-            .map(|(&r, &c)| <F::Extension as FieldExtension<D>>::scalar_mul(&c, r)),
-    );
-    if zero_tail_is_unread {
-        // SAFETY: identical to `coset_fft_zero_tail`; capacity is exactly
-        // `len` and the zero-padded FFT writes every tail element before
-        // reading it.
-        unsafe { scaled.set_len(len) };
-    } else {
-        scaled.resize(len, <F::Extension as Field>::ZERO);
     }
     if crate::hash::poseidon2::is_exclusive_gpu_phase() {
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
@@ -935,43 +794,6 @@ fn accumulate_linear_quotient<F: Field>(
     }
     // Highest slot: the quotient coefficient there is the explicit zero pad.
     buf[d - 1] *= shift;
-    // Production Goldilocks-quadratic fast path. Each synthetic-division step
-    // is two multiply-accumulates, and the separate spelling pays four
-    // `reduce160` per step (two for the delayed extension multiply, two more
-    // for the canonicalizing extension add). `ext2_mul_add` folds the addend
-    // into the multiply's accumulators for exactly two per step. The result
-    // is the same field element with a representative that may be the
-    // canonical one where the separate spelling's `Add` left a `+ p` on it
-    // (see `ext2_mul_add_matches_mul_then_add_as_field_values`); noncanonical
-    // representatives are ordinary here and every consumer downstream is
-    // congruence-preserving.
-    if TypeId::of::<F>() == TypeId::of::<QuadraticExtension<GoldilocksField>>() {
-        // SAFETY: the `TypeId` comparison proves `F` is exactly
-        // `QuadraticExtension<GoldilocksField>`, so the casts below preserve
-        // layout, length and alignment, and the reads are of an initialized
-        // `Copy` value of that same type.
-        let buf_q = unsafe {
-            core::slice::from_raw_parts_mut(
-                buf.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
-                buf.len(),
-            )
-        };
-        let coeffs_q = unsafe {
-            core::slice::from_raw_parts(
-                coeffs.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
-                coeffs.len(),
-            )
-        };
-        let z_q = unsafe { *(&z as *const F).cast::<QuadraticExtension<GoldilocksField>>() };
-        let shift_q =
-            unsafe { *(&shift as *const F).cast::<QuadraticExtension<GoldilocksField>>() };
-        let mut acc = QuadraticExtension::<GoldilocksField>::ZERO;
-        for i in (0..d - 1).rev() {
-            acc = ext2_mul_add(acc, z_q, coeffs_q[i + 1]);
-            buf_q[i] = ext2_mul_add(buf_q[i], shift_q, acc);
-        }
-        return;
-    }
     // Synthetic division, highest coefficient first: the quotient's
     // coefficient at `x^i` is the accumulator after absorbing `coeffs[i + 1]`.
     let mut acc = F::ZERO;
@@ -1204,186 +1026,6 @@ mod tests {
         check::<<GoldilocksField as Extendable<2>>::Extension>();
     }
 
-    /// A2's whole claim in one place: for the embedded shift both prover call
-    /// sites actually pass, `c.scalar_mul(r)` and `[r, 0] * c` produce the
-    /// *same raw `u64` words*, not merely the same field element. Compared on
-    /// `to_noncanonical_u64` limbs, never on the field type (whose `PartialEq`
-    /// canonicalizes and would hide exactly this bug class). The last case is
-    /// the sabotage control: one limb of the reference is perturbed and the
-    /// differential must fail.
-    #[test]
-    fn base_scalar_mul_matches_embedded_extension_mul_raw_words() {
-        use crate::field::extension::FieldExtension;
-        use crate::field::types::{Field64, PrimeField64, Sample};
-
-        type FE = <GoldilocksField as Extendable<2>>::Extension;
-
-        fn raw(x: FE) -> [u64; 2] {
-            let limbs: [GoldilocksField; 2] =
-                <FE as FieldExtension<2>>::to_basefield_array(&x);
-            [limbs[0].to_noncanonical_u64(), limbs[1].to_noncanonical_u64()]
-        }
-
-        // Noncanonical and boundary representatives are the interesting
-        // inputs: `reduce128`/`reduce160` may leave a `+ p` on the word.
-        let edge_base = [
-            GoldilocksField::ZERO,
-            GoldilocksField::ONE,
-            GoldilocksField(u64::MAX),
-            GoldilocksField(GoldilocksField::ORDER),
-            GoldilocksField(GoldilocksField::ORDER - 1),
-            GoldilocksField(0xffff_ffff),
-            GoldilocksField::coset_shift(),
-            GoldilocksField::MULTIPLICATIVE_GROUP_GENERATOR,
-        ];
-        let mut scalars: Vec<GoldilocksField> = edge_base.to_vec();
-        scalars.extend(GoldilocksField::rand_vec(64));
-
-        let mut values: Vec<FE> = Vec::new();
-        for &a in &edge_base {
-            for &b in &edge_base {
-                values.push(FE::from_basefield_array([a, b]));
-            }
-        }
-        values.extend(FE::rand_vec(64));
-
-        let mut compared = 0usize;
-        for &r in &scalars {
-            let embedded: FE = r.into();
-            for &c in &values {
-                // Reference: the embedded extension multiply this replaces,
-                // in the same operand order the old scaling loop used.
-                let expected = raw(embedded * c);
-                let actual = raw(<FE as FieldExtension<2>>::scalar_mul(&c, r));
-                assert_eq!(actual, expected, "scalar_mul diverges for r={r:?} c={c:?}");
-                compared += 1;
-            }
-        }
-        assert!(compared >= 4096, "differential ran on too few pairs");
-
-        // The base power chain must equal the embedded one word for word,
-        // which is what lets the cached base table stand in for the
-        // extension table.
-        for &shift in &[
-            GoldilocksField::coset_shift(),
-            GoldilocksField::MULTIPLICATIVE_GROUP_GENERATOR,
-            GoldilocksField::MULTIPLICATIVE_GROUP_GENERATOR.exp_u64(16),
-        ] {
-            let base_chain: Vec<GoldilocksField> = shift.powers().take(512).collect();
-            let embedded_chain: Vec<FE> = FE::from(shift).powers().take(512).collect();
-            for (i, (&b, &e)) in base_chain.iter().zip(&embedded_chain).enumerate() {
-                assert_eq!(
-                    [b.to_noncanonical_u64(), 0],
-                    raw(e),
-                    "power chain diverges at {i}"
-                );
-            }
-        }
-
-        // Sabotage control: a differential that has never failed is not
-        // evidence. Perturb one limb of the reference and require a mismatch.
-        let r = scalars[3];
-        let c = values[7];
-        let mut sabotaged = raw(<FE as FieldExtension<2>>::scalar_mul(&c, r));
-        sabotaged[1] ^= 1;
-        assert_ne!(
-            sabotaged,
-            raw(FE::from(r) * c),
-            "sabotage control did not trip: the differential cannot detect a limb flip"
-        );
-    }
-
-    /// A2 end to end, over the real shapes: the base-shift zero-tail coset FFT
-    /// must produce the identical raw words as the generic extension-shift one
-    /// it replaces, including at the production `rate_bits = 3` / `live ==
-    /// n >> 3` shape and at the FRI folding rounds' arbitrary base shifts.
-    #[test]
-    fn coset_fft_zero_tail_base_matches_generic_raw_words() {
-        use crate::field::extension::FieldExtension;
-        use crate::field::types::{PrimeField64, Sample};
-
-        type FE = <GoldilocksField as Extendable<2>>::Extension;
-
-        fn raw(values: &[FE]) -> Vec<u64> {
-            let mut out = Vec::with_capacity(values.len() * 2);
-            for value in values {
-                let limbs: [GoldilocksField; 2] =
-                    <FE as FieldExtension<2>>::to_basefield_array(value);
-                out.push(limbs[0].to_noncanonical_u64());
-                out.push(limbs[1].to_noncanonical_u64());
-            }
-            out
-        }
-
-        let shifts = [
-            GoldilocksField::coset_shift(),
-            GoldilocksField::MULTIPLICATIVE_GROUP_GENERATOR,
-            GoldilocksField::MULTIPLICATIVE_GROUP_GENERATOR.exp_u64(16),
-            GoldilocksField::MULTIPLICATIVE_GROUP_GENERATOR.exp_u64(256),
-        ];
-        let mut cases = 0usize;
-        for lg_n in [4usize, 6, 9, 11] {
-            let n = 1usize << lg_n;
-            for rate_bits in 1..=3usize.min(lg_n) {
-                let support = n >> rate_bits;
-                for live in [support, support / 2] {
-                    if live < 2 {
-                        continue;
-                    }
-                    let mut coeffs = FE::rand_vec(live);
-                    coeffs.resize(n, FE::ZERO);
-                    let poly = PolynomialCoeffs::new(coeffs);
-                    for &shift in &shifts {
-                        let expected = coset_fft_zero_tail(
-                            &poly,
-                            shift.into(),
-                            live,
-                            Some(rate_bits),
-                            None,
-                        );
-                        let actual = coset_fft_zero_tail_base::<GoldilocksField, 2>(
-                            &poly,
-                            shift,
-                            live,
-                            Some(rate_bits),
-                            None,
-                        );
-                        assert_eq!(
-                            raw(&actual.values),
-                            raw(&expected.values),
-                            "lg_n={lg_n} rate_bits={rate_bits} live={live}"
-                        );
-                        cases += 1;
-                    }
-                }
-            }
-        }
-        assert!(cases >= 24, "differential ran on too few shapes");
-
-        // Sabotage control: shift the base table by one step and require the
-        // raw-word comparison to fail.
-        let n = 1usize << 9;
-        let live = n >> 3;
-        let mut coeffs = FE::rand_vec(live);
-        coeffs.resize(n, FE::ZERO);
-        let poly = PolynomialCoeffs::new(coeffs);
-        let shift = GoldilocksField::coset_shift();
-        let good = coset_fft_zero_tail_base::<GoldilocksField, 2>(
-            &poly,
-            shift,
-            live,
-            Some(3),
-            None,
-        );
-        let sabotaged =
-            coset_fft_zero_tail(&poly, (shift * shift).into(), live, Some(3), None);
-        assert_ne!(
-            raw(&good.values),
-            raw(&sabotaged.values),
-            "sabotage control did not trip: the differential cannot detect a wrong shift"
-        );
-    }
-
     /// The fused quotient accumulation must be bit-identical (raw u64
     /// representation) to the pre-fusion op sequences it replaces: both the
     /// classic reference (`divide_by_linear` + explicit zero pad +
@@ -1441,60 +1083,6 @@ mod tests {
 
             assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
             assert_eq!(raw(&actual.coeffs), raw(&expected_in_place.coeffs));
-        }
-    }
-
-    /// Streaming a small opening batch must preserve the complete reduction,
-    /// alpha-power shift and synthetic-division recurrence. In particular,
-    /// block boundaries run in descending order, because Horner's accumulator
-    /// carries from the high block into the next lower block.
-    #[test]
-    fn streamed_small_opening_batch_matches_materialized_path() {
-        use crate::field::extension::FieldExtension;
-        use crate::field::types::PrimeField64;
-
-        type BF = GoldilocksField;
-        type F = <BF as Extendable<2>>::Extension;
-
-        fn raw(values: &[F]) -> Vec<u64> {
-            values
-                .iter()
-                .flat_map(|x| FieldExtension::<2>::to_basefield_array(x))
-                .map(|c: BF| c.to_noncanonical_u64())
-                .collect()
-        }
-
-        for &(num_polys, degree, old_len) in &[
-            (1usize, 1usize, 0usize),
-            (2, 8, 8),
-            (2, 2048, 2048),
-            (2, 2049, 2049),
-            (2, 4097, 4097),
-            (16, 257, 300),
-        ] {
-            let polys = (0..num_polys)
-                .map(|_| PolynomialCoeffs::new(BF::rand_vec(degree)))
-                .collect::<Vec<_>>();
-            let initial = PolynomialCoeffs::new(F::rand_vec(old_len));
-            let base = F::rand();
-            let z = F::rand();
-
-            let mut reference_factor = ReducingFactor::new(base);
-            let composition =
-                reference_factor.reduce_polys_base::<BF, 2>(polys.iter());
-            let shift = reference_factor.shift_factor();
-            let mut expected = initial.clone();
-            accumulate_linear_quotient(&mut expected, &composition, z, shift);
-
-            let mut streamed_factor = ReducingFactor::new(base);
-            let mut actual = initial;
-            streamed_factor.accumulate_small_polys_base_linear_quotient::<BF, 2>(
-                polys.iter(),
-                &mut actual,
-                z,
-            );
-
-            assert_eq!(raw(&actual.coeffs), raw(&expected.coeffs));
         }
     }
 
