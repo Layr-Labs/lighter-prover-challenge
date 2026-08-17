@@ -1397,16 +1397,20 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
-                continue;
-            }
+            // The U32 quotient specs are walked by every thread of the
+            // process-shared Range/U32 Metal command at a per-row cost set
+            // by the spec itself, not by how many trace rows use the gate.
+            // Random-access proved the point (bit-selection folds are the
+            // most expensive); the remaining arithmetic-shaped U32 specs
+            // are cheaper per row but there are many more of them, so their
+            // combined column still dominates the union. Keep the entire
+            // U32 family on the CPU quotient evaluators instead: skipping
+            // them here means they are never added to `gate_indices`, so
+            // the generic CPU pass retains its unchanged selector and
+            // alpha work, while the Metal command keeps only the range
+            // specs whose bit-decomposition work is genuinely GPU-bound.
+            let _ = &u32_gate;
+            continue;
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
                 U32QuotientGate::Arithmetic { num_ops } => (
                     U32QuotientKind::Arithmetic,
