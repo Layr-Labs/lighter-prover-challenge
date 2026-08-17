@@ -1397,15 +1397,35 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
-                continue;
+            // Random-access gates walk a data-dependent selection fold whose
+            // cost scales with 2^bits, extending the process-shared Range/U32
+            // Metal command for every shape that carries them, not just the
+            // six-bit one. Keep the whole family on the existing CPU
+            // direct-accumulation evaluator instead: skipping them here means
+            // they are never added to `gate_indices`, so the generic CPU
+            // quotient pass retains its unchanged selector and alpha work.
+            // Amplifier-free subset withdrawal. The CPU quotient pass
+            // sizes its scratch by the widest surviving gate, so a spec
+            // may move to the CPU only when it fits under the ceilings
+            // that already exist there, otherwise it widens every CPU
+            // batch to accommodate one gate. Random-access folds (all
+            // shapes) plus base-addition (78 wires / 26 constraints,
+            // under every shape's ceiling) always stay on the CPU; on the
+            // >= 2^16 shapes, whose CPU pass is already pinned at 136
+            // wires / 68 constraint rows, selection (100/40) and the
+            // 63-limb base-sum decomposition (64/64) also fit and are
+            // withdrawn. The heavy subtraction family (>= 104 constraint
+            // rows) keeps its GPU acceleration everywhere.
+            let wide_shape = common_data.degree_bits() >= 16;
+            match u32_gate {
+                U32QuotientGate::RandomAccess { .. }
+                | U32QuotientGate::BaseAddition { .. } => continue,
+                U32QuotientGate::Selection { .. }
+                | U32QuotientGate::BaseSum {
+                    base: 2,
+                    num_limbs: 63,
+                } if wide_shape => continue,
+                _ => {}
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
                 U32QuotientGate::Arithmetic { num_ops } => (
@@ -3000,6 +3020,14 @@ mod quotient_layout_tests {
             .collect::<Vec<_>>();
         assert_eq!(selections, vec![20]);
 
+        // This circuit still carries GPU-resident specs (the base-4 sums
+        // and subtraction family are never withdrawn), so the combined
+        // command starts, the retained-column differential compares the
+        // Metal rows against a CPU recomputation, and the fault path
+        // exercises the CPU fallback. The withdrawn specs (random access,
+        // base addition, and on wide shapes selection/base-2 sums) are
+        // simply absent from the union; their CPU evaluation is covered by
+        // the same differential through the generic pass.
         let before = gpu_poseidon_quotient_stats();
         COMPARE_GPU_QUOTIENT.store(true, Ordering::SeqCst);
         let proof = data.prove(PartialWitness::new());
