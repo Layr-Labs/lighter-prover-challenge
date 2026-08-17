@@ -1621,6 +1621,16 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
             }
         }
         let gate = &common_data.gates[i];
+        // A gate with no constraints contributes nothing to `constraints_batch`
+        // -- its accumulate zips over zero rows -- but `eval_filtered_base_batch`
+        // still walks the whole selector group to build a filter column that is
+        // then discarded. Selector group 0 holds seven gates in every circuit
+        // this prover builds and `NoopGate` sits in it, so every batch of every
+        // proof paid `6 * batch_size` multiplies for a column nothing reads.
+        // Skipping writes the same bytes because the gate wrote none.
+        if gate.0.num_constraints() == 0 {
+            continue;
+        }
         let selector_index = common_data.selectors_info.selector_indices[i];
         gate.0.eval_filtered_base_batch(
             vars_batch,

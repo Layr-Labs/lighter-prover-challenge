@@ -396,9 +396,72 @@ fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
     (result0, result1)
 }
 
+/// [`mul_reduce_pair`] that does not clobber its operands.
+///
+/// Instruction for instruction the same block — so the same intermediates and
+/// the same non-canonical `u64` representatives — differing only in the
+/// register constraints: the four factors are `in(reg)` and the six scratch
+/// values are fresh `out(reg)`s, instead of the two factors doubling as the
+/// result and scratch registers.
+///
+/// That costs four more registers per pair, which is why it is not the default:
+/// the seven-register form is what lets a butterfly keep its loads, twiddles
+/// and accumulators in flight. It earns its keep only where a factor is *still
+/// live* after the product, because there the compact form has to copy the
+/// factor into place first — one `mov` per reused operand per product.
+///
+/// The one such caller is the zero-padded LDE expansion, whose eight layer-3
+/// twiddles and broadcast source word are each multiplied four times per source
+/// pair: fifteen `mov`s in a 161-instruction loop. Removing them is **-4.1% to
+/// -4.2%** on that block at 4, 8 and 12 threads. On a butterfly kernel, where
+/// no operand is reused, the wider register demand measures flat (-0.3%, inside
+/// the noise), so this is not a general replacement.
+#[inline(always)]
+pub(crate) fn mul_reduce_pair_keep(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
+    let result0: u64;
+    let result1: u64;
+
+    unsafe {
+        asm!(
+            "umulh {hi0}, {a0}, {b0}",
+            "umulh {hi1}, {a1}, {b1}",
+            "mul   {result0}, {a0}, {b0}",
+            "mul   {result1}, {a1}, {b1}",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            a0 = in(reg) a0,
+            b0 = in(reg) b0,
+            a1 = in(reg) a1,
+            b1 = in(reg) b1,
+            result0 = out(reg) result0,
+            result1 = out(reg) result1,
+            scratch0 = out(reg) _,
+            scratch1 = out(reg) _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    (result0, result1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::NeonGoldilocksField;
+    use super::{NeonGoldilocksField, mul_reduce_pair, mul_reduce_pair_keep};
     use crate::goldilocks_field::GoldilocksField;
     use crate::ops::Square;
     use crate::packed::PackedField;
@@ -436,6 +499,41 @@ mod tests {
                 assert_eq!((a * scalar).0, [a.0[0] * scalar, a.0[1] * scalar]);
                 assert_eq!((-a).0, [-a.0[0], -a.0[1]]);
                 assert_eq!(a.square().0, [a.0[0].square(), a.0[1].square()]);
+            }
+        }
+    }
+
+    /// The non-clobbering pair multiply must agree with the compact form on
+    /// raw `u64` words, not merely on field elements: it exists only to change
+    /// register allocation.
+    #[test]
+    fn mul_reduce_pair_keep_matches_mul_reduce_pair_raw_words() {
+        let mut probes = values().iter().map(|x| x.0).collect::<Vec<_>>();
+        probes.extend([
+            0xFFFF_FFFF_0000_0000,
+            0xFFFF_FFFF_0000_0001,
+            0xFFFF_FFFE_FFFF_FFFF,
+            GoldilocksField::ORDER.wrapping_neg(),
+        ]);
+        for i in 0..64u64 {
+            probes.push(0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i + 1));
+        }
+        for &a0 in &probes {
+            for &b0 in &probes {
+                // Second lane offset so the two lanes never carry the same
+                // operands; a shared-register bug would otherwise hide.
+                let a1 = b0.rotate_left(17);
+                let b1 = a0.rotate_right(29);
+                assert_eq!(
+                    mul_reduce_pair(a0, b0, a1, b1),
+                    mul_reduce_pair_keep(a0, b0, a1, b1),
+                    "diverged on ({a0:#x}, {b0:#x}, {a1:#x}, {b1:#x})"
+                );
+                // And both must be the scalar product's raw word.
+                assert_eq!(
+                    mul_reduce_pair_keep(a0, b0, a1, b1).0,
+                    (GoldilocksField(a0) * GoldilocksField(b0)).0
+                );
             }
         }
     }
