@@ -336,8 +336,36 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // `(..(c_{n-1} z + c_{n-2}) z + ..)`, so every opening is the
         // identical field element and the transcript is unchanged.
         let degree = common_data.degree();
-        let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
-        let zeta_pows = table(zeta);
+        // Build the ζ-powers table as four independent multiply chains
+        // instead of one degree-long dependent chain. `out[i] = ζ^i` under
+        // any association, so every table entry is the identical field
+        // element and every opening (and the transcript) is unchanged; the
+        // value-exactness argument above still holds verbatim. Four chains
+        // give the serial opening phase 4-way ILP on the extension
+        // multiplies (each `out[i] = out[i-4] * ζ^4` is independent of its
+        // three siblings in the same group).
+        let zeta_pows: Vec<F::Extension> = {
+            let mut out = Vec::with_capacity(degree);
+            let mut powers = zeta.powers();
+            let one = powers.next().expect("powers iterator is infinite");
+            out.push(one);
+            if degree > 1 {
+                out.push(zeta);
+            }
+            if degree > 2 {
+                out.push(zeta * zeta);
+            }
+            if degree > 3 {
+                out.push(zeta * zeta * zeta);
+            }
+            let step = zeta * zeta * zeta * zeta; // ζ^4
+            let mut i = 4;
+            while i < degree {
+                out.push(out[i - 4] * step);
+                i += 1;
+            }
+            out
+        };
         // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
         // the process-cached natural-order two-adic subgroup, and
         // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
@@ -370,7 +398,32 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
                 .collect();
             if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
-                let reference = table(g * zeta);
+                // Same four-chain ILP construction as the ζ table above, for
+                // the shifted point `g·ζ`.
+                let mut reference = Vec::with_capacity(degree);
+                let mut powers = (g * zeta).powers();
+                let one = powers.next().expect("powers iterator is infinite");
+                reference.push(one);
+                if degree > 1 {
+                    reference.push(g * zeta);
+                }
+                if degree > 2 {
+                    let t = g * zeta;
+                    reference.push(t * t);
+                }
+                if degree > 3 {
+                    let t = g * zeta;
+                    reference.push(t * t * t);
+                }
+                let step = {
+                    let t = g * zeta;
+                    t * t * t * t
+                };
+                let mut i = 4;
+                while i < degree {
+                    reference.push(reference[i - 4] * step);
+                    i += 1;
+                }
                 assert_eq!(reference.len(), g_zeta_pows.len());
                 for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
                     let a_raw: Vec<u64> = a
