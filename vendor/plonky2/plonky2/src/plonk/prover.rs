@@ -31,8 +31,8 @@ use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
-    VanishingScratch,
+    accumulate_two_challenge_product_column_packed, eval_vanishing_poly_base_batch, get_lut_poly,
+    interleave_pair_plan, PermutationBatch, VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
@@ -1043,6 +1043,22 @@ fn compute_all_lookup_polys<
 
 const BATCH_SIZE: usize = 32;
 
+#[inline]
+fn fused_packed_permutation_gather_enabled() -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !std::env::var_os("PLONKY2_FUSED_PACKED_PERMUTATION_GATHER")
+                .is_some_and(|value| value == "0")
+        })
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    {
+        false
+    }
+}
+
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
 /// lookups, two challenges, the 135-wire/123-constraint Poseidon2 gate, and
@@ -1162,6 +1178,10 @@ pub(crate) static COMPARE_GPU_QUOTIENT: core::sync::atomic::AtomicBool =
 #[cfg(test)]
 pub(crate) static COMPARE_QUOTIENT_LAYOUTS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+static FUSED_PACKED_GATHER_BATCHES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Diagnostics-only gate census: prints, once per distinct circuit shape, the
 /// full gate list with the wire span / constraint count / degree that decide
@@ -2033,6 +2053,7 @@ fn compute_quotient_polys<
         local_constants: Vec<F>,
         local_wires: Vec<F>,
         s_sigmas_flat: Vec<F>,
+        precomputed_permutation_products: Vec<F>,
         zs_local_flat: Vec<F>,
         zs_next_flat: Vec<F>,
         vanishing: VanishingScratch<F>,
@@ -2118,6 +2139,7 @@ fn compute_quotient_polys<
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
+                precomputed_permutation_products: Vec::new(),
                 zs_local_flat: Vec::new(),
                 zs_next_flat: Vec::new(),
                 vanishing: VanishingScratch::default(),
@@ -2159,6 +2181,16 @@ fn compute_quotient_polys<
                 } else {
                     None
                 };
+                let use_fused_packed_gather = fused_packed_permutation_gather_enabled()
+                    && col_major_perm
+                    && !permutation_products_offloaded
+                    && num_challenges == 2
+                    && n == BATCH_SIZE
+                    && step == 1
+                    && prover_data
+                        .constants_sigmas_commitment
+                        .has_column_lde_storage()
+                    && wires_commitment.has_column_lde_storage();
                 if let Some(cache) = constants_cache {
                     debug_assert_eq!(
                         prover_data.constants_sigmas_quotient_step, step,
@@ -2172,7 +2204,7 @@ fn compute_quotient_polys<
                             &cache[ci * q + cache_start..ci * q + cache_start + n],
                         );
                     }
-                    if permutation_products_offloaded {
+                    if permutation_products_offloaded || use_fused_packed_gather {
                         scratch.s_sigmas_flat.clear();
                     } else {
                         let sc = common_data.sigmas_range().len();
@@ -2202,7 +2234,7 @@ fn compute_quotient_polys<
                         (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                     };
 
-                    if permutation_products_offloaded {
+                    if permutation_products_offloaded || use_fused_packed_gather {
                         scratch.s_sigmas_flat.clear();
                     } else {
                         prover_data.constants_sigmas_commitment.fill_lde_batch(
@@ -2231,13 +2263,68 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
-                wires_commitment.fill_lde_batch(
-                    &scratch.indices,
-                    step,
-                    0..cpu_num_wires,
-                    BatchLayout::PolyMajor,
-                    &mut scratch.local_wires,
-                );
+                if use_fused_packed_gather {
+                    #[cfg(test)]
+                    FUSED_PACKED_GATHER_BATCHES
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let chunk_size = common_data.quotient_degree_factor;
+                    let num_chunks = num_routed_wires.div_ceil(chunk_size);
+                    let family_len = num_chunks * n;
+                    scratch
+                        .precomputed_permutation_products
+                        .resize(4 * family_len, F::ZERO);
+
+                    let products = &mut scratch.precomputed_permutation_products;
+                    let constants_sigmas_commitment = &prover_data.constants_sigmas_commitment;
+                    let sigma_start_column = common_data.sigmas_range().start;
+                    let gathered = wires_commitment.fill_lde_batch_contiguous_with(
+                        cache_start,
+                        n,
+                        0..cpu_num_wires,
+                        &mut scratch.local_wires,
+                        |j, wire_col| {
+                            if j >= num_routed_wires {
+                                return;
+                            }
+                            let sigma_col = constants_sigmas_commitment
+                                .lde_column_contiguous(sigma_start_column + j, cache_start, n)
+                                .expect("fused gather requires column-backed sigma LDEs");
+
+                            let c = j / chunk_size;
+                            let chunk_start = c * n;
+                            let (family_0, rest) = products.split_at_mut(family_len);
+                            let (family_1, rest) = rest.split_at_mut(family_len);
+                            let (family_2, family_3) = rest.split_at_mut(family_len);
+                            accumulate_two_challenge_product_column_packed(
+                                wire_col,
+                                sigma_col,
+                                shifted_xs_batch,
+                                num_routed_wires,
+                                j,
+                                betas[0],
+                                betas[1],
+                                gammas[0],
+                                gammas[1],
+                                beta_k_is,
+                                j % chunk_size == 0,
+                                &mut family_0[chunk_start..chunk_start + n],
+                                &mut family_1[chunk_start..chunk_start + n],
+                                &mut family_2[chunk_start..chunk_start + n],
+                                &mut family_3[chunk_start..chunk_start + n],
+                            );
+                        },
+                    );
+                    assert!(gathered, "fused gather requires column-backed wire LDEs");
+                } else {
+                    scratch.precomputed_permutation_products.clear();
+                    wires_commitment.fill_lde_batch(
+                        &scratch.indices,
+                        step,
+                        0..cpu_num_wires,
+                        BatchLayout::PolyMajor,
+                        &mut scratch.local_wires,
+                    );
+                }
                 zs_partial_products_and_lookup_commitment.fill_lde_batch(
                     &scratch.indices,
                     step,
@@ -2315,6 +2402,8 @@ fn compute_quotient_polys<
                         zs_partial_products_cols: &scratch.zs_local_flat,
                         zs_next_cols: &scratch.zs_next_flat,
                         s_sigmas_cols: &scratch.s_sigmas_flat,
+                        precomputed_products: use_fused_packed_gather
+                            .then_some(scratch.precomputed_permutation_products.as_slice()),
                     }
                 } else {
                     PermutationBatch::Rows {
@@ -2774,7 +2863,9 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS, FUSED_PACKED_GATHER_BATCHES,
+    };
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
@@ -2839,11 +2930,14 @@ mod quotient_layout_tests {
         let (data, pw) = small_circuit();
         assert!(data.common.luts.is_empty());
 
+        let fused_before = FUSED_PACKED_GATHER_BATCHES.load(Ordering::Relaxed);
         COMPARE_QUOTIENT_LAYOUTS.store(true, Ordering::SeqCst);
         let proof = data.prove(pw);
         COMPARE_QUOTIENT_LAYOUTS.store(false, Ordering::SeqCst);
+        let fused_after = FUSED_PACKED_GATHER_BATCHES.load(Ordering::Relaxed);
 
         data.verify(proof?)?;
+        assert!(fused_after > fused_before, "fused packed gather did not run");
         Ok(())
     }
 
@@ -3056,7 +3150,7 @@ mod quotient_layout_tests {
         let (data, _) = small_circuit();
         let commitment = &data.prover_only.constants_sigmas_commitment;
         let range = data.common.sigmas_range();
-        let indices = [3usize, 4, 5, 6, 7, 8, 9];
+        let indices = (0usize..32).collect::<Vec<_>>();
         let mut indexed = Vec::new();
         let mut contiguous = Vec::new();
 
