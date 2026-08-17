@@ -14,6 +14,7 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use circuit::block_constraints::BlockTarget;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
@@ -28,6 +29,7 @@ static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx
 static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_chain.embed"));
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
+static BLOCK_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block.embed"));
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
@@ -78,6 +80,17 @@ fn load_blob<T: serde::de::DeserializeOwned>(
     );
     deserialize_embedded::<T>(blob)
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
+}
+
+/// Loads the embedded final block circuit, which folds the pre-execution and
+/// both chain circuits and is deterministic per binary. The runtime used to
+/// rebuild it from scratch in every worker (the permutation-argument forest,
+/// generator watch index and sigma derivation dominate the worker profile);
+/// embedding moves that construction to the untimed compile job. Returns
+/// `None` when compiled with `LIGHTER_SKIP_EMBED=1` (empty stub) so the caller
+/// falls back to building.
+pub(crate) fn load_block_blob() -> anyhow::Result<(BlockTarget, CircuitData<F, C, D>)> {
+    load_blob::<BlockTarget>("block", BLOCK_BLOB)
 }
 
 impl Circuits {
@@ -345,7 +358,22 @@ mod tests {
                 .expect("common data must serialize");
             assert!(!bytes.is_empty());
 
-            println!("embedded_matches_rebuilt: all five circuits are value-identical");
+            // Final block circuit: embedded blob vs fresh build. The blob is
+            // loaded through `build_block_circuit` (production path); the
+            // fresh build goes through the scratch builder. Both must be
+            // value-identical, exactly like the five startup circuits.
+            let (rebuilt_block_target, rebuilt_block_data) =
+                rebuilt.build_block_circuit_from_scratch();
+            let (embedded_block_target, embedded_block_data) = embedded.build_block_circuit();
+            assert_circuit_pair_identical(
+                "block",
+                (&rebuilt_block_target, &rebuilt_block_data),
+                (&embedded_block_target, &embedded_block_data),
+            );
+            drop(rebuilt_block_data);
+            drop(embedded_block_data);
+
+            println!("embedded_matches_rebuilt: all six circuits are value-identical");
         });
     }
 
@@ -424,6 +452,7 @@ mod tests {
             ("heavy_chain", HEAVY_CHAIN_BLOB),
             ("light_tx", LIGHT_TX_BLOB),
             ("light_chain", LIGHT_CHAIN_BLOB),
+            ("block", BLOCK_BLOB),
         ] {
             assert!(
                 !blob.is_empty(),

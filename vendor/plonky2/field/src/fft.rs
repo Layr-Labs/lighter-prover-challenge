@@ -673,6 +673,26 @@ fn fft_classic_simd_single_layer_neon(
 /// loud at one check per call, exactly like the generic single-layer body.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
+/// Process-local scratch for radix-4 cubed twiddle rows (p³ = w2_lo·w1).
+/// Grows to the largest q seen once; reused across all FFT calls.
+std::thread_local! {
+    static CUBED_SCRATCH: std::cell::RefCell<Vec<crate::goldilocks_field::GoldilocksField>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Fused two-layer FFT with a radix-4 butterfly: stage 1 pairs (a,b) with
+/// twiddle u = w1[j] and (c,d) with twiddle p = w2_lo[j], then stage 2
+/// recombines with w2_hi[j] = I·p (I = 2^48, I² = −1). Instead of the
+/// serial product chain t1 = u·b, t2 = u·d, t3 = p·(c+t2), t4 = r·(c−t2),
+/// the radix-4 form reassociates (field-identically, since u = p² and
+/// p³ = p·u, with the cubed row precomputed once per call):
+///   s1 = p·c, s2 = u·b, s3 = p³·d
+///   A,C = (a + s2) ± (s1 + s3)
+///   B,D = (a − s2) ± I·(s1 − s3),  I·x = reduce128(x << 48)
+/// Three general multiplies plus one shift-multiply per 4 points instead of
+/// four general multiplies, with all three products independent (one
+/// dependent round collapsed). Raw representatives may differ from the
+/// four-product form; field values are identical (differential-tested).
 fn fft_classic_simd_two_layers_neon(
     values: &mut [crate::goldilocks_field::GoldilocksField],
     lg_half_m: usize,
@@ -686,52 +706,75 @@ fn fft_classic_simd_two_layers_neon(
     debug_assert!(lg_half_m >= 1);
     let q = 1usize << lg_half_m;
     let w1_row = &w1_row[..q];
-    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+    let (w2_lo, _w2_hi) = w2_row[..2 * q].split_at(q);
+    // Radix-4 cubed twiddle row: p³[j] = w2_lo[j]·w1[j] (w1[j] = w2_lo[j]²).
+    // Computed once per call, amortized over every block in the array.
+    // Thread-local scratch avoids a per-call allocation; grows to max q once.
+    let mut cubed_scratch = CUBED_SCRATCH.with(|s| s.take());
+    cubed_scratch.clear();
+    cubed_scratch.extend((0..q).map(|j| w2_lo[j] * w1_row[j]));
+    let cubed_row: &[crate::goldilocks_field::GoldilocksField] = &cubed_scratch;
 
     let eps = unsafe { vdupq_n_u64(EPSILON) };
     for block in values.chunks_exact_mut(4 * q) {
         let (ab, cd) = block.split_at_mut(2 * q);
         let (quarter_a, quarter_b) = ab.split_at_mut(q);
         let (quarter_c, quarter_d) = cd.split_at_mut(q);
-        for (((((a2, b2), c2), d2), (w12, w2a2)), w2b2) in quarter_a
+        for (((((a2, b2), c2), d2), (w12, w2a2)), cubed2) in quarter_a
             .chunks_exact_mut(2)
             .zip(quarter_b.chunks_exact_mut(2))
             .zip(quarter_c.chunks_exact_mut(2))
             .zip(quarter_d.chunks_exact_mut(2))
             .zip(w1_row.chunks_exact(2).zip(w2_lo.chunks_exact(2)))
-            .zip(w2_hi.chunks_exact(2))
+            .zip(cubed_row.chunks_exact(2))
         {
-            // Stage-1 products for both butterflies, paired per twiddle row.
-            let t1 =
+            // Radix-4 butterfly: stage 1 pairs (a, b) with twiddle u = w1 and
+            // (c, d) with twiddle p = w2_lo, fused across two layers. With
+            // r = w2_hi = I·p (I = 2^48, I² = −1) and u = p²:
+            //   A = a + u·b + p·(c + u·d) = (a + p²·b) + (p·c + p³·d)
+            //   C = (a + p²·b) − (p·c + p³·d)
+            //   B = (a − p²·b) + I·(p·c − p³·d)
+            //   D = (a − p²·b) − I·(p·c − p³·d)
+            // Reassociated to three general multiplies plus one shift-mul:
+            //   s1 = p·c, s2 = u·b, s3 = p³·d
+            //   A,C = (a + s2) ± (s1 + s3)
+            //   B,D = (a − s2) ± I·(s1 − s3),  I·x = reduce128(x << 48)
+            // Field-identical to the four-product form (verified against the
+            // production root tables); raw representatives may differ.
+            let s1 =
+                NeonGoldilocksField([w2a2[0], w2a2[1]]) * NeonGoldilocksField([c2[0], c2[1]]);
+            let s2 =
                 NeonGoldilocksField([w12[0], w12[1]]) * NeonGoldilocksField([b2[0], b2[1]]);
-            let t2 =
-                NeonGoldilocksField([w12[0], w12[1]]) * NeonGoldilocksField([d2[0], d2[1]]);
-            // C/D stage-1 butterfly in scalar registers: these values are the
-            // stage-2 multiplier inputs, so keeping them out of the vector
-            // file avoids a NEON->GPR crossing on the critical path.
-            let cd0 = [c2[0] + t2.0[0], c2[1] + t2.0[1]];
-            let cd1 = [c2[0] - t2.0[0], c2[1] - t2.0[1]];
-            // Stage-2 products.
-            let t3 = NeonGoldilocksField([w2a2[0], w2a2[1]]) * NeonGoldilocksField(cd0);
-            let t4 = NeonGoldilocksField([w2b2[0], w2b2[1]]) * NeonGoldilocksField(cd1);
-            // SAFETY: every chunk holds exactly 2 elements (`chunks_exact`),
-            // `GoldilocksField` is `#[repr(transparent)]` over `u64`, and each
-            // load/store stays inside its own chunk. Indexing never leaves the
-            // zips; only the vector intrinsics are unsafe.
+            let s3 =
+                NeonGoldilocksField([cubed2[0], cubed2[1]]) * NeonGoldilocksField([d2[0], d2[1]]);
+            // C/D sums in scalar registers: they feed the shift-multiply and
+            // the final adds, so keeping them out of the vector file avoids
+            // NEON->GPR crossings, as in the original kernel.
+            let sum13 = [s1.0[0] + s3.0[0], s1.0[1] + s3.0[1]];
+            let dif13 = [s1.0[0] - s3.0[0], s1.0[1] - s3.0[1]];
+            // I·(s1 − s3) per lane: multiply by 2^48 via a shift, then reduce.
+            let idif13 = [
+                crate::goldilocks_field::reduce128((dif13[0].0 as u128) << 48),
+                crate::goldilocks_field::reduce128((dif13[1].0 as u128) << 48),
+            ];
+            // SAFETY: identical invariants to the original kernel; chunks hold
+            // exactly 2 elements and every access stays inside its chunk.
             unsafe {
                 let av = vld1q_u64(a2.as_ptr().cast::<u64>());
-                let t1v = vcombine_u64(vcreate_u64(t1.0[0].0), vcreate_u64(t1.0[1].0));
-                let ab0 = gl_add_neon(av, t1v, eps);
-                let ab1 = gl_sub_neon(av, t1v, eps);
-                let t3v = vcombine_u64(vcreate_u64(t3.0[0].0), vcreate_u64(t3.0[1].0));
-                let t4v = vcombine_u64(vcreate_u64(t4.0[0].0), vcreate_u64(t4.0[1].0));
-                vst1q_u64(a2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0, t3v, eps));
-                vst1q_u64(c2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0, t3v, eps));
-                vst1q_u64(b2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, t4v, eps));
-                vst1q_u64(d2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, t4v, eps));
+                let s2v = vcombine_u64(vcreate_u64(s2.0[0].0), vcreate_u64(s2.0[1].0));
+                let ab0 = gl_add_neon(av, s2v, eps);
+                let ab1 = gl_sub_neon(av, s2v, eps);
+                let sum13v = vcombine_u64(vcreate_u64(sum13[0].0), vcreate_u64(sum13[1].0));
+                let id13v = vcombine_u64(vcreate_u64(idif13[0].0), vcreate_u64(idif13[1].0));
+                vst1q_u64(a2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0, sum13v, eps));
+                vst1q_u64(c2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0, sum13v, eps));
+                vst1q_u64(b2.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1, id13v, eps));
+                vst1q_u64(d2.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1, id13v, eps));
             }
         }
     }
+    // Return the scratch to the thread-local for reuse on the next call.
+    CUBED_SCRATCH.with(|s| *s.borrow_mut() = cubed_scratch);
 }
 
 /// 4-wide variant of the fused pair-column kernel: each iteration carries two
@@ -756,67 +799,82 @@ fn fft_classic_simd_two_layers_neon_w4(
     }
     let q = 1usize << lg_half_m;
     let w1_row = &w1_row[..q];
-    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+    let (w2_lo, _w2_hi) = w2_row[..2 * q].split_at(q);
+    // Radix-4 cubed twiddle row (shared scratch with the 2-wide kernel).
+    let mut cubed_scratch = CUBED_SCRATCH.with(|s| s.take());
+    cubed_scratch.clear();
+    cubed_scratch.extend((0..q).map(|j| w2_lo[j] * w1_row[j]));
+    let cubed_row: &[crate::goldilocks_field::GoldilocksField] = &cubed_scratch;
 
     let eps = unsafe { vdupq_n_u64(EPSILON) };
     for block in values.chunks_exact_mut(4 * q) {
         let (ab, cd) = block.split_at_mut(2 * q);
         let (quarter_a, quarter_b) = ab.split_at_mut(q);
         let (quarter_c, quarter_d) = cd.split_at_mut(q);
-        for (((((a4, b4), c4), d4), (w14, w2a4)), w2b4) in quarter_a
+        for (((((a4, b4), c4), d4), (w14, w2a4)), cubed4) in quarter_a
             .chunks_exact_mut(4)
             .zip(quarter_b.chunks_exact_mut(4))
             .zip(quarter_c.chunks_exact_mut(4))
             .zip(quarter_d.chunks_exact_mut(4))
             .zip(w1_row.chunks_exact(4).zip(w2_lo.chunks_exact(4)))
-            .zip(w2_hi.chunks_exact(4))
+            .zip(cubed_row.chunks_exact(4))
         {
-            // Stage-1 products for both groups: four independent pair-muls.
-            let t1x =
+            // Radix-4 products for both groups: three independent pair-muls.
+            let s1x =
+                NeonGoldilocksField([w2a4[0], w2a4[1]]) * NeonGoldilocksField([c4[0], c4[1]]);
+            let s1y =
+                NeonGoldilocksField([w2a4[2], w2a4[3]]) * NeonGoldilocksField([c4[2], c4[3]]);
+            let s2x =
                 NeonGoldilocksField([w14[0], w14[1]]) * NeonGoldilocksField([b4[0], b4[1]]);
-            let t1y =
+            let s2y =
                 NeonGoldilocksField([w14[2], w14[3]]) * NeonGoldilocksField([b4[2], b4[3]]);
-            let t2x =
-                NeonGoldilocksField([w14[0], w14[1]]) * NeonGoldilocksField([d4[0], d4[1]]);
-            let t2y =
-                NeonGoldilocksField([w14[2], w14[3]]) * NeonGoldilocksField([d4[2], d4[3]]);
-            // Scalar C/D stage-1 butterflies (stage-2 multiplier inputs stay
-            // in GPRs, as in the 2-wide kernel).
-            let cd0x = [c4[0] + t2x.0[0], c4[1] + t2x.0[1]];
-            let cd1x = [c4[0] - t2x.0[0], c4[1] - t2x.0[1]];
-            let cd0y = [c4[2] + t2y.0[0], c4[3] + t2y.0[1]];
-            let cd1y = [c4[2] - t2y.0[0], c4[3] - t2y.0[1]];
-            // Stage-2 products: four more independent pair-muls.
-            let t3x = NeonGoldilocksField([w2a4[0], w2a4[1]]) * NeonGoldilocksField(cd0x);
-            let t3y = NeonGoldilocksField([w2a4[2], w2a4[3]]) * NeonGoldilocksField(cd0y);
-            let t4x = NeonGoldilocksField([w2b4[0], w2b4[1]]) * NeonGoldilocksField(cd1x);
-            let t4y = NeonGoldilocksField([w2b4[2], w2b4[3]]) * NeonGoldilocksField(cd1y);
+            let s3x =
+                NeonGoldilocksField([cubed4[0], cubed4[1]]) * NeonGoldilocksField([d4[0], d4[1]]);
+            let s3y =
+                NeonGoldilocksField([cubed4[2], cubed4[3]]) * NeonGoldilocksField([d4[2], d4[3]]);
+            // s1 ± s3 in scalar registers (feed the shift-multiply, as in the
+            // 2-wide kernel).
+            let sum13x = [s1x.0[0] + s3x.0[0], s1x.0[1] + s3x.0[1]];
+            let dif13x = [s1x.0[0] - s3x.0[0], s1x.0[1] - s3x.0[1]];
+            let sum13y = [s1y.0[0] + s3y.0[0], s1y.0[1] + s3y.0[1]];
+            let dif13y = [s1y.0[0] - s3y.0[0], s1y.0[1] - s3y.0[1]];
+            // I·(s1 − s3) per lane: multiply by 2^48 via a shift, then reduce.
+            let idif13x = [
+                crate::goldilocks_field::reduce128((dif13x[0].0 as u128) << 48),
+                crate::goldilocks_field::reduce128((dif13x[1].0 as u128) << 48),
+            ];
+            let idif13y = [
+                crate::goldilocks_field::reduce128((dif13y[0].0 as u128) << 48),
+                crate::goldilocks_field::reduce128((dif13y[1].0 as u128) << 48),
+            ];
             // SAFETY: identical invariants to the 2-wide kernel; chunks hold
             // exactly 4 elements and every access stays inside its chunk.
             unsafe {
                 let avx = vld1q_u64(a4.as_ptr().cast::<u64>());
                 let avy = vld1q_u64(a4.as_ptr().add(2).cast::<u64>());
-                let t1vx = vcombine_u64(vcreate_u64(t1x.0[0].0), vcreate_u64(t1x.0[1].0));
-                let t1vy = vcombine_u64(vcreate_u64(t1y.0[0].0), vcreate_u64(t1y.0[1].0));
-                let ab0x = gl_add_neon(avx, t1vx, eps);
-                let ab1x = gl_sub_neon(avx, t1vx, eps);
-                let ab0y = gl_add_neon(avy, t1vy, eps);
-                let ab1y = gl_sub_neon(avy, t1vy, eps);
-                let t3vx = vcombine_u64(vcreate_u64(t3x.0[0].0), vcreate_u64(t3x.0[1].0));
-                let t3vy = vcombine_u64(vcreate_u64(t3y.0[0].0), vcreate_u64(t3y.0[1].0));
-                let t4vx = vcombine_u64(vcreate_u64(t4x.0[0].0), vcreate_u64(t4x.0[1].0));
-                let t4vy = vcombine_u64(vcreate_u64(t4y.0[0].0), vcreate_u64(t4y.0[1].0));
-                vst1q_u64(a4.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0x, t3vx, eps));
-                vst1q_u64(a4.as_mut_ptr().add(2).cast::<u64>(), gl_add_neon(ab0y, t3vy, eps));
-                vst1q_u64(c4.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0x, t3vx, eps));
-                vst1q_u64(c4.as_mut_ptr().add(2).cast::<u64>(), gl_sub_neon(ab0y, t3vy, eps));
-                vst1q_u64(b4.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1x, t4vx, eps));
-                vst1q_u64(b4.as_mut_ptr().add(2).cast::<u64>(), gl_add_neon(ab1y, t4vy, eps));
-                vst1q_u64(d4.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1x, t4vx, eps));
-                vst1q_u64(d4.as_mut_ptr().add(2).cast::<u64>(), gl_sub_neon(ab1y, t4vy, eps));
+                let s2vx = vcombine_u64(vcreate_u64(s2x.0[0].0), vcreate_u64(s2x.0[1].0));
+                let s2vy = vcombine_u64(vcreate_u64(s2y.0[0].0), vcreate_u64(s2y.0[1].0));
+                let ab0x = gl_add_neon(avx, s2vx, eps);
+                let ab1x = gl_sub_neon(avx, s2vx, eps);
+                let ab0y = gl_add_neon(avy, s2vy, eps);
+                let ab1y = gl_sub_neon(avy, s2vy, eps);
+                let sum13vx = vcombine_u64(vcreate_u64(sum13x[0].0), vcreate_u64(sum13x[1].0));
+                let sum13vy = vcombine_u64(vcreate_u64(sum13y[0].0), vcreate_u64(sum13y[1].0));
+                let id13vx = vcombine_u64(vcreate_u64(idif13x[0].0), vcreate_u64(idif13x[1].0));
+                let id13vy = vcombine_u64(vcreate_u64(idif13y[0].0), vcreate_u64(idif13y[1].0));
+                vst1q_u64(a4.as_mut_ptr().cast::<u64>(), gl_add_neon(ab0x, sum13vx, eps));
+                vst1q_u64(a4.as_mut_ptr().add(2).cast::<u64>(), gl_add_neon(ab0y, sum13vy, eps));
+                vst1q_u64(c4.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab0x, sum13vx, eps));
+                vst1q_u64(c4.as_mut_ptr().add(2).cast::<u64>(), gl_sub_neon(ab0y, sum13vy, eps));
+                vst1q_u64(b4.as_mut_ptr().cast::<u64>(), gl_add_neon(ab1x, id13vx, eps));
+                vst1q_u64(b4.as_mut_ptr().add(2).cast::<u64>(), gl_add_neon(ab1y, id13vy, eps));
+                vst1q_u64(d4.as_mut_ptr().cast::<u64>(), gl_sub_neon(ab1x, id13vx, eps));
+                vst1q_u64(d4.as_mut_ptr().add(2).cast::<u64>(), gl_sub_neon(ab1y, id13vy, eps));
             }
         }
     }
+    // Return the scratch to the thread-local for reuse on the next call.
+    CUBED_SCRATCH.with(|s| *s.borrow_mut() = cubed_scratch);
 }
 
 /// Three consecutive layers in one memory sweep: blocks of `8q` split into
@@ -2779,6 +2837,7 @@ mod tests {
         fft_in_place_with_options_parallel, fft_root_table, fft_with_options, ifft,
     };
     use crate::goldilocks_field::GoldilocksField;
+    use crate::types::PrimeField64;
 
     /// Portable copy of the general extension-butterfly product used by the
     /// NEON path: `(a0 + a1*u) * (b0 + b1*u)` with `u^2 = 7`, reduced
@@ -2889,14 +2948,15 @@ mod tests {
     }
 
 
-    /// Driving the layers as single stages must be **bit**-identical to the
-    /// radix-4 fused traversal it replaced on the production path, not
-    /// merely congruent: the two perform the same butterflies on the same
-    /// values with the same twiddles in the same per-element order, so the
-    /// raw `GoldilocksField.0` words must match exactly. Every start stage
+    /// Driving the layers as single stages must be field-identical to the
+    /// radix-4 fused traversal on the production path. The fused pair now
+    /// reassociates the butterfly (three products + a shift-multiply vs four
+    /// products) to cut general multiplies; the reassociation is verified
+    /// field-exact on the production root tables, so the comparison is on
+    /// canonical values rather than raw representatives. Every start stage
     /// at each size is covered, so both stage-count parities are exercised.
     #[test]
-    fn single_layer_driver_matches_fused_reference_raw_words() {
+    fn single_layer_driver_matches_fused_reference() {
         use crate::fft::{
             fft_classic_simd_fused_two_layers_with, fft_classic_simd_layers,
             fft_classic_simd_single_layer_with,
@@ -2953,8 +3013,9 @@ mod tests {
                 );
                 for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                     assert_eq!(
-                        a.0, e.0,
-                        "raw word mismatch at 2^{lg_n} start {start} index {i}"
+                        a.to_canonical_u64(),
+                        e.to_canonical_u64(),
+                        "canonical value mismatch at 2^{lg_n} start {start} index {i}"
                     );
                 }
             }
@@ -3351,9 +3412,15 @@ mod tests {
             let mut actual = padded;
             fft_classic(&mut actual, r, &roots);
             assert_eq!(
-                actual.iter().map(|x| x.0).collect::<Vec<_>>(),
-                expected.iter().map(|x| x.0).collect::<Vec<_>>(),
-                "raw limb mismatch at 2^{lg_n}, r={r}"
+                actual
+                    .iter()
+                    .map(|x| x.to_canonical_u64())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|x| x.to_canonical_u64())
+                    .collect::<Vec<_>>(),
+                "canonical value mismatch at 2^{lg_n}, r={r}"
             );
         }
     }
