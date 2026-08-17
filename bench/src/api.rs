@@ -1,4 +1,4 @@
-// Redraw marker 628
+// exact 4d7d856 live-frontier cluster sample 2026-08-17-d
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
