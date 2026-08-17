@@ -91,9 +91,6 @@ impl<F: Field> PolynomialValues<F> {
         ifft_with_options_and_prescaled_postscale(self, None, None, prescaled_inverse_shift_powers)
     }
 
-    /// [`Self::coset_ifft_with_prescaled_powers`] with the transform's outer
-    /// stages spread across the worker pool. Byte-identical output; only use
-    /// where the call is not already inside a wider parallel phase.
     pub fn coset_ifft_with_prescaled_powers_parallel(
         self,
         prescaled_inverse_shift_powers: &[F],
