@@ -337,6 +337,21 @@ pub struct WirePartition {
 }
 
 impl WirePartition {
+    /// Reconstructs a partition from its serialized permutation. Used by the
+    /// embedded-circuit loader; `sigma` must be the exact vector
+    /// [`Forest::wire_partition`] produces for the same circuit (indexed by
+    /// `column * degree + row`, each entry the next element of its copy
+    /// class). Feeding anything else changes the sigma polynomials, which the
+    /// loader's commitment-cap check rejects.
+    pub fn from_sigma(sigma: Vec<u32>) -> Self {
+        Self { sigma }
+    }
+
+    /// The underlying permutation, exposed for embedded serialization.
+    pub fn sigma(&self) -> &[u32] {
+        &self.sigma
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,

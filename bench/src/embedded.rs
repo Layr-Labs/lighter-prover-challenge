@@ -194,6 +194,45 @@ mod tests {
         bytes
     }
 
+    /// Value-level Merkle tree equality: leaves (normalized out of row-major
+    /// or column-major, CPU or Metal-shared storage), digests (normalized to
+    /// the interleaved layout), cap, and shape. See the call site for why the
+    /// derived representation-sensitive `==` is not used.
+    fn assert_merkle_trees_value_identical<
+        F2: plonky2::hash::hash_types::RichField,
+        H: plonky2::plonk::config::Hasher<F2>,
+    >(
+        name: &str,
+        rebuilt: &plonky2::hash::merkle_tree::MerkleTree<F2, H>,
+        embedded: &plonky2::hash::merkle_tree::MerkleTree<F2, H>,
+    ) {
+        assert!(
+            rebuilt.num_leaves == embedded.num_leaves,
+            "{name}: merkle tree leaf count diverges"
+        );
+        assert!(
+            rebuilt.leaf_width() == embedded.leaf_width(),
+            "{name}: merkle tree leaf width diverges"
+        );
+        assert!(rebuilt.cap == embedded.cap, "{name}: merkle cap diverges");
+        for i in 0..rebuilt.num_leaves {
+            assert!(
+                rebuilt.leaf_vec(i) == embedded.leaf_vec(i),
+                "{name}: merkle leaf {i} diverges"
+            );
+        }
+        let interleaved = |tree: &plonky2::hash::merkle_tree::MerkleTree<F2, H>| match &tree
+            .level_digests
+        {
+            Some(levels) => levels.to_interleaved(),
+            None => tree.digests.clone(),
+        };
+        assert!(
+            interleaved(rebuilt) == interleaved(embedded),
+            "{name}: merkle digests diverge"
+        );
+    }
+
     fn assert_circuit_pair_identical<T: serde::Serialize>(
         name: &str,
         rebuilt: (&T, &CircuitData<F, C, D>),
@@ -262,12 +301,74 @@ mod tests {
             "{name}: common circuit data diverges"
         );
 
-        // Prover-only: full structural equality (commitment polynomials and
-        // Merkle tree, sigmas, subgroup, public inputs, representative map,
-        // watch index + counts, fft root table, lookups; generators by id).
+        // Field-by-field narrowing before the blanket assert, so a divergence
+        // names its field.
+        let r = &rebuilt_data.prover_only;
+        let e = &embedded_data.prover_only;
         assert!(
-            rebuilt_data.prover_only == embedded_data.prover_only,
-            "{name}: prover-only circuit data diverges"
+            r.generator_indices_by_watches == e.generator_indices_by_watches,
+            "{name}: generator_indices_by_watches diverges"
+        );
+        assert!(
+            r.generator_watch_counts == e.generator_watch_counts,
+            "{name}: generator_watch_counts diverges"
+        );
+        assert!(
+            r.generators_defer_until_ready == e.generators_defer_until_ready,
+            "{name}: generators_defer_until_ready diverges"
+        );
+        assert!(
+            r.constants_sigmas_commitment.polynomials == e.constants_sigmas_commitment.polynomials,
+            "{name}: commitment polynomials diverge"
+        );
+        // The Merkle tree is compared value-wise, not representation-wise:
+        // whether the leaves/digests live in CPU-owned vectors or a retained
+        // Metal shared buffer (and whether digests are interleaved or
+        // level-order) depends on when the build ran relative to the Metal
+        // context becoming ready (`probe_declines` diverts exactly one early
+        // caller per latch to the CPU while the shader compile is in flight).
+        // The storage locus is documented and differentially asserted to be
+        // value-identical in vendor metal.rs; deriving `==` over the enums
+        // would make this oracle flaky on arrival timing.
+        assert_merkle_trees_value_identical(
+            name,
+            &r.constants_sigmas_commitment.merkle_tree,
+            &e.constants_sigmas_commitment.merkle_tree,
+        );
+        assert!(
+            r.constants_sigmas_commitment.degree_log == e.constants_sigmas_commitment.degree_log
+                && r.constants_sigmas_commitment.rate_bits
+                    == e.constants_sigmas_commitment.rate_bits
+                && r.constants_sigmas_commitment.blinding == e.constants_sigmas_commitment.blinding,
+            "{name}: commitment parameters diverge"
+        );
+        assert!(r.sigmas == e.sigmas, "{name}: sigmas transpose diverges");
+        assert!(r.subgroup == e.subgroup, "{name}: subgroup diverges");
+        assert!(r.public_inputs == e.public_inputs, "{name}: public inputs diverge");
+        assert!(
+            r.representative_map == e.representative_map,
+            "{name}: representative map diverges"
+        );
+        assert!(
+            r.fixed_routed_wires == e.fixed_routed_wires,
+            "{name}: fixed_routed_wires diverges"
+        );
+        assert!(
+            r.fft_root_table == e.fft_root_table,
+            "{name}: fft_root_table diverges"
+        );
+        assert!(r.circuit_digest == e.circuit_digest, "{name}: circuit digest field diverges");
+        assert!(r.lookup_rows == e.lookup_rows, "{name}: lookup rows diverge");
+        assert!(r.lut_to_lookups == e.lut_to_lookups, "{name}: lookup tables diverge");
+        assert!(
+            r.constants_sigmas_quotient_cache == e.constants_sigmas_quotient_cache
+                && r.constants_sigmas_quotient_step == e.constants_sigmas_quotient_step
+                && r.constants_sigmas_quotient_domain == e.constants_sigmas_quotient_domain,
+            "{name}: quotient cache diverges"
+        );
+        assert!(
+            r.generators == e.generators,
+            "{name}: generator refs diverge (by id)"
         );
     }
 
@@ -411,6 +512,197 @@ mod tests {
                 "net startup win (cold embedded vs rebuild): {:+.1} ms",
                 (t_rebuild.as_secs_f64() - t_embedded_cold.as_secs_f64()) * 1e3
             );
+        });
+    }
+
+    /// Frontier microbench: prices the v1 (recompute) vs v2 (store) side of
+    /// each retuned embed item on the loaded circuits. Run:
+    /// `cargo test --release -p bench --bin prove -- --ignored embed_frontier_microbench --nocapture`
+    #[test]
+    #[ignore = "manual timing harness"]
+    fn embed_frontier_microbench() {
+        use std::time::Instant;
+
+        use plonky2::field::fft::cached_two_adic_subgroup;
+        use plonky2::plonk::permutation_argument::{Forest, WirePartition};
+
+        fn write_uvarint(out: &mut Vec<u8>, mut value: u64) {
+            loop {
+                let byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value == 0 {
+                    out.push(byte);
+                    return;
+                }
+                out.push(byte | 0x80);
+            }
+        }
+        fn read_uvarint(bytes: &[u8], pos: &mut usize) -> u64 {
+            let mut value = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let byte = bytes[*pos];
+                *pos += 1;
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+            }
+        }
+        const fn zigzag(value: i64) -> u64 {
+            ((value << 1) ^ (value >> 63)) as u64
+        }
+        const fn unzigzag(value: u64) -> i64 {
+            ((value >> 1) as i64) ^ -((value & 1) as i64)
+        }
+
+        on_big_stack(|| {
+            let circuits = Circuits::from_embedded().expect("embedded circuits must load");
+            let mut cases: Vec<(&str, &CircuitData<F, C, D>)> = Vec::new();
+            let heavy_tx = circuits.heavy_tx_data.read().unwrap();
+            let light_tx = circuits.light_tx_data.read().unwrap();
+            let heavy_chain = circuits.heavy_chain_data.read().unwrap();
+            let light_chain = circuits.light_chain_data.read().unwrap();
+            cases.push(("pre", &circuits.pre_data));
+            cases.push(("heavy_tx", &heavy_tx));
+            cases.push(("heavy_chain", &heavy_chain));
+            cases.push(("light_tx", &light_tx));
+            cases.push(("light_chain", &light_chain));
+
+            for (name, data) in cases {
+                let common = &data.common;
+                let prover = &data.prover_only;
+                let degree_bits = common.degree_bits();
+                let degree = 1usize << degree_bits;
+                let num_wires = common.config.num_wires;
+                let num_routed = common.config.num_routed_wires;
+                let subgroup = cached_two_adic_subgroup::<F>(degree_bits).as_ref().clone();
+
+                // v1 sigma path: forest + wire_partition + get_sigma_polys.
+                let t = Instant::now();
+                let mut forest = Forest::from_parents(
+                    prover.representative_map.clone(),
+                    num_wires,
+                    num_routed,
+                    degree,
+                );
+                let partition = forest.wire_partition();
+                let v1_sigma_vecs =
+                    partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
+                let t_v1_sigma = t.elapsed();
+
+                // v2 sigma path: get_sigma_polys from the stored permutation.
+                let sigma_vec = partition.sigma().to_vec();
+                let t = Instant::now();
+                let partition2 = WirePartition::from_sigma(sigma_vec);
+                let v2_sigma_vecs =
+                    partition2.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
+                let t_v2_sigma = t.elapsed();
+                assert!(v1_sigma_vecs == v2_sigma_vecs);
+
+                // Representative map codec: v1 serial zigzag-varint decode vs
+                // v2 parallel raw-i32-delta reconstruct (codec cost only, both
+                // on uncompressed bytes).
+                let map = &prover.representative_map;
+                let mut varint = Vec::with_capacity(2 * map.len());
+                for (index, &parent) in map.iter().enumerate() {
+                    write_uvarint(&mut varint, zigzag(i64::from(parent) - index as i64));
+                }
+                let t = Instant::now();
+                let mut decoded = Vec::with_capacity(map.len());
+                let mut vpos = 0usize;
+                for index in 0..map.len() {
+                    let delta = unzigzag(read_uvarint(&varint, &mut vpos));
+                    decoded.push(u32::try_from(index as i64 + delta).unwrap());
+                }
+                let t_v1_repmap = t.elapsed();
+                assert!(&decoded == map);
+                let mut raw = Vec::with_capacity(4 * map.len());
+                for (index, &parent) in map.iter().enumerate() {
+                    raw.extend_from_slice(
+                        &(i32::try_from(i64::from(parent) - index as i64).unwrap()).to_le_bytes(),
+                    );
+                }
+                let t = Instant::now();
+                let decoded2: Vec<u32> = {
+                    use rayon::prelude::*;
+                    raw.par_chunks_exact(4)
+                        .enumerate()
+                        .map(|(index, chunk)| {
+                            let delta = i32::from_le_bytes(chunk.try_into().unwrap());
+                            u32::try_from(index as i64 + i64::from(delta)).unwrap()
+                        })
+                        .collect()
+                };
+                let t_v2_repmap = t.elapsed();
+                assert!(&decoded2 == map);
+
+                // Generator stream: v1 serial decode vs v2 parallel chunked
+                // decode (1024-generator chunks), identical bytes.
+                let serializer = EmbedGeneratorSerializer {
+                    _phantom: Default::default(),
+                    _phantom2: Default::default(),
+                };
+                let mut stream = Vec::new();
+                let mut lengths = Vec::with_capacity(prover.generators.len());
+                for generator in &prover.generators {
+                    let start = stream.len();
+                    stream
+                        .write_generator::<F, D>(generator, &serializer, common)
+                        .expect("generator must serialize");
+                    lengths.push((stream.len() - start) as u32);
+                }
+                let t = Instant::now();
+                {
+                    use plonky2::util::serialization::{Buffer, Read as _};
+                    let mut reader = Buffer::new(&stream);
+                    for _ in 0..prover.generators.len() {
+                        reader
+                            .read_generator::<F, D>(&serializer, common)
+                            .expect("generator must deserialize");
+                    }
+                }
+                let t_v1_generators = t.elapsed();
+                let t = Instant::now();
+                {
+                    use plonky2::util::serialization::{Buffer, Read as _};
+                    use rayon::prelude::*;
+                    const CHUNK: usize = 1024;
+                    let mut starts = Vec::new();
+                    let mut b = 0u64;
+                    for (index, &len) in lengths.iter().enumerate() {
+                        if index % CHUNK == 0 {
+                            starts.push(b as usize);
+                        }
+                        b += u64::from(len);
+                    }
+                    starts.push(b as usize);
+                    let decoded: Vec<Vec<_>> = starts
+                        .par_windows(2)
+                        .enumerate()
+                        .map(|(chunk_index, window)| {
+                            let count =
+                                CHUNK.min(prover.generators.len() - chunk_index * CHUNK);
+                            let mut reader = Buffer::new(&stream[window[0]..window[1]]);
+                            (0..count)
+                                .map(|_| {
+                                    reader
+                                        .read_generator::<F, D>(&serializer, common)
+                                        .expect("generator must deserialize")
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    assert!(decoded.iter().map(Vec::len).sum::<usize>() == prover.generators.len());
+                }
+                let t_v2_generators = t.elapsed();
+
+                println!(
+                    "{name:<12} sigma v1 {:>8.1?} -> v2 {:>8.1?} | repmap v1 {:>8.1?} -> v2 {:>8.1?} | generators v1 {:>8.1?} -> v2 {:>8.1?}",
+                    t_v1_sigma, t_v2_sigma, t_v1_repmap, t_v2_repmap, t_v1_generators, t_v2_generators
+                );
+            }
         });
     }
 
