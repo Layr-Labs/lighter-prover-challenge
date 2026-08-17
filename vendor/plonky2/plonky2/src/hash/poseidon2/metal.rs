@@ -4250,7 +4250,7 @@ fn dispatch(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(64)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
