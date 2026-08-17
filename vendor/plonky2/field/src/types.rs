@@ -686,6 +686,43 @@ impl<F: Field> Iterator for Powers<F> {
 }
 
 impl<F: Field> Powers<F> {
+    /// Collect the first `n` terms with `WIDTH` independent multiply
+    /// chains. Identical field values to [`Iterator::take`] +
+    /// [`Iterator::collect`] on this iterator: `out[i] = current * base^i`.
+    /// The serial iterator is a single dependent chain; this form keeps
+    /// four accumulators in registers the same way Montgomery inverse
+    /// does, then steps each by `base^WIDTH`.
+    pub fn take_ilp(self, n: usize) -> Vec<F> {
+        const WIDTH: usize = 4;
+        let mut out = Vec::with_capacity(n);
+        if n == 0 {
+            return out;
+        }
+        let Powers { base, mut current } = self;
+        out.push(current);
+        let prefix = n.min(WIDTH);
+        for _ in 1..prefix {
+            current *= base;
+            out.push(current);
+        }
+        if n <= WIDTH {
+            return out;
+        }
+        // `current` is `start * base^{WIDTH-1}`. The lane step must be
+        // `base^WIDTH`, not `current * base` (that would bake `start` in).
+        let mut step = base;
+        for _ in 1..WIDTH {
+            step *= base;
+        }
+        let mut lanes: [F; WIDTH] = out[..WIDTH].try_into().expect("prefix is WIDTH");
+        for i in WIDTH..n {
+            let lane = i % WIDTH;
+            lanes[lane] *= step;
+            out.push(lanes[lane]);
+        }
+        out
+    }
+
     /// Apply the Frobenius automorphism `k` times.
     pub fn repeated_frobenius<const D: usize>(self, k: usize) -> Self
     where
@@ -703,7 +740,7 @@ impl<F: Field> Powers<F> {
 mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    use super::{Field, Field64, PrimeField64};
+    use super::{Field, Field64, PrimeField64, Sample};
     use crate::extension::quadratic::QuadraticExtension;
     use crate::goldilocks_field::GoldilocksField;
 
@@ -785,6 +822,31 @@ mod tests {
             for &expect_next in &powers_of_two[n + 1..] {
                 assert_eq!(iter.next(), Some(expect_next));
             }
+        }
+    }
+
+    #[test]
+    fn take_ilp_matches_serial_powers_raw_words() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<GoldilocksField>;
+
+        fn check<T: Field + Sample>(n: usize) {
+            let base = T::rand();
+            let start = T::rand();
+            let serial: Vec<T> = base.shifted_powers(start).take(n).collect();
+            let actual = base.shifted_powers(start).take_ilp(n);
+            assert_eq!(actual.len(), n, "len n={n}");
+            for (i, (a, e)) in actual.iter().zip(serial.iter()).enumerate() {
+                assert_eq!(a, e, "lane {i} of n={n}");
+            }
+            let from_one_serial: Vec<T> = base.powers().take(n).collect();
+            let from_one_ilp = base.powers().take_ilp(n);
+            assert_eq!(from_one_ilp, from_one_serial, "from-one n={n}");
+        }
+
+        for n in [0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 64, 257] {
+            check::<F>(n);
+            check::<FE>(n);
         }
     }
 

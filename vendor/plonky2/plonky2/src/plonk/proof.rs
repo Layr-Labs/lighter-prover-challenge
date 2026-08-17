@@ -336,7 +336,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // `(..(c_{n-1} z + c_{n-2}) z + ..)`, so every opening is the
         // identical field element and the transcript is unchanged.
         let degree = common_data.degree();
-        let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
+        let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take_ilp(degree) };
         let zeta_pows = table(zeta);
         // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
         // the process-cached natural-order two-adic subgroup, and
