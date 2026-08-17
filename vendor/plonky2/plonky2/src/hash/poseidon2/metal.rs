@@ -1504,14 +1504,59 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// the balance point.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
 const SPINE_URGENT_BACKLOG: isize = 3;
+/// Monotonic admission acknowledgements for urgent classic 2^17 spine trees.
+/// Incremented only after their command buffer is submitted to the shared
+/// Metal queue, so streamed groups can hand off at queue admission rather
+/// than waiting for the complete chain proof to finish.
+static SPINE_COMMIT_EPOCH: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
     SPINE_BACKLOG.fetch_add(delta, core::sync::atomic::Ordering::Relaxed);
 }
 
+fn spine_backlog_is_urgent(backlog: isize) -> bool {
+    backlog >= SPINE_URGENT_BACKLOG
+}
+
 fn spine_urgent() -> bool {
-    SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed) >= SPINE_URGENT_BACKLOG
+    spine_backlog_is_urgent(SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+fn spine_commit_epoch() -> u64 {
+    SPINE_COMMIT_EPOCH.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Pure form of the group/phase/backlog admission predicate used by the
+/// deterministic handoff tests.
+fn streamed_group_handoff_required(group: usize, exclusive: bool, backlog: isize) -> bool {
+    group != 0 && !exclusive && spine_backlog_is_urgent(backlog)
+}
+
+/// Returns whether a later streamed group should keep yielding for the
+/// current handoff. A changed commit epoch acknowledges an actual urgent
+/// classic spine submission; an urgency drop remains the fallback when the
+/// classic path cannot submit a Metal command buffer.
+fn streamed_group_wait_required(
+    group: usize,
+    exclusive: bool,
+    backlog: isize,
+    observed_epoch: u64,
+    current_epoch: u64,
+) -> bool {
+    streamed_group_handoff_required(group, exclusive, backlog)
+        && observed_epoch == current_epoch
+}
+
+fn streamed_group_should_wait_for_spine(group: usize, observed_epoch: u64) -> bool {
+    streamed_group_wait_required(
+        group,
+        EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed),
+        SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed),
+        observed_epoch,
+        spine_commit_epoch(),
+    )
 }
 
 /// Number of Merkle builds currently occupying the serialized GPU stream
@@ -2304,6 +2349,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
     // order, and each pass is committed before the next group''s fill starts.
+    // Each later group may hand off once the next actual classic spine
+    // command is submitted; a fresh epoch permits the next repeated handoff.
+    let mut observed_spine_epoch = spine_commit_epoch();
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
@@ -2390,6 +2438,15 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            // Group zero is always submitted. Before each later group, wait
+            // only until an urgent non-exclusive 2^17 spine command buffer
+            // is submitted, or until the urgency clears. This is scheduling
+            // only: command-buffer order, buffers, and all shader
+            // dependencies remain unchanged, and exclusive phases bypass it.
+            while streamed_group_should_wait_for_spine(group, observed_spine_epoch) {
+                std::thread::yield_now();
+            }
+            observed_spine_epoch = spine_commit_epoch();
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3849,6 +3906,7 @@ impl MetalShared {
             leaf_width,
             leaf_count,
             cap_height,
+            spine,
             input_len,
             input_bytes,
             output_len,
@@ -3867,6 +3925,7 @@ impl MetalShared {
         leaf_width: usize,
         leaf_count: usize,
         cap_height: usize,
+        spine: bool,
         input_len: usize,
         input_bytes: usize,
         output_len: usize,
@@ -4023,6 +4082,9 @@ impl MetalShared {
                 (leaf_count * leaf_width) as u64,
             );
             command_buffer.commit();
+            if spine {
+                SPINE_COMMIT_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Release);
+            }
             command_buffer.to_owned()
         });
 
@@ -6817,6 +6879,82 @@ kernel void goldilocks_mul_bench_native(
     }
 
     #[test]
+    fn streamed_group_handoff_gate_trace_is_deterministic() {
+        let urgent = (0..4)
+            .map(|group| {
+                streamed_group_handoff_required(group, false, SPINE_URGENT_BACKLOG)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(urgent, vec![false, true, true, true]);
+
+        let below_threshold = (0..4)
+            .map(|group| {
+                streamed_group_handoff_required(group, false, SPINE_URGENT_BACKLOG - 1)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(below_threshold, vec![false, false, false, false]);
+
+        let exclusive = (0..4)
+            .map(|group| streamed_group_handoff_required(group, true, SPINE_URGENT_BACKLOG))
+            .collect::<Vec<_>>();
+        assert_eq!(exclusive, vec![false, false, false, false]);
+
+        // An ordinary classic commit leaves the epoch unchanged and cannot
+        // acknowledge the wait. Each actual spine commit advances it, so a
+        // later group can hand off repeatedly without waiting for proof
+        // completion.
+        assert!(streamed_group_wait_required(
+            1,
+            false,
+            SPINE_URGENT_BACKLOG,
+            7,
+            7,
+        ));
+        assert!(!streamed_group_wait_required(
+            1,
+            false,
+            SPINE_URGENT_BACKLOG,
+            7,
+            8,
+        ));
+
+        let trace = [
+            (0, 7, 7), // group zero always commits
+            (1, 7, 7), // wait for spine commit #1
+            (1, 7, 8), // commit #1 acknowledged
+            (2, 8, 8), // wait for spine commit #2
+            (2, 8, 9), // commit #2 acknowledged
+        ]
+        .into_iter()
+        .map(|(group, observed, current)| {
+            streamed_group_wait_required(
+                group,
+                false,
+                SPINE_URGENT_BACKLOG,
+                observed,
+                current,
+            )
+        })
+        .collect::<Vec<_>>();
+        assert_eq!(trace, vec![false, true, false, true, false]);
+
+        assert!(!streamed_group_wait_required(
+            1,
+            false,
+            SPINE_URGENT_BACKLOG - 1,
+            7,
+            7,
+        ));
+        assert!(!streamed_group_wait_required(
+            1,
+            true,
+            SPINE_URGENT_BACKLOG,
+            7,
+            7,
+        ));
+    }
+
+    #[test]
     fn streamed_merkle_keeps_digests_resident_and_matches_classic() {
         type F = GoldilocksField;
         struct ExclusiveReset;
@@ -6832,6 +6970,8 @@ kernel void goldilocks_mul_bench_native(
         // the group that now carries the parent ladder is the short one.
         let cols = 17;
         let cap_height = 4;
+        let groups_seen = Arc::new(Mutex::new(Vec::new()));
+        let groups_seen_by_fill = Arc::clone(&groups_seen);
         let columns = context
             .allocate_columns::<F>(rows, cols)
             .expect("shared columns");
@@ -6842,7 +6982,8 @@ kernel void goldilocks_mul_bench_native(
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
-            &|group, destinations| {
+            &move |group, destinations| {
+                groups_seen_by_fill.lock().unwrap().push(group);
                 for (index, destination) in destinations.iter_mut().enumerate() {
                     destination.fill(F::from_canonical_usize(group * 8 + index + 1));
                 }
@@ -6850,6 +6991,7 @@ kernel void goldilocks_mul_bench_native(
         )
         .expect("streamed tree");
         assert!(streamed.0.nodes.is_shared());
+        assert_eq!(*groups_seen.lock().unwrap(), vec![0, 1, 2]);
 
         let classic = context
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
