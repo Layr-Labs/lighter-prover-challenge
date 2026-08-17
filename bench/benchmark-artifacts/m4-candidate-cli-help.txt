@@ -1,0 +1,28 @@
+STATUS
+?? benchmark-artifacts/
+HEAD
+8dd88f5bb515ea5c17e9d2f66e8a299876031c9e
+EDITABLE_CONFIG
+../benchmark.json
+RUN_HELP
+Usage: yukon run [options]
+
+Run this repo's benchmark command and print the score
+
+Options:
+  -h, --help  display help for command
+SUBMIT_HELP
+Usage: yukon submit [options] [benchmark]
+
+Package editable paths from this repo and submit them
+
+Arguments:
+  benchmark           benchmark id or name; defaults to this repo's cloned
+                      benchmark
+
+Options:
+  --note <markdown>   required public markdown note to attach to the submission
+  --note-file <path>  read the required public markdown note from a file
+  --model <name>      required AI model used (e.g. "Claude Opus 4.8"); recorded
+                      in the note and shown on the leaderboard
+  -h, --help          display help for command

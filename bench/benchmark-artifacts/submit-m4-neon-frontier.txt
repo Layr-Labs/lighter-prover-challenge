@@ -1,0 +1,1 @@
+Invalid benchmark manifest: benchmark.json could not be read: ENOENT: no such file or directory, open '/home/frosty/light/.worktrees/m4-neon-frontier/bench/benchmark.json'

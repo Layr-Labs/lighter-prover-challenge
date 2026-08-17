@@ -1,0 +1,3 @@
+[2m$[22m bash -lc ./benchmark.sh
+setup.sh: macOS is required
+benchmarkCommand failed with exit code 1

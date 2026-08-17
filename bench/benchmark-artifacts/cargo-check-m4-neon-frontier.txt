@@ -1,0 +1,179 @@
+warning: unused variable: `sigma`
+    --> vendor/plonky2/field/src/fft.rs:2781:9
+     |
+2781 |         sigma: P::Scalar,
+     |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_sigma`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `sigma`
+    --> vendor/plonky2/field/src/fft.rs:2965:9
+     |
+2965 |         sigma: P::Scalar,
+     |         ^^^^^ help: if this is intentional, prefix it with an underscore: `_sigma`
+
+warning: unused import: `EvaluationVarsBaseBatch`
+  --> vendor/plonky2/plonky2/src/gates/poseidon2.rs:25:60
+   |
+25 |     EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+   |                                                            ^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::gates::poseidon2::Poseidon2Gate`
+  --> vendor/plonky2/plonky2/src/plonk/prover.rs:20:5
+   |
+20 | use crate::gates::poseidon2::Poseidon2Gate;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+    --> vendor/plonky2/plonky2/src/plonk/prover.rs:2526:25
+     |
+2526 |                     let mut value = cpu;
+     |                         ----^^^^^
+     |                         |
+     |                         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `start`
+    --> vendor/plonky2/plonky2/src/plonk/prover.rs:2522:21
+     |
+2522 |                 let start = i * num_challenges;
+     |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_start`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `challenge`
+    --> vendor/plonky2/plonky2/src/plonk/prover.rs:2523:22
+     |
+2523 |                 for (challenge, (&cpu, column)) in
+     |                      ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_challenge`
+
+warning: unused variable: `root_name`
+  --> vendor/plonky2/plonky2/src/util/timing.rs:60:16
+   |
+60 |     pub fn new(root_name: &str, level: Level) -> Self {
+   |                ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_root_name`
+
+warning: unused variable: `ctx`
+   --> vendor/plonky2/plonky2/src/util/timing.rs:118:28
+    |
+118 |     pub fn push(&mut self, ctx: &str, _level: log::Level) {
+    |                            ^^^ help: if this is intentional, prefix it with an underscore: `_ctx`
+
+warning: function `evaluate_gate_constraints_base_batch` is never used
+    --> vendor/plonky2/plonky2/src/plonk/vanishing_poly.rs:1432:8
+     |
+1432 | pub fn evaluate_gate_constraints_base_batch<F: RichField + Extendable<D>, const D: usize>(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `evaluate_gate_constraints_base_batch_into` is never used
+    --> vendor/plonky2/plonky2/src/plonk/vanishing_poly.rs:1442:8
+     |
+1442 | pub fn evaluate_gate_constraints_base_batch_into<F: RichField + Extendable<D>, const D: usize>(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `cpu_gate_constraint_rows` is never used
+    --> vendor/plonky2/plonky2/src/plonk/vanishing_poly.rs:1460:15
+     |
+1460 | pub(crate) fn cpu_gate_constraint_rows<F: RichField + Extendable<D>, const D: usize>(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_gate_constraints_base_batch_into_excluding` is never used
+    --> vendor/plonky2/plonky2/src/plonk/vanishing_poly.rs:1476:15
+     |
+1476 | pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding<
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `evaluate_gate_constraints_base_batch_into_excluding_many` is never used
+    --> vendor/plonky2/plonky2/src/plonk/vanishing_poly.rs:1510:15
+     |
+1510 | pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `quotient_chunk_products` is never used
+  --> vendor/plonky2/plonky2/src/util/partial_products.rs:13:15
+   |
+13 | pub(crate) fn quotient_chunk_products<F: Field>(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `quotient_chunk_products_into` is never used
+  --> vendor/plonky2/plonky2/src/util/partial_products.rs:32:15
+   |
+32 | pub(crate) fn quotient_chunk_products_into<F: Field>(
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `partial_products_and_z_gx` is never used
+  --> vendor/plonky2/plonky2/src/util/partial_products.rs:49:15
+   |
+49 | pub(crate) fn partial_products_and_z_gx<F: Field>(z_x: F, quotient_chunk_products: &[F]) -> Vec<F> {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `prove`
+  --> circuit/src/block_pre_execution_constraints.rs:16:30
+   |
+16 | use plonky2::plonk::prover::{prove, prove_with_partition_witness};
+   |                              ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `plonky2::field::types::Field`
+  --> circuit/src/embed.rs:39:5
+   |
+39 | use plonky2::field::types::Field;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PrimeField64`
+  --> circuit/src/uint/u16/gates/arithmetic_u16.rs:16:36
+   |
+16 | use plonky2::field::types::{Field, PrimeField64};
+   |                                    ^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> circuit/src/eddsa/gates/mul_quintic_ext_base.rs:159:17
+    |
+159 |             let mut outs: [&mut [F]; 5] = core::array::from_fn(|_| chunks.next().unwrap());
+    |                 ----^^^^
+    |                 |
+    |                 help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> circuit/src/eddsa/gates/square_quintic_ext_base.rs:170:17
+    |
+170 |             let mut outs: [&mut [F]; 15] = core::array::from_fn(|_| chunks.next().unwrap());
+    |                 ----^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: unused import: `Circuit`
+ --> bench/src/bin/../prover.rs:8:48
+  |
+8 | use circuit::block_constraints::{BlockCircuit, Circuit as _};
+  |                                                ^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `pre_target` is never read
+  --> bench/src/bin/../api.rs:58:9
+   |
+34 | pub struct Circuits {
+   |            -------- field in this struct
+...
+58 |     pub pre_target: BlockPreExecutionTarget,
+   |         ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Ready` is never constructed
+   --> bench/src/bin/../prover.rs:246:5
+    |
+245 | enum ChainState<'scope> {
+    |      ---------- variant in this enum
+246 |     Ready(Proof),
+    |     ^^^^^
+
