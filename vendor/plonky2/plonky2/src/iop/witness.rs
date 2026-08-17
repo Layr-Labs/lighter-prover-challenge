@@ -405,6 +405,33 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         }
     }
 
+    /// Index-specialized form of [`Self::set_target_returning_rep`] for scheduler paths that have
+    /// already linearized a [`Target`]. This avoids carrying the larger enum through intermediate
+    /// buffers and avoids recomputing the same row/column index during merge.
+    pub(crate) fn set_target_index_returning_rep(
+        &mut self,
+        target_index: usize,
+        value: F,
+    ) -> Result<Option<usize>> {
+        let rep_index = self.representative_map[target_index] as usize;
+        if self.is_set_by_rep_index(rep_index) {
+            let old_value = self.values[rep_index];
+            if value != old_value {
+                return Err(anyhow!(
+                    "Partition containing target index {} was set twice with different values: {} != {}",
+                    target_index,
+                    old_value,
+                    value
+                ));
+            }
+            Ok(None)
+        } else {
+            self.values[rep_index] = value;
+            self.mark_set(rep_index);
+            Ok(Some(rep_index))
+        }
+    }
+
     /// [`Self::set_target_returning_rep`] with the representative supplied by
     /// the caller instead of gathered from `representative_map`.
     ///
