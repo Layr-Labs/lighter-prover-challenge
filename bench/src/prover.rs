@@ -111,6 +111,10 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // 500-active-tx ranked fixture, so a window-depth effect is structurally
 // understated locally. Per the file's own guidance the ranked draw, not the
 // local number, settles it.
+// Ranked sweep result: window 5 drew 29.1421309958896 tx/s (submission
+// 2f036f38, rejected) against the frontier's window-6 draw of 31.1267 — the
+// shallow-depth hypothesis is not supported by the ranked draw, so restore
+// the frontier depth and re-sample the frontier tree's own distribution.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
@@ -132,7 +136,14 @@ fn light_tx_proof_window() -> usize {
     })
 }
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+// Probe ovl3: engage the full window from the very first heavy chunk (step 1).
+// Rationale: ovl2 (step 2) showed the light lane is the terminal constraint on the
+// ranked host; this extends the same overlap hypothesis to its limit — the full
+// depth-6 window starts against heavy chunk 1 instead of chunk 2, so no initial
+// serial light proofs remain on the critical path. Memory headroom (~8.7 GiB per
+// worker peak at depth 6 on 48 GiB) still applies. One variable only:
+// LIGHT_TX_PROOF_WINDOW stays at the frontier value 6.
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 1;
 
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
