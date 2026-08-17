@@ -341,19 +341,70 @@ pub(crate) fn ifft_with_options_and_prescaled_postscale<F: Field>(
     let PolynomialValues { values: mut buffer } = poly;
     fft_dispatch(&mut buffer, zero_factor, root_table);
 
-    // Same reversal and same write order as the two-multiply post-pass.
-    buffer[0] *= prescaled_scales[0];
-    if n > 1 {
-        buffer[n / 2] *= prescaled_scales[n / 2];
+    packed_ifft_prescaled_postscale(&mut buffer, prescaled_scales);
+    PolynomialCoeffs { coeffs: buffer }
+}
+
+/// Reverse the lanes of a packed word. `WIDTH` is a power of two; a
+/// WIDTH-1 packing is a no-op.
+#[inline(always)]
+fn reverse_packed<P: PackedField>(mut v: P) -> P {
+    let width = P::WIDTH;
+    {
+        let lanes = v.as_slice_mut();
+        for k in 0..width / 2 {
+            lanes.swap(k, width - 1 - k);
+        }
     }
-    for i in 1..(n / 2) {
+    v
+}
+
+/// Fused IFFT reverse + prescaled multiply, packed over mirrored WIDTH
+/// blocks. Ends 0 and `n/2` stay scalar. Each packed group starting at
+/// `i` with `i + WIDTH <= n/2` writes
+///
+/// ```text
+/// dest[i + k]           = old[n - (i + k)]     * s[i + k]
+/// dest[n - (i + k)]     = old[i + k]           * s[n - (i + k)]
+/// ```
+///
+/// which is `reverse(buf_hi) * sc_lo` on the low block and
+/// `reverse(buf_lo) * sc_hi` on the high block. The ragged tail keeps
+/// the original pair loop. Bit-identical to the scalar form.
+pub(crate) fn packed_ifft_prescaled_postscale<F: Field>(buffer: &mut [F], scales: &[F]) {
+    let n = buffer.len();
+    debug_assert_eq!(scales.len(), n);
+    if n == 0 {
+        return;
+    }
+    buffer[0] *= scales[0];
+    if n > 1 {
+        buffer[n / 2] *= scales[n / 2];
+    }
+    let width = <F as Packable>::Packing::WIDTH;
+    let mut i = 1;
+    if width >= 2 {
+        while i + width <= n / 2 {
+            let hi_start = n - (i + width - 1);
+            let buf_lo = *<F as Packable>::Packing::from_slice(&buffer[i..i + width]);
+            let buf_hi = *<F as Packable>::Packing::from_slice(&buffer[hi_start..hi_start + width]);
+            let sc_lo = *<F as Packable>::Packing::from_slice(&scales[i..i + width]);
+            let sc_hi = *<F as Packable>::Packing::from_slice(&scales[hi_start..hi_start + width]);
+            let dest_lo = reverse_packed(buf_hi) * sc_lo;
+            let dest_hi = reverse_packed(buf_lo) * sc_hi;
+            buffer[i..i + width].copy_from_slice(dest_lo.as_slice());
+            buffer[hi_start..hi_start + width].copy_from_slice(dest_hi.as_slice());
+            i += width;
+        }
+    }
+    while i < n / 2 {
         let j = n - i;
-        let coeffs_i = buffer[j] * prescaled_scales[i];
-        let coeffs_j = buffer[i] * prescaled_scales[j];
+        let coeffs_i = buffer[j] * scales[i];
+        let coeffs_j = buffer[i] * scales[j];
         buffer[i] = coeffs_i;
         buffer[j] = coeffs_j;
+        i += 1;
     }
-    PolynomialCoeffs { coeffs: buffer }
 }
 
 
@@ -2822,6 +2873,52 @@ mod tests {
         check::<GoldilocksField>();
         check::<QuadraticExtension<GoldilocksField>>();
         check::<QuarticExtension<GoldilocksField>>();
+    }
+
+    /// Packed reverse-mul post-pass must be raw-`u64`-identical to the
+    /// scalar `(i, n-i)` pair loop it replaces, including the WIDTH-ragged
+    /// tail and the n=2 / n=4 fall-through that never enters the packed body.
+    #[test]
+    fn packed_ifft_prescaled_postscale_matches_scalar_pairs() {
+        use crate::fft::packed_ifft_prescaled_postscale;
+        use crate::types::{PrimeField64, Sample};
+
+        type F = GoldilocksField;
+
+        fn scalar_pairs(buffer: &mut [F], scales: &[F]) {
+            let n = buffer.len();
+            if n == 0 {
+                return;
+            }
+            buffer[0] *= scales[0];
+            if n > 1 {
+                buffer[n / 2] *= scales[n / 2];
+            }
+            for i in 1..(n / 2) {
+                let j = n - i;
+                let coeffs_i = buffer[j] * scales[i];
+                let coeffs_j = buffer[i] * scales[j];
+                buffer[i] = coeffs_i;
+                buffer[j] = coeffs_j;
+            }
+        }
+
+        for k in [1usize, 2, 3, 4, 5, 6, 8, 10] {
+            let n = 1 << k;
+            let original = F::rand_vec(n);
+            let scales = F::rand_vec(n);
+            let mut expected = original.clone();
+            scalar_pairs(&mut expected, &scales);
+            let mut actual = original;
+            packed_ifft_prescaled_postscale(&mut actual, &scales);
+            for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    a.to_canonical_u64(),
+                    e.to_canonical_u64(),
+                    "limb {idx} of n={n}"
+                );
+            }
+        }
     }
 
     /// The cached-table dispatch path (no caller-supplied table) must return

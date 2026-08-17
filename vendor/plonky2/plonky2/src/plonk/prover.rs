@@ -12,6 +12,8 @@ use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::fri::oracle::{BatchLayout, PolynomialBatch};
@@ -1824,6 +1826,123 @@ fn start_gpu_permutation_quotient<
     Some(job)
 }
 
+/// `dest[j*2 + c] *= invs[j]` for c in {0,1}. Packed over consecutive
+/// points: each `Packing` group holds `WIDTH/2` points with the inverse
+/// duplicated onto both challenge lanes. Tail stays scalar.
+fn packed_scale_challenge_pairs<F: Field + Packable>(dest: &mut [F], invs: &[F]) {
+    debug_assert_eq!(dest.len(), invs.len() * 2);
+    let width = F::Packing::WIDTH;
+    let n = invs.len();
+    let mut pts = 0;
+    if width >= 2 && width % 2 == 0 {
+        let pts_per = width / 2;
+        while pts + pts_per <= n {
+            let dest_off = pts * 2;
+            let d = *F::Packing::from_slice(&dest[dest_off..dest_off + width]);
+            let mut inv_lanes = F::Packing::ZEROS;
+            {
+                let lanes = inv_lanes.as_slice_mut();
+                for i in 0..pts_per {
+                    lanes[i * 2] = invs[pts + i];
+                    lanes[i * 2 + 1] = invs[pts + i];
+                }
+            }
+            dest[dest_off..dest_off + width].copy_from_slice((d * inv_lanes).as_slice());
+            pts += pts_per;
+        }
+    }
+    for j in pts..n {
+        dest[j * 2] *= invs[j];
+        dest[j * 2 + 1] *= invs[j];
+    }
+}
+
+/// `col[c][global_start + j] = cpu[j*2+c] + (p+r+perm)[j*2+c] * invs[j]`.
+/// Packed over consecutive C=2 points: each `Packing` group holds
+/// `WIDTH/2` points with the inverse duplicated onto both challenge
+/// lanes, matching `packed_scale_challenge_pairs`. Absent GPU sources
+/// contribute zero. Tail stays scalar. Field-value-identical to the
+/// per-point `cpu + gpu * inv` fuse.
+fn packed_gpu_merge_c2<F: Field + Packable>(
+    cpu: &[F],
+    gpu_p: Option<&[F]>,
+    gpu_r: Option<&[F]>,
+    gpu_perm: Option<&[F]>,
+    invs: &[F],
+    col0: *mut F,
+    col1: *mut F,
+    global_start: usize,
+) {
+    debug_assert_eq!(cpu.len(), invs.len() * 2);
+    let width = F::Packing::WIDTH;
+    let n = invs.len();
+    let mut pts = 0;
+    if width >= 2 && width % 2 == 0 {
+        let pts_per = width / 2;
+        while pts + pts_per <= n {
+            let dest_off = pts * 2;
+            let g_off = (global_start + pts) * 2;
+            let cpu_p = *F::Packing::from_slice(&cpu[dest_off..dest_off + width]);
+            let mut gpu = F::Packing::ZEROS;
+            if let Some(values) = gpu_p {
+                gpu += *F::Packing::from_slice(&values[g_off..g_off + width]);
+            }
+            if let Some(values) = gpu_r {
+                gpu += *F::Packing::from_slice(&values[g_off..g_off + width]);
+            }
+            if let Some(values) = gpu_perm {
+                gpu += *F::Packing::from_slice(&values[g_off..g_off + width]);
+            }
+            let mut inv_lanes = F::Packing::ZEROS;
+            {
+                let lanes = inv_lanes.as_slice_mut();
+                for i in 0..pts_per {
+                    lanes[i * 2] = invs[pts + i];
+                    lanes[i * 2 + 1] = invs[pts + i];
+                }
+            }
+            let out = cpu_p + gpu * inv_lanes;
+            let out_s = out.as_slice();
+            for i in 0..pts_per {
+                let gi = global_start + pts + i;
+                // SAFETY: caller owns `col0`/`col1` over this point range;
+                // each (challenge, point) is written once.
+                unsafe {
+                    *col0.add(gi) = out_s[i * 2];
+                    *col1.add(gi) = out_s[i * 2 + 1];
+                }
+            }
+            pts += pts_per;
+        }
+    }
+    for j in pts..n {
+        let dest_off = j * 2;
+        let gi = global_start + j;
+        let g_off = gi * 2;
+        for c in 0..2 {
+            let mut gpu = F::ZERO;
+            if let Some(values) = gpu_p {
+                gpu += values[g_off + c];
+            }
+            if let Some(values) = gpu_r {
+                gpu += values[g_off + c];
+            }
+            if let Some(values) = gpu_perm {
+                gpu += values[g_off + c];
+            }
+            let value = cpu[dest_off + c] + gpu * invs[j];
+            // SAFETY: same disjoint write as the packed path.
+            unsafe {
+                if c == 0 {
+                    *col0.add(gi) = value;
+                } else {
+                    *col1.add(gi) = value;
+                }
+            }
+        }
+    }
+}
+
 fn compute_quotient_polys<
     'a,
     F: RichField + Extendable<D>,
@@ -2357,14 +2476,25 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                for (&i, quotient_values) in indices_batch
-                    .iter()
-                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
-                {
-                    let denominator_inv = z_h_on_coset.eval_inverse(i);
-                    quotient_values
-                        .iter_mut()
-                        .for_each(|v| *v *= denominator_inv);
+                let n_pts = indices_batch.len();
+                if n_pts > 0 {
+                    debug_assert!(indices_batch
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &i)| i == indices_batch[0] + k));
+                    z_h_on_coset.for_each_inverse_run(indices_batch[0], n_pts, |k, invs| {
+                        let dest = &mut quotient_values_batch
+                            [k * num_challenges..(k + invs.len()) * num_challenges];
+                        if num_challenges == 2 {
+                            packed_scale_challenge_pairs(dest, invs);
+                        } else {
+                            for (inv, quotient_values) in
+                                invs.iter().zip(dest.chunks_exact_mut(num_challenges))
+                            {
+                                quotient_values.iter_mut().for_each(|v| *v *= *inv);
+                            }
+                        }
+                    });
                 }
             },
         );
@@ -2514,31 +2644,68 @@ fn compute_quotient_polys<
         // CPU quotient pages are now read once and never dirtied again.
         // validator population; this comment changes no executable behavior.
         quotient_values
-            .par_chunks_exact(num_challenges)
+            .par_chunks(BATCH_SIZE * num_challenges)
             .enumerate()
-            .for_each(|(i, cpu_values)| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                let start = i * num_challenges;
-                for (challenge, (&cpu, column)) in
-                    cpu_values.iter().zip(column_ptrs).enumerate()
-                {
-                    let mut value = cpu;
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    {
-                        if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge] * denominator_inv;
-                        }
-                        if let Some(values) = gpu_range_values {
-                            value += values[start + challenge] * denominator_inv;
-                        }
-                        if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge] * denominator_inv;
+            .for_each(|(chunk_i, chunk)| {
+                let base = BATCH_SIZE * chunk_i;
+                let n_pts = chunk.len() / num_challenges;
+                debug_assert_eq!(chunk.len(), n_pts * num_challenges);
+                z_h_on_coset.for_each_inverse_run(base, n_pts, |k, invs| {
+                    #[cfg(all(
+                        feature = "std",
+                        target_arch = "aarch64",
+                        target_os = "macos"
+                    ))]
+                    if num_challenges == 2 {
+                        packed_gpu_merge_c2(
+                            &chunk[k * 2..(k + invs.len()) * 2],
+                            gpu_poseidon_values.as_deref(),
+                            gpu_range_values.as_deref(),
+                            gpu_permutation_values.as_deref(),
+                            invs,
+                            column_ptrs[0].0,
+                            column_ptrs[1].0,
+                            base + k,
+                        );
+                        return;
+                    }
+                    for (off, &inv) in invs.iter().enumerate() {
+                        let local = k + off;
+                        let i = base + local;
+                        let cpu_values = &chunk
+                            [local * num_challenges..(local + 1) * num_challenges];
+                        let start = i * num_challenges;
+                        for (challenge, (&cpu, column)) in
+                            cpu_values.iter().zip(column_ptrs).enumerate()
+                        {
+                            let mut value = cpu;
+                            #[cfg(all(
+                                feature = "std",
+                                target_arch = "aarch64",
+                                target_os = "macos"
+                            ))] {
+                                // `cpu + (p+r+perm)*inv` is field-value-
+                                // identical to three `+= src*inv` (Goldilocks
+                                // distributes). One mul instead of three.
+                                let mut gpu = F::ZERO;
+                                if let Some(values) = gpu_poseidon_values {
+                                    gpu += values[start + challenge];
+                                }
+                                if let Some(values) = gpu_range_values {
+                                    gpu += values[start + challenge];
+                                }
+                                if let Some(values) = gpu_permutation_values {
+                                    gpu += values[start + challenge];
+                                }
+                                value = cpu + gpu * inv;
+                            }
+                            // SAFETY: point `i` is owned by this chunk's
+                            // disjoint range; each (challenge, point) is
+                            // written once.
+                            unsafe { *column.0.add(i) = value };
                         }
                     }
-                    // SAFETY: point `i` is owned by this parallel iteration,
-                    // and every (challenge, point) destination is written once.
-                    unsafe { *column.0.add(i) = value };
-                }
+                });
             });
     } else {
         // CPU-only path: parallel scatter of the interleaved point-major
@@ -2774,7 +2941,10 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        packed_gpu_merge_c2, packed_scale_challenge_pairs, precomputed, BatchLayout,
+        COMPARE_QUOTIENT_LAYOUTS,
+    };
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
@@ -3023,6 +3193,92 @@ mod quotient_layout_tests {
             for c in 0..w {
                 assert_eq!(point_major[k * w + c].0, poly_major[c * n + k].0);
             }
+        }
+    }
+
+    #[test]
+    fn packed_scale_challenge_pairs_matches_scalar() {
+        type F = GoldilocksField;
+        for n in [1, 2, 3, 4, 7, 31, 32] {
+            let invs: Vec<F> = (0..n)
+                .map(|i| F::from_canonical_usize(i * 11 + 3))
+                .collect();
+            let mut packed: Vec<F> = (0..n * 2)
+                .map(|i| F::from_canonical_usize(i * 17 + 5))
+                .collect();
+            let mut scalar = packed.clone();
+            packed_scale_challenge_pairs(&mut packed, &invs);
+            for j in 0..n {
+                scalar[j * 2] *= invs[j];
+                scalar[j * 2 + 1] *= invs[j];
+            }
+            assert_eq!(packed, scalar, "n={n}");
+        }
+    }
+
+    #[test]
+    fn packed_gpu_merge_c2_matches_scalar() {
+        type F = GoldilocksField;
+        for n in [1, 2, 3, 4, 7, 31, 32] {
+            let invs: Vec<F> = (0..n)
+                .map(|i| F::from_canonical_usize(i * 11 + 3))
+                .collect();
+            let cpu: Vec<F> = (0..n * 2)
+                .map(|i| F::from_canonical_usize(i * 17 + 5))
+                .collect();
+            let poseidon: Vec<F> = (0..n * 2)
+                .map(|i| F::from_canonical_usize(i * 19 + 7))
+                .collect();
+            let range: Vec<F> = (0..n * 2)
+                .map(|i| F::from_canonical_usize(i * 23 + 9))
+                .collect();
+            let perm: Vec<F> = (0..n * 2)
+                .map(|i| F::from_canonical_usize(i * 29 + 11))
+                .collect();
+            let mut packed0 = vec![F::ZERO; n];
+            let mut packed1 = vec![F::ZERO; n];
+            packed_gpu_merge_c2(
+                &cpu,
+                Some(poseidon.as_slice()),
+                Some(range.as_slice()),
+                Some(perm.as_slice()),
+                &invs,
+                packed0.as_mut_ptr(),
+                packed1.as_mut_ptr(),
+                0,
+            );
+            for j in 0..n {
+                let gpu0 = poseidon[j * 2] + range[j * 2] + perm[j * 2];
+                let gpu1 = poseidon[j * 2 + 1] + range[j * 2 + 1] + perm[j * 2 + 1];
+                assert_eq!(
+                    packed0[j],
+                    cpu[j * 2] + gpu0 * invs[j],
+                    "n={n} j={j} c0"
+                );
+                assert_eq!(
+                    packed1[j],
+                    cpu[j * 2 + 1] + gpu1 * invs[j],
+                    "n={n} j={j} c1"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_inv_fuse_matches_three_scaled_adds() {
+        type F = GoldilocksField;
+        for i in 0..32usize {
+            let cpu = F::from_canonical_usize(i * 3 + 1);
+            let p = F::from_canonical_usize(i * 5 + 2);
+            let r = F::from_canonical_usize(i * 7 + 4);
+            let perm = F::from_canonical_usize(i * 11 + 6);
+            let inv = F::from_canonical_usize(i * 13 + 8);
+            let mut three = cpu;
+            three += p * inv;
+            three += r * inv;
+            three += perm * inv;
+            let fused = cpu + (p + r + perm) * inv;
+            assert_eq!(fused, three, "i={i}");
         }
     }
 
