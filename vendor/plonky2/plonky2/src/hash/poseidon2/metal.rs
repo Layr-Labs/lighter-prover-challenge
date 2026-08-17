@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "3bc4545aad706e3ab1f737ed7e64d4df3b36e808534ddda6f1c60ca6beae1a9d";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -2305,22 +2305,58 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // absorption of group g: commands on one queue execute in submission
     // order, and each pass is committed before the next group''s fill starts.
     let groups = leaf_width.div_ceil(8);
+    // The overlap above is bought with the sponge state's round trip through
+    // device memory: every dispatch but the last stores twelve words per leaf
+    // and every dispatch but the first reloads them. At one rate-8 block per
+    // dispatch that traffic is 1.61 GB against 0.57 GB of column data on the
+    // widest production commitment, and it lands on the GPU -- which this
+    // host's traces put at 89.7% occupancy while the CPU that the overlap
+    // serves sits between 31% and 45%. Absorbing several blocks per dispatch
+    // keeps the state in registers across them and pays the round trip once
+    // per batch instead of once per block, while the fill of batch b+1 still
+    // overlaps the absorption of batch b -- coarser, but against the resource
+    // that is not the bottleneck.
+    // Two blocks per dispatch, not more: it halves the state round trips while
+    // the fill of batch b+1 still covers the absorption of batch b. Measured on
+    // the two-worker harness, alternating arms round by round: two blocks beat
+    // one in seven of eight paired rounds (-4.4% on medians over five rounds,
+    // 5/5), while four blocks lost all three rounds by 30.6% -- past two, the
+    // overlap the batching gives up costs more than the traffic it saves.
+    const ABSORB_BLOCKS_PER_DISPATCH: usize = 2;
+    /// Batch size, overridable via `LIGHTER_ABSORB_BLOCKS` (1..=64) so the
+    /// concurrent-worker harness can A/B it; one restores the per-block form.
+    fn absorb_blocks_per_dispatch() -> usize {
+        static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            std::env::var("LIGHTER_ABSORB_BLOCKS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| (1..=64).contains(v))
+                .unwrap_or(ABSORB_BLOCKS_PER_DISPATCH)
+        })
+    }
+    let blocks_per_dispatch = absorb_blocks_per_dispatch();
+    let batches = groups.div_ceil(blocks_per_dispatch);
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    // Filled by the final group's encoder, which now carries the parent ladder
+    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(batches);
+    // Filled by the final batch's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
-        {
+    for batch in 0..batches {
+        let first_group = batch * blocks_per_dispatch;
+        let group_end = ((batch + 1) * blocks_per_dispatch).min(groups);
+        let col_start = first_group * 8;
+        let chunk = (leaf_width - col_start).min((group_end - first_group) * 8);
+        for group in first_group..group_end {
+            let group_start = group * 8;
+            let group_chunk = (leaf_width - group_start).min(8);
             // SAFETY: each column slice covers a disjoint `leaf_count` range
-            // of the shared buffer; the GPU only reads columns of groups
+            // of the shared buffer; the GPU only reads columns of batches
             // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
+            let mut slices: Vec<&mut [F]> = (0..group_chunk)
                 .map(|k| unsafe {
                     slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        base.add((group_start + k) * leaf_count).cast::<F>(),
                         leaf_count,
                     )
                 })
@@ -2339,8 +2375,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 5, leaf_count.ilog2());
             set_u32(encoder, 6, col_start as u32);
             set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
+            set_u32(encoder, 8, (batch == 0) as u32);
+            set_u32(encoder, 9, (batch == batches - 1) as u32);
             dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
@@ -2350,7 +2386,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // second command buffer with one encoder per level. Identical
             // shaders, dispatch counts and buffer offsets; strictly fewer
             // command buffers and encoders.
-            if group == groups - 1 {
+            if batch == batches - 1 {
                 let mut level_offset = 0usize;
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
