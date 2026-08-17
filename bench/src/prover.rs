@@ -148,27 +148,44 @@ fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
 /// Whether the calling transaction path may claim the process-global exclusive
 /// GPU phase for its chain tail.
 ///
-/// `set_exclusive_gpu_phase` lowers the CPU/GPU Merkle routing cutoff and makes
-/// the 2^17-leaf narrow commitment trees (the chain steps' Z/partial-product and
-/// quotient trees) bypass the GPU occupancy check entirely. Its documented
-/// contract is that no other proof runs concurrently while it is enabled, because
-/// Metal command buffers execute FIFO on one queue: a fold's ~8 ms tree enqueued
-/// behind a pipelined 2^19-leaf chunk tree waits hundreds of milliseconds instead
-/// of ~15 ms on the CPU.
+/// `set_exclusive_gpu_phase` lowers the CPU/GPU Merkle routing cutoff to
+/// `1<<16` and makes the 2^17-leaf narrow commitment trees (the chain steps'
+/// Z/partial-product and quotient trees) bypass the default occupancy check.
+/// Metal command buffers execute FIFO on one queue: a fold's ~8 ms tree
+/// enqueued behind a *pipelined window* 2^19-leaf chunk tree waits hundreds of
+/// milliseconds instead of ~15 ms on the CPU.
 ///
-/// The tail-drain condition each path can test locally — "this path spawns no
-/// further chunk work" — is *not* that contract. The heavy path has three chunks
-/// and the light path forty-nine, so the heavy path reaches its drain while the
-/// light pipeline is at full saturation. Claiming the exclusive phase there
-/// disables occupancy-conditional routing process-wide for the light pipeline and
-/// simultaneously force-routes this path's own fold trees behind the light
-/// pipeline's chunk trees — it hurts both sides. The claim is legitimate only for
-/// the path that is the last one still proving, which this counter identifies.
+/// Invariant (rank-4): exclusive may be claimed only by the last remaining
+/// path (`active_paths == 1`), and only once that path will spawn **no new**
+/// hideable 2^19 chunk proofs (drain has started). The sibling's hideable
+/// 2^19 must already be gone — the heavy path has three chunks and reaches
+/// drain while the light window is still saturated, so a heavy-side claim
+/// would park folds behind light window trees.
+///
+/// Leftover drain-phase tx proofs of that last path (the in-flight window,
+/// typically ≤6 light) may still be hashing. Those trees **stream** off the
+/// pooled buffer set (`MAX_BUFFER_SETS` stays 1) while `hideable_tx` work is
+/// live, so they do not own the classic FIFO the exclusive cutoff is for.
+/// Exclusive must **not** overlap a still-running sibling window.
 ///
 /// Routing is a scheduling heuristic: either outcome hashes the identical tree,
 /// so a stale read here is benign and no proof byte depends on the answer.
 fn claims_exclusive_gpu_phase(active_paths: &AtomicUsize) -> bool {
     active_paths.load(Ordering::Acquire) == 1
+}
+
+/// Last remaining path, drain started: claim the process-global exclusive
+/// GPU phase. Idempotent via `exclusive_claimed`.
+fn try_claim_exclusive_gpu_phase(active_paths: &AtomicUsize, exclusive_claimed: &AtomicUsize) {
+    if !claims_exclusive_gpu_phase(active_paths) {
+        return;
+    }
+    if exclusive_claimed
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+    }
 }
 
 /// Marks the calling thread as latency-critical to the macOS scheduler.
@@ -242,6 +259,54 @@ fn mark_thread_utility() {
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_utility() {}
 
+/// Hideable final-block compile/preprocess rayon width. Default 2. Override
+/// `LIGHTER_HIDEABLE_POOL_THREADS` in `1..=8` without a rebuild. The global
+/// prover pool in `bin/prove.rs` is never shrunk.
+fn hideable_configured_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("LIGHTER_HIDEABLE_POOL_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| (1..=8).contains(n))
+            .unwrap_or(2)
+    })
+}
+
+fn build_hideable_pool(num_threads: usize) -> rayon::ThreadPool {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .thread_name(|i| format!("hideable-{i}"))
+        .build()
+        .expect("cannot configure hideable rayon pool")
+}
+
+/// Private rayon pool for hideable `build_block_circuit` / preprocess.
+///
+/// v9r2 (and the live tip) still dispatch that lane onto the **global** pool,
+/// so FFT/LDE/`par_iter` inside `CircuitBuilder::build` steal cores from the
+/// light chain's `prove_prepared` for the whole overlap. Exp-4 reserved a
+/// pool *around* `prove_prepared` and ranked 27.20; this is the opposite
+/// split: chain stays on the full global pool, hideable compile is capped.
+///
+/// During [`plonky2::hash::poseidon2::is_spine_urgent`] or exclusive drain
+/// the cap tightens to 1 so a late-started or still-running preprocess cannot
+/// keep two extra workers busy while the spine is already the laggard.
+fn hideable_pool() -> &'static rayon::ThreadPool {
+    static DEFAULT: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    static NARROW: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let configured = hideable_configured_threads();
+    let urgent = plonky2::hash::poseidon2::is_spine_urgent()
+        || plonky2::hash::poseidon2::is_exclusive_gpu_phase();
+    let n = if urgent { 1.min(configured) } else { configured };
+    if n <= 1 {
+        NARROW.get_or_init(|| build_hideable_pool(1))
+    } else {
+        DEFAULT.get_or_init(|| build_hideable_pool(configured))
+    }
+}
+
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -301,6 +366,11 @@ fn chain_step_proof(
         )?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
+        // Tip profile (welttowelt / PR 6805): this join is 553.5 ms/call × 52
+        // on the scored spine. Phase 1 above is the only legal overlap; the
+        // pipeline now starts that phase immediately after the tx-window join
+        // (and drain joins inside the step thread) so this wait is leftover
+        // predecessor prove, not host station-hold.
         let previous_proof = previous.map(ChainState::wait);
         pending.feed_seeded(|feeder| {
             BlockTxChainCircuit::witness_inputs_cyclic_into(
@@ -432,6 +502,16 @@ fn prove_tx_witness(
     );
     #[cfg(feature = "diagnostic_profile")]
     let _profile_span = plonky2::util::profile::span("orchestration", "prove_tx_witness");
+    // Drain leftover 2^19 trees stream instead of taking the pooled set while
+    // this count is nonzero; see `claims_exclusive_gpu_phase`.
+    struct HideableTxGuard;
+    impl Drop for HideableTxGuard {
+        fn drop(&mut self) {
+            plonky2::hash::poseidon2::hideable_tx_inflight_add(-1);
+        }
+    }
+    plonky2::hash::poseidon2::hideable_tx_inflight_add(1);
+    let _hideable = HideableTxGuard;
     let proof = prove_with_partition_witness::<F, C, D>(
         &tx_data.prover_only,
         &tx_data.common,
@@ -555,39 +635,10 @@ fn prove_path(
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
         let mut chain: Option<ChainState<'_>> = None;
-        let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
         let mut current_step = 0u64;
 
         loop {
-            if let Some((chain_step, tx_proof)) = pending_tx.take() {
-                // The predecessor handle moves into the chain thread, which waits for it only
-                // after its tx-proof-side witness generation: the path thread never blocks here.
-                let previous = chain.take();
-                // This step is now runnable (its tx proof exists); while the
-                // count of runnable-but-unproven steps is high, the chain is
-                // the laggard and its GPU trees take priority (see
-                // spine_backlog_add). Decremented inside chain_step_proof.
-                plonky2::hash::poseidon2::spine_backlog_add(1);
-                let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
-                    .stack_size(PROVER_THREAD_STACK_BYTES)
-                    .spawn_scoped(scope, move || {
-                        chain_step_proof(
-                            path,
-                            chain_target,
-                            chain_data,
-                            chain_step,
-                            previous,
-                            base,
-                            dummy_proof,
-                            &tx_proof,
-                        )
-                    })
-                    .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
-            }
-
             let witness = current_witness;
             let proof_handle = std::thread::Builder::new()
                 .name(format!("{path:?}-tx-proof-{current_step}"))
@@ -637,15 +688,40 @@ fn prove_path(
                     1
                 };
             if in_flight.len() >= max_in_flight {
+                // Join on the path thread: that is the GPU-window throttle
+                // (MAX_BUFFER_SETS stays 1). Spawn the chain step immediately
+                // so its predecessor-independent phase-1 starts before the
+                // next tx submit, hiding part of the measured
+                // `chain_predecessor_join` 553.5 ms × 52 serial remainder.
                 let (proof_step, proof_handle) = in_flight
                     .pop_front()
                     .expect("transaction proof window must not be empty");
-                #[cfg(feature = "diagnostic_profile")]
-                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_window_join");
-                let tx_proof = proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                pending_tx = Some((proof_step, tx_proof));
+                let tx_proof = {
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _join_wait = plonky2::util::profile::span("wait", "tx_proof_window_join");
+                    proof_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                };
+                let previous = chain.take();
+                plonky2::hash::poseidon2::spine_backlog_add(1);
+                let handle = std::thread::Builder::new()
+                    .name(format!("{path:?}-chain-step-{proof_step}"))
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        chain_step_proof(
+                            path,
+                            chain_target,
+                            chain_data,
+                            proof_step,
+                            previous,
+                            base,
+                            dummy_proof,
+                            &tx_proof,
+                        )
+                    })
+                    .expect("chain step pipeline thread must start");
+                chain = Some(ChainState::InFlight(handle));
             }
             current_step += 1;
 
@@ -658,74 +734,42 @@ fn prove_path(
             }
         }
 
-        if let Some((chain_step, tx_proof)) = pending_tx.take() {
-            // This post-loop step is runnable and decrements the global
-            // backlog in `chain_step_proof`, exactly like both spawn loops.
-            plonky2::hash::poseidon2::spine_backlog_add(1);
-            let previous = chain.take();
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous,
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                    )
-                })
-                .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
-        }
-        // Past this point the pipeline spawns no new chunk work: the drain
-        // below is the strictly sequential chain tail, so its mid-size
-        // commitment trees can use the mostly idle GPU exactly like the
-        // pre-execution and final block phases — but only once this path is the
-        // last one proving, since the switch is process-global (see
-        // [`claims_exclusive_gpu_phase`]).
-        let mut exclusive_drain = false;
+        // Drain: spawn each remaining step with its own tx-proof handle so
+        // the path thread does not serially join before the next spawn.
+        // That is the measured spine leftover in miniature — each drained
+        // step's phase-1 can start as soon as *its* tx proof resolves,
+        // overlapping the predecessor prove that still owns
+        // `chain_predecessor_join`.
+        //
+        // Rank-4: claim exclusive as soon as this last path enters drain
+        // (no new 2^19 will be spawned) even if leftover drain txs have
+        // not joined. Retry on each drain join so a late sibling retirement
+        // still promotes. Do not claim from the window loop.
+        let exclusive_claimed = Arc::new(AtomicUsize::new(0));
+        try_claim_exclusive_gpu_phase(active_paths, &exclusive_claimed);
         #[cfg(feature = "diagnostic_profile")]
         plonky2::util::profile::counter(
             "scheduler",
             "drain_tx_in_flight",
             in_flight.len() as u64,
         );
-        while let Some((chain_step, proof_handle)) = in_flight.pop_front() {
-            let tx_proof = {
-                #[cfg(feature = "diagnostic_profile")]
-                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_drain_join");
-                proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-            };
-            // Claim the exclusive phase only once the window has flushed AND
-            // the last chunk proof has retired (the join above): before this
-            // point the exclusive routing's lower GPU cutoff and occupancy
-            // bypass would queue still-running chunk proofs' trees against
-            // the drain's. Covers the sibling retiring mid-drain (relaxed).
-            if !exclusive_drain
-                && in_flight.is_empty()
-                && claims_exclusive_gpu_phase(active_paths)
-            {
-                exclusive_drain = true;
-                plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
-            }
-            // Spawn the drained step exactly like the pipelined phase so its
-            // phase-1 witness (which needs only the tx proof) overlaps the
-            // predecessor's prove instead of serializing behind it. Only one
-            // proof's GPU work is in flight at a time either way — phase 1 is
-            // pure CPU generator execution — so the exclusive-drain contract
-            // above is unchanged.
+        for (chain_step, proof_handle) in in_flight.drain(..) {
             let previous = chain.take();
             plonky2::hash::poseidon2::spine_backlog_add(1);
+            let exclusive_claimed = Arc::clone(&exclusive_claimed);
             let handle = std::thread::Builder::new()
                 .name(format!("{path:?}-chain-drain-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    let tx_proof = {
+                        #[cfg(feature = "diagnostic_profile")]
+                        let _join_wait =
+                            plonky2::util::profile::span("wait", "tx_proof_drain_join");
+                        proof_handle
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    };
+                    try_claim_exclusive_gpu_phase(active_paths, &exclusive_claimed);
                     chain_step_proof(
                         path,
                         chain_target,
@@ -743,45 +787,19 @@ fn prove_path(
         let chain_proof = chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof");
-        if exclusive_drain {
+        if exclusive_claimed.load(Ordering::Acquire) != 0 {
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
         }
         chain_proof
     });
     // This path has produced its last proof. Retiring it here — after the scope,
     // so every thread it spawned has joined — is what lets the sibling path's
-    // drain observe that it is alone and claim the exclusive GPU phase.
+    // drain (start or a later leftover-tx join) observe that it is alone and
+    // claim the exclusive GPU phase.
+    // Column-store + streamed-buffer prewarm now starts at the top of
+    // `prove_block_after_pre` so it overlaps the whole tx/chain pipeline;
+    // a second spawn here would double-walk the same pages.
     active_paths.fetch_sub(1, Ordering::Release);
-    if path == TxPath::Heavy {
-        // The heavy path retires far ahead of the light path; use the slack
-        // to pre-fault the final block's wires column store (larger than the
-        // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
-        // run's most serial window). Detached: only populates a stash the
-        // block's allocation consults; a size miss falls through unchanged.
-        std::thread::Builder::new()
-            .name("block-store-prewarm".to_owned())
-            .spawn(|| {
-                // Page-walking ~2 GiB at default QoS competes with the light
-                // pipeline for P-cores; utility class prefers the E-cores,
-                // whose memory-bound fault service is nearly as fast.
-                mark_thread_utility();
-                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
-                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
-                // num_wires; a drift just misses the stash harmlessly.
-                const BLOCK_WIRES_STORE_BYTES: u64 =
-                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
-                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
-                // Same slack, same problem, different allocation: every streamed
-                // build before the final block is 2^19-leaf, so the streamed
-                // sponge's buffer pair is grown for the first time by the block
-                // itself (192 MiB state + ~128 MiB output) inside the exclusive
-                // serial tail. Pre-fault it here instead. Ordered after the
-                // wires store because that one is the larger fault set and the
-                // block reaches it first.
-                plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
-            })
-            .ok();
-    }
     chain_proof
 }
 
@@ -867,6 +885,23 @@ pub(crate) fn prove_block_after_pre(
     let pre_output = BlockPreExecWitness::from_public_inputs(&pre_proof.public_inputs);
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
+    // Item C: walk the serial-tail buffers at the start of the pipeline, not
+    // from heavy-path retirement. The new tip already stashes the ~2 GiB
+    // wires store plus streamed sponge/digest (~320 MiB + 3×128 MiB) on the
+    // heavy-slack thread — that still races the light spine. Starting here
+    // overlaps the entire tx/chain window so the exclusive tail cannot
+    // first-touch them. Scheduling-only; stash miss falls through.
+    std::thread::Builder::new()
+        .name("block-store-prewarm".to_owned())
+        .spawn(|| {
+            mark_thread_utility();
+            const BLOCK_WIRES_STORE_BYTES: u64 =
+                (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
+            plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+            plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
+        })
+        .ok();
+
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
     let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
     let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
@@ -929,11 +964,11 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    mark_thread_utility();
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_context = plonky2::util::profile::enter_context(
                         "final_block_build",
@@ -947,7 +982,10 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        // Hideable: final block is not needed until both chain
+                        // proofs exist. Nested `par_iter` inside `define`/`build`
+                        // must not share the global pool with the light spine.
+                        hideable_pool().install(|| circuits.build_block_circuit())
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
@@ -962,12 +1000,14 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                pre_proof_ref,
+                                &pre_proof,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
+                    // Every remaining stage consumes `pre_output`, not this proof.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
@@ -1458,15 +1498,27 @@ mod tests {
         // heavy path) must not claim the process-global exclusive phase while the
         // forty-nine-chunk light pipeline is still running.
         let active_paths = AtomicUsize::new(2);
+        let exclusive_claimed = AtomicUsize::new(0);
         assert!(!claims_exclusive_gpu_phase(&active_paths));
+        try_claim_exclusive_gpu_phase(&active_paths, &exclusive_claimed);
+        assert_eq!(exclusive_claimed.load(Ordering::Acquire), 0);
 
-        // The heavy path retires; the light path's drain is now genuinely alone.
+        // The heavy path retires; the light path's drain may claim immediately,
+        // without waiting for leftover drain txs to join (rank-4).
         active_paths.fetch_sub(1, Ordering::Release);
         assert!(claims_exclusive_gpu_phase(&active_paths));
+        try_claim_exclusive_gpu_phase(&active_paths, &exclusive_claimed);
+        assert_eq!(exclusive_claimed.load(Ordering::Acquire), 1);
+        try_claim_exclusive_gpu_phase(&active_paths, &exclusive_claimed);
+        assert_eq!(exclusive_claimed.load(Ordering::Acquire), 1);
+        plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
 
-        // Both retired: nothing is proving, so nothing claims the phase either.
+        // Both retired: nothing is proving, so a fresh counter does not claim.
         active_paths.fetch_sub(1, Ordering::Release);
+        let leftover = AtomicUsize::new(0);
         assert!(!claims_exclusive_gpu_phase(&active_paths));
+        try_claim_exclusive_gpu_phase(&active_paths, &leftover);
+        assert_eq!(leftover.load(Ordering::Acquire), 0);
     }
 
     #[test]
