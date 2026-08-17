@@ -1603,6 +1603,47 @@ pub fn prewarm() {
                 }
             }
             let _ = force_context();
+            // Recurring tx-proof wires LDE: 136 cols × 2^19 rows × 8 bytes
+            // = 544 MiB, under MAX_CACHED_COLUMN_STORE_BYTES, so the first
+            // take_or_new_column_buffer of that size hits the pool instead
+            // of zero-faulting on the proving critical path. Five sequential
+            // cold workers each pay this once. Page-walk at utility QoS so
+            // it prefers E-cores while circuit blobs finish loading.
+            // Scheduling-only: fill writes every live word before any read.
+            {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+            }
+            const TX_WIRES_STORE_BYTES: u64 = 136 * (1 << 19) * 8;
+            if let Some(context) = shared_context() {
+                let buffer = autoreleasepool(|| {
+                    context.device.new_buffer(
+                        TX_WIRES_STORE_BYTES,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                });
+                let base = buffer.contents().cast::<u8>();
+                if !base.is_null() {
+                    const PAGE: isize = 16 * 1024;
+                    let mut offset: isize = 0;
+                    while (offset as u64) < TX_WIRES_STORE_BYTES {
+                        // SAFETY: offset stays within the allocated length.
+                        unsafe { base.offset(offset).write_volatile(0) };
+                        offset += PAGE;
+                    }
+                    if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
+                        pool.recycle(buffer);
+                    }
+                }
+            }
         })
         .ok();
 }
@@ -1721,6 +1762,26 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
         return true;
+    }
+    // FRI fold trees: extension leaves (width = arity * D = 32 for the
+    // arity-16 rounds, 16 for arity-8) from the folded LDE codewords,
+    // starting at 2^16 leaves and shrinking by arity each round. Their
+    // permutation counts (width-32: 2^13 at 2^11 leaves .. 2^18 at 2^16
+    // leaves) sit below MIN_GPU_PERMUTATIONS, so gpu_worthwhile otherwise
+    // routes them to the CPU. The fold trees commit on the FRI serial
+    // critical path right after the big commitment trees, where the GPU
+    // stream is often unoccupied; when idle the GPU hashes these shapes
+    // ~2x faster (measured 7.8 ms vs 14.9 ms at 262k permutations). The
+    // same occupancy gate as the serial-critical shapes applies: routing a
+    // fold tree behind an in-flight pipelined 2^19 chunk tree would stretch
+    // it (measured 200-320 ms FIFO waits), so keep the CPU path while the
+    // stream is busy. Either routing hashes the identical tree, so this is
+    // value-exact.
+    let fold_shape = (17..=64).contains(&leaf_width)
+        && (1 << 14) <= leaf_count
+        && leaf_count <= (1 << 17);
+    if fold_shape && leaf_permutations + parent_permutations < min_permutations {
+        return exclusive || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
     leaf_permutations + parent_permutations >= min_permutations
 }
