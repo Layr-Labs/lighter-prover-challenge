@@ -368,40 +368,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 #[derive(Eq, PartialEq, Debug)]
 pub struct GeneratorWatchIndex {
     offsets: Vec<u32>,
-    /// Generator indices, `u32` rather than `usize`: the circuit builder already
-    /// refuses a generator count that does not fit a `u32` (see the guards in
-    /// [`Self::from_map`] and [`Self::from_sorted_generator_representatives`]),
-    /// and the serialized form has always been 4-byte little-endian, so the
-    /// narrow payload is the on-disk width.
-    watchers: Vec<u32>,
+    watchers: Vec<usize>,
     entries: usize,
-    /// One bit per representative, set exactly when that representative's watcher list is
-    /// non-empty (`offsets[r] != offsets[r + 1]`).
-    ///
-    /// `offsets` carries one `u32` per representative -- 36.7 MB on the light transaction
-    /// circuit -- and every prover lookup indexes it at a freshly populated representative,
-    /// i.e. at a scattered position. Measured on the public fixture, 178.96 M of the light
-    /// path's 218.79 M lookups (81.8 %) name a representative nobody watches, so each paid a
-    /// scattered probe into that 36.7 MB table only to compare two equal words. This bitmap
-    /// answers the same question in 1/32 of the bytes (1.15 MB, cache-resident), so those
-    /// lookups never touch `offsets` at all.
-    ///
-    /// Pure function of `offsets`, derived at construction inside passes that already walk
-    /// them; `get` returns exactly what it returned before, so no witness value, no queue
-    /// push and no proof byte can move.
-    watched: Vec<u64>,
-}
-
-/// Sets bit `representative` of a [`GeneratorWatchIndex::watched`] bitmap under construction.
-#[inline]
-fn mark_watched(watched: &mut [u64], representative: usize) {
-    watched[representative >> 6] |= 1u64 << (representative & 63);
-}
-
-/// Allocates a zeroed [`GeneratorWatchIndex::watched`] bitmap sized for `offsets_len` offsets,
-/// i.e. for the `offsets_len - 1` representatives those offsets describe.
-fn empty_watched(offsets_len: usize) -> Vec<u64> {
-    vec![0u64; offsets_len.saturating_sub(1).div_ceil(64)]
 }
 
 impl GeneratorWatchIndex {
@@ -412,7 +380,6 @@ impl GeneratorWatchIndex {
                 offsets: vec![0],
                 watchers: Vec::new(),
                 entries: 0,
-                watched: Vec::new(),
             };
         };
 
@@ -426,7 +393,6 @@ impl GeneratorWatchIndex {
         );
 
         let mut offsets = vec![0u32; offsets_len];
-        let mut watched = empty_watched(offsets_len);
         let mut watchers = Vec::with_capacity(total_watchers);
         let mut entries_iter = map.into_iter().peekable();
         for representative in 0..=max_representative {
@@ -436,12 +402,7 @@ impl GeneratorWatchIndex {
                 .is_some_and(|(key, _)| *key == representative)
             {
                 let (_, representative_watchers) = entries_iter.next().unwrap();
-                if !representative_watchers.is_empty() {
-                    mark_watched(&mut watched, representative);
-                }
-                watchers.extend(representative_watchers.into_iter().map(|generator| {
-                    u32::try_from(generator).expect("generator index exceeds u32 watch index")
-                }));
+                watchers.extend(representative_watchers);
             }
         }
         offsets[max_representative + 1] = watchers.len() as u32;
@@ -451,7 +412,6 @@ impl GeneratorWatchIndex {
             offsets,
             watchers,
             entries,
-            watched,
         }
     }
 
@@ -484,7 +444,6 @@ impl GeneratorWatchIndex {
                 offsets: vec![0],
                 watchers: Vec::new(),
                 entries: 0,
-                watched: Vec::new(),
             };
         };
         let max_representative = max_representative as usize;
@@ -494,10 +453,6 @@ impl GeneratorWatchIndex {
         assert!(
             u32::try_from(representatives.len()).is_ok(),
             "generator watch index exceeds u32 offsets"
-        );
-        assert!(
-            u32::try_from(generator_watch_counts.len()).is_ok(),
-            "generator count exceeds u32 watch index"
         );
 
         // First form cumulative end offsets. Counts live in slot `representative + 1`, so the
@@ -520,14 +475,14 @@ impl GeneratorWatchIndex {
         // preserves the old ascending generator order without a second cursor array. Afterwards,
         // each end cursor has become the next representative's start, so one overlapping shift
         // restores the original CSR offsets.
-        let mut watchers = vec![0u32; representatives.len()];
+        let mut watchers = vec![0usize; representatives.len()];
         let mut group_end = representatives.len();
         for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
             let group_start = group_end - count;
             for &representative in &representatives[group_start..group_end] {
                 let cursor = &mut offsets[representative as usize + 1];
                 *cursor -= 1;
-                watchers[*cursor as usize] = generator as u32;
+                watchers[*cursor as usize] = generator;
             }
             group_end = group_start;
         }
@@ -535,19 +490,10 @@ impl GeneratorWatchIndex {
         offsets.copy_within(2.., 1);
         *offsets.last_mut().unwrap() = total;
 
-        // Derived from the finished offsets, in the same shape `from_parts` uses.
-        let mut watched = empty_watched(offsets.len());
-        for (representative, bounds) in offsets.windows(2).enumerate() {
-            if bounds[0] != bounds[1] {
-                mark_watched(&mut watched, representative);
-            }
-        }
-
         Self {
             offsets,
             watchers,
             entries,
-            watched,
         }
     }
 
@@ -558,7 +504,7 @@ impl GeneratorWatchIndex {
     }
 
     /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
-    pub fn watchers(&self) -> &[u32] {
+    pub fn watchers(&self) -> &[usize] {
         &self.watchers
     }
 
@@ -567,7 +513,7 @@ impl GeneratorWatchIndex {
     /// function of the offsets and is re-derived. The offsets must be
     /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
     /// exactly as [`Self::from_map`] produces them.
-    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<u32>) -> Self {
+    pub fn from_parts(offsets: Vec<u32>, watchers: Vec<usize>) -> Self {
         assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
         assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
         assert_eq!(
@@ -576,46 +522,34 @@ impl GeneratorWatchIndex {
             "watch index offsets must cover the watcher list"
         );
         let mut entries = 0usize;
-        // The presence bitmap is filled by this existing validation walk, so deriving it
-        // costs no extra traversal of the offsets table on the circuit-loading path.
-        let mut watched = empty_watched(offsets.len());
-        for (representative, bounds) in offsets.windows(2).enumerate() {
+        for bounds in offsets.windows(2) {
             assert!(bounds[0] <= bounds[1], "watch index offsets must be sorted");
             if bounds[0] != bounds[1] {
                 entries += 1;
-                mark_watched(&mut watched, representative);
             }
         }
         Self {
             offsets,
             watchers,
             entries,
-            watched,
         }
     }
 
     #[inline]
-    pub fn get(&self, representative: &usize) -> Option<&[u32]> {
-        let representative = *representative;
-        // Answer the common case (nobody watches this representative) out of the 1.15 MB
-        // bitmap instead of the 36.7 MB offsets table; see [`Self::watched`]. A bit is set
-        // only for representatives strictly below `offsets.len() - 1` whose watcher list is
-        // non-empty, so reaching the indexing below implies both `offsets` reads are in
-        // bounds and that the slice is non-empty -- exactly the old `Some` condition.
-        if (self.watched.get(representative >> 6)? >> (representative & 63)) & 1 == 0 {
-            return None;
-        }
-        let start = self.offsets[representative] as usize;
-        let end = self.offsets[representative + 1] as usize;
-        debug_assert!(start != end);
-        Some(&self.watchers[start..end])
+    pub fn get(&self, representative: &usize) -> Option<&[usize]> {
+        let end_index = representative.checked_add(1)?;
+        let (&start, &end) = (
+            self.offsets.get(*representative)?,
+            self.offsets.get(end_index)?,
+        );
+        (start != end).then(|| &self.watchers[start as usize..end as usize])
     }
 
     pub const fn len(&self) -> usize {
         self.entries
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (usize, &[u32])> {
+    pub fn iter(&self) -> impl Iterator<Item = (usize, &[usize])> {
         self.offsets
             .windows(2)
             .enumerate()
@@ -648,18 +582,6 @@ pub struct ProverOnlyCircuitData<
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
     pub generator_watch_counts: Vec<usize>,
-    /// Whether every generator in [`Self::generators`] reports
-    /// [`WitnessGenerator::defers_until_ready`].
-    ///
-    /// When it holds, the worklist may skip a queued generator whose `unresolved_watches`
-    /// counter is still non-zero without dispatching to it, because that dispatch is a proven
-    /// no-op. Measured on the public fixture, 66.77 M of the light path's 98.15 M generator
-    /// invocations (68 %) are such no-ops, each costing a scattered load out of the 10 MB
-    /// `Box<dyn WitnessGenerator>` table and an indirect call.
-    ///
-    /// Runtime-only: a pure function of `generators`, re-derived wherever they are, so the
-    /// serialized format is unchanged.
-    pub generators_defer_until_ready: bool,
     /// Commitments to the constants polynomials and sigma polynomials.
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
@@ -1031,10 +953,10 @@ mod generator_watch_index_tests {
 
         assert_eq!(index.len(), 2);
         assert_eq!(index.get(&0), None);
-        assert_eq!(index.get(&1), Some([2u32, 5].as_slice()));
+        assert_eq!(index.get(&1), Some([2usize, 5].as_slice()));
         assert_eq!(index.get(&2), None);
         assert_eq!(index.get(&3), None);
-        assert_eq!(index.get(&4), Some([3u32].as_slice()));
+        assert_eq!(index.get(&4), Some([3usize].as_slice()));
         assert_eq!(index.get(&5), None);
 
         let entries = index
@@ -1042,138 +964,5 @@ mod generator_watch_index_tests {
             .map(|(representative, watchers)| (representative, watchers.to_vec()))
             .collect::<Vec<_>>();
         assert_eq!(entries, vec![(1, vec![2, 5]), (4, vec![3])]);
-    }
-
-    /// The narrowed `u32` watcher payload must answer every query with exactly
-    /// the sequence the `usize` payload answered, for both construction seams
-    /// and both readers. The comparison is on raw `u64` widenings of the stored
-    /// words, so a truncation or a sign/width mistake cannot hide behind the
-    /// slice type. The last block is the sabotage control.
-    #[test]
-    fn narrow_watch_index_matches_wide_reference_raw_words() {
-        // A deterministic pseudo-random edge list: dense and sparse
-        // representatives, singleton and long watcher lists, a representative
-        // range with holes, and generator indices past every byte boundary.
-        fn edge_lists(seed: u64) -> BTreeMap<usize, Vec<usize>> {
-            let mut state = seed | 1;
-            let mut next = move || {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                state
-            };
-            let mut map: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-            for _ in 0..512 {
-                let representative = (next() % 4096) as usize;
-                let generator = (next() % 300_000) as usize;
-                let list = map.entry(representative).or_default();
-                if !list.contains(&generator) {
-                    list.push(generator);
-                }
-            }
-            // Boundary generator indices the narrowing must carry intact.
-            map.insert(4096, vec![0, 1, 255, 256, 65_535, 65_536, 16_777_215, 16_777_216]);
-            for list in map.values_mut() {
-                list.sort_unstable();
-            }
-            map.retain(|_, list| !list.is_empty());
-            map
-        }
-
-        // Reference reader over the same edge list, in the pre-narrowing width.
-        fn reference_get(map: &BTreeMap<usize, Vec<usize>>, representative: usize) -> Option<Vec<u64>> {
-            map.get(&representative)
-                .filter(|list| !list.is_empty())
-                .map(|list| list.iter().map(|&g| g as u64).collect())
-        }
-
-        let mut compared = 0usize;
-        for seed in [1u64, 0xdead_beef, 0x9e37_79b9_7f4a_7c15, 42] {
-            let map = edge_lists(seed);
-            let max_representative = *map.keys().max().unwrap();
-
-            // Seam 1: `from_map`.
-            let from_map = GeneratorWatchIndex::from_map(map.clone());
-
-            // Seam 2: `from_sorted_generator_representatives`, fed the same
-            // edge list transposed into per-generator groups (its contract).
-            let mut per_generator: BTreeMap<usize, Vec<u32>> = BTreeMap::new();
-            for (&representative, watchers) in &map {
-                for &generator in watchers {
-                    per_generator
-                        .entry(generator)
-                        .or_default()
-                        .push(representative as u32);
-                }
-            }
-            let max_generator = *per_generator.keys().max().unwrap();
-            let mut representatives: Vec<u32> = Vec::new();
-            let mut counts: Vec<usize> = vec![0usize; max_generator + 1];
-            for generator in 0..=max_generator {
-                let mut group = per_generator.get(&generator).cloned().unwrap_or_default();
-                group.sort_unstable();
-                group.dedup();
-                counts[generator] = group.len();
-                representatives.extend(group);
-            }
-            let from_groups = GeneratorWatchIndex::from_sorted_generator_representatives(
-                &representatives,
-                &counts,
-            );
-
-            // Seam 3: `from_parts`, i.e. the embedded-blob loader.
-            let from_parts = GeneratorWatchIndex::from_parts(
-                from_map.offsets().to_vec(),
-                from_map.watchers().to_vec(),
-            );
-
-            for representative in 0..=(max_representative + 8) {
-                let expected = reference_get(&map, representative);
-                for (name, index) in [
-                    ("from_map", &from_map),
-                    ("from_groups", &from_groups),
-                    ("from_parts", &from_parts),
-                ] {
-                    let actual = index
-                        .get(&representative)
-                        .map(|watchers| watchers.iter().map(|&g| g as u64).collect::<Vec<u64>>());
-                    assert_eq!(actual, expected, "{name} diverges at {representative}");
-                    compared += 1;
-                }
-            }
-
-            // `iter` must enumerate the same (representative, list) pairs.
-            let expected_entries: Vec<(usize, Vec<u64>)> = map
-                .iter()
-                .filter(|(_, list)| !list.is_empty())
-                .map(|(&r, list)| (r, list.iter().map(|&g| g as u64).collect()))
-                .collect();
-            for (name, index) in [
-                ("from_map", &from_map),
-                ("from_groups", &from_groups),
-                ("from_parts", &from_parts),
-            ] {
-                let actual_entries: Vec<(usize, Vec<u64>)> = index
-                    .iter()
-                    .map(|(r, list)| (r, list.iter().map(|&g| g as u64).collect()))
-                    .collect();
-                assert_eq!(actual_entries, expected_entries, "{name} iter diverges");
-                assert_eq!(index.len(), expected_entries.len(), "{name} len diverges");
-            }
-        }
-        assert!(compared >= 12_000, "differential ran on too few queries");
-
-        // Sabotage control: truncate one watcher to 16 bits in the reference
-        // and require the raw-word comparison to see it. A differential that
-        // has never failed is not evidence.
-        let map = BTreeMap::from([(7usize, vec![65_536usize, 3])]);
-        let index = GeneratorWatchIndex::from_map(map);
-        let actual: Vec<u64> = index.get(&7).unwrap().iter().map(|&g| g as u64).collect();
-        let truncated: Vec<u64> = vec![(65_536u64 as u16) as u64, 3];
-        assert_ne!(
-            actual, truncated,
-            "sabotage control did not trip: the differential cannot detect a truncated watcher"
-        );
-        assert_eq!(actual, vec![65_536u64, 3]);
     }
 }

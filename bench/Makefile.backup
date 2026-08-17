@@ -5,7 +5,7 @@ WITNESS ?= bench_test.json
 
 build:
 	@echo ""
-	@export RUSTFLAGS=""
+	@export RUSTFLAGS="-C target-cpu=native"
 	cargo build --release --bin bench;
 	@mv ../target/release/bench bench;
 
