@@ -218,15 +218,9 @@ pub trait Witness<F: Field>: WitnessWrite<F> {
     where
         F: RichField + Extendable<D>,
     {
-        // Read the D coordinates straight into the array. The previous form went
-        // through `get_targets`, which collects into a `Vec` — one malloc/free
-        // pair per extension-field read, for D=2 a 16-byte allocation that fits
-        // in two registers. The arithmetic-extension, multiplication-extension,
-        // reducing and Poseidon-MDS generators call this on the order of 10^5 to
-        // 10^6 times per proof. Same read order, same panic behaviour: the
-        // length is a compile-time `D`, so the old `try_into().unwrap()` could
-        // never fail.
-        F::Extension::from_basefield_array(core::array::from_fn(|i| self.get_target(et.0[i])))
+        F::Extension::from_basefield_array(
+            self.get_targets(&et.to_target_array()).try_into().unwrap(),
+        )
     }
 
     fn get_extension_targets<const D: usize>(&self, ets: &[ExtensionTarget<D>]) -> Vec<F::Extension>
@@ -250,11 +244,8 @@ pub trait Witness<F: Field>: WitnessWrite<F> {
     }
 
     fn get_hash_target(&self, ht: HashOutTarget) -> HashOut<F> {
-        // Same allocation-free read as `get_extension_target`; `elements` is a
-        // fixed `[Target; 4]`, so the collect-then-`try_into` was a heap round
-        // trip for 32 bytes.
         HashOut {
-            elements: core::array::from_fn(|i| self.get_target(ht.elements[i])),
+            elements: self.get_targets(&ht.elements).try_into().unwrap(),
         }
     }
 
