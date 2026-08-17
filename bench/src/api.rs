@@ -1,4 +1,46 @@
-// Redraw marker 573
+// Redraw marker 501
+// beibei-decode-on-i34-1786827000
+// beibei-idle-fold-on-i34-1786827600
+// beibei-drain-early-on-i34-1786828200
+// beibei-block-pool-on-i34-1786828800
+// beibei-txwires-prewarm-on-i34-1786829400
+// beibei-fold-w32-on-i34-1786830000
+// beibei-u160-pair-on-i34-1786830600
+// beibei-fold16-pair-on-i34-1786831200
+// beibei-madd-pair-on-i34-1786831800
+// beibei-dotslots-pair-on-i34-1786832400
+// beibei-txwires2-on-i34-1786833000
+// beibei-serial-wires-on-i34-1786833600
+// beibei-fold-w32-13-on-i34-1786834200
+// beibei-madd-c1-pair-on-i34-1786834800
+// beibei-fold16-c1-on-i34-1786835400
+// beibei-odd-tail-pair-on-i34-1786836000
+// beibei-window4-on-i34-1786836600
+// beibei-packed-load-on-i34-1786837200
+// beibei-lde-resize-on-i34-1786837800
+// beibei-cache-resize-on-i34-1786838400
+// beibei-term-resize-on-i34-1786839000
+// beibei-inv-run-on-i34-1786839600
+// beibei-inv-scatter-on-i34-1786840200
+// beibei-l0-run-on-i34-1786840800
+// beibei-un-cache-resize-on-i34-1786841400
+// beibei-z1-packed-on-i34-1786842000
+// beibei-pp-packed-on-i34-1786842600
+// beibei-fma-packed-on-i34-1786843200
+// beibei-horner-packed-on-i34-1786843800
+// beibei-offload-l0-on-i34-1786844400
+// beibei-stream-17-on-i34-1786845000
+// beibei-fuse-wait-on-i34-1786845600
+// beibei-inv-scale-on-i34-1786846200
+// beibei-gpu-inv-fuse-on-i34-1786846800
+// beibei-l0-mul-on-i34-1786847400
+// beibei-gpu-merge-pack-on-i34-1786848000
+// beibei-coeff-join-on-i34-1786848600
+// beibei-offload-deint-on-i34-1786849200
+// beibei-fri-scale-on-i34-1786849800
+// beibei-ifft-rev-on-i34-1786850400
+// beibei-ifft-ninv-on-i34-1786851000
+// beibei-powers-ilp-on-i34-1786851600
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
@@ -272,7 +314,20 @@ impl Circuits {
         );
         drop(light_chain_data);
         drop(heavy_chain_data);
-        (block.target, block.builder.build::<C>())
+        // The final-block `build` is `try_build_with_options` over the global
+        // rayon pool. That same pool is the light path's CPU lane. A nested
+        // pool of half the host (floor 6) keeps the construction off the
+        // pipeline's workers. Scheduling only: same `build`, same circuit
+        // bytes. Adopted from xadenryan `d04111c` (30.399 on the prior tip).
+        let threads = std::thread::available_parallelism()
+            .map(|n| (n.get() / 2).max(6))
+            .unwrap_or(6);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build()
+            .expect("final-block build pool must start");
+        (block.target, pool.install(|| block.builder.build::<C>()))
     }
 }
 
