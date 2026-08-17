@@ -13,7 +13,7 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
-use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::merkle_tree::{MerkleCap, MerkleTree};
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
@@ -61,13 +61,23 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     // Query phase
     let query_round_proofs =
         fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
+    // Query construction is the final borrower of the commit-phase trees. Move
+    // each cap's backing allocation into the proof after that borrow ends;
+    // cloning here used to allocate and copy every hash in every FRI cap.
+    let commit_phase_merkle_caps = into_commit_phase_merkle_caps(trees);
 
     FriProof {
-        commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
+        commit_phase_merkle_caps,
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
     }
+}
+
+fn into_commit_phase_merkle_caps<F: RichField, H: Hasher<F>>(
+    trees: Vec<MerkleTree<F, H>>,
+) -> Vec<MerkleCap<F, H>> {
+    trees.into_iter().map(|tree| tree.cap).collect()
 }
 
 pub(crate) type FriCommitedTrees<F, C, const D: usize> = (
@@ -444,6 +454,42 @@ mod tests {
     use crate::field::types::{Field, PrimeField64};
     use crate::fri::reduction_strategies::FriReductionStrategy;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    #[test]
+    fn commit_phase_caps_move_empty_and_preserve_value_order_and_allocation() {
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+        type H = <C as GenericConfig<2>>::Hasher;
+
+        assert!(into_commit_phase_merkle_caps::<F, H>(Vec::new()).is_empty());
+
+        let trees = (0..3)
+            .map(|tree_index| {
+                MerkleTree::<F, H>::new(
+                    vec![
+                        vec![F::from_canonical_usize(2 * tree_index + 1)],
+                        vec![F::from_canonical_usize(2 * tree_index + 2)],
+                    ],
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = trees.iter().map(|tree| tree.cap.clone()).collect::<Vec<_>>();
+        let cap_allocations = trees
+            .iter()
+            .map(|tree| tree.cap.0.as_ptr())
+            .collect::<Vec<_>>();
+
+        let actual = into_commit_phase_merkle_caps(trees);
+
+        assert_eq!(actual, expected, "cap values or tree order changed");
+        for (index, (cap, allocation)) in actual.iter().zip(cap_allocations).enumerate() {
+            assert_eq!(
+                cap.0.as_ptr(), allocation,
+                "tree {index} cap allocation was copied instead of moved"
+            );
+        }
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
