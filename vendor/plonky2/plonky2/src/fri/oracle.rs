@@ -6,11 +6,12 @@ use itertools::Itertools;
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
-use crate::field::batch_util::batch_multiply_into;
+use crate::field::batch_util::{batch_multiply_into, bit_reversed_copy_into};
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
-    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
+    FftRootTable, cached_coset_folded_root_table, fft_in_place_with_options,
+    fft_in_place_with_options_parallel, fft_in_place_with_options_prereversed,
 };
 use crate::field::goldilocks_extensions::ext2_mul_add;
 use crate::field::goldilocks_field::GoldilocksField;
@@ -31,6 +32,37 @@ use crate::util::{log2_strict, reverse_bits};
 
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
+
+/// Thread-time accumulators for the streamed commitment fill. The per-column
+/// work runs on rayon workers, which carry no proof context, so the workers
+/// only add nanoseconds here and the proof thread drains one counter set per
+/// group. Compiled only under `diagnostic_profile`.
+#[cfg(feature = "diagnostic_profile")]
+#[derive(Default)]
+struct StreamFillMeters {
+    coset_ns: core::sync::atomic::AtomicU64,
+    fft_ns: core::sync::atomic::AtomicU64,
+    columns: core::sync::atomic::AtomicU64,
+}
+
+#[cfg(feature = "diagnostic_profile")]
+impl StreamFillMeters {
+    fn record(&self, coset_ns: u64, fft_ns: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.coset_ns.fetch_add(coset_ns, Relaxed);
+        self.fft_ns.fetch_add(fft_ns, Relaxed);
+        self.columns.fetch_add(1, Relaxed);
+    }
+
+    /// Drains the group's accumulators onto the calling proof thread.
+    fn flush_group(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        let counter = crate::util::profile::counter;
+        counter("wires_fill", "coset_shift_ns", self.coset_ns.swap(0, Relaxed));
+        counter("wires_fill", "lde_fft_ns", self.fft_ns.swap(0, Relaxed));
+        counter("wires_fill", "columns", self.columns.swap(0, Relaxed));
+    }
+}
 
 /// Route the whole commitment (NTT + hashing) through the GPU backend.
 /// Official ranked A/B: submission 644c4257 (this on, over the 8.0011
@@ -170,9 +202,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // buffer instead of copying every column through the pooled input.
         let lde_len = degree << rate_bits;
         if !blinding {
-            if let Some(mut columns) =
-                C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height)
-            {
+            #[cfg(feature = "diagnostic_profile")]
+            let allocation = crate::util::profile::span("commit", "column store alloc");
+            let allocated =
+                C::Hasher::try_allocate_merkle_tree_columns(polynomials.len(), lde_len, cap_height);
+            #[cfg(feature = "diagnostic_profile")]
+            drop(allocation);
+            if let Some(mut columns) = allocated {
                 // Streamed exclusive-phase path: the backend absorbs each
                 // group of eight LDE columns while the CPU computes the next
                 // group, collapsing the serial FFT-then-hash commitment into
@@ -183,11 +219,22 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+                    // Twiddles with the coset shift already folded in, so the
+                    // fill below writes raw coefficients and the transform
+                    // applies the shift as it goes.
+                    let folded_root_table = cached_coset_folded_root_table::<F>(lde_len);
                     let polys = &polynomials;
+                    #[cfg(feature = "diagnostic_profile")]
+                    let meters = StreamFillMeters::default();
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _streamed =
+                        crate::util::profile::span("commit", "streamed column store");
                     C::Hasher::try_build_merkle_tree_column_store_streamed(
                         &columns,
                         cap_height,
                         &|group, destinations: &mut [&mut [F]]| {
+                            #[cfg(feature = "diagnostic_profile")]
+                            let _fill = crate::util::profile::span("commit", "stream fill group");
                             destinations.par_iter_mut().enumerate().for_each(
                                 |(k, destination)| {
                                     let polynomial = &polys[group * 8 + k];
@@ -196,21 +243,51 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         degree,
                                         "Polynomial degrees inconsistent"
                                     );
-                                    batch_multiply_into(
-                                        &mut destination[..degree],
-                                        &polynomial.coeffs,
-                                        &coset_powers,
-                                    );
+                                    #[cfg(feature = "diagnostic_profile")]
+                                    let coset_start = std::time::Instant::now();
+                                    // Same fill as `fill_lde_column_store`
+                                    // below, prologue and coset scale
+                                    // included. The shape condition is tested
+                                    // twice rather than once so the fill
+                                    // meters keep bracketing the two halves;
+                                    // it is invariant across the commitment.
                                     if rate_bits == 0 || degree < 2 {
+                                        batch_multiply_into(
+                                            &mut destination[..degree],
+                                            &polynomial.coeffs,
+                                            &coset_powers,
+                                        );
                                         destination[degree..].fill(F::ZERO);
+                                    } else {
+                                        bit_reversed_copy_into(
+                                            &mut destination[..degree],
+                                            &polynomial.coeffs,
+                                        );
                                     }
-                                    fft_in_place_with_options(
-                                        destination,
-                                        Some(rate_bits),
-                                        fft_root_table,
+                                    #[cfg(feature = "diagnostic_profile")]
+                                    let fft_start = std::time::Instant::now();
+                                    if rate_bits == 0 || degree < 2 {
+                                        fft_in_place_with_options(
+                                            destination,
+                                            Some(rate_bits),
+                                            fft_root_table,
+                                        );
+                                    } else {
+                                        fft_in_place_with_options_prereversed(
+                                            destination,
+                                            Some(rate_bits),
+                                            Some(folded_root_table.as_ref()),
+                                        );
+                                    }
+                                    #[cfg(feature = "diagnostic_profile")]
+                                    meters.record(
+                                        fft_start.duration_since(coset_start).as_nanos() as u64,
+                                        fft_start.elapsed().as_nanos() as u64,
                                     );
                                 },
                             );
+                            #[cfg(feature = "diagnostic_profile")]
+                            meters.flush_group();
                         },
                     )
                 };
@@ -346,6 +423,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let degree = polynomials[0].len();
         let lde_len = degree << rate_bits;
         let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+        // Twiddles with the coset shift folded in; see the fill below.
+        let folded_root_table = cached_coset_folded_root_table::<F>(lde_len);
         let Some(destinations) = columns.columns_mut() else {
             return false;
         };
@@ -357,27 +436,43 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .zip(polynomials.par_iter())
             .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
-                // Fused copy-and-scale: the unscaled coefficient image that
-                // `copy_from_slice` used to materialize here is never observed —
-                // the FFT reads only the coset-scaled values — so writing the
-                // product directly deletes one full read+write pass over
-                // `degree` words per column, per commitment, per proof. Word
-                // values are unchanged: `batch_multiply_into` uses the same
-                // packed-prefix/scalar-tail schedule as the
-                // `batch_multiply_inplace` it replaces, and it never reads the
-                // (possibly uninitialized) destination.
-                batch_multiply_into(
-                    &mut destination[..degree],
-                    &polynomial.coeffs,
-                    &coset_powers,
-                );
+                // Neither arm materializes an unscaled coefficient image
+                // first — the FFT only ever reads transformed input — so the
+                // fill writes its final words directly and the read+write pass
+                // over `degree` words that `copy_from_slice` used to cost per
+                // column, per commitment, per proof is gone. Neither arm reads
+                // the (possibly uninitialized) destination.
+                //
+                // At a nontrivial zero-padded shape both of the old prologue
+                // passes are gone. The coset scale moved into the twiddles —
+                // row `l` of `folded_root_table` carries
+                // `shift^(2^(lg_n - 1 - l))`, the same evaluation — and the
+                // bit reversal that `prepare_zero_padded_fft` would apply to
+                // this same `degree`-word prefix in a second read+write pass
+                // moved onto the destination index of the copy that has to
+                // happen anyway. What is left is one permuted copy of the
+                // coefficients. The degenerate arm keeps the scale as a pass,
+                // on the same packed-prefix/scalar-tail `batch_multiply_into`
+                // schedule as the `batch_multiply_inplace` it replaced.
                 if rate_bits == 0 || degree < 2 {
+                    batch_multiply_into(
+                        &mut destination[..degree],
+                        &polynomial.coeffs,
+                        &coset_powers,
+                    );
                     destination[degree..].fill(F::ZERO);
+                    fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                } else {
+                    bit_reversed_copy_into(&mut destination[..degree], &polynomial.coeffs);
+                    // The expansion path writes every tail element before
+                    // reading it, which is the same invariant `lde_values` uses
+                    // to avoid a dead tail memset.
+                    fft_in_place_with_options_prereversed(
+                        destination,
+                        Some(rate_bits),
+                        Some(folded_root_table.as_ref()),
+                    );
                 }
-                // For a nontrivial zero-padded FFT, the expansion path writes
-                // every tail element before reading it. This is the same
-                // invariant used by `lde_values` to avoid a dead tail memset.
-                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
             });
         true
     }
