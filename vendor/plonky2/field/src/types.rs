@@ -8,6 +8,7 @@ use num::bigint::BigUint;
 use num::{Integer, One, ToPrimitive, Zero};
 use plonky2_util::bits_u64;
 use rand::rngs::OsRng;
+use rand::SeedableRng;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -27,10 +28,20 @@ pub trait Sample: Sized {
         Self::sample(&mut OsRng)
     }
 
-    /// Samples a [`Vec`] of values of length `n` using [`OsRng`].
+    /// Samples a [`Vec`] of values of length `n` using the thread-local RNG.
+    ///
+    /// The FRI oracle's blinding-salt generation calls this with
+    /// `degree << rate_bits` elements per salt; the previous per-element
+    /// `OsRng` path made a system call per value (millions of `getentropy`
+    /// calls per commitment), which dominated the salt cost. `thread_rng`
+    /// is seeded from `OsRng` once and draws from a fast CSPRNG, so the
+    /// values are still cryptographically random and every consumer
+    /// (blinding salts, test data) is value-agnostic.
     #[inline]
     fn rand_vec(n: usize) -> Vec<Self> {
-        (0..n).map(|_| Self::rand()).collect()
+        let mut rng =
+            rand::rngs::SmallRng::from_rng(OsRng).expect("rng seeding failed");
+        (0..n).map(|_| Self::sample(&mut rng)).collect()
     }
 
     /// Samples an array of values of length `N` using [`OsRng`].
