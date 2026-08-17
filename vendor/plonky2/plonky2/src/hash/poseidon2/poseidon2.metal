@@ -1832,3 +1832,66 @@ kernel void poseidon2_absorb_pass(
         }
     }
 }
+
+// Bottom-level parent compression fused in threadgroup shared memory: one
+// threadgroup compresses `1 << levels` child digests into a single parent
+// digest, so intermediate digests never round-trip device memory. The
+// dispatcher must size the threadgroup at exactly `1 << (levels - 1)`
+// threads (128 for the 8 levels used by the tree build); each thread
+// reduces one pair of child digests in the first round, then the frontier
+// halves once per level through two ping-pong shared buffers (128 digests
+// x 4 limbs x 2 halves = 8 KiB). One parent digest is written per group.
+kernel void poseidon2_hash_parents_fused(
+    const device ulong* children [[buffer(0)]],
+    device ulong* parents [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& levels [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lsize [[threads_per_threadgroup]]) {
+    // Shared frontier: two ping-pong halves of 128 digests (4 u64 limbs each).
+    constexpr ulong HALF_U64 = 128u * 4u;
+    threadgroup ulong shared[2 * 128 * 4];
+
+    // Round 0: every thread compresses one child pair (16 limbs) and parks
+    // the 4-limb digest in the first shared half.
+    const ulong pair = (ulong)gid * 16u;
+    ulong st[12] = { 0 };
+    for (uint i = 0; i < 8; ++i) {
+        st[i] = children[pair + (ulong)i];
+    }
+    poseidon2(st, parameters);
+    for (uint i = 0; i < 4; ++i) {
+        shared[(ulong)gid * 4u + (ulong)i] = gl_canonicalize(st[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Halve the frontier once per level, ping-ponging between the two
+    // shared halves so each round reads the previous round's writes.
+    uint count = lsize;
+    for (uint level = 1u; level < levels; ++level) {
+        const uint next = count / 2u;
+        const ulong src = ((level - 1u) & 1u) == 0u ? 0u : HALF_U64;
+        const ulong dst = ((level - 1u) & 1u) == 0u ? HALF_U64 : 0u;
+        if (gid < next) {
+            ulong cur[12] = { 0 };
+            for (uint i = 0; i < 8; ++i) {
+                cur[i] = shared[src + (ulong)gid * 8u + (ulong)i];
+            }
+            poseidon2(cur, parameters);
+            for (uint i = 0; i < 4; ++i) {
+                shared[dst + (ulong)gid * 4u + (ulong)i] = gl_canonicalize(cur[i]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        count = next;
+    }
+
+    // Thread 0 of each threadgroup writes its group's single parent digest.
+    if (gid % lsize == 0u) {
+        const ulong final_half = (levels - 1u) % 2u == 0u ? 0u : HALF_U64;
+        const ulong parent = (ulong)(gid / lsize) * 4u;
+        for (uint i = 0; i < 4; ++i) {
+            parents[parent + (ulong)i] = shared[final_half + (ulong)i];
+        }
+    }
+}

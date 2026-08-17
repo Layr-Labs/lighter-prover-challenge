@@ -21,7 +21,7 @@ parallel = ["plonky2_maybe_rayon/parallel"]
 anyhow = { workspace = true }
 itertools = { workspace = true, features = ["use_alloc"] }
 num = { workspace = true, features = ["alloc"] }
-rand = { workspace = true, features = ["getrandom"] }
+rand = { workspace = true, features = ["getrandom", "small_rng"] }
 serde = { workspace = true, features = ["alloc"] }
 static_assertions = { workspace = true }
 unroll = { workspace = true }
