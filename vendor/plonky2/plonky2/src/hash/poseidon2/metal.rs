@@ -813,10 +813,11 @@ pub fn prewarm_large_column_store(bytes: u64) {
 /// install, and only when the stashed pair is actually smaller, so a build that
 /// is mid-flight simply finishes first.
 ///
-/// Writing zeros is semantics-preserving: a fresh `StorageModeShared` buffer is
-/// already zero-filled, and no build can observe this one until it is
-/// published, so the pair a later build takes holds exactly what a fresh
-/// allocation would have held.
+/// The inter-pass state is GPU-only: the first absorb dispatch initializes all
+/// twelve lanes before any later dispatch reads them. Keep that buffer in
+/// `StorageModePrivate`, avoiding a CPU mapping and allowing Metal to choose
+/// its GPU-optimal placement. The digest output remains shared and page-walked
+/// because it is returned to the CPU after the parent ladder completes.
 /// Pre-faulted digest-output buffers for the final block's streamed builds.
 ///
 /// Each streamed build swaps a fresh output buffer in so the completed one can
@@ -878,9 +879,11 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
     };
     let (state_bytes, output_bytes) = (state_bytes as u64, output_bytes as u64);
 
-    let Some(state) = allocate_page_walked(&context.device, state_bytes) else {
-        return;
-    };
+    let state = autoreleasepool(|| {
+        context
+            .device
+            .new_buffer(state_bytes, MTLResourceOptions::StorageModePrivate)
+    });
     let Some(output) = allocate_page_walked(&context.device, output_bytes) else {
         return;
     };
@@ -2368,8 +2371,9 @@ pub(crate) fn allocate_columns<F: RichField>(
 
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
-/// Retained buffers for the streamed sponge build: the inter-pass state
-/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
+/// Retained buffers for the streamed sponge build: the GPU-private inter-pass
+/// state (12 u64 lanes per leaf, column-major) and the shared level-order digest
+/// output.
 /// One streamed build runs at a time (exclusive proving phases only), so a
 /// single grow-on-demand pair suffices; holding the lock for the whole build
 /// serializes any unexpected second caller onto the classic path.
@@ -2447,7 +2451,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             (
                 context.device.new_buffer(
                     state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
+                    MTLResourceOptions::StorageModePrivate,
                 ),
                 context.device.new_buffer(
                     output_bytes as u64,
@@ -2503,7 +2507,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch_with_cap(encoder, pipeline, leaf_count, 64);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -4247,10 +4251,19 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_with_cap(encoder, pipeline, thread_count, 128);
+}
+
+fn dispatch_with_cap(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    cap: usize,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
