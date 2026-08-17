@@ -368,9 +368,62 @@ const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 
+/// Leaf count of the degree-2^14 serial circuits' commitment trees, and the
+/// quotient-domain row count of their gate/permutation quotient jobs
+/// (`degree_bits + quotient_degree_bits = 14 + 3`). Both are produced only by
+/// the chain steps and the pre-execution proof; the pipelined chunk circuits
+/// commit at 2^19 leaves / 2^19 quotient rows and the final block at 2^21. See
+/// `gpu_worthwhile`'s `serial_critical_shape` note for the derivation.
+const SPINE_SHAPE_ROWS: usize = 1 << 17;
+
+/// Whether a Merkle build's shape is one the strictly serial spine produces.
+/// Identical predicate to `gpu_worthwhile`'s `serial_critical_shape` and to
+/// `build`'s buffer-set priority key, minus the `spine_urgent()` term: queue
+/// membership is a property of the shape alone, so it does not flicker with the
+/// backlog while a build is in flight.
+fn spine_tree_shape(leaf_width: usize, leaf_count: usize) -> bool {
+    leaf_count == SPINE_SHAPE_ROWS && leaf_width > 4
+}
+
+/// Whether a job of the given shape class belongs on [`MetalShared::spine_queue`].
+///
+/// The second queue exists to escape FIFO queueing behind chunk-pipeline
+/// kernels, so it is claimed only where such queueing can happen. Inside an
+/// exclusive phase (pre-execution, the chain tail once this path is the last one
+/// proving, the final block) the contract is that nothing else submits, so the
+/// shared queue is already contention-free. Measured in the drain phase of both
+/// reference traces, a spine buffer's submit-to-GPU-start is 4-5% of its
+/// submit-to-completed span against 19-29% in the pipelined phase, so there is
+/// nothing there for a second queue to remove -- and a colder second queue is
+/// not free. Reading the flag once per job keeps every command buffer of that
+/// job on one queue.
+fn spine_queue_class(spine_shape: bool) -> bool {
+    spine_shape && !EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 struct MetalShared {
     device: Device,
     queue: CommandQueue,
+    /// Second queue carrying contended serial-spine work (see
+    /// [`spine_queue_class`]). Command buffers execute FIFO *per queue*, so with
+    /// a single process-wide queue every spine buffer submitted during the
+    /// pipelined phase waits behind whatever 2^19-leaf chunk kernels are already
+    /// enqueued -- 833 streamed `merkle_absorb` buffers per run, 30% of wall of
+    /// GPU execution, against the spine's 12.5%.
+    ///
+    /// Nothing depends on cross-buffer ordering between spine and chunk work:
+    /// every job is awaited on the CPU through its own command buffer before its
+    /// output is read (`wait_until_completed` at the end of `build_with_set`,
+    /// `build_from_values`, `build_from_coeffs_with_set`, the streamed build's
+    /// drain loop, and in all three `*QuotientJob::finish` bodies), the single
+    /// `BufferSet` serializes the staged builds among themselves, and the
+    /// `StreamedPairLease` serializes streamed builds on their retained pair.
+    /// The one genuine intra-job FIFO dependency -- the streamed sponge's
+    /// per-group absorb chain, whose passes accumulate `state_buffer` across
+    /// command buffers with no CPU wait between them -- is preserved because
+    /// that build resolves this queue once and uses the binding for all of its
+    /// command buffers.
+    spine_queue: CommandQueue,
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
@@ -1494,15 +1547,37 @@ pub fn is_exclusive_gpu_phase() -> bool {
 
 /// Runnable-but-unproven chain steps: incremented by the orchestrator when a
 /// chain step's transaction proof is ready (the step could prove right now),
-/// decremented when its proof completes. While this backlog is at or above
-/// [`SPINE_URGENT_BACKLOG`], the chain is the pipeline's laggard and its
-/// 2^17 spine trees take priority for the single GPU buffer set; below it,
-/// chunk trees keep plain FIFO so the transaction pipeline is not slowed on
-/// the spine's behalf while the spine has slack. A plain unconditional
-/// priority measured both directions: the chain's predecessor waits fell but
-/// the deferred chunk trees stretched the light path — this backlog gate is
-/// the balance point.
+/// decremented when its proof completes.
+///
+/// READINESS is what is counted, deliberately: the orchestrator feeds this at
+/// the instant it queues a runnable step for its spine driver — NOT at
+/// fold-thread creation — so the census is independent of how many fold
+/// threads exist and of any bound on the spine's thread-level run-ahead. That
+/// independence is load-bearing for the single consumer below,
+/// `acquire_set_priority`'s `spine` argument in `build`: the light spine is
+/// behind essentially whenever chunk proofs retire faster than folds, which is
+/// the whole pipelined phase, so the signal is true for most of it. A signal
+/// tied to spawned threads would collapse below [`SPINE_URGENT_BACKLOG`] the
+/// moment the run-ahead is bounded (~2 in-flight steps), silently turning the
+/// spine's buffer-set priority off. Under the bounded-run-ahead orchestrator
+/// the increment happens at the same instants as the old spawn-per-step form
+/// (each step's tx-proof join) and the decrement at the same fold completions,
+/// so the counter's trajectory — and the consumer's behavior — is unchanged.
+///
+/// Note the queue routing in `spine_queue_class` does NOT read this: queue
+/// membership is a property of the shape alone (plus the exclusive phase), so
+/// it is unaffected either way.
+///
+/// While this backlog is at or above [`SPINE_URGENT_BACKLOG`], the chain is
+/// the pipeline's laggard and its 2^17 spine trees take priority for the
+/// single GPU buffer set; below it, chunk trees keep plain FIFO so the
+/// transaction pipeline is not slowed on the spine's behalf while the spine
+/// has slack. A plain unconditional priority measured both directions: the
+/// chain's predecessor waits fell but the deferred chunk trees stretched the
+/// light path — this backlog gate is the balance point.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
+// Unchanged by the bounded-run-ahead orchestrator: the counter still means
+// "steps whose tx proof exists but whose fold has not completed".
 const SPINE_URGENT_BACKLOG: isize = 3;
 
 /// See [`SPINE_BACKLOG`].
@@ -1561,7 +1636,13 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // wide commitment off the single buffer set: admitted without it, these
     // trees hand back as acquisition wait everything they save in hashing.
     // The two are one change; do not relax either alone.
-    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
+    //
+    // These shapes now submit to `MetalShared::spine_queue`, so the FIFO wait
+    // behind chunk kernels is gone from their path. Neither this admission nor
+    // the streaming rule moves with it: which trees are hashed on the GPU at
+    // all is a separate question from which queue a GPU-routed tree goes to,
+    // and the pair above is still one change.
+    let serial_critical_shape = spine_tree_shape(leaf_width, leaf_count);
     if serial_critical_shape {
         return true;
     }
@@ -2213,10 +2294,94 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// staging buffer.
 /// Retained buffers for the streamed sponge build: the inter-pass state
 /// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
-static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+/// A build needs one such pair for its whole duration, so the pairs are a
+/// bounded pool: acquiring blocks while every pair is checked out, and the
+/// lease returns its pair when the build ends.
+///
+/// The pool holds one pair by default, which is exactly the single
+/// grow-on-demand pair this used to be — one streamed build at a time, every
+/// other caller waiting for it. That was free when only the exclusive proving
+/// phases streamed, but the admission rule below was widened so the pipelined
+/// 2^19 commitments stream too, and those arrive `LIGHT_TX_PROOF_WINDOW`-deep;
+/// the single pair then serializes the widest phase of every transaction proof.
+///
+/// `LIGHTER_STREAM_PAIRS` (1..=4) provisions more pairs, letting that many
+/// builds overlap their CPU fill against each other's GPU absorb on the shared
+/// queue. Each extra pair costs a state + output pair sized to the largest
+/// streamed shape it has served (~84 MB at 2^19 leaves: 50.3 MB of state plus
+/// 33.5 MB of output). More concurrent GPU submission is the same family of
+/// risk as `MAX_BUFFER_SETS`, so the default stays at 1.
+const STREAM_PAIRS_ENV: &str = "LIGHTER_STREAM_PAIRS";
+const MAX_STREAM_PAIRS: usize = 4;
+
+fn streamed_pair_capacity() -> usize {
+    static CAPACITY: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var(STREAM_PAIRS_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .map_or(1, |pairs| pairs.clamp(1, MAX_STREAM_PAIRS))
+    });
+    *CAPACITY
+}
+
+struct StreamedBufferPool {
+    /// Pairs that exist and are not currently leased.
+    idle: Vec<(Buffer, Buffer)>,
+    /// Pairs currently checked out; `idle.len() + leased <= capacity`.
+    leased: usize,
+}
+
+static STREAMED_BUFFERS: Mutex<StreamedBufferPool> = Mutex::new(StreamedBufferPool {
+    idle: Vec::new(),
+    leased: 0,
+});
+static STREAMED_BUFFERS_RELEASED: Condvar = Condvar::new();
+
+/// A checked-out scratch pair, `None` until the build sizes it. Dropping the
+/// lease returns the pair, so every exit from the streamed build — the `?`
+/// early returns, the command-failure fallback, an unwind — releases it at
+/// exactly the point the single pair's `MutexGuard` was released.
+struct StreamedPairLease {
+    pair: Option<(Buffer, Buffer)>,
+}
+
+impl StreamedPairLease {
+    /// Blocks until a pair is free. Pairs are created lazily, so a capacity of
+    /// 1 allocates the one pair on the first streamed build and hands the same
+    /// pair back out afterwards, as before.
+    fn acquire() -> Option<Self> {
+        let capacity = streamed_pair_capacity();
+        let mut pool = STREAMED_BUFFERS.lock().ok()?;
+        loop {
+            if let Some(pair) = pool.idle.pop() {
+                pool.leased += 1;
+                return Some(Self { pair: Some(pair) });
+            }
+            if pool.leased < capacity {
+                pool.leased += 1;
+                return Some(Self { pair: None });
+            }
+            pool = STREAMED_BUFFERS_RELEASED.wait(pool).ok()?;
+        }
+    }
+}
+
+impl Drop for StreamedPairLease {
+    fn drop(&mut self) {
+        let mut pool = STREAMED_BUFFERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(pair) = self.pair.take() {
+            pool.idle.push(pair);
+        }
+        pool.leased -= 1;
+        drop(pool);
+        // Exactly one pair became available, so one waiter can proceed. A
+        // wakeup lost to a thread that acquired without waiting is harmless:
+        // that thread notifies in turn when it releases.
+        STREAMED_BUFFERS_RELEASED.notify_one();
+    }
+}
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
@@ -2270,8 +2435,22 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     {
         return None;
     }
+    #[cfg(feature = "diagnostic_profile")]
+    let setup = crate::util::profile::span("commit", "stream setup");
     let context = ready_context(leaf_width, leaf_count)?;
     let pipeline = absorb_pass_pipeline()?;
+    // One decision for the whole build: each group's absorb pass reads the
+    // sponge state the previous group's pass wrote, with no CPU wait between
+    // them (they are all committed before the drain loop below), and the final
+    // group's encoder additionally reads its own leaf digests for the parent
+    // ladder. Those hazards are ordered only by the queue's submission order, so
+    // every command buffer below must come from this one binding.
+    //
+    // `stream_admitted` above requires 2^19 leaves outside an exclusive phase
+    // and 2^20 inside one, so no 2^17 spine shape reaches here today and this
+    // resolves to the shared queue; it starts using the spine queue by itself if
+    // that admission is ever widened.
+    let queue = context.queue_for(spine_queue_class(spine_tree_shape(leaf_width, leaf_count)));
     log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
 
     let cap_count = 1usize << cap_height;
@@ -2281,12 +2460,20 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
-    let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
+    #[cfg(feature = "diagnostic_profile")]
+    let buffer_lock = crate::util::profile::span("commit", "stream buffer lock");
+    let mut buffers = StreamedPairLease::acquire()?;
+    #[cfg(feature = "diagnostic_profile")]
+    drop(buffer_lock);
+    // Grow-on-demand, per pair: a pair too small for this shape is replaced
+    // wholesale and keeps the larger buffers for its later builds, so the
+    // final block's wider trees allocate on the pair that serves them just as
+    // the single pair allocated for them before.
+    let needs_new = buffers.pair.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
     if needs_new {
-        *buffers = Some(autoreleasepool(|| {
+        buffers.pair = Some(autoreleasepool(|| {
             (
                 context.device.new_buffer(
                     state_bytes as u64,
@@ -2299,7 +2486,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             )
         }));
     }
-    let (state_buffer, output_buffer) = buffers.as_mut()?;
+    let (state_buffer, output_buffer) = buffers.pair.as_mut()?;
+    #[cfg(feature = "diagnostic_profile")]
+    drop(setup);
 
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
@@ -2328,7 +2517,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             fill_group(group, &mut slices);
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = context.queue.new_command_buffer();
+            #[cfg(feature = "diagnostic_profile")]
+            let _submit = crate::util::profile::span("commit", "stream absorb submit");
+            let command_buffer = queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&columns.buffer), 0);
@@ -2396,16 +2587,22 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
+    #[cfg(feature = "diagnostic_profile")]
+    let drain = crate::util::profile::span("commit", "stream absorb drain");
     let all_ok = absorb_commands.iter().all(|command_buffer| {
         command_buffer.wait_until_completed();
         command_buffer.status() == MTLCommandBufferStatus::Completed
     });
     drop(job);
+    #[cfg(feature = "diagnostic_profile")]
+    drop(drain);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
         return None;
     }
 
+    #[cfg(feature = "diagnostic_profile")]
+    let _handoff = crate::util::profile::span("commit", "stream digest handoff");
     let replacement = context
         .digest_output_pool
         .lock()
@@ -2752,6 +2949,7 @@ impl MetalShared {
 
             Ok(Self {
                 queue: device.new_command_queue(),
+                spine_queue: device.new_command_queue(),
                 device,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -2777,6 +2975,27 @@ impl MetalShared {
                 permutation_points: Mutex::new(HashMap::new()),
             })
         })
+    }
+
+    /// The queue a job of this class submits to. Every command buffer of one job
+    /// must come from the same queue: ordering is guaranteed only within a
+    /// queue, and the streamed sponge build relies on it between its own absorb
+    /// passes.
+    fn queue_for(&self, spine: bool) -> &metal::CommandQueueRef {
+        // Census of what actually lands on each queue, per submitting thread --
+        // routing is invisible in the trace otherwise, and "no effect measured"
+        // and "the routing never fired" look identical without it.
+        #[cfg(feature = "diagnostic_profile")]
+        crate::util::profile::counter(
+            "metal_queue",
+            if spine { "spine" } else { "shared" },
+            1,
+        );
+        if spine {
+            &self.spine_queue
+        } else {
+            &self.queue
+        }
     }
 
     fn allocate_columns<F: RichField>(
@@ -2830,9 +3049,10 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
+        let queue = self.queue_for(spine_queue_class(quotient_rows == SPINE_SHAPE_ROWS));
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -2900,9 +3120,10 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
+        let queue = self.queue_for(spine_queue_class(quotient_rows == SPINE_SHAPE_ROWS));
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -2992,9 +3213,10 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("permutation quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
+        let queue = self.queue_for(spine_queue_class(quotient_rows == SPINE_SHAPE_ROWS));
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -3405,7 +3627,9 @@ impl MetalShared {
                 let log_degree_u32 = degree.ilog2();
                 let rate_bits_u32 = rate_bits as u32;
                 let cols_u32 = cols as u32;
-                let command_buffer = self.queue.new_command_buffer();
+                let command_buffer = self
+                    .queue_for(spine_queue_class(spine_tree_shape(cols, lde_size)))
+                    .new_command_buffer();
 
                 // Plain forward FFT of the values: bit-reversed gather (the
                 // identity "shift" table, no zero-run replication), then
@@ -3712,7 +3936,9 @@ impl MetalShared {
             let log_degree_u32 = degree.ilog2();
             let rate_bits_u32 = rate_bits as u32;
             let cols_u32 = cols as u32;
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self
+                .queue_for(spine_queue_class(spine_tree_shape(cols, lde_size)))
+                .new_command_buffer();
 
             let prepare = command_buffer.new_compute_command_encoder();
             prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
@@ -3841,7 +4067,7 @@ impl MetalShared {
         // Spine trees (the 2^17 serial-critical shapes, same predicate as
         // gpu_worthwhile) jump queued chunk-tree waiters for the single set —
         // but only while the chain is actually the laggard (see SPINE_BACKLOG).
-        let spine = leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent();
+        let spine = spine_tree_shape(leaf_width, leaf_count) && spine_urgent();
         let mut set = self.acquire_set_priority(spine)?;
         let result = self.build_with_set(
             &mut set,
@@ -3950,7 +4176,9 @@ impl MetalShared {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = self
+                .queue_for(spine_queue_class(spine_tree_shape(leaf_width, leaf_count)))
+                .new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(leaf_pipeline);
             encoder.set_buffer(0, Some(input_buffer), 0);

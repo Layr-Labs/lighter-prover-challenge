@@ -63,6 +63,43 @@ pub fn fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     root_table
 }
 
+/// [`fft_root_table`] with a coset shift folded into the twiddles: row `l` is
+/// premultiplied by `shift^(2^(lg_n - 1 - l))`.
+///
+/// Running the ordinary `fft_classic` against this table on *raw* coefficients
+/// computes the coset FFT for `shift`, so the separate pass that scales `c_i`
+/// by `shift^i` disappears. The identity is the standard distribution of the
+/// coset point over a decimation-in-time schedule: layer `l` twiddles a
+/// butterfly at offset `j` by `base_l^j`, where `base_l` has order `2^(l+1)`,
+/// and evaluating at `shift * omega^k` instead of `omega^k` contributes
+/// exactly one factor of `shift^(2^(lg_n - 1 - l))` to that layer.
+///
+/// Zero-padded shapes are covered as well: the layers the padding lets
+/// `prepare_zero_padded_fft` skip are butterflies against a zero operand, so
+/// the twiddle value they would have used never reaches a product.
+///
+/// Every entry here is a product, so its raw `u64` is generally a different
+/// representative of the same field element than the unfolded row's. The
+/// transform's values are unchanged; its raw words are not.
+///
+/// A folded table must not meet a kernel that assumes an unfolded row. The
+/// only such kernel is `fft_zero_padded_rate_8_first_layer_block`, whose
+/// `mul_16th_root_powers` multiplies by the canonical powers of two rather than
+/// reading row 3; it is off the production dispatch, and
+/// `coset_folded_table_matches_prescaled_fft` fails at the production shape if
+/// it is ever put back without a folded-aware variant.
+pub fn coset_folded_root_table<F: Field>(n: usize, shift: F) -> FftRootTable<F> {
+    let lg_n = log2_strict(n);
+    let mut table = fft_root_table::<F>(n);
+    for (l, row) in table.iter_mut().enumerate() {
+        let s = shift.exp_power_of_2(lg_n - 1 - l);
+        for x in row.iter_mut() {
+            *x = s * *x;
+        }
+    }
+    table
+}
+
 /// Process-wide cache of FFT root tables for the prover's hot field types,
 /// contention-free on the steady-state path: one static fixed-size array of
 /// `OnceLock` slots per cached field type, indexed by log2(size). A hit is a
@@ -80,7 +117,7 @@ mod root_table_cache {
     use core::any::{Any, TypeId};
     use std::sync::{Arc, OnceLock};
 
-    use super::{FftRootTable, fft_root_table};
+    use super::{FftRootTable, coset_folded_root_table, fft_root_table};
     use crate::extension::quadratic::QuadraticExtension;
     use crate::goldilocks_field::GoldilocksField;
     use crate::types::Field;
@@ -126,6 +163,34 @@ mod root_table_cache {
             }
         }
         Arc::new(fft_root_table::<F>(1 << lg_n))
+    }
+
+    static GOLDILOCKS_COSET_FOLDED_TABLES: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
+
+    /// The dedicated coset-folded slot array for `F`, if `F` is a cached type.
+    /// Only the base field is cached: no extension transform runs against a
+    /// folded table.
+    fn per_type_coset_folded<F: Field>() -> Option<&'static [Slot; MAX_LG_N]> {
+        (TypeId::of::<F>() == TypeId::of::<GoldilocksField>())
+            .then_some(&GOLDILOCKS_COSET_FOLDED_TABLES)
+    }
+
+    /// `coset_folded_root_table(1 << lg_n, F::coset_shift())` through the same
+    /// discipline as the plain root tables. The shift is a constant, so there
+    /// is one folded table per (field, size), deterministic in both, and a hit
+    /// returns exactly the values a fresh build would.
+    pub(super) fn get_coset_folded<F: Field>(lg_n: usize) -> Arc<FftRootTable<F>> {
+        if let Some(tables) = per_type_coset_folded::<F>() {
+            if let Some(slot) = tables.get(lg_n) {
+                let erased = slot.get_or_init(|| {
+                    Arc::new(coset_folded_root_table::<F>(1 << lg_n, F::coset_shift()))
+                });
+                if let Ok(table) = Arc::clone(erased).downcast::<FftRootTable<F>>() {
+                    return table;
+                }
+            }
+        }
+        Arc::new(coset_folded_root_table::<F>(1 << lg_n, F::coset_shift()))
     }
 
     static GOLDILOCKS_SUBGROUPS: [Slot; MAX_LG_N] = [EMPTY_SLOT; MAX_LG_N];
@@ -181,6 +246,24 @@ pub fn cached_fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
     fft_root_table::<F>(n)
 }
 
+/// Process-wide cached [`coset_folded_root_table`] for `F::coset_shift()`,
+/// value-identical to a fresh build.
+///
+/// Handed out as an `Arc` rather than cloned: at the ranked d16 LDE the table
+/// is `2^19` entries, and every wire, Z/partial-product and quotient column of
+/// every commitment at that degree shares the one build. It is retained for the
+/// life of the process next to the unfolded table of the same size -- about
+/// 4 MiB at `2^19`, 1 MiB at `2^17`, 16 MiB at `2^21`.
+#[cfg(feature = "std")]
+pub fn cached_coset_folded_root_table<F: Field>(n: usize) -> alloc::sync::Arc<FftRootTable<F>> {
+    root_table_cache::get_coset_folded::<F>(log2_strict(n))
+}
+
+#[cfg(not(feature = "std"))]
+pub fn cached_coset_folded_root_table<F: Field>(n: usize) -> alloc::sync::Arc<FftRootTable<F>> {
+    alloc::sync::Arc::new(coset_folded_root_table::<F>(n, F::coset_shift()))
+}
+
 #[inline]
 fn fft_dispatch<F: Field>(
     input: &mut [F],
@@ -197,6 +280,25 @@ fn fft_dispatch<F: Field>(
     let computed_root_table = fft_root_table::<F>(input.len());
 
     fft_classic(input, zero_factor.unwrap_or(0), &computed_root_table);
+}
+
+/// [`fft_dispatch`] for a buffer whose live prefix is already bit-reversed.
+#[inline]
+fn fft_dispatch_prereversed<F: Field>(
+    input: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    if let Some(table) = root_table {
+        fft_classic_prereversed(input, zero_factor.unwrap_or(0), table);
+        return;
+    }
+    #[cfg(feature = "std")]
+    let computed_root_table = root_table_cache::get::<F>(log2_strict(input.len()));
+    #[cfg(not(feature = "std"))]
+    let computed_root_table = fft_root_table::<F>(input.len());
+
+    fft_classic_prereversed(input, zero_factor.unwrap_or(0), &computed_root_table);
 }
 
 #[inline]
@@ -228,6 +330,33 @@ pub fn fft_in_place_with_options<F: Field>(
     root_table: Option<&FftRootTable<F>>,
 ) {
     fft_dispatch(buffer, zero_factor, root_table);
+}
+
+/// [`fft_in_place_with_options`] for a zero-padded buffer whose live prefix is
+/// *already* in bit-reversed order.
+///
+/// `prepare_zero_padded_fft` opens by reversing `buffer[..len >> zero_factor]`
+/// in place, a read+write pass over the live prefix on top of the pass that
+/// materialised it. A caller that writes the prefix itself can apply the
+/// permutation while writing -- the LDE fill already touches every one of those
+/// words to scale them by the coset powers -- and enter here instead. Nothing
+/// downstream of the prologue changes, so the transform's output is unchanged
+/// word for word.
+///
+/// `zero_factor` must be `Some(r)` with `r > 0`: at `r == 0` the classic path
+/// reverses the whole buffer rather than a prefix, which is not the
+/// permutation a prefix-writing caller can have applied.
+#[inline]
+pub fn fft_in_place_with_options_prereversed<F: Field>(
+    buffer: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+) {
+    debug_assert!(
+        matches!(zero_factor, Some(r) if r > 0),
+        "the prereversed entry only covers zero-padded shapes"
+    );
+    fft_dispatch_prereversed(buffer, zero_factor, root_table);
 }
 
 /// Computes an FFT in place, distributing independent blocks of the large
@@ -1427,6 +1556,31 @@ fn fft_zero_padded_first_layer_block_with<P, M>(
     }
 }
 
+/// The rate-8 expansion block with layer-`r` twiddling done by the
+/// power-of-two 16th-root shift kernel instead of a packed multiply.
+///
+/// OFF THE PRODUCTION DISPATCH, kept as the record of the direction and as the
+/// expansion block the lab variants still use. `mul_16th_root_powers` trades
+/// `mul`/`umulh` for shifts, but `reduce128` -- seven of the nine instructions
+/// in `mul_reduce_pair` -- is untouched, and four of the eight products have to
+/// assemble their `u128` by hand: indices 1 and 2 build `x * (ORDER + 2^12)`
+/// and `x * (ORDER + 2^24)` from four shifts and three 128-bit adds each,
+/// indices 6 and 7 from two shifts and one. Counted against the generic block
+/// that now drives production -- eight lanes through the tuned nine-instruction
+/// pair kernel, both `omega_table` vectors loop-invariant across the `pair`
+/// loop -- that is roughly 94 instructions per eight outputs against roughly
+/// 74. It fits the profile: `prepare_zero_padded_fft` is 3.2% of busy CPU for
+/// one layer's work where an ordinary layer is about 1.9%.
+///
+/// That is a static instruction count, not a timing. Restoring the
+/// specialization is a one-hunk revert in `fft_zero_padded_cache_blocks`.
+///
+/// The two kernels agree on values, not on raw representatives:
+/// `fft_root_table` builds every row by repeated `reduce128` multiplication,
+/// so `root_table[3][j]` is generally a non-canonical representative of
+/// `omega_16^j` while the shift form multiplies by the canonical power of two,
+/// and the two feed different `u128`s into the same reduction.
+/// `rate_8_expansion_matches_generic_packed_expansion` pins the agreement.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 fn fft_zero_padded_rate_8_first_layer_block(
@@ -1505,34 +1659,10 @@ fn fft_zero_padded_cache_blocks<P, M>(
     for block in (0..num_blocks).rev() {
         let source_start = block * nonzero_per_block;
         let destination = block * packed_block_len;
-        #[cfg(target_arch = "aarch64")]
-        if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
-        {
-            let wide_values = unsafe {
-                // SAFETY: The TypeId check proves this is the exact concrete packed type;
-                // only the generic spelling of the slice differs at this point.
-                core::slice::from_raw_parts_mut(
-                    packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
-                    packed_values.len(),
-                )
-            };
-            fft_zero_padded_rate_8_first_layer_block(
-                wide_values,
-                source_start,
-                nonzero_per_block,
-                destination,
-            );
-        } else {
-            fft_zero_padded_first_layer_block_with::<P, M>(
-                packed_values,
-                source_start,
-                nonzero_per_block,
-                destination,
-                packed_repeat,
-                omega_table,
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
+        // One expansion kernel for every shape. The aarch64 rate-8
+        // specialization that used to sit here is off the dispatch; see
+        // `fft_zero_padded_rate_8_first_layer_block` for the instruction count
+        // behind the switch.
         fft_zero_padded_first_layer_block_with::<P, M>(
             packed_values,
             source_start,
@@ -1557,6 +1687,7 @@ fn prepare_zero_padded_fft<F, M>(
     lg_n: usize,
     lg_packed_width: usize,
     root_table: &FftRootTable<F>,
+    prereversed: bool,
 ) -> usize
 where
     F: Field,
@@ -1570,7 +1701,12 @@ where
     // just the live prefix.
     let repeat = 1 << r;
     let nonzero_len = values.len() >> r;
-    reverse_index_bits_in_place(&mut values[..nonzero_len]);
+    if !prereversed {
+        // A caller entering through `fft_in_place_with_options_prereversed`
+        // has already applied exactly this permutation while writing the
+        // prefix, so the pass is skipped rather than repeated.
+        reverse_index_bits_in_place(&mut values[..nonzero_len]);
+    }
 
     if r >= lg_packed_width && r < lg_n {
         // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
@@ -1607,8 +1743,12 @@ where
 /// input may be non-zero, but the last 1 - 1/2^r entries are
 /// definitely zero.
 #[inline(always)]
-fn fft_classic_with<F, M>(values: &mut [F], r: usize, root_table: &FftRootTable<F>)
-where
+fn fft_classic_with<F, M>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+    prereversed: bool,
+) where
     F: Field,
     M: FftTwiddleMul<F> + FftTwiddleMul<<F as Packable>::Packing>,
 {
@@ -1616,10 +1756,11 @@ where
     let lg_n = log2_strict(n);
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
     let first_layer = if r == 0 {
+        debug_assert!(!prereversed);
         reverse_index_bits_in_place(values);
         0
     } else {
-        prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table)
+        prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table, prereversed)
     };
 
     if lg_n <= lg_packed_width {
@@ -1644,7 +1785,7 @@ where
         reverse_index_bits_in_place(values);
         0
     } else {
-        prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table)
+        prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table, false)
     };
 
     if lg_n <= lg_packed_width {
@@ -1660,6 +1801,26 @@ where
 }
 
 pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &FftRootTable<F>) {
+    fft_classic_maybe_prereversed(values, r, root_table, false);
+}
+
+/// [`fft_classic`] for a zero-padded buffer whose live prefix already carries
+/// the prologue's bit-reversal permutation.
+pub(crate) fn fft_classic_prereversed<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+) {
+    debug_assert!(r > 0, "the prereversed entry only covers zero-padded shapes");
+    fft_classic_maybe_prereversed(values, r, root_table, true);
+}
+
+fn fft_classic_maybe_prereversed<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+    prereversed: bool,
+) {
     let lg_n = log2_strict(values.len());
     if root_table.len() != lg_n {
         panic!(
@@ -1673,9 +1834,9 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         // The final quadratic-extension root is not in its base field. Keep
         // the full multiplication fallback for the entire transform. This
         // branch is once per FFT, never once per butterfly.
-        fft_classic_with::<F, GeneralTwiddle>(values, r, root_table);
+        fft_classic_with::<F, GeneralTwiddle>(values, r, root_table, prereversed);
     } else {
-        fft_classic_with::<F, BaseSubfieldTwiddle>(values, r, root_table);
+        fft_classic_with::<F, BaseSubfieldTwiddle>(values, r, root_table, prereversed);
     }
 }
 
@@ -1722,9 +1883,10 @@ pub mod lab {
     // to stay in a base subfield, so `GeneralTwiddle` is also the only sound
     // marker for them.
     use super::{
-        FftRootTable, GeneralTwiddle, fft_classic, fft_classic_simd_fused_two_layers_with,
-        fft_classic_simd_layers, fft_classic_simd_single_layer_with, fft_classic_simd_with,
-        fft_root_table, fft_zero_padded_first_layer_block_with,
+        FftRootTable, GeneralTwiddle, coset_folded_root_table as production_coset_folded_root_table,
+        fft_classic, fft_classic_simd_fused_two_layers_with, fft_classic_simd_layers,
+        fft_classic_simd_single_layer_with, fft_classic_simd_with,
+        fft_zero_padded_first_layer_block_with,
     };
     #[cfg(target_arch = "aarch64")]
     use super::fft_zero_padded_rate_8_first_layer_block;
@@ -2271,15 +2433,7 @@ pub mod lab {
 
     /// Build the coset-folded root table for size `n` and shift `shift`.
     pub fn coset_folded_root_table<F: Field>(n: usize, shift: F) -> FftRootTable<F> {
-        let lg_n = log2_strict(n);
-        let mut table = fft_root_table::<F>(n);
-        for (l, row) in table.iter_mut().enumerate() {
-            let s = shift.exp_power_of_2(lg_n - 1 - l);
-            for x in row.iter_mut() {
-                *x = s * *x;
-            }
-        }
-        table
+        production_coset_folded_root_table(n, shift)
     }
 
     /// aarch64 rate-8 expansion block under coset folding: the folded row-3
@@ -3850,4 +4004,264 @@ mod tests {
         assert_eq!(parallel, serial, "packed base-field public entry diverged");
     }
 
+    /// The LDE prologue fused into a single pass -- `bit_reversed_multiply_into`
+    /// then the prereversed transform -- reproduces the two-pass form it
+    /// replaces word for word: `batch_multiply_into` then the ordinary
+    /// zero-padded transform, whose prologue reverses the live prefix itself.
+    ///
+    /// Compared on the raw `u64`, not canonically. Both `r >= lg_packed_width`
+    /// shapes (cache-blocked expansion) and `r < lg_packed_width` shapes (the
+    /// scalar replication branch) are covered, since the skipped pass sits
+    /// above that split.
+    ///
+    /// The shapes also straddle the fused writer's own size dispatch: a
+    /// `degree` of 2^13 is 64 KiB and takes its trivial gather, while 2^16 and
+    /// 2^18 -- the ranked circuit's prefix and the block circuit's -- take the
+    /// blocked one.
+    #[test]
+    fn prereversed_zero_padded_fft_matches_two_pass_prologue() {
+        use crate::batch_util::{batch_multiply_into, bit_reversed_multiply_into};
+        use crate::fft::fft_in_place_with_options_prereversed;
+
+        type F = GoldilocksField;
+        for (lg_degree, rate_bits) in [(10usize, 3usize), (13, 3), (16, 3), (18, 3), (12, 1), (11, 2)]
+        {
+            let degree = 1usize << lg_degree;
+            let lde_len = degree << rate_bits;
+            let roots = fft_root_table::<F>(lde_len);
+
+            let coeffs = (0..degree)
+                .map(|i| {
+                    let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    x ^= x >> 30;
+                    GoldilocksField(x)
+                })
+                .collect::<Vec<_>>();
+            let coset_powers = F::coset_shift().powers().take(degree).collect::<Vec<_>>();
+
+            let mut two_pass = (0..lde_len).map(|_| F::ZERO).collect::<Vec<_>>();
+            batch_multiply_into(&mut two_pass[..degree], &coeffs, &coset_powers);
+            fft_in_place_with_options(&mut two_pass, Some(rate_bits), Some(&roots));
+
+            let mut fused = (0..lde_len).map(|_| F::ZERO).collect::<Vec<_>>();
+            bit_reversed_multiply_into(&mut fused[..degree], &coeffs, &coset_powers);
+            fft_in_place_with_options_prereversed(&mut fused, Some(rate_bits), Some(&roots));
+
+            assert_eq!(
+                two_pass.iter().map(|x| x.0).collect::<Vec<_>>(),
+                fused.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "fused LDE prologue diverged at degree 2^{lg_degree}, rate_bits={rate_bits}"
+            );
+        }
+    }
+
+    /// The coset LDE built against a folded twiddle table, from raw
+    /// coefficients, is value-identical to the prescale-then-transform form it
+    /// replaces, at every production LDE shape.
+    ///
+    /// Compared canonically, not raw: every folded twiddle is a product, so it
+    /// is generally a different representative of the same root than the
+    /// unfolded row's entry, and the transform inherits that. The `assert_eq!`
+    /// here is `to_canonical_u64` equality, which is what the switch claims.
+    ///
+    /// This also guards the expansion kernel. A folded row 3 is
+    /// `sigma * omega_16^j`, which `mul_16th_root_powers` does not compute, so
+    /// putting `fft_zero_padded_rate_8_first_layer_block` back on the dispatch
+    /// without a folded-aware variant fails this test at `rate_bits = 3`.
+    #[test]
+    fn coset_folded_table_matches_prescaled_fft() {
+        use crate::batch_util::{batch_multiply_into, bit_reversed_copy_into};
+        use crate::fft::{cached_coset_folded_root_table, fft_in_place_with_options_prereversed};
+
+        type F = GoldilocksField;
+        for (lg_degree, rate_bits) in [(10usize, 3usize), (13, 3), (16, 3), (12, 1), (11, 2)] {
+            let degree = 1usize << lg_degree;
+            let lde_len = degree << rate_bits;
+            let roots = fft_root_table::<F>(lde_len);
+            let folded = cached_coset_folded_root_table::<F>(lde_len);
+
+            let coeffs = (0..degree)
+                .map(|i| {
+                    let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    x ^= x >> 30;
+                    GoldilocksField(x)
+                })
+                .collect::<Vec<_>>();
+            let coset_powers = F::coset_shift().powers().take(degree).collect::<Vec<_>>();
+
+            let mut prescaled = (0..lde_len).map(|_| F::ZERO).collect::<Vec<_>>();
+            batch_multiply_into(&mut prescaled[..degree], &coeffs, &coset_powers);
+            fft_in_place_with_options(&mut prescaled, Some(rate_bits), Some(&roots));
+
+            let mut folded_out = (0..lde_len).map(|_| F::ZERO).collect::<Vec<_>>();
+            bit_reversed_copy_into(&mut folded_out[..degree], &coeffs);
+            fft_in_place_with_options_prereversed(
+                &mut folded_out,
+                Some(rate_bits),
+                Some(folded.as_ref()),
+            );
+
+            assert_eq!(
+                prescaled, folded_out,
+                "folded-twiddle LDE diverged at degree 2^{lg_degree}, rate_bits={rate_bits}"
+            );
+        }
+    }
+
+    /// The cached folded table is the table a fresh build produces.
+    #[test]
+    fn cached_coset_folded_root_table_matches_fresh_build() {
+        use crate::fft::{cached_coset_folded_root_table, coset_folded_root_table};
+
+        type F = GoldilocksField;
+        for lg_n in [4usize, 10, 13] {
+            let n = 1usize << lg_n;
+            let fresh = coset_folded_root_table::<F>(n, F::coset_shift());
+            let cached = cached_coset_folded_root_table::<F>(n);
+            assert_eq!(fresh, *cached, "cached folded table diverged at 2^{lg_n}");
+        }
+    }
+
+    /// Raw words that look like a real coset-scaled prefix: straight out of a
+    /// reduction, non-canonical representatives included.
+    #[cfg(target_arch = "aarch64")]
+    fn expansion_test_prefix(len: usize) -> Vec<GoldilocksField> {
+        (0..len)
+            .map(|i| {
+                let mut x = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x ^= x >> 32;
+                if i % 37 == 0 {
+                    // Force a representative at or above ORDER.
+                    x |= 0xFFFF_FFFF_0000_0001;
+                }
+                GoldilocksField(x)
+            })
+            .collect()
+    }
+
+    /// The rate-8 shift expansion and the generic packed-twiddle expansion that
+    /// replaced it on the production dispatch must agree on every word of an
+    /// expanded cache block, at the exact production shape (`r = 3`,
+    /// `lg_block_n = 13`, `WideGoldilocksField`).
+    ///
+    /// Agreement is on values. `fft_root_table` builds each row by repeated
+    /// `reduce128` multiplication, so `root_table[3][j]` is generally a
+    /// non-canonical representative of `omega_16^j` while the shift form
+    /// multiplies by the canonical power of two; the two therefore reduce
+    /// different `u128`s. `PartialEq` for `GoldilocksField` compares
+    /// `to_canonical_u64`, which is the invariant the switch relies on.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn rate_8_expansion_matches_generic_packed_expansion() {
+        use super::{
+            fft_zero_padded_first_layer_block_with, fft_zero_padded_rate_8_first_layer_block,
+        };
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+
+        const LG_BLOCK_N: usize = 13;
+        const R: usize = 3;
+        let block_len = 1usize << LG_BLOCK_N;
+        let nonzero_per_block = block_len >> R;
+        let root_table = fft_root_table::<GoldilocksField>(block_len);
+        let packed_repeat = (1usize << R) / WideGoldilocksField::WIDTH;
+
+        let mut generic = expansion_test_prefix(block_len);
+        let mut shifted = generic.clone();
+
+        {
+            let packed = WideGoldilocksField::pack_slice_mut(&mut generic);
+            let omega_table = WideGoldilocksField::pack_slice(&root_table[R]);
+            fft_zero_padded_first_layer_block_with::<WideGoldilocksField, BaseSubfieldTwiddle>(
+                packed,
+                0,
+                nonzero_per_block,
+                0,
+                packed_repeat,
+                omega_table,
+            );
+        }
+        {
+            let packed = WideGoldilocksField::pack_slice_mut(&mut shifted);
+            fft_zero_padded_rate_8_first_layer_block(packed, 0, nonzero_per_block, 0);
+        }
+
+        assert_eq!(
+            generic, shifted,
+            "generic packed expansion diverged from the rate-8 shift expansion"
+        );
+    }
+
+    /// The whole zero-padded transform is unchanged by taking the rate-8
+    /// specialization off the dispatch, at every production LDE size. The
+    /// reference below is the pre-change `fft_zero_padded_cache_blocks` body:
+    /// same blocking, same layer schedule, rate-8 shift expansion.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn zero_padded_fft_matches_rate_8_expansion_variant() {
+        use super::{
+            fft_classic_simd_layers, fft_classic_simd_with,
+            fft_zero_padded_rate_8_first_layer_block,
+        };
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+
+        fn reference(values: &mut [GoldilocksField], root_table: &FftRootTable<GoldilocksField>) {
+            const R: usize = 3;
+            const LG_BLOCK_N: usize = 13;
+            let lg_n = log2_strict(values.len());
+            let nonzero_len = values.len() >> R;
+            reverse_index_bits_in_place(&mut values[..nonzero_len]);
+
+            let block_len = 1usize << LG_BLOCK_N;
+            let nonzero_per_block = block_len >> R;
+            let packed_block_len = block_len / WideGoldilocksField::WIDTH;
+            let num_blocks = values.len() / block_len;
+            {
+                let packed_values = WideGoldilocksField::pack_slice_mut(values);
+                for block in (0..num_blocks).rev() {
+                    let source_start = block * nonzero_per_block;
+                    let destination = block * packed_block_len;
+                    fft_zero_padded_rate_8_first_layer_block(
+                        packed_values,
+                        source_start,
+                        nonzero_per_block,
+                        destination,
+                    );
+                    fft_classic_simd_layers::<WideGoldilocksField, BaseSubfieldTwiddle>(
+                        &mut packed_values[destination..destination + packed_block_len],
+                        R + 1,
+                        LG_BLOCK_N,
+                        root_table,
+                    );
+                }
+            }
+            fft_classic_simd_with::<WideGoldilocksField, BaseSubfieldTwiddle>(
+                values,
+                LG_BLOCK_N,
+                lg_n,
+                root_table,
+            );
+        }
+
+        const R: usize = 3;
+        for lg_n in [16usize, 17, 19] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let nonzero_len = n >> R;
+            let mut production = expansion_test_prefix(nonzero_len)
+                .into_iter()
+                .chain(core::iter::repeat_n(GoldilocksField::ZERO, n - nonzero_len))
+                .collect::<Vec<_>>();
+            let mut expected = production.clone();
+
+            fft_classic(&mut production, R, &roots);
+            reference(&mut expected, &roots);
+
+            assert_eq!(
+                production, expected,
+                "retiring the rate-8 expansion changed the 2^{lg_n} transform"
+            );
+        }
+    }
 }
