@@ -18,7 +18,7 @@ use crate::fft::{
 };
 use crate::types::Field;
 
-/// A polynomial in point-value form.
+///     A polynomial in point-value form.
 ///
 /// The points are implicitly `g^i`, where `g` generates the subgroup whose size equals the number
 /// of points.
