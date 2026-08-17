@@ -23,6 +23,7 @@ use crate::bigint::big_u16::CircuitBuilderBigIntU16;
 use crate::bigint::biguint::CircuitBuilderBiguint;
 use crate::bigint::comparison::CircuitBuilderBiguintSubtractiveComparison;
 use crate::block::{Block, BlockWitness};
+#[cfg(test)]
 use crate::block_pre_execution::BlockPreExecWitnessTarget;
 use crate::block_tx::JumpStateTarget;
 use crate::block_tx_chain::BlockTxChainWitnessTarget;
@@ -36,11 +37,16 @@ use crate::nonnative::CircuitBuilderNonNative;
 use crate::poseidon2::Poseidon2Hash;
 use crate::recursion::block_witness::BlockWitnessTarget;
 use crate::types::config::{Builder, C, D, F};
-use crate::types::constants::{KECCAK_HASH_OUT_BYTE_SIZE, POSITION_LIST_SIZE};
+use crate::types::constants::{
+    KECCAK_HASH_OUT_BYTE_SIZE, MARGINED_ASSET_LIST_SIZE, POSITION_LIST_SIZE,
+};
+use crate::types::margined_asset::MARGINED_ASSET_SIZE;
 use crate::types::market_details::{
-    MarketRiskDetailsTarget, PublicMarketDetailsTarget, PublicMarketDetailsWitness,
+    MarketRiskDetailsTarget, PublicMarketDetails, PublicMarketDetailsTarget,
+    PublicMarketDetailsWitness,
     all_public_market_details_hash,
 };
+use crate::types::state_metadata::STATE_METADATA_SIZE;
 use crate::uint::u8::U8Target;
 use crate::utils::CircuitBuilderUtils;
 
@@ -109,6 +115,43 @@ pub struct BlockTarget {
     // Private witness: raw public market details after the block.
     #[serde_as(as = "[_; POSITION_LIST_SIZE]")]
     pub new_market_risk_details_partial: [MarketRiskDetailsTarget; POSITION_LIST_SIZE],
+}
+
+const BLOCK_PRE_EXEC_ROOTS_OFFSET: usize = STATE_METADATA_SIZE
+    + POSITION_LIST_SIZE * PublicMarketDetails::PARTIAL_PUBLIC_INPUTS_SIZE
+    + MARGINED_ASSET_LIST_SIZE * MARGINED_ASSET_SIZE;
+const BLOCK_PRE_EXEC_PUBLIC_INPUTS_SIZE: usize = BLOCK_PRE_EXEC_ROOTS_OFFSET + 14;
+
+/// The only pre-execution public-input targets consumed by the final block circuit.
+/// Recursive verification still binds every public input; this only avoids
+/// materializing unused host-side wrapper objects around existing targets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BlockPreExecLinkTargets {
+    old_state_root: HashOutTarget,
+    new_state_root: HashOutTarget,
+    block_number: Target,
+    created_at: Target,
+}
+
+impl BlockPreExecLinkTargets {
+    fn from_public_inputs(pis: &[Target]) -> Self {
+        assert_eq!(pis.len(), BLOCK_PRE_EXEC_PUBLIC_INPUTS_SIZE);
+
+        Self {
+            old_state_root: HashOutTarget {
+                elements: pis[BLOCK_PRE_EXEC_ROOTS_OFFSET..BLOCK_PRE_EXEC_ROOTS_OFFSET + 4]
+                    .try_into()
+                    .expect("old state root must contain four targets"),
+            },
+            new_state_root: HashOutTarget {
+                elements: pis[BLOCK_PRE_EXEC_ROOTS_OFFSET + 4..BLOCK_PRE_EXEC_ROOTS_OFFSET + 8]
+                    .try_into()
+                    .expect("new state root must contain four targets"),
+            },
+            block_number: pis[BLOCK_PRE_EXEC_ROOTS_OFFSET + 12],
+            created_at: pis[BLOCK_PRE_EXEC_ROOTS_OFFSET + 13],
+        }
+    }
 }
 
 impl BlockCircuit {
@@ -316,7 +359,7 @@ impl BlockCircuit {
         block_light_tx_chain_circuit: &CircuitData<F, C, D>,
         block_heavy_tx_chain_circuit: &CircuitData<F, C, D>,
     ) -> (
-        BlockPreExecWitnessTarget,
+        BlockPreExecLinkTargets,
         BlockTxChainWitnessTarget,
         BlockTxChainWitnessTarget,
     ) {
@@ -369,7 +412,7 @@ impl BlockCircuit {
         );
 
         // Extract pre-exec and tx chain witnesses from the proofs
-        let pre_exec_witness = BlockPreExecWitnessTarget::from_public_inputs(
+        let pre_exec_witness = BlockPreExecLinkTargets::from_public_inputs(
             &self.target.pre_exec_proof.public_inputs,
         );
         let (light_tx_chain_witness, _) = BlockTxChainWitnessTarget::from_public_inputs(
@@ -392,7 +435,7 @@ impl BlockCircuit {
 
     fn perform_sanity_checks(
         &mut self,
-        pre_exec_witness: &BlockPreExecWitnessTarget,
+        pre_exec_witness: &BlockPreExecLinkTargets,
         light_tx_chain_witness: &BlockTxChainWitnessTarget,
         heavy_tx_chain_witness: &BlockTxChainWitnessTarget,
     ) {
@@ -869,5 +912,72 @@ impl Circuit<C, F, D> for BlockCircuit {
         timing.print();
 
         Ok(compressed_proof)
+    }
+}
+
+#[cfg(test)]
+mod pre_exec_link_projection_tests {
+    use super::*;
+
+    fn indexed_targets(len: usize) -> Vec<Target> {
+        (0..len)
+            .map(|index| Target::VirtualTarget { index })
+            .collect()
+    }
+
+    #[test]
+    fn narrow_projection_matches_legacy_consumed_targets() {
+        let public_inputs = indexed_targets(BLOCK_PRE_EXEC_PUBLIC_INPUTS_SIZE);
+        let narrow = BlockPreExecLinkTargets::from_public_inputs(&public_inputs);
+        let legacy = BlockPreExecWitnessTarget::from_public_inputs(&public_inputs);
+
+        assert_eq!(narrow.old_state_root, legacy.old_state_root);
+        assert_eq!(narrow.new_state_root, legacy.new_state_root);
+        assert_eq!(narrow.block_number, legacy.block_number);
+        assert_eq!(narrow.created_at, legacy.created_at);
+
+        let narrow_targets = [
+            narrow.old_state_root.elements[0],
+            narrow.old_state_root.elements[1],
+            narrow.old_state_root.elements[2],
+            narrow.old_state_root.elements[3],
+            narrow.new_state_root.elements[0],
+            narrow.new_state_root.elements[1],
+            narrow.new_state_root.elements[2],
+            narrow.new_state_root.elements[3],
+            narrow.block_number,
+            narrow.created_at,
+        ];
+        assert_eq!(
+            narrow_targets,
+            [
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 1],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 2],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 3],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 4],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 5],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 6],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 7],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 12],
+                public_inputs[BLOCK_PRE_EXEC_ROOTS_OFFSET + 13],
+            ]
+        );
+    }
+
+    #[test]
+    fn narrow_projection_rejects_wrong_public_input_shape() {
+        for len in [
+            BLOCK_PRE_EXEC_PUBLIC_INPUTS_SIZE - 1,
+            BLOCK_PRE_EXEC_PUBLIC_INPUTS_SIZE + 1,
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    BlockPreExecLinkTargets::from_public_inputs(&indexed_targets(len));
+                })
+                .is_err(),
+                "unexpectedly accepted {len} pre-execution public inputs"
+            );
+        }
     }
 }
