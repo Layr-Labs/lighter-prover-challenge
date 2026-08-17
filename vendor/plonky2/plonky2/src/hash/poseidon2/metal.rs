@@ -4224,9 +4224,13 @@ fn dispatch2d(
     height: usize,
 ) {
     let execution_width = pipeline.thread_execution_width();
+    // 128 matches the 1-D `dispatch` clamp above. The NTT/IFFT/LDE kernels
+    // this routes read only thread_position_in_grid — no threadgroup memory,
+    // barriers, simdgroup ops, or atomics — so threadgroup width is pure
+    // scheduling and cannot change any computed value.
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
