@@ -1,4 +1,4 @@
-// Redraw marker 628
+// Redraw marker sonnet-poseidon2-mulacc-v5-r2
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
