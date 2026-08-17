@@ -481,7 +481,7 @@ where
             common_data
         )
     );
-    challenger.observe_openings(&openings.to_fri_openings());
+    openings.observe_fri_openings(&mut challenger);
     let instance = common_data.get_fri_instance(zeta);
 
     let opening_proof = timed!(

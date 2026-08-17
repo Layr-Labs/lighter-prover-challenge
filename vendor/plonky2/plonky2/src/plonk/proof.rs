@@ -23,6 +23,7 @@ use crate::fri::structure::{
 use crate::fri::FriParams;
 use crate::hash::hash_types::{MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
+use crate::iop::challenger::Challenger;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::Target;
 use crate::plonk::circuit_data::{CommonCircuitData, VerifierOnlyCircuitData};
@@ -522,6 +523,38 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .to_vec(),
         }
     }
+
+    /// Absorbs the FRI opening batches in transcript order without first
+    /// flattening this structured opening set into temporary owned vectors.
+    ///
+    /// [`Self::to_fri_openings`] must remain available for consumers that need
+    /// an owned [`FriOpenings`], but the prover only observes the values and
+    /// discards that representation immediately. Walking the final field
+    /// slices removes both batch-value allocations, their full copy passes,
+    /// and the outer batch allocation from every proof. The slice order below
+    /// is deliberately identical to `to_fri_openings`, so the challenger sees
+    /// exactly the same base-field limbs in exactly the same order.
+    pub(crate) fn observe_fri_openings<H: Hasher<F>>(&self, challenger: &mut Challenger<F, H>) {
+        for values in [
+            self.constants.as_slice(),
+            self.plonk_sigmas.as_slice(),
+            self.wires.as_slice(),
+            self.plonk_zs.as_slice(),
+            self.partial_products.as_slice(),
+            self.quotient_polys.as_slice(),
+        ] {
+            challenger.observe_extension_elements(values);
+        }
+        let has_lookup = !self.lookup_zs.is_empty();
+        if has_lookup {
+            challenger.observe_extension_elements(&self.lookup_zs);
+        }
+        challenger.observe_extension_elements(&self.plonk_zs_next);
+        if has_lookup {
+            challenger.observe_extension_elements(&self.lookup_zs_next);
+        }
+    }
+
     pub(crate) fn to_fri_openings(&self) -> FriOpenings<F, D> {
         let has_lookup = !self.lookup_zs.is_empty();
         let zeta_batch = if has_lookup {
@@ -643,6 +676,71 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    fn sample_opening_set(
+        with_lookup: bool,
+    ) -> OpeningSet<plonky2_field::goldilocks_field::GoldilocksField, 2> {
+        type F = plonky2_field::goldilocks_field::GoldilocksField;
+        type EF = <F as Extendable<2>>::Extension;
+
+        let mut next = 1u64;
+        let mut values = |len: usize| {
+            (0..len)
+                .map(|_| {
+                    let value =
+                        <EF as crate::field::extension::FieldExtension<2>>::from_basefield(
+                            F::from_canonical_u64(next),
+                        );
+                    next += 1;
+                    value
+                })
+                .collect()
+        };
+        OpeningSet {
+            constants: values(2),
+            plonk_sigmas: values(3),
+            wires: values(4),
+            plonk_zs: values(2),
+            plonk_zs_next: values(2),
+            partial_products: values(3),
+            quotient_polys: values(4),
+            lookup_zs: if with_lookup { values(2) } else { Vec::new() },
+            lookup_zs_next: if with_lookup { values(2) } else { Vec::new() },
+        }
+    }
+
+    fn assert_direct_opening_observation_matches_materialized(with_lookup: bool) {
+        const D: usize = 2;
+        type C = crate::plonk::config::Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let openings = sample_opening_set(with_lookup);
+        let mut materialized = Challenger::<F, H>::new();
+        materialized.observe_openings(&openings.to_fri_openings());
+        let mut direct = Challenger::<F, H>::new();
+        openings.observe_fri_openings(&mut direct);
+
+        // Compare more than one sponge rate so equality covers the buffered
+        // tail as well as all duplexed transcript state.
+        for draw in 0..24 {
+            assert_eq!(
+                direct.get_challenge(),
+                materialized.get_challenge(),
+                "opening transcript diverged at draw {draw}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_opening_observation_matches_materialized_without_lookups() {
+        assert_direct_opening_observation_matches_materialized(false);
+    }
+
+    #[test]
+    fn direct_opening_observation_matches_materialized_with_lookups() {
+        assert_direct_opening_observation_matches_materialized(true);
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {
