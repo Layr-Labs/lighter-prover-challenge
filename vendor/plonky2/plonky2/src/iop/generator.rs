@@ -178,12 +178,15 @@ fn run_generator_worklist<
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
-                Vec<(Target, F, Option<&[u32]>)>,
+                Vec<(Target, F, usize, Option<&[u32]>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
                     let mut entries = Vec::with_capacity(chunk.len());
-                    let mut annotated_values = Vec::new();
+                    // Same capacity discipline as `entries`: at least one value per
+                    // generator, so the geometric doubling chain starts past its
+                    // first few reallocations instead of from zero.
+                    let mut annotated_values = Vec::with_capacity(chunk.len());
                     let mut round_buffer = GeneratedValues::empty();
                     for &generator_idx in chunk {
                         if round_generator_is_expired[generator_idx] {
@@ -210,7 +213,7 @@ fn run_generator_worklist<
                                 // cannot newly populate it and never needs watchers.
                                 None
                             };
-                            annotated_values.push((t, v, watchers));
+                            annotated_values.push((t, v, rep_index, watchers));
                         }
                     }
                     (entries, annotated_values)
@@ -227,8 +230,25 @@ fn run_generator_worklist<
                         *remaining_generators -= 1;
                     }
 
-                    for (t, v, watchers) in annotated_values.by_ref().take(value_count) {
-                        if witness.set_target_returning_rep(t, v)?.is_none() {
+                    for (t, v, rep_index, watchers) in annotated_values.by_ref().take(value_count) {
+                        // Reuse the representative the run phase already gathered
+                        // instead of gathering it again. `round_witness` above is an
+                        // immutable reborrow of this very `witness`, and
+                        // `representative_map` is an immutable `&[u32]` for the
+                        // witness's whole lifetime, so the index is by construction
+                        // the one `set_target_returning_rep` would have looked up.
+                        // `set_rep_index_returning_new` is documented as running the
+                        // identical sequence on the identical slot from that point on,
+                        // so the resulting witness is bit-for-bit unchanged. What goes
+                        // away is a second scattered 4-byte read out of a table of
+                        // `num_wires * degree` entries — one per generated value, on
+                        // the order of 10^6 per proof — and it is a read that misses
+                        // twice, because the whole round's outputs are collected
+                        // between the two lookups.
+                        if witness
+                            .set_rep_index_returning_new(rep_index, t, v)?
+                            .is_none()
+                        {
                             continue;
                         }
                         if let Some(watchers) = watchers {
