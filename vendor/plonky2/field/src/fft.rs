@@ -1019,6 +1019,47 @@ fn fft_classic_simd_single_layer_neon_w4(
 /// run as two-lane vector adds/subs reproducing `impl Add/Sub for
 /// GoldilocksField` word for word. Same blocks, same pairing, same twiddles,
 /// same order as the generic body.
+/// Cached `omega_row` "all imag parts are 0" test for the quadratic-extension
+/// neon layer. The scan is O(half) and runs on every layer of every extension
+/// FFT; root tables are process-cached `Arc`s, so the pointer+len key is
+/// stable. Same boolean as the old full-row scan, so the butterfly path is
+/// unchanged (bit-identical).
+#[cfg(target_arch = "aarch64")]
+fn ext_omega_row_is_base_subfield(
+    omega_row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+) -> bool {
+    #[cfg(feature = "std")]
+    {
+        std::thread_local! {
+            static CACHE: std::cell::RefCell<Vec<(*const u8, usize, bool)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let key = (omega_row.as_ptr() as *const u8, omega_row.len());
+        let hit = CACHE.with(|cache| {
+            cache
+                .borrow()
+                .iter()
+                .find(|&&(p, n, _)| p == key.0 && n == key.1)
+                .map(|&(_, _, v)| v)
+        });
+        if let Some(v) = hit {
+            return v;
+        }
+        let v = omega_row.iter().all(|w| w.0[1].0 == 0);
+        CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if cache.len() < 128 {
+                cache.push((key.0, key.1, v));
+            }
+        });
+        return v;
+    }
+    #[cfg(not(feature = "std"))]
+    omega_row.iter().all(|w| w.0[1].0 == 0)
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fft_classic_simd_single_layer_neon_ext(
@@ -1040,9 +1081,7 @@ fn fft_classic_simd_single_layer_neon_ext(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    let base_subfield = ext_omega_row_is_base_subfield(omega_row);
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
