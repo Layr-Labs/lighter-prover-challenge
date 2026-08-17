@@ -111,7 +111,17 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // 500-active-tx ranked fixture, so a window-depth effect is structurally
 // understated locally. Per the file's own guidance the ranked draw, not the
 // local number, settles it.
-const LIGHT_TX_PROOF_WINDOW: usize = 6;
+// Ranked sweep result: window 5 drew 29.1421309958896 tx/s (submission
+// 2f036f38, rejected) against the frontier's window-6 draw of 31.1267 — the
+// shallow-depth hypothesis is not supported by the ranked draw, so restore
+// the frontier depth and re-sample the frontier tree's own distribution.
+// Depth-7 probe: the ranked depth curve is 5 -> 29.14, 6 -> 31.1267, and 8
+// collapses (~9.5 GiB allocator churn), so 7 is the single untested interior
+// point. The scored harness runs workers strictly sequentially (quiet host),
+// the regime where depth 6 beats 4 by ~4.6%; one more concurrent light proof
+// lands mid-way to the churn cliff (~8.6-9.0 GiB projected, under the 9.5 GiB
+// collapse). One-variable ranked probe; the frontier's own tree otherwise.
+const LIGHT_TX_PROOF_WINDOW: usize = 7;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
