@@ -8,6 +8,8 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
@@ -184,6 +186,223 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+}
+
+/// Grow or shrink `out` to `len` without a zero fill. The column evaluator
+/// writes every `term_rows` slot before the Horner read. `F` is a plain
+/// field wrapper.
+fn resize_overwritten<F: Field>(out: &mut Vec<F>, len: usize) {
+    if out.len() == len {
+        return;
+    }
+    if out.capacity() < len {
+        out.reserve(len - out.len());
+    }
+    // SAFETY: callers write every slot before any read.
+    unsafe {
+        out.set_len(len);
+    }
+}
+
+/// `out[k] = l0[k] * (z[k] - 1)`, packed. Bit-identical to the scalar loop.
+fn packed_mul_sub_one<F: Packable>(l0: &[F], z: &[F], out: &mut [F]) {
+    debug_assert_eq!(l0.len(), z.len());
+    debug_assert_eq!(l0.len(), out.len());
+    let width = F::Packing::WIDTH;
+    let n = l0.len();
+    let mut off = 0;
+    while off + width <= n {
+        let l = *F::Packing::from_slice(&l0[off..off + width]);
+        let zv = *F::Packing::from_slice(&z[off..off + width]);
+        out[off..off + width].copy_from_slice((l * (zv - F::Packing::ONES)).as_slice());
+        off += width;
+    }
+    for k in off..n {
+        out[k] = l0[k] * (z[k] - F::ONE);
+    }
+}
+
+/// `out[k] = prev[k] * num[k] - next[k] * den[k]`, packed. Bit-identical
+/// to the scalar partial-product row.
+fn packed_mul_sub_mul<F: Packable>(
+    prev: &[F],
+    num: &[F],
+    next: &[F],
+    den: &[F],
+    out: &mut [F],
+) {
+    debug_assert_eq!(prev.len(), num.len());
+    debug_assert_eq!(prev.len(), next.len());
+    debug_assert_eq!(prev.len(), den.len());
+    debug_assert_eq!(prev.len(), out.len());
+    let width = F::Packing::WIDTH;
+    let n = prev.len();
+    let mut off = 0;
+    while off + width <= n {
+        let p = *F::Packing::from_slice(&prev[off..off + width]);
+        let nu = *F::Packing::from_slice(&num[off..off + width]);
+        let nx = *F::Packing::from_slice(&next[off..off + width]);
+        let d = *F::Packing::from_slice(&den[off..off + width]);
+        out[off..off + width].copy_from_slice((p * nu - nx * d).as_slice());
+        off += width;
+    }
+    for k in off..n {
+        out[k] = prev[k] * num[k] - next[k] * den[k];
+    }
+}
+
+/// `out[k] = wire[k] + beta * point[k] + gamma`, packed. Bit-identical to
+/// [`permutation_factor_fma`].
+fn packed_perm_fma<F: Packable>(
+    wire: &[F],
+    beta: F,
+    point: &[F],
+    gamma: F,
+    out: &mut [F],
+) {
+    debug_assert_eq!(wire.len(), point.len());
+    debug_assert_eq!(wire.len(), out.len());
+    let width = F::Packing::WIDTH;
+    let n = wire.len();
+    let mut off = 0;
+    while off + width <= n {
+        let w = *F::Packing::from_slice(&wire[off..off + width]);
+        let p = *F::Packing::from_slice(&point[off..off + width]);
+        out[off..off + width].copy_from_slice((w + p * beta + gamma).as_slice());
+        off += width;
+    }
+    for k in off..n {
+        out[k] = permutation_factor_fma(wire[k], beta, point[k], gamma);
+    }
+}
+
+/// `acc[k] *= wire[k] + beta * point[k] + gamma`, packed.
+fn packed_perm_fma_mul<F: Packable>(
+    acc: &mut [F],
+    wire: &[F],
+    beta: F,
+    point: &[F],
+    gamma: F,
+) {
+    debug_assert_eq!(acc.len(), wire.len());
+    debug_assert_eq!(acc.len(), point.len());
+    let width = F::Packing::WIDTH;
+    let n = acc.len();
+    let mut off = 0;
+    while off + width <= n {
+        let a = *F::Packing::from_slice(&acc[off..off + width]);
+        let w = *F::Packing::from_slice(&wire[off..off + width]);
+        let p = *F::Packing::from_slice(&point[off..off + width]);
+        acc[off..off + width].copy_from_slice((a * (w + p * beta + gamma)).as_slice());
+        off += width;
+    }
+    for k in off..n {
+        acc[k] *= permutation_factor_fma(wire[k], beta, point[k], gamma);
+    }
+}
+
+/// `acc[k] = row[k] + acc[k] * alpha`, packed. Bit-identical to
+/// `row[k].multiply_accumulate(acc[k], alpha)` on aarch64 Goldilocks
+/// (fused `mul_acc_reduce` / `mul_acc_reduce_pair`).
+fn packed_horner_mac<F: Field + Packable>(row: &[F], acc: &mut [F], alpha: F) {
+    debug_assert_eq!(row.len(), acc.len());
+    let width = F::Packing::WIDTH;
+    let n = row.len();
+    let alpha_p = F::Packing::from(alpha);
+    let mut off = 0;
+    while off + width <= n {
+        let r = *F::Packing::from_slice(&row[off..off + width]);
+        let a = *F::Packing::from_slice(&acc[off..off + width]);
+        acc[off..off + width]
+            .copy_from_slice(PackedField::multiply_accumulate(&r, a, alpha_p).as_slice());
+        off += width;
+    }
+    for k in off..n {
+        acc[k] = Field::multiply_accumulate(&row[k], acc[k], alpha);
+    }
+}
+
+/// `acc[k] = z1_0[k] + z1_1[k] * alpha + acc[k] * scale`, packed.
+/// Same association as the Metal-offload L0 combine.
+fn packed_offload_combine<F: Field + Packable>(
+    z1_0: &[F],
+    z1_1: &[F],
+    alpha: F,
+    scale: F,
+    acc: &mut [F],
+) {
+    debug_assert_eq!(z1_0.len(), acc.len());
+    debug_assert_eq!(z1_1.len(), acc.len());
+    let width = F::Packing::WIDTH;
+    let n = acc.len();
+    let alpha_p = F::Packing::from(alpha);
+    let scale_p = F::Packing::from(scale);
+    let mut off = 0;
+    while off + width <= n {
+        let a0 = *F::Packing::from_slice(&z1_0[off..off + width]);
+        let a1 = *F::Packing::from_slice(&z1_1[off..off + width]);
+        let g = *F::Packing::from_slice(&acc[off..off + width]);
+        acc[off..off + width].copy_from_slice((a0 + a1 * alpha_p + g * scale_p).as_slice());
+        off += width;
+    }
+    for k in off..n {
+        acc[k] = z1_0[k] + z1_1[k] * alpha + acc[k] * scale;
+    }
+}
+
+/// `even[j] = src[j*2]`, `odd[j] = src[j*2+1]`. Packed over consecutive
+/// C=2 points: each `Packing` group holds `WIDTH/2` pairs. Tail scalar.
+/// Bit-identical to the scalar deinterleave on the Metal-offload path.
+fn packed_deinterleave_c2<F: Field + Packable>(src: &[F], even: &mut [F], odd: &mut [F]) {
+    debug_assert_eq!(src.len(), even.len() * 2);
+    debug_assert_eq!(even.len(), odd.len());
+    let n = even.len();
+    let width = F::Packing::WIDTH;
+    let mut pts = 0;
+    if width >= 2 && width % 2 == 0 {
+        let pts_per = width / 2;
+        while pts + pts_per <= n {
+            let s = *F::Packing::from_slice(&src[pts * 2..pts * 2 + width]);
+            let sl = s.as_slice();
+            for i in 0..pts_per {
+                even[pts + i] = sl[i * 2];
+                odd[pts + i] = sl[i * 2 + 1];
+            }
+            pts += pts_per;
+        }
+    }
+    for j in pts..n {
+        even[j] = src[j * 2];
+        odd[j] = src[j * 2 + 1];
+    }
+}
+
+/// Inverse of [`packed_deinterleave_c2`]. Packed store of `WIDTH/2` pairs.
+fn packed_interleave_c2<F: Field + Packable>(even: &[F], odd: &[F], dest: &mut [F]) {
+    debug_assert_eq!(even.len(), odd.len());
+    debug_assert_eq!(dest.len(), even.len() * 2);
+    let n = even.len();
+    let width = F::Packing::WIDTH;
+    let mut pts = 0;
+    if width >= 2 && width % 2 == 0 {
+        let pts_per = width / 2;
+        while pts + pts_per <= n {
+            let mut packed = F::Packing::ZEROS;
+            {
+                let lanes = packed.as_slice_mut();
+                for i in 0..pts_per {
+                    lanes[i * 2] = even[pts + i];
+                    lanes[i * 2 + 1] = odd[pts + i];
+                }
+            }
+            dest[pts * 2..pts * 2 + width].copy_from_slice(packed.as_slice());
+            pts += pts_per;
+        }
+    }
+    for j in pts..n {
+        dest[j * 2] = even[j];
+        dest[j * 2 + 1] = odd[j];
+    }
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -675,18 +894,78 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // partial-product traversal from the CPU without moving a transcript
         // barrier or changing an alpha exponent.
         assert_eq!(permutation_gate_scales.len(), num_challenges);
-        for k in 0..n {
-            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-            let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-            let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
-            let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-            for ((&alpha, &gate_scale), value) in alphas
+        // Metal perm offload is C=2 only (`start_gpu_permutation_quotient`).
+        // Port the Cols L0 table-run + packed Z1 onto this early-return,
+        // then packed-combine the already-reduced gate Horner. The Cols
+        // CPU walk below is skipped whenever this job started.
+        if num_challenges == 2 && n > 0 {
+            debug_assert!(indices_batch
                 .iter()
-                .zip(permutation_gate_scales)
-                .zip(point.iter_mut())
-            {
-                let gate_terms = *value * gate_scale;
-                *value = z1_0 + z1_1 * alpha + gate_terms;
+                .enumerate()
+                .all(|(k, &i)| i == indices_batch[0] + k));
+            scratch.vanishing_z_1_terms.resize(n, F::ZERO);
+            z_h_on_coset.eval_l_0_into(
+                indices_batch[0],
+                xs_batch,
+                &mut scratch.vanishing_z_1_terms,
+            );
+            scratch.numerator_values.resize(n, F::ZERO);
+            scratch.numerator_values_second.resize(n, F::ZERO);
+            packed_mul_sub_one(
+                &scratch.vanishing_z_1_terms,
+                &zs_partial_products_cols[..n],
+                &mut scratch.numerator_values,
+            );
+            packed_mul_sub_one(
+                &scratch.vanishing_z_1_terms,
+                &zs_partial_products_cols[n..2 * n],
+                &mut scratch.numerator_values_second,
+            );
+            scratch.denominator_values.resize(n, F::ZERO);
+            scratch.denominator_values_second.resize(n, F::ZERO);
+            packed_deinterleave_c2(
+                res_out,
+                &mut scratch.denominator_values,
+                &mut scratch.denominator_values_second,
+            );
+            packed_offload_combine(
+                &scratch.numerator_values,
+                &scratch.numerator_values_second,
+                alphas[0],
+                permutation_gate_scales[0],
+                &mut scratch.denominator_values,
+            );
+            packed_offload_combine(
+                &scratch.numerator_values,
+                &scratch.numerator_values_second,
+                alphas[1],
+                permutation_gate_scales[1],
+                &mut scratch.denominator_values_second,
+            );
+            packed_interleave_c2(
+                &scratch.denominator_values,
+                &scratch.denominator_values_second,
+                res_out,
+            );
+            scratch.vanishing_z_1_terms.clear();
+            scratch.numerator_values.clear();
+            scratch.numerator_values_second.clear();
+            scratch.denominator_values.clear();
+            scratch.denominator_values_second.clear();
+        } else {
+            for k in 0..n {
+                let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
+                let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
+                let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
+                let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                for ((&alpha, &gate_scale), value) in alphas
+                    .iter()
+                    .zip(permutation_gate_scales)
+                    .zip(point.iter_mut())
+                {
+                    let gate_terms = *value * gate_scale;
+                    *value = z1_0 + z1_1 * alpha + gate_terms;
+                }
             }
         }
         return;
@@ -744,18 +1023,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         let num_rows = num_challenges * (1 + num_chunks);
 
         let term_rows = &mut scratch.vanishing_partial_products_terms;
-        if term_rows.len() != num_rows * n {
-            term_rows.resize(num_rows * n, F::ZERO);
-        }
+        resize_overwritten(term_rows, num_rows * n);
 
         let l_0_xs = &mut scratch.vanishing_z_1_terms;
-        l_0_xs.clear();
-        l_0_xs.extend(
-            indices_batch
+        l_0_xs.resize(n, F::ZERO);
+        if n > 0 {
+            debug_assert!(indices_batch
                 .iter()
-                .zip(xs_batch)
-                .map(|(&index, &x)| z_h_on_coset.eval_l_0(index, x)),
-        );
+                .enumerate()
+                .all(|(k, &i)| i == indices_batch[0] + k));
+            z_h_on_coset.eval_l_0_into(indices_batch[0], xs_batch, l_0_xs);
+        }
 
         let num_prod = &mut scratch.numerator_values;
         let den_prod = &mut scratch.denominator_values;
@@ -782,9 +1060,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         for i in 0..num_challenges {
             let z_col = acc_col(i, 0);
             let z1_row = &mut term_rows[i * n..][..n];
-            for k in 0..n {
-                z1_row[k] = l_0_xs[k] * z_col[k].sub_one();
-            }
+            packed_mul_sub_one(l_0_xs, z_col, z1_row);
         }
 
         if num_challenges == 2 {
@@ -801,39 +1077,29 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
 
-                num_prod.clear();
-                den_prod.clear();
-                num_prod_second.clear();
-                den_prod_second.clear();
+                num_prod.resize(n, F::ZERO);
+                den_prod.resize(n, F::ZERO);
+                num_prod_second.resize(n, F::ZERO);
+                den_prod_second.resize(n, F::ZERO);
                 {
                     let wire_col = &wires[j_start * n..][..n];
                     let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                     let beta_k_0 = beta_k_is[j_start];
                     let beta_k_1 = beta_k_is[num_routed_wires + j_start];
-                    for k in 0..n {
-                        let wire = wire_col[k];
-                        let sigma = sigma_col[k];
-                        let x = xs_batch[k];
-                        num_prod.push(permutation_factor_fma(wire, beta_k_0, x, gamma_0));
-                        den_prod.push(permutation_factor_fma(wire, beta_0, sigma, gamma_0));
-                        num_prod_second.push(permutation_factor_fma(wire, beta_k_1, x, gamma_1));
-                        den_prod_second.push(permutation_factor_fma(wire, beta_1, sigma, gamma_1));
-                    }
+                    packed_perm_fma(wire_col, beta_k_0, xs_batch, gamma_0, num_prod);
+                    packed_perm_fma(wire_col, beta_0, sigma_col, gamma_0, den_prod);
+                    packed_perm_fma(wire_col, beta_k_1, xs_batch, gamma_1, num_prod_second);
+                    packed_perm_fma(wire_col, beta_1, sigma_col, gamma_1, den_prod_second);
                 }
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
                     let sigma_col = &s_sigmas_cols[j * n..][..n];
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
-                    for k in 0..n {
-                        let wire = wire_col[k];
-                        let sigma = sigma_col[k];
-                        let x = xs_batch[k];
-                        num_prod[k] *= permutation_factor_fma(wire, beta_k_0, x, gamma_0);
-                        den_prod[k] *= permutation_factor_fma(wire, beta_0, sigma, gamma_0);
-                        num_prod_second[k] *= permutation_factor_fma(wire, beta_k_1, x, gamma_1);
-                        den_prod_second[k] *= permutation_factor_fma(wire, beta_1, sigma, gamma_1);
-                    }
+                    packed_perm_fma_mul(num_prod, wire_col, beta_k_0, xs_batch, gamma_0);
+                    packed_perm_fma_mul(den_prod, wire_col, beta_0, sigma_col, gamma_0);
+                    packed_perm_fma_mul(num_prod_second, wire_col, beta_k_1, xs_batch, gamma_1);
+                    packed_perm_fma_mul(den_prod_second, wire_col, beta_1, sigma_col, gamma_1);
                 }
 
                 let row_0 = (num_challenges + c) * n;
@@ -845,11 +1111,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 let next_0 = acc_col(0, c + 1);
                 let prev_1 = acc_col(1, c);
                 let next_1 = acc_col(1, c + 1);
-                for k in 0..n {
-                    row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
-                    row_1[k] = prev_1[k] * num_prod_second[k]
-                        - next_1[k] * den_prod_second[k];
-                }
+                packed_mul_sub_mul(prev_0, num_prod, next_0, den_prod, row_0);
+                packed_mul_sub_mul(
+                    prev_1,
+                    num_prod_second,
+                    next_1,
+                    den_prod_second,
+                    row_1,
+                );
             }
         } else {
             for i in 0..num_challenges {
@@ -887,20 +1156,42 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         &mut term_rows[(num_challenges + i * num_chunks + c) * n..][..n];
                     let prev_col = acc_col(i, c);
                     let next_col = acc_col(i, c + 1);
-                    for k in 0..n {
-                        row[k] = prev_col[k] * num_prod[k] - next_col[k] * den_prod[k];
-                    }
+                    packed_mul_sub_mul(prev_col, num_prod, next_col, den_prod, row);
                 }
             }
         }
 
         // Same reversed-order Horner reduction as the per-point loop.
-        for t in (0..num_rows).rev() {
-            let row = &term_rows[t * n..][..n];
+        // Production is two challenges; `res_out` is point-major interleaved.
+        // Split once into contiguous challenge banks, packed-MAC each row,
+        // then write back. Gate Horner (`reduce_gate_constraints_base_batch`)
+        // stays scalar — that gather pack already lost on a healthy host.
+        if num_challenges == 2 {
+            let alpha_0 = alphas[0];
+            let alpha_1 = alphas[1];
+            num_prod.resize(n, F::ZERO);
+            num_prod_second.resize(n, F::ZERO);
             for k in 0..n {
-                let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-                for (c, &alpha) in res.iter_mut().zip(alphas) {
-                    *c = row[k].multiply_accumulate(*c, alpha);
+                num_prod[k] = res_out[k * 2];
+                num_prod_second[k] = res_out[k * 2 + 1];
+            }
+            for t in (0..num_rows).rev() {
+                let row = &term_rows[t * n..][..n];
+                packed_horner_mac(row, num_prod, alpha_0);
+                packed_horner_mac(row, num_prod_second, alpha_1);
+            }
+            for k in 0..n {
+                res_out[k * 2] = num_prod[k];
+                res_out[k * 2 + 1] = num_prod_second[k];
+            }
+        } else {
+            for t in (0..num_rows).rev() {
+                let row = &term_rows[t * n..][..n];
+                for k in 0..n {
+                    let res = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+                    for (c, &alpha) in res.iter_mut().zip(alphas) {
+                        *c = row[k].multiply_accumulate(*c, alpha);
+                    }
                 }
             }
         }
@@ -1831,7 +2122,7 @@ mod tests {
                 for constraint_row in terms.chunks_exact(batch_size).rev() {
                     let term = constraint_row[point];
                     for (result, &alpha) in point_result.iter_mut().zip(&alphas) {
-                        *result = term.multiply_accumulate(*result, alpha);
+                        *result = Field::multiply_accumulate(&term, *result, alpha);
                     }
                 }
             }
@@ -1839,6 +2130,70 @@ mod tests {
             let mut actual = initial;
             reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
             assert_eq!(actual, expected, "batch size {batch_size}");
+        }
+    }
+
+    #[test]
+    fn packed_horner_mac_matches_scalar_multiply_accumulate() {
+        type F = GoldilocksField;
+        for n in [1, 3, 4, 7, 31, 32] {
+            let row: Vec<F> = (0..n)
+                .map(|i| F::from_canonical_usize(i * 13 + 5))
+                .collect();
+            let mut packed: Vec<F> = (0..n)
+                .map(|i| F::from_canonical_usize(i * 17 + 2))
+                .collect();
+            let mut scalar = packed.clone();
+            let alpha = F::from_canonical_u64(7);
+            packed_horner_mac(&row, &mut packed, alpha);
+            for k in 0..n {
+                scalar[k] = Field::multiply_accumulate(&row[k], scalar[k], alpha);
+            }
+            assert_eq!(packed, scalar, "n={n}");
+        }
+    }
+
+    #[test]
+    fn packed_deinterleave_interleave_c2_roundtrip() {
+        type F = GoldilocksField;
+        for n in [1, 2, 3, 4, 7, 31, 32] {
+            let src: Vec<F> = (0..n * 2)
+                .map(|i| F::from_canonical_usize(i * 13 + 5))
+                .collect();
+            let mut even = vec![F::ZERO; n];
+            let mut odd = vec![F::ZERO; n];
+            packed_deinterleave_c2(&src, &mut even, &mut odd);
+            for j in 0..n {
+                assert_eq!(even[j], src[j * 2], "n={n} j={j} even");
+                assert_eq!(odd[j], src[j * 2 + 1], "n={n} j={j} odd");
+            }
+            let mut dest = vec![F::ZERO; n * 2];
+            packed_interleave_c2(&even, &odd, &mut dest);
+            assert_eq!(dest, src, "n={n} roundtrip");
+        }
+    }
+
+    #[test]
+    fn packed_offload_combine_matches_scalar() {
+        type F = GoldilocksField;
+        let alpha = F::from_canonical_u64(3);
+        let scale = F::from_canonical_u64(11);
+        for n in [1, 3, 4, 7, 31, 32] {
+            let z1_0: Vec<F> = (0..n)
+                .map(|i| F::from_canonical_usize(i * 5 + 1))
+                .collect();
+            let z1_1: Vec<F> = (0..n)
+                .map(|i| F::from_canonical_usize(i * 7 + 2))
+                .collect();
+            let mut packed: Vec<F> = (0..n)
+                .map(|i| F::from_canonical_usize(i * 9 + 4))
+                .collect();
+            let mut scalar = packed.clone();
+            packed_offload_combine(&z1_0, &z1_1, alpha, scale, &mut packed);
+            for k in 0..n {
+                scalar[k] = z1_0[k] + z1_1[k] * alpha + scalar[k] * scale;
+            }
+            assert_eq!(packed, scalar, "n={n}");
         }
     }
 
