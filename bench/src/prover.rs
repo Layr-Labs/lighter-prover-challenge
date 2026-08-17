@@ -10,7 +10,7 @@ use circuit::block_pre_execution::{BlockPreExec, BlockPreExecWitness};
 use circuit::block_pre_execution_constraints::{
     BlockPreExecutionCircuit, BlockPreExecutionTarget, Circuit as _,
 };
-use circuit::block_tx::{BlockTx, JumpState, JumpStateTarget};
+use circuit::block_tx::{BlockTx, BlockTxWitness, JumpState, JumpStateTarget};
 use circuit::block_tx_chain_constraints::{
     BlockTxChainCircuit, BlockTxChainTarget, cyclic_base_witness,
 };
@@ -19,7 +19,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget};
 use circuit::block_tx_constraints::Circuit as _;
 use circuit::tx::Tx;
 use circuit::types::config::{C, D, F};
-use circuit::types::constants::TX_LIGHT;
+use circuit::types::constants::{TX_LIGHT, TX_TYPE_EMPTY};
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{
     ParallelWitnessGuard, PartitionSeedLayout, PendingPartitionWitness, is_seed_layout_mismatch,
@@ -141,6 +141,24 @@ fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
         == TX_LIGHT
 }
 
+/// Whether every slot in every chunk is the same immutable empty-padding
+/// transaction. `Block::empty_tx_chunks` deliberately shares one `Arc` per
+/// path, so the pointer check identifies that construction without comparing
+/// the large `Tx`; any path containing an active transaction falls through.
+fn chunks_repeat_one_padding_transaction(chunks: &[(usize, Vec<Arc<Tx<F>>>)]) -> bool {
+    let Some((_, first_chunk)) = chunks.first() else {
+        return false;
+    };
+    let Some(first) = first_chunk.first() else {
+        return false;
+    };
+    chunks.len() > 1
+        && first.tx_type == TX_TYPE_EMPTY
+        && chunks.iter().all(|(_, txs)| {
+            txs.len() == first_chunk.len() && txs.iter().all(|tx| Arc::ptr_eq(tx, first))
+        })
+}
+
 fn final_chain_inputs<'a, T>(light: &'a T, heavy: &'a T) -> (&'a T, &'a T) {
     (light, heavy)
 }
@@ -243,6 +261,7 @@ fn mark_thread_utility() {
 fn mark_thread_utility() {}
 
 enum ChainState<'scope> {
+    #[cfg(test)]
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
 }
@@ -252,6 +271,7 @@ impl ChainState<'_> {
         #[cfg(feature = "diagnostic_profile")]
         let _wait = plonky2::util::profile::span("wait", "chain_predecessor_join");
         match self {
+            #[cfg(test)]
             ChainState::Ready(proof) => proof,
             ChainState::InFlight(handle) => handle
                 .join()
@@ -448,6 +468,44 @@ fn prove_tx_witness(
     proof
 }
 
+fn finish_path(path: TxPath, active_paths: &AtomicUsize, chain_proof: Proof) -> Proof {
+    // This path has produced its last proof. Retiring it here — after every
+    // scoped thread has joined — lets the sibling path observe that it is alone
+    // and claim the exclusive GPU phase.
+    active_paths.fetch_sub(1, Ordering::Release);
+    if path == TxPath::Heavy {
+        // The heavy path retires far ahead of the light path; use the slack
+        // to pre-fault the final block's wires column store (larger than the
+        // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
+        // run's most serial window). Detached: only populates a stash the
+        // block's allocation consults; a size miss falls through unchanged.
+        std::thread::Builder::new()
+            .name("block-store-prewarm".to_owned())
+            .spawn(|| {
+                // Page-walking ~2 GiB at default QoS competes with the light
+                // pipeline for P-cores; utility class prefers the E-cores,
+                // whose memory-bound fault service is nearly as fast.
+                mark_thread_utility();
+                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
+                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
+                // num_wires; a drift just misses the stash harmlessly.
+                const BLOCK_WIRES_STORE_BYTES: u64 =
+                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
+                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
+                // Same slack, same problem, different allocation: every streamed
+                // build before the final block is 2^19-leaf, so the streamed
+                // sponge's buffer pair is grown for the first time by the block
+                // itself (192 MiB state + ~128 MiB output) inside the exclusive
+                // serial tail. Pre-fault it here instead. Ordered after the
+                // wires store because that one is the larger fault set and the
+                // block reaches it first.
+                plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
+            })
+            .ok();
+    }
+    chain_proof
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prove_path(
     path: TxPath,
@@ -464,6 +522,7 @@ fn prove_path(
         !chunks.is_empty(),
         "{path:?} transaction path must contain at least one chunk"
     );
+    let repeated_padding = chunks_repeat_one_padding_transaction(&chunks);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
         match path {
@@ -551,6 +610,42 @@ fn prove_path(
     );
     jump = next_jump;
 
+    if repeated_padding {
+        // Every chunk represents the same no-op statement, including its old
+        // and new jump state. The final block circuit verifies the chain proof's
+        // state but does not consume its recursion-depth public input, so one
+        // valid recursive step has the same block-visible statement as all of
+        // the repeated padding steps. Paths containing an active transaction
+        // stay on the general pipeline below.
+        mark_thread_user_initiated();
+        let tx_proof = prove_tx_witness(path, current_chunk_index, tx_data, current_witness);
+        let tx_public = BlockTxWitness::from_public_inputs(&tx_proof.public_inputs);
+        assert_eq!(
+            tx_public.old_jump.to_vec(),
+            tx_public.new_jump.to_vec(),
+            "shared padding proof unexpectedly changes the jump state"
+        );
+
+        let exclusive = claims_exclusive_gpu_phase(active_paths);
+        if exclusive {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
+        }
+        plonky2::hash::poseidon2::spine_backlog_add(1);
+        let chain_proof = chain_step_proof(
+            path,
+            chain_target,
+            chain_data,
+            0,
+            None,
+            &base_proof,
+            dummy_proof,
+            &tx_proof,
+        );
+        if exclusive {
+            plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
+        }
+        return finish_path(path, active_paths, chain_proof);
+    }
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
@@ -748,41 +843,7 @@ fn prove_path(
         }
         chain_proof
     });
-    // This path has produced its last proof. Retiring it here — after the scope,
-    // so every thread it spawned has joined — is what lets the sibling path's
-    // drain observe that it is alone and claim the exclusive GPU phase.
-    active_paths.fetch_sub(1, Ordering::Release);
-    if path == TxPath::Heavy {
-        // The heavy path retires far ahead of the light path; use the slack
-        // to pre-fault the final block's wires column store (larger than the
-        // Metal pool cap, so otherwise freshly zero-faulted ~2 GiB inside the
-        // run's most serial window). Detached: only populates a stash the
-        // block's allocation consults; a size miss falls through unchanged.
-        std::thread::Builder::new()
-            .name("block-store-prewarm".to_owned())
-            .spawn(|| {
-                // Page-walking ~2 GiB at default QoS competes with the light
-                // pipeline for P-cores; utility class prefers the E-cores,
-                // whose memory-bound fault service is nearly as fast.
-                mark_thread_utility();
-                // Final block: 2^18 rows << 3 rate bits = 2^21 LDE rows, one
-                // u64 per wire column. Kept in sync with CIRCUIT_CONFIG's
-                // num_wires; a drift just misses the stash harmlessly.
-                const BLOCK_WIRES_STORE_BYTES: u64 =
-                    (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
-                plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
-                // Same slack, same problem, different allocation: every streamed
-                // build before the final block is 2^19-leaf, so the streamed
-                // sponge's buffer pair is grown for the first time by the block
-                // itself (192 MiB state + ~128 MiB output) inside the exclusive
-                // serial tail. Pre-fault it here instead. Ordered after the
-                // wires store because that one is the larger fault set and the
-                // block reaches it first.
-                plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
-            })
-            .ok();
-    }
-    chain_proof
+    finish_path(path, active_paths, chain_proof)
 }
 
 /// Proves the block pre-execution circuit. The startup-overlap path must NOT
