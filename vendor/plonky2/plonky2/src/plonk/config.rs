@@ -197,6 +197,8 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     fn try_build_merkle_tree_column_store_streamed(
         _columns: &crate::hash::merkle_tree::ColumnStore<F>,
         _cap_height: usize,
+        _coeff_columns: &[&[F]],
+        _rate_bits: usize,
         _fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
     ) -> Option<(
         crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,

@@ -8,6 +8,7 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
 use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
@@ -214,6 +215,11 @@ pub(crate) enum PermutationBatch<'a, F> {
         zs_next_cols: &'a [F],
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
         s_sigmas_cols: &'a [F],
+        /// Optional four product families laid out
+        /// `[family][chunk][point]`, filled while gathering the compact wire
+        /// and sigma columns. When present the evaluator consumes them instead
+        /// of traversing those columns a second time.
+        precomputed_products: Option<&'a [F]>,
     },
 }
 
@@ -587,6 +593,152 @@ fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
     wire.multiply_accumulate(beta, point) + gamma
 }
 
+#[inline]
+fn packed_permutation_products_enabled() -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !std::env::var_os("PLONKY2_PACKED_PERMUTATION_PRODUCTS")
+                .is_some_and(|value| value == "0")
+        })
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn accumulate_two_challenge_product_column_packed<F: Field + Packable>(
+    wire_col: &[F],
+    sigma_col: &[F],
+    xs: &[F],
+    num_routed_wires: usize,
+    j: usize,
+    beta_0: F,
+    beta_1: F,
+    gamma_0: F,
+    gamma_1: F,
+    beta_k_is: &[F],
+    first: bool,
+    num_prod: &mut [F],
+    den_prod: &mut [F],
+    num_prod_second: &mut [F],
+    den_prod_second: &mut [F],
+) {
+    type Packing<T> = <T as Packable>::Packing;
+    let n = wire_col.len();
+    let width = <Packing<F> as crate::field::packed::PackedField>::WIDTH;
+    debug_assert_eq!(n % width, 0);
+    debug_assert_eq!(sigma_col.len(), n);
+    debug_assert_eq!(xs.len(), n);
+    debug_assert_eq!(num_prod.len(), n);
+    debug_assert_eq!(den_prod.len(), n);
+    debug_assert_eq!(num_prod_second.len(), n);
+    debug_assert_eq!(den_prod_second.len(), n);
+
+    let beta_0_p = Packing::<F>::from(beta_0);
+    let beta_1_p = Packing::<F>::from(beta_1);
+    let beta_k_0_p = Packing::<F>::from(beta_k_is[j]);
+    let beta_k_1_p = Packing::<F>::from(beta_k_is[num_routed_wires + j]);
+    for k in (0..n).step_by(width) {
+            let wire = *<Packing<F> as crate::field::packed::PackedField>::from_slice(
+                &wire_col[k..k + width],
+            );
+            let sigma = *<Packing<F> as crate::field::packed::PackedField>::from_slice(
+                &sigma_col[k..k + width],
+            );
+            let x = *<Packing<F> as crate::field::packed::PackedField>::from_slice(
+                &xs[k..k + width],
+            );
+            let factors = [
+                <Packing<F> as crate::field::packed::PackedField>::multiply_accumulate(
+                    &wire, beta_k_0_p, x,
+                ) + gamma_0,
+                <Packing<F> as crate::field::packed::PackedField>::multiply_accumulate(
+                    &wire, beta_0_p, sigma,
+                ) + gamma_0,
+                <Packing<F> as crate::field::packed::PackedField>::multiply_accumulate(
+                    &wire, beta_k_1_p, x,
+                ) + gamma_1,
+                <Packing<F> as crate::field::packed::PackedField>::multiply_accumulate(
+                    &wire, beta_1_p, sigma,
+                ) + gamma_1,
+            ];
+            for (product, factor) in [
+                &mut *num_prod,
+                &mut *den_prod,
+                &mut *num_prod_second,
+                &mut *den_prod_second,
+            ]
+            .into_iter()
+            .zip(factors)
+            {
+                let destination = &mut product[k..k + width];
+                if first {
+                    destination.copy_from_slice(
+                        <Packing<F> as crate::field::packed::PackedField>::as_slice(&factor),
+                    );
+                } else {
+                    let accumulated =
+                        *<Packing<F> as crate::field::packed::PackedField>::from_slice(destination)
+                            * factor;
+                    destination.copy_from_slice(
+                        <Packing<F> as crate::field::packed::PackedField>::as_slice(&accumulated),
+                    );
+                }
+            }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_two_challenge_product_chunk_packed<F: Field + Packable>(
+    wires: &[F],
+    sigmas: &[F],
+    xs: &[F],
+    n: usize,
+    num_routed_wires: usize,
+    j_start: usize,
+    j_end: usize,
+    beta_0: F,
+    beta_1: F,
+    gamma_0: F,
+    gamma_1: F,
+    beta_k_is: &[F],
+    num_prod: &mut [F],
+    den_prod: &mut [F],
+    num_prod_second: &mut [F],
+    den_prod_second: &mut [F],
+) {
+    debug_assert_eq!(num_prod.len(), n);
+    debug_assert_eq!(den_prod.len(), n);
+    debug_assert_eq!(num_prod_second.len(), n);
+    debug_assert_eq!(den_prod_second.len(), n);
+
+    for j in j_start..j_end {
+        let wire_col = &wires[j * n..][..n];
+        let sigma_col = &sigmas[j * n..][..n];
+        accumulate_two_challenge_product_column_packed(
+            wire_col,
+            sigma_col,
+            xs,
+            num_routed_wires,
+            j,
+            beta_0,
+            beta_1,
+            gamma_0,
+            gamma_1,
+            beta_k_is,
+            j == j_start,
+            num_prod,
+            den_prod,
+            num_prod_second,
+            den_prod_second,
+        );
+    }
+}
+
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
@@ -721,6 +873,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         zs_partial_products_cols,
         zs_next_cols,
         s_sigmas_cols,
+        precomputed_products,
     } = perm
     {
         assert!(
@@ -732,12 +885,15 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             (num_prods + 1) * num_challenges * n
         );
         assert_eq!(zs_next_cols.len(), num_challenges * n);
-        assert_eq!(s_sigmas_cols.len(), num_routed_wires * n);
+        assert!(precomputed_products.is_some() || s_sigmas_cols.len() == num_routed_wires * n);
 
         let wires = vars_batch.local_wires;
         let chunk_size = max_degree;
         let num_chunks = num_routed_wires.div_ceil(chunk_size);
         debug_assert_eq!(num_chunks, num_prods + 1);
+        if let Some(products) = precomputed_products {
+            assert_eq!(products.len(), 4 * num_chunks * n);
+        }
         // The per-point loop chains ALL z_1 terms (i ascending) before ALL
         // partial-product terms (i-major, chunk-minor); the row layout must
         // match exactly so each term meets the same alpha power.
@@ -797,6 +953,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             let beta_1 = betas[1];
             let gamma_0 = gammas[0];
             let gamma_1 = gammas[1];
+            let packing_width =
+                <<F as Packable>::Packing as crate::field::packed::PackedField>::WIDTH;
+            let use_packed_products = packed_permutation_products_enabled()
+                && n % packing_width == 0;
             for c in 0..num_chunks {
                 let j_start = c * chunk_size;
                 let j_end = ((c + 1) * chunk_size).min(num_routed_wires);
@@ -805,7 +965,52 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 den_prod.clear();
                 num_prod_second.clear();
                 den_prod_second.clear();
-                {
+                let (
+                    num_prod_values,
+                    den_prod_values,
+                    num_prod_second_values,
+                    den_prod_second_values,
+                ): (&[F], &[F], &[F], &[F]) = if let Some(products) = precomputed_products {
+                    let family_chunk = |family: usize| {
+                        let start = (family * num_chunks + c) * n;
+                        &products[start..start + n]
+                    };
+                    (
+                        family_chunk(0),
+                        family_chunk(1),
+                        family_chunk(2),
+                        family_chunk(3),
+                    )
+                } else if use_packed_products {
+                    num_prod.resize(n, F::ZERO);
+                    den_prod.resize(n, F::ZERO);
+                    num_prod_second.resize(n, F::ZERO);
+                    den_prod_second.resize(n, F::ZERO);
+                    fill_two_challenge_product_chunk_packed(
+                        wires,
+                        s_sigmas_cols,
+                        xs_batch,
+                        n,
+                        num_routed_wires,
+                        j_start,
+                        j_end,
+                        beta_0,
+                        beta_1,
+                        gamma_0,
+                        gamma_1,
+                        beta_k_is,
+                        num_prod,
+                        den_prod,
+                        num_prod_second,
+                        den_prod_second,
+                    );
+                    (
+                        &num_prod[..],
+                        &den_prod[..],
+                        &num_prod_second[..],
+                        &den_prod_second[..],
+                    )
+                } else {
                     let wire_col = &wires[j_start * n..][..n];
                     let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                     let beta_k_0 = beta_k_is[j_start];
@@ -819,22 +1024,32 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         num_prod_second.push(permutation_factor_fma(wire, beta_k_1, x, gamma_1));
                         den_prod_second.push(permutation_factor_fma(wire, beta_1, sigma, gamma_1));
                     }
-                }
-                for j in j_start + 1..j_end {
-                    let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j * n..][..n];
-                    let beta_k_0 = beta_k_is[j];
-                    let beta_k_1 = beta_k_is[num_routed_wires + j];
-                    for k in 0..n {
-                        let wire = wire_col[k];
-                        let sigma = sigma_col[k];
-                        let x = xs_batch[k];
-                        num_prod[k] *= permutation_factor_fma(wire, beta_k_0, x, gamma_0);
-                        den_prod[k] *= permutation_factor_fma(wire, beta_0, sigma, gamma_0);
-                        num_prod_second[k] *= permutation_factor_fma(wire, beta_k_1, x, gamma_1);
-                        den_prod_second[k] *= permutation_factor_fma(wire, beta_1, sigma, gamma_1);
+                    for j in j_start + 1..j_end {
+                        let wire_col = &wires[j * n..][..n];
+                        let sigma_col = &s_sigmas_cols[j * n..][..n];
+                        let beta_k_0 = beta_k_is[j];
+                        let beta_k_1 = beta_k_is[num_routed_wires + j];
+                        for k in 0..n {
+                            let wire = wire_col[k];
+                            let sigma = sigma_col[k];
+                            let x = xs_batch[k];
+                            num_prod[k] *=
+                                permutation_factor_fma(wire, beta_k_0, x, gamma_0);
+                            den_prod[k] *=
+                                permutation_factor_fma(wire, beta_0, sigma, gamma_0);
+                            num_prod_second[k] *=
+                                permutation_factor_fma(wire, beta_k_1, x, gamma_1);
+                            den_prod_second[k] *=
+                                permutation_factor_fma(wire, beta_1, sigma, gamma_1);
+                        }
                     }
-                }
+                    (
+                        &num_prod[..],
+                        &den_prod[..],
+                        &num_prod_second[..],
+                        &den_prod_second[..],
+                    )
+                };
 
                 let row_0 = (num_challenges + c) * n;
                 let row_1 = (num_challenges + num_chunks + c) * n;
@@ -846,9 +1061,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 let prev_1 = acc_col(1, c);
                 let next_1 = acc_col(1, c + 1);
                 for k in 0..n {
-                    row_0[k] = prev_0[k] * num_prod[k] - next_0[k] * den_prod[k];
-                    row_1[k] = prev_1[k] * num_prod_second[k]
-                        - next_1[k] * den_prod_second[k];
+                    row_0[k] = prev_0[k] * num_prod_values[k] - next_0[k] * den_prod_values[k];
+                    row_1[k] = prev_1[k] * num_prod_second_values[k]
+                        - next_1[k] * den_prod_second_values[k];
                 }
             }
         } else {
@@ -1792,6 +2007,65 @@ mod tests {
     use plonky2_field::types::PrimeField64;
 
     use super::*;
+
+    #[test]
+    fn packed_permutation_products_match_scalar_raw_limbs() {
+        type F = GoldilocksField;
+        const N: usize = 32;
+        const ROUTED: usize = 80;
+        const J_START: usize = 8;
+        const J_END: usize = 16;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut draw = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            GoldilocksField(state)
+        };
+        let wires = (0..ROUTED * N).map(|_| draw()).collect::<Vec<_>>();
+        let sigmas = (0..ROUTED * N).map(|_| draw()).collect::<Vec<_>>();
+        let xs = (0..N).map(|_| draw()).collect::<Vec<_>>();
+        let beta_k = (0..2 * ROUTED).map(|_| draw()).collect::<Vec<_>>();
+        let beta_0 = draw();
+        let beta_1 = draw();
+        let gamma_0 = draw();
+        let gamma_1 = draw();
+
+        let mut expected: [Vec<F>; 4] = core::array::from_fn(|_| vec![F::ZERO; N]);
+        for j in J_START..J_END {
+            for k in 0..N {
+                let wire = wires[j * N + k];
+                let sigma = sigmas[j * N + k];
+                let factors = [
+                    permutation_factor_fma(wire, beta_k[j], xs[k], gamma_0),
+                    permutation_factor_fma(wire, beta_0, sigma, gamma_0),
+                    permutation_factor_fma(wire, beta_k[ROUTED + j], xs[k], gamma_1),
+                    permutation_factor_fma(wire, beta_1, sigma, gamma_1),
+                ];
+                for (product, factor) in expected.iter_mut().zip(factors) {
+                    if j == J_START {
+                        product[k] = factor;
+                    } else {
+                        product[k] *= factor;
+                    }
+                }
+            }
+        }
+
+        let mut actual: [Vec<F>; 4] = core::array::from_fn(|_| vec![F::ZERO; N]);
+        let [p0, p1, p2, p3] = &mut actual;
+        fill_two_challenge_product_chunk_packed(
+            &wires, &sigmas, &xs, N, ROUTED, J_START, J_END, beta_0, beta_1, gamma_0,
+            gamma_1, &beta_k, p0, p1, p2, p3,
+        );
+
+        for (actual_product, expected_product) in actual.iter().zip(&expected) {
+            for (&actual_value, &expected_value) in actual_product.iter().zip(expected_product) {
+                assert_eq!(actual_value.0, expected_value.0);
+            }
+        }
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
