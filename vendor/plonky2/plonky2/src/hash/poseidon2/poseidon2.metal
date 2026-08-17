@@ -1664,6 +1664,73 @@ kernel void ntt_prepare(
     out[(ulong)col * lde_size + i] = value;
 }
 
+// Combines the bit-reversed coset preparation with the first two radix-2 DIT
+// stages. Each output quartet is produced from coefficient storage and written
+// once, deleting the prepared-array write/read pass while preserving the exact
+// ntt_prepare followed by ntt_stage_pair arithmetic order.
+kernel void ntt_prepare_pair(
+    const device ulong* coeffs [[buffer(0)]],
+    const device ulong* shift_pows [[buffer(1)]],
+    const device ulong* roots_first [[buffer(2)]],
+    const device ulong* roots_second [[buffer(3)]],
+    device ulong* out [[buffer(4)]],
+    constant uint& degree [[buffer(5)]],
+    constant uint& lde_size [[buffer(6)]],
+    constant uint& log_degree [[buffer(7)]],
+    constant uint& rate_bits [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint t = gid.x;
+    uint quarter_butterflies = lde_size >> 2;
+    if (t >= quarter_butterflies) {
+        return;
+    }
+
+    uint half_m = 1u << rate_bits;
+    uint j = t & (half_m - 1u);
+    uint base = ((t >> rate_bits) << (rate_bits + 2u));
+    uint i0 = base + j;
+    uint i1 = i0 + half_m;
+    uint i2 = i1 + half_m;
+    uint i3 = i2 + half_m;
+    uint k0 = log_degree == 0
+        ? 0
+        : (reverse_bits(i0 >> rate_bits) >> (32 - log_degree));
+    uint k1 = log_degree == 0
+        ? 0
+        : (reverse_bits(i1 >> rate_bits) >> (32 - log_degree));
+    uint k2 = log_degree == 0
+        ? 0
+        : (reverse_bits(i2 >> rate_bits) >> (32 - log_degree));
+    uint k3 = log_degree == 0
+        ? 0
+        : (reverse_bits(i3 >> rate_bits) >> (32 - log_degree));
+    ulong colbase = (ulong)gid.y * degree;
+    ulong a0 = gl_mul(shift_pows[k0], coeffs[colbase + k0]);
+    ulong a1 = gl_mul(shift_pows[k1], coeffs[colbase + k1]);
+    ulong a2 = gl_mul(shift_pows[k2], coeffs[colbase + k2]);
+    ulong a3 = gl_mul(shift_pows[k3], coeffs[colbase + k3]);
+
+    ulong w_first = roots_first[j];
+    ulong p1 = gl_mul(w_first, a1);
+    ulong p3 = gl_mul(w_first, a3);
+    ulong b0 = gl_add(a0, p1);
+    ulong b1 = gl_sub(a0, p1);
+    ulong b2 = gl_add(a2, p3);
+    ulong b3 = gl_sub(a2, p3);
+
+    ulong p2 = gl_mul(roots_second[j], b2);
+    ulong p4 = gl_mul(roots_second[j + half_m], b3);
+    ulong out0 = gl_add(b0, p2);
+    ulong out2 = gl_sub(b0, p2);
+    ulong out1 = gl_add(b1, p4);
+    ulong out3 = gl_sub(b1, p4);
+    ulong outbase = (ulong)gid.y * lde_size;
+    out[outbase + i0] = out0;
+    out[outbase + i1] = out1;
+    out[outbase + i2] = out2;
+    out[outbase + i3] = out3;
+}
+
 // One radix-2 decimation-in-time butterfly stage over every column, matching
 // fft_classic: (u, v) := (u + w*v, u - w*v) with w = roots[j]. The final stage
 // canonicalizes so downstream consumers see canonical representations.
@@ -1698,6 +1765,63 @@ kernel void ntt_stage(
     }
     values[colbase + u_index] = out_u;
     values[colbase + v_index] = out_v;
+}
+
+// Two adjacent radix-2 DIT stages in one global-memory pass. Each thread owns
+// the exact quartet touched by two consecutive stages, keeps the first-stage
+// representatives in registers, then applies the second stage in the same
+// arithmetic order as two ntt_stage dispatches.
+kernel void ntt_stage_pair(
+    device ulong* values [[buffer(0)]],
+    const device ulong* roots_first [[buffer(1)]],
+    const device ulong* roots_second [[buffer(2)]],
+    constant uint& lde_size [[buffer(3)]],
+    constant uint& log_half_m [[buffer(4)]],
+    constant uint& canonicalize [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint t = gid.x;
+    uint quarter_butterflies = lde_size >> 2;
+    if (t >= quarter_butterflies) {
+        return;
+    }
+
+    ulong colbase = (ulong)gid.y * lde_size;
+    uint half_m = 1u << log_half_m;
+    uint j = t & (half_m - 1u);
+    uint base = ((t >> log_half_m) << (log_half_m + 2u));
+    uint i0 = base + j;
+    uint i1 = i0 + half_m;
+    uint i2 = i1 + half_m;
+    uint i3 = i2 + half_m;
+
+    ulong a0 = values[colbase + i0];
+    ulong a1 = values[colbase + i1];
+    ulong a2 = values[colbase + i2];
+    ulong a3 = values[colbase + i3];
+    ulong w_first = roots_first[j];
+    ulong p1 = gl_mul(w_first, a1);
+    ulong p3 = gl_mul(w_first, a3);
+    ulong b0 = gl_add(a0, p1);
+    ulong b1 = gl_sub(a0, p1);
+    ulong b2 = gl_add(a2, p3);
+    ulong b3 = gl_sub(a2, p3);
+
+    ulong p2 = gl_mul(roots_second[j], b2);
+    ulong p4 = gl_mul(roots_second[j + half_m], b3);
+    ulong out0 = gl_add(b0, p2);
+    ulong out2 = gl_sub(b0, p2);
+    ulong out1 = gl_add(b1, p4);
+    ulong out3 = gl_sub(b1, p4);
+    if (canonicalize != 0u) {
+        out0 = gl_canonicalize(out0);
+        out1 = gl_canonicalize(out1);
+        out2 = gl_canonicalize(out2);
+        out3 = gl_canonicalize(out3);
+    }
+    values[colbase + i0] = out0;
+    values[colbase + i1] = out1;
+    values[colbase + i2] = out2;
+    values[colbase + i3] = out3;
 }
 
 // Converts a forward-FFT output into IFFT coefficients, matching plonky2's
