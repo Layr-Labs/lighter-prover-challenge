@@ -86,6 +86,7 @@ fn main() {
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        .start_handler(|_| prover::mark_thread_user_initiated())
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
@@ -146,7 +147,6 @@ fn main() {
             circuit::block_pre_execution::BlockPreExec::from_block(&block)
         };
         let pre_handle = std::thread::Builder::new()
-            .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
             .spawn(move || {
                 let (pre_target, mut pre_data) = pre_circuits;
