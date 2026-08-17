@@ -1397,16 +1397,20 @@ fn start_gpu_range_check_gate_quotient<
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
-            // A six-bit random access evaluates a 64-entry selection fold for
-            // only ten quotient rows. On the five-worker ranked workload that
-            // data-dependent branch extends the process-shared Range/U32 Metal
-            // command disproportionately. Keep exactly this shape on the
-            // existing CPU direct-accumulation evaluator instead: skipping it
-            // here means it is never added to `gate_indices`, so the generic
-            // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
-                continue;
-            }
+            // The U32 quotient specs are walked by every thread of the
+            // process-shared Range/U32 Metal command at a per-row cost set
+            // by the spec itself, not by how many trace rows use the gate.
+            // Random-access proved the point (bit-selection folds are the
+            // most expensive); the remaining arithmetic-shaped U32 specs
+            // are cheaper per row but there are many more of them, so their
+            // combined column still dominates the union. Keep the entire
+            // U32 family on the CPU quotient evaluators instead: skipping
+            // them here means they are never added to `gate_indices`, so
+            // the generic CPU pass retains its unchanged selector and
+            // alpha work, while the Metal command keeps only the range
+            // specs whose bit-decomposition work is genuinely GPU-bound.
+            let _ = &u32_gate;
+            continue;
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
                 U32QuotientGate::Arithmetic { num_ops } => (
                     U32QuotientKind::Arithmetic,
@@ -1614,14 +1618,22 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
+        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>()
+            || gate.0.as_any().is::<EqualityGate>()
+            || gate.0.as_any().is::<ReducingGate<D>>()
+            || gate.0.as_any().is::<ReducingExtensionGate<D>>()
+        {
             // The transaction circuits' 67-bit exponentiation loop is the
-            // most divergent native branch in the shared Range/U32 command.
-            // Leave this one family on the existing CPU quotient evaluator:
-            // it stays out of `gate_indices`, so it is not CPU-excluded and
-            // its selector/alpha contribution remains byte-for-byte the
-            // ordinary generic path. This trades a small parallel CPU span
-            // for a shorter process-shared Metal queue tail.
+            // most divergent native branch in the shared Range/U32 command,
+            // and the equality/reducing natives are the same story at
+            // smaller scale: each spec is walked by every thread at its
+            // own per-row cost regardless of trace usage. Leave the whole
+            // native column on the existing CPU quotient evaluators: these
+            // gates stay out of `gate_indices`, so they are not
+            // CPU-excluded and their selector/alpha contribution remains
+            // byte-for-byte the ordinary generic path. This trades a small
+            // parallel CPU span for a shorter process-shared Metal queue
+            // tail.
             None
         } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
             // The gate reads its single constant (the "one" value) as local
