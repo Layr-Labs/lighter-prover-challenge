@@ -27,8 +27,25 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
-// mapped long enough for the next identically-shaped allocation to reuse them.
+#[cfg(not(target_env = "msvc"))]
+union JemallocConfPtr {
+    byte: &'static u8,
+    char: &'static std::ffi::c_char,
+}
+
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static std::ffi::c_char> = Some(unsafe {
+    JemallocConfPtr {
+        byte: &b"narenas:8\0"[0],
+    }
+    .char
+});
+
+// Eight arenas bound fragmentation while preserving allocator concurrency for
+// the Rayon pool. The default decay periods continue to retain freed pages
+// long enough for the next identically-shaped allocation to reuse them.
 //
 // A previous revision exported `_rjem_malloc_conf = "dirty_decay_ms:0,
 // muzzy_decay_ms:0"` on the stated premise that five scored workers run
@@ -146,7 +163,6 @@ fn main() {
             circuit::block_pre_execution::BlockPreExec::from_block(&block)
         };
         let pre_handle = std::thread::Builder::new()
-            .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
             .spawn(move || {
                 let (pre_target, mut pre_data) = pre_circuits;
