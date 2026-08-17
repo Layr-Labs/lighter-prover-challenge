@@ -12,7 +12,7 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
-use crate::field::goldilocks_extensions::ext2_mul_add;
+use crate::field::goldilocks_extensions::{ext2_mul_add, ext2_scale_by_base_into};
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
@@ -47,6 +47,22 @@ pub(crate) enum BatchLayout {
     PointMajor,
     /// `out[column * num_points + point]`
     PolyMajor,
+}
+
+/// Grow or shrink `out` to `len` without a zero fill. Every caller overwrites
+/// all `len` slots before any is read; `F` is a plain field wrapper (any bit
+/// pattern is a valid `F`). Same idiom as `extract_lde_batch_columns`.
+fn resize_overwritten<F: Field>(out: &mut Vec<F>, len: usize) {
+    if out.len() == len {
+        return;
+    }
+    if out.capacity() < len {
+        out.reserve(len - out.len());
+    }
+    // SAFETY: callers write every slot before any read.
+    unsafe {
+        out.set_len(len);
+    }
 }
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
@@ -435,10 +451,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         //     `out[k * w..(k + 1) * w]`;
         //   - Rows/PolyMajor: each `k` writes `ci * n + k` for every `ci` in
         //     `0..w` (`row.len() == w`).
-        // So the zero-fill of a correctly sized buffer is a dead store: adjust
-        // the length only (`resize` is a no-op when it already matches, and
-        // still zero-initializes any newly created or grown scratch).
-        out.resize(n * w, F::ZERO);
+        // So the zero-fill is a dead store. Skip it: reused scratch already
+        // has the right length (no-op), and a first/grown buffer is written
+        // in full by every arm below before any read. Same idiom as
+        // `extract_lde_batch_columns`.
+        resize_overwritten(out, n * w);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
@@ -490,7 +507,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) {
         let start = col_range.start;
         let w = col_range.len();
-        out.resize(n * w, F::ZERO);
+        resize_overwritten(out, n * w);
 
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
@@ -843,6 +860,45 @@ pub(crate) fn coset_fft_zero_tail<F: Field>(
 /// exactly `x * shift` with a zero high accumulator.
 /// `base_scalar_mul_matches_embedded_extension_mul_raw_words` is the
 /// differential; `coset_fft_zero_tail` stays as the generic test oracle.
+///
+/// For `n_log <= GoldilocksField::TWO_ADICITY` the quadratic twiddles are
+/// `[w, 0]`, so the two limbs are independent base-field FFTs. Run the
+/// production packed Goldilocks transform on each limb instead of the
+/// WIDTH=1 `QuadraticExtension` FFT. Bit-identical: `Add` is limb-wise
+/// and `mul_fft_quadratic_base_twiddle` is `[w*a0, w*a1]`.
+fn fft_quadratic_as_two_base_ffts(
+    values: &mut [QuadraticExtension<GoldilocksField>],
+    zero_factor: Option<usize>,
+) {
+    let n = values.len();
+    if n <= 1 {
+        return;
+    }
+    debug_assert!(n.is_power_of_two());
+    debug_assert!(log2_strict(n) <= GoldilocksField::TWO_ADICITY);
+
+    let mut limb0 = Vec::with_capacity(n);
+    let mut limb1 = Vec::with_capacity(n);
+    for &QuadraticExtension([a, b]) in values.iter() {
+        limb0.push(a);
+        limb1.push(b);
+    }
+
+    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+        join(
+            || fft_in_place_with_options_parallel(&mut limb0, zero_factor, None),
+            || fft_in_place_with_options_parallel(&mut limb1, zero_factor, None),
+        );
+    } else {
+        fft_in_place_with_options(&mut limb0, zero_factor, None);
+        fft_in_place_with_options(&mut limb1, zero_factor, None);
+    }
+
+    for (slot, (a, b)) in values.iter_mut().zip(limb0.into_iter().zip(limb1)) {
+        *slot = QuadraticExtension([a, b]);
+    }
+}
+
 pub(crate) fn coset_fft_zero_tail_base<F: Extendable<D>, const D: usize>(
     coeffs: &PolynomialCoeffs<F::Extension>,
     shift_base: F,
@@ -860,7 +916,7 @@ pub(crate) fn coset_fft_zero_tail_base<F: Extendable<D>, const D: usize>(
                 .iter()
                 .all(<F::Extension as Field>::is_zero)
     );
-    let mut scaled = Vec::with_capacity(len);
+    let mut scaled: Vec<F::Extension> = Vec::with_capacity(len);
     // The opening site's `live` is the circuit degree, so this is the very
     // table the LDE coset scaling already warmed for this process; the FRI
     // folding rounds reuse the arbitrary-shift cache exactly as before, only
@@ -878,12 +934,36 @@ pub(crate) fn coset_fft_zero_tail_base<F: Extendable<D>, const D: usize>(
     } else {
         crate::plonk::prover::precomputed::shift_powers::<F>(shift_base, live)
     };
-    scaled.extend(
-        powers[..live]
-            .iter()
-            .zip(&coeffs.coeffs[..live])
-            .map(|(&r, &c)| <F::Extension as FieldExtension<D>>::scalar_mul(&c, r)),
-    );
+    if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() && D == 2 {
+        // Packed C=2 limb scale: `out[j] = coeffs[j] * powers[j]` with
+        // the base power duplicated onto both extension lanes. Same
+        // values as `scalar_mul`. Tail of `scaled` is still written
+        // by the zero-padded FFT below.
+        unsafe { scaled.set_len(live) };
+        let coeffs_g = unsafe {
+            core::slice::from_raw_parts(
+                coeffs.coeffs.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                live,
+            )
+        };
+        let powers_g = unsafe {
+            core::slice::from_raw_parts(powers.as_ptr().cast::<GoldilocksField>(), live)
+        };
+        let dest_g = unsafe {
+            core::slice::from_raw_parts_mut(
+                scaled.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                live,
+            )
+        };
+        ext2_scale_by_base_into(coeffs_g, powers_g, dest_g);
+    } else {
+        scaled.extend(
+            powers[..live]
+                .iter()
+                .zip(&coeffs.coeffs[..live])
+                .map(|(&r, &c)| <F::Extension as FieldExtension<D>>::scalar_mul(&c, r)),
+        );
+    }
     if zero_tail_is_unread {
         // SAFETY: identical to `coset_fft_zero_tail`; capacity is exactly
         // `len` and the zero-padded FFT writes every tail element before
@@ -892,7 +972,21 @@ pub(crate) fn coset_fft_zero_tail_base<F: Extendable<D>, const D: usize>(
     } else {
         scaled.resize(len, <F::Extension as Field>::ZERO);
     }
-    if crate::hash::poseidon2::is_exclusive_gpu_phase() {
+    if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() && D == 2 {
+        // Production FRI folds are 2^19 and below — well under the
+        // quadratic extra two-adic level — so the limbs split.
+        debug_assert!(log2_strict(len) <= GoldilocksField::TWO_ADICITY);
+        let scaled_g = unsafe {
+            core::slice::from_raw_parts_mut(
+                scaled
+                    .as_mut_ptr()
+                    .cast::<QuadraticExtension<GoldilocksField>>(),
+                scaled.len(),
+            )
+        };
+        fft_quadratic_as_two_base_ffts(scaled_g, zero_factor);
+        let _ = root_table;
+    } else if crate::hash::poseidon2::is_exclusive_gpu_phase() {
         fft_in_place_with_options_parallel(&mut scaled, zero_factor, root_table);
     } else {
         fft_in_place_with_options(&mut scaled, zero_factor, root_table);
