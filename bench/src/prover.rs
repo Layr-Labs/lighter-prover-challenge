@@ -227,6 +227,10 @@ fn mark_thread_utility() {
 fn mark_thread_utility() {}
 
 enum ChainState<'scope> {
+    /// Test-only convenience for the manual timing harness. Production hands
+    /// the spine driver's handle to `InFlight`; completed predecessor proofs
+    /// stay plain `Proof`s inside the driver and never re-enter this type.
+    #[cfg_attr(not(test), allow(dead_code))]
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
 }
@@ -244,6 +248,89 @@ impl ChainState<'_> {
     }
 }
 
+/// Phase 1 of a chain step: runs every generator that does not depend on the
+/// previous chain proof. It needs only the step's transaction proof, so it runs
+/// on the spine prefetch thread while the predecessor still proves. Inputs are
+/// written directly into the partition's representative slots — no
+/// PartialWitness map, no per-path template clone, no replay pass.
+fn chain_step_phase1<'data>(
+    path: TxPath,
+    chain_target: &BlockTxChainTarget,
+    chain_data: &'data CircuitData<F, C, D>,
+    chain_step: u64,
+    dummy_proof: &Proof,
+    tx_proof: &Proof,
+) -> PendingPartitionWitness<'data, F, C, D> {
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_context = plonky2::util::profile::enter_context(
+        profile_path_context(path, "chain"),
+        chain_step,
+        &[("chain_step", chain_step), ("path", path as u64)],
+    );
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_span = plonky2::util::profile::span("orchestration", "chain_step_phase1");
+    PendingPartitionWitness::start_seeded(&chain_data.prover_only, &chain_data.common, |seeder| {
+        BlockTxChainCircuit::witness_inputs_early_into(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            seeder,
+        )
+    })
+    .unwrap_or_else(|error| {
+        panic!(
+            "{path:?} block transaction chain step #{chain_step} phase-1 witness failed: {error:?}"
+        )
+    })
+}
+
+/// Phase 2 + prove of a chain step: feeds the previous chain proof directly
+/// into the prepared phase-1 witness and proves. Runs on the spine driver
+/// thread, strictly in step order.
+fn chain_step_finish(
+    path: TxPath,
+    chain_target: &BlockTxChainTarget,
+    chain_data: &CircuitData<F, C, D>,
+    chain_step: u64,
+    mut pending: PendingPartitionWitness<'_, F, C, D>,
+    previous_proof: Option<&Proof>,
+    base_proof: &Proof,
+) -> Proof {
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_context = plonky2::util::profile::enter_context(
+        profile_path_context(path, "chain"),
+        chain_step,
+        &[("chain_step", chain_step), ("path", path as u64)],
+    );
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_span = plonky2::util::profile::span("orchestration", "chain_step");
+    let result = (|| {
+        // Phase 2: the previous chain proof is already here (the driver proved
+        // it one iteration ago); feed it directly and prove.
+        pending.feed_seeded(|feeder| {
+            BlockTxChainCircuit::witness_inputs_cyclic_into(
+                chain_target,
+                previous_proof.unwrap_or(base_proof),
+                feeder,
+            )
+        })?;
+        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+    })();
+    // This step is no longer part of the runnable backlog (see the matching
+    // spine_backlog_add(1) at the feeder's queue-push sites).
+    plonky2::hash::poseidon2::spine_backlog_add(-1);
+    result.unwrap_or_else(|error| {
+        panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
+    })
+}
+
+/// Single-thread composition of the two halves above, with the predecessor
+/// supplied as a [`ChainState`]. Production routes phase 1 and phase 2 through
+/// the spine prefetch/driver pair instead; this form is the reference used by
+/// the manual timing harness and its differential integration check.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn chain_step_proof(
     path: TxPath,
@@ -256,51 +343,26 @@ fn chain_step_proof(
     tx_proof: &Proof,
 ) -> Proof {
     mark_spine_thread_latency_critical();
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_context = plonky2::util::profile::enter_context(
-        profile_path_context(path, "chain"),
+    // Phase 1 before the predecessor wait, exactly like the production prefetch
+    // thread runs it relative to the driver.
+    let pending = chain_step_phase1(
+        path,
+        chain_target,
+        chain_data,
         chain_step,
-        &[("chain_step", chain_step), ("path", path as u64)],
+        dummy_proof,
+        tx_proof,
     );
-    #[cfg(feature = "diagnostic_profile")]
-    let _profile_span = plonky2::util::profile::span("orchestration", "chain_step");
-    let result = (|| {
-        // Phase 1: run every generator that does not depend on the previous chain proof while
-        // that proof may still be in flight. Inputs are written directly into
-        // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
-        )?;
-
-        // Phase 2: wait for the previous chain proof, feed it directly, and prove.
-        let previous_proof = previous.map(ChainState::wait);
-        pending.feed_seeded(|feeder| {
-            BlockTxChainCircuit::witness_inputs_cyclic_into(
-                chain_target,
-                previous_proof.as_ref().unwrap_or(base_proof),
-                feeder,
-            )
-        })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
-    })();
-    // This step is no longer part of the runnable backlog (see the matching
-    // spine_backlog_add(1) at all spawn sites).
-    plonky2::hash::poseidon2::spine_backlog_add(-1);
-    result.unwrap_or_else(|error| {
-        panic!("{path:?} block transaction chain step #{chain_step} failed: {error:?}")
-    })
+    let previous_proof = previous.map(ChainState::wait);
+    chain_step_finish(
+        path,
+        chain_target,
+        chain_data,
+        chain_step,
+        pending,
+        previous_proof.as_ref(),
+        base_proof,
+    )
 }
 
 fn hash_from_witness(witness: &impl Witness<F>, target: &HashOutTarget) -> HashOut<F> {
@@ -538,38 +600,131 @@ fn prove_path(
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
-        let mut chain: Option<ChainState<'_>> = None;
+        // Bounded spine run-ahead. The spawn-per-step orchestration this
+        // replaces created a fresh OS thread the moment each tx proof was
+        // joined — 49 light folds, 49 threads, each carrying
+        // PROVER_THREAD_STACK_BYTES of stack, its finished phase-1 witness and
+        // its tx proof while it blocked on the predecessor join. Phase 1 costs
+        // ~11 ms and its only purpose is to overlap the predecessor's
+        // several-hundred-ms prove, which a fixed two-step lookahead achieves
+        // in full. The chain is therefore two long-lived threads fed by a
+        // queue:
+        //
+        //   feeder  --(unbounded channel: the feeder NEVER blocks on the
+        //              chain, so the tx-proof window is untouched; queued
+        //              entries are ~200 KB proofs, not witnesses)-->
+        //   prefetch: pops (step, tx proof), runs the phase-1 witness, hands it
+        //              to the driver over a rendezvous channel — so phase 1 for
+        //              step i+1 runs while step i proves (the same relative
+        //              point as the old per-step threads' overlap), and at most
+        //              one finished phase-1 witness ever waits beyond the step
+        //              being proven;
+        //   driver:   feeds each step's phase-2 witness from the proof it
+        //              produced one iteration earlier and proves strictly in
+        //              step order.
+        //
+        // Value-exact: fold order, per-step generator order and every witness
+        // value are identical to the spawn-per-step form — only thread
+        // placement changes. SPINE_BACKLOG is still fed at tx-proof readiness
+        // (the queue pushes below), not at thread creation, so the routing
+        // signal's census is independent of the bounded run-ahead (see
+        // SPINE_BACKLOG in metal.rs).
+        let (chain_feed_send, chain_feed_recv) = std::sync::mpsc::channel();
+        let (phase1_send, phase1_recv) = std::sync::mpsc::sync_channel(0);
+        std::thread::Builder::new()
+            .name(format!("{path:?}-chain-prefetch"))
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                // Phase 1 previously ran at the head of every latency-critical
+                // chain-step thread; keep its scheduling class (see
+                // mark_spine_thread_latency_critical).
+                mark_spine_thread_latency_critical();
+                loop {
+                    let received = {
+                        #[cfg(feature = "diagnostic_profile")]
+                        let _recv_wait = plonky2::util::profile::span("wait", "chain_feed_recv");
+                        chain_feed_recv.recv()
+                    };
+                    let Ok((chain_step, tx_proof)) = received else {
+                        // The feeder dropped its sender: every step was fed.
+                        break;
+                    };
+                    let pending = chain_step_phase1(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        &tx_proof,
+                    );
+                    // The tx proof's values are copied into the witness; free
+                    // the proof before parking on the handoff.
+                    drop(tx_proof);
+                    if phase1_send.send((chain_step, pending)).is_err() {
+                        // The driver exits before this channel closes only by
+                        // panicking, which the scope join surfaces on its own;
+                        // just stop feeding it.
+                        break;
+                    }
+                }
+            })
+            .expect("chain prefetch thread must start");
+        let driver_handle = std::thread::Builder::new()
+            .name(format!("{path:?}-chain-step-driver"))
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                mark_spine_thread_latency_critical();
+                let mut previous: Option<Proof> = None;
+                let mut next_step = 0u64;
+                loop {
+                    let received = {
+                        #[cfg(feature = "diagnostic_profile")]
+                        let _recv_wait = plonky2::util::profile::span("wait", "chain_pending_recv");
+                        phase1_recv.recv()
+                    };
+                    let Ok((chain_step, pending)) = received else {
+                        break;
+                    };
+                    // The folds are cyclic — each consumes its predecessor's
+                    // proof — so arrival order must be step order. The single
+                    // feeder pushes in order and both channels preserve it.
+                    assert_eq!(
+                        chain_step, next_step,
+                        "{path:?} chain steps must arrive in order"
+                    );
+                    next_step += 1;
+                    let proof = chain_step_finish(
+                        path,
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        pending,
+                        previous.as_ref(),
+                        base,
+                    );
+                    previous = Some(proof);
+                }
+                previous.expect("transaction path must produce a chain proof")
+            })
+            .expect("chain driver thread must start");
+        let chain = ChainState::InFlight(driver_handle);
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
         let mut current_step = 0u64;
 
         loop {
             if let Some((chain_step, tx_proof)) = pending_tx.take() {
-                // The predecessor handle moves into the chain thread, which waits for it only
-                // after its tx-proof-side witness generation: the path thread never blocks here.
-                let previous = chain.take();
                 // This step is now runnable (its tx proof exists); while the
                 // count of runnable-but-unproven steps is high, the chain is
                 // the laggard and its GPU trees take priority (see
-                // spine_backlog_add). Decremented inside chain_step_proof.
+                // spine_backlog_add). The queue push below happens at the same
+                // instant the old form spawned the step's thread, so the
+                // backlog census does not depend on the bounded run-ahead.
+                // Decremented inside chain_step_finish.
                 plonky2::hash::poseidon2::spine_backlog_add(1);
-                let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
-                    .stack_size(PROVER_THREAD_STACK_BYTES)
-                    .spawn_scoped(scope, move || {
-                        chain_step_proof(
-                            path,
-                            chain_target,
-                            chain_data,
-                            chain_step,
-                            previous,
-                            base,
-                            dummy_proof,
-                            &tx_proof,
-                        )
-                    })
-                    .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
+                chain_feed_send
+                    .send((chain_step, tx_proof))
+                    .expect("chain prefetch thread must outlive the feeder");
             }
 
             let witness = current_witness;
@@ -644,26 +799,11 @@ fn prove_path(
 
         if let Some((chain_step, tx_proof)) = pending_tx.take() {
             // This post-loop step is runnable and decrements the global
-            // backlog in `chain_step_proof`, exactly like both spawn loops.
+            // backlog in `chain_step_finish`, exactly like both queue loops.
             plonky2::hash::poseidon2::spine_backlog_add(1);
-            let previous = chain.take();
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous,
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                    )
-                })
-                .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
+            chain_feed_send
+                .send((chain_step, tx_proof))
+                .expect("chain prefetch thread must outlive the feeder");
         }
         // Past this point the pipeline spawns no new chunk work: the drain
         // below is the strictly sequential chain tail, so its mid-size
@@ -698,35 +838,23 @@ fn prove_path(
                 exclusive_drain = true;
                 plonky2::hash::poseidon2::set_exclusive_gpu_phase(true);
             }
-            // Spawn the drained step exactly like the pipelined phase so its
+            // Queue the drained step exactly like the pipelined phase so its
             // phase-1 witness (which needs only the tx proof) overlaps the
             // predecessor's prove instead of serializing behind it. Only one
             // proof's GPU work is in flight at a time either way — phase 1 is
             // pure CPU generator execution — so the exclusive-drain contract
             // above is unchanged.
-            let previous = chain.take();
             plonky2::hash::poseidon2::spine_backlog_add(1);
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-drain-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous,
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                    )
-                })
-                .expect("chain drain thread must start");
-            chain = Some(ChainState::InFlight(handle));
+            chain_feed_send
+                .send((chain_step, tx_proof))
+                .expect("chain prefetch thread must outlive the feeder");
         }
-        let chain_proof = chain
-            .map(ChainState::wait)
-            .expect("transaction path must produce a chain proof");
+        // Every chain step is queued: close the feed so the prefetch thread and
+        // then the driver retire after the last fold. The driver join below is
+        // the path's spine-lag wait, exactly where the old form joined the last
+        // spawned-per-step handle.
+        drop(chain_feed_send);
+        let chain_proof = chain.wait();
         if exclusive_drain {
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
         }
