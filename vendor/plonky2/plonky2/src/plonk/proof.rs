@@ -56,7 +56,7 @@ pub struct ProofTarget<const D: usize> {
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Proof<F, C, D> {
     /// Compress the proof.
-    pub fn compress(self, indices: &[usize], params: &FriParams) -> CompressedProof<F, C, D> {
+    pub fn compress(self, indices: Vec<usize>, params: &FriParams) -> CompressedProof<F, C, D> {
         let Proof {
             wires_cap,
             plonk_zs_partial_products_cap,
@@ -95,7 +95,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         common_data: &CommonCircuitData<F, D>,
     ) -> anyhow::Result<CompressedProofWithPublicInputs<F, C, D>> {
         let indices = self.fri_query_indices(circuit_digest, common_data)?;
-        let compressed_proof = self.proof.compress(&indices, &common_data.fri_params);
+        let compressed_proof = self.proof.compress(indices, &common_data.fri_params);
         Ok(CompressedProofWithPublicInputs {
             public_inputs: self.public_inputs,
             proof: compressed_proof,

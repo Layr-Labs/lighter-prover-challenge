@@ -213,8 +213,83 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Z columns only (`zs_range`), gathered at the "next" indices.
         zs_next_cols: &'a [F],
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
-        s_sigmas_cols: &'a [F],
+        ///
+        /// Unlike the proof-local Z buffers, these may remain in the
+        /// circuit-wide quotient cache. `ColumnBatch` keeps the batch window
+        /// as a borrowed strided view, so each proof reads the cached columns
+        /// directly instead of copying every routed-wire sigma into a worker
+        /// scratch buffer first.
+        s_sigmas_cols: ColumnBatch<'a, F>,
     },
+}
+
+/// A point window over column-major values without repacking the columns.
+///
+/// Column `c` occupies `data[c * column_stride + offset..][..batch_len]`.
+/// The ordinary proof-local gather uses `column_stride == batch_len` and
+/// `offset == 0`; a circuit-wide cache uses the full quotient-domain stride
+/// and a per-batch offset. Both expose the same contiguous per-column slice to
+/// the permutation evaluator.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnBatch<'a, F> {
+    data: &'a [F],
+    columns: usize,
+    column_stride: usize,
+    offset: usize,
+    batch_len: usize,
+}
+
+impl<'a, F> ColumnBatch<'a, F> {
+    pub(crate) fn new(
+        data: &'a [F],
+        columns: usize,
+        column_stride: usize,
+        offset: usize,
+        batch_len: usize,
+    ) -> Self {
+        if columns == 0 {
+            assert!(data.is_empty());
+        } else {
+            assert!(offset + batch_len <= column_stride);
+            assert!(
+                (columns - 1) * column_stride + offset + batch_len <= data.len(),
+                "column batch exceeds its backing store"
+            );
+        }
+        Self {
+            data,
+            columns,
+            column_stride,
+            offset,
+            batch_len,
+        }
+    }
+
+    pub(crate) fn contiguous(data: &'a [F], columns: usize, batch_len: usize) -> Self {
+        assert_eq!(data.len(), columns * batch_len);
+        Self::new(data, columns, batch_len, 0, batch_len)
+    }
+
+    pub(crate) fn empty(batch_len: usize) -> Self {
+        Self {
+            data: &[],
+            columns: 0,
+            column_stride: 0,
+            offset: 0,
+            batch_len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.columns * self.batch_len
+    }
+
+    #[inline]
+    fn col(&self, column: usize) -> &'a [F] {
+        assert!(column < self.columns);
+        let start = column * self.column_stride + self.offset;
+        &self.data[start..start + self.batch_len]
+    }
 }
 
 const INTERLEAVE_PAIR_WIRES: usize = 136;
@@ -297,7 +372,7 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
     let batch_size = vars_batch.len();
     debug_assert_eq!(output.len(), batch_size);
     let selector_index = common_data.selectors_info.selector_indices[gate_index];
-    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+    let selector_col = vars_batch.local_constants_col(selector_index);
     let mut factors = common_data.selectors_info.groups[selector_index]
         .clone()
         .filter(|&index| index != gate_index)
@@ -509,21 +584,12 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     }
 }
 
-/// Reduces the per-row constraint terms into `res_out`.
-///
-/// `clear_as_consumed` zeroes each term as it is read. Every element is read
-/// exactly once here, so a caller that owns the buffer as reusable scratch gets
-/// it back all-zero and can skip re-zeroing it before the next batch. Doing it
-/// on this walk rather than in a separate pass is what makes it nearly free:
-/// the line is already resident and dirty from the read. Callers that do not
-/// own the buffer, or that want to inspect it afterwards, pass `false`.
 fn reduce_gate_constraints_base_batch<F: Field>(
-    constraint_terms_batch: &mut [F],
+    constraint_terms_batch: &[F],
     batch_size: usize,
     alphas: &[F],
     res_out: &mut [F],
     res_out_is_zero_seed: bool,
-    clear_as_consumed: bool,
 ) {
     debug_assert!(batch_size > 0);
     debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
@@ -541,7 +607,7 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     //
     // This is NOT valid for a caller that passes a nonzero running
     // accumulator, which the general contract permits, so it is opt-in.
-    let mut rows = constraint_terms_batch.chunks_exact_mut(batch_size).rev();
+    let mut rows = constraint_terms_batch.chunks_exact(batch_size).rev();
     if alphas.len() == 2 {
         // Production always uses two challenges: load alphas once and walk
         // point-major output in exact pairs instead of rediscovering the
@@ -551,28 +617,18 @@ fn reduce_gate_constraints_base_batch<F: Field>(
         if res_out_is_zero_seed {
             match rows.next() {
                 Some(first_row) => {
-                    for (term_slot, result) in
-                        first_row.iter_mut().zip(res_out.chunks_exact_mut(2))
-                    {
-                        let term = *term_slot;
+                    for (&term, result) in first_row.iter().zip(res_out.chunks_exact_mut(2)) {
                         result[0] = term;
                         result[1] = term;
-                        if clear_as_consumed {
-                            *term_slot = F::ZERO;
-                        }
                     }
                 }
                 None => res_out.fill(F::ZERO),
             }
         }
         for constraint_row in rows {
-            for (term_slot, result) in constraint_row.iter_mut().zip(res_out.chunks_exact_mut(2)) {
-                let term = *term_slot;
+            for (&term, result) in constraint_row.iter().zip(res_out.chunks_exact_mut(2)) {
                 result[0] = term.multiply_accumulate(result[0], alpha_0);
                 result[1] = term.multiply_accumulate(result[1], alpha_1);
-                if clear_as_consumed {
-                    *term_slot = F::ZERO;
-                }
             }
         }
         return;
@@ -581,13 +637,9 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     if res_out_is_zero_seed {
         match rows.next() {
             Some(first_row) => {
-                for (point, term_slot) in first_row.iter_mut().enumerate() {
-                    let term = *term_slot;
+                for (point, &term) in first_row.iter().enumerate() {
                     let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
                     result.fill(term);
-                    if clear_as_consumed {
-                        *term_slot = F::ZERO;
-                    }
                 }
             }
             // No constraint rows: preserve the "every slot written" contract.
@@ -596,14 +648,10 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 
     for constraint_row in rows {
-        for (point, term_slot) in constraint_row.iter_mut().enumerate() {
-            let term = *term_slot;
+        for (point, &term) in constraint_row.iter().enumerate() {
             let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
             for (value, &alpha) in result.iter_mut().zip(alphas) {
                 *value = term.multiply_accumulate(*value, alpha);
-            }
-            if clear_as_consumed {
-                *term_slot = F::ZERO;
             }
         }
     }
@@ -670,7 +718,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         cpu_num_gate_constraints,
         interleave_pair,
     );
-    let constraint_terms_batch = &mut scratch.constraint_terms_batch;
+    let constraint_terms_batch = &scratch.constraint_terms_batch;
     // `<=`, not `==`: the buffer is sized by the widest gate still on the CPU,
     // which is at most `num_gate_constraints` and strictly less whenever a
     // widest gate has been offloaded.
@@ -682,7 +730,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true, true);
+    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true);
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -834,7 +882,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 den_prod_second.clear();
                 {
                     let wire_col = &wires[j_start * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                    let sigma_col = s_sigmas_cols.col(j_start);
                     let beta_k_0 = beta_k_is[j_start];
                     let beta_k_1 = beta_k_is[num_routed_wires + j_start];
                     for k in 0..n {
@@ -849,7 +897,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 }
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j * n..][..n];
+                    let sigma_col = s_sigmas_cols.col(j);
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
                     for k in 0..n {
@@ -893,7 +941,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     den_prod.clear();
                     {
                         let wire_col = &wires[j_start * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                        let sigma_col = s_sigmas_cols.col(j_start);
                         let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                         for k in 0..n {
                             num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
@@ -902,7 +950,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                     for j in j_start + 1..j_end {
                         let wire_col = &wires[j * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j * n..][..n];
+                        let sigma_col = s_sigmas_cols.col(j);
                         let beta_k_i = beta_k_is[i * num_routed_wires + j];
                         for k in 0..n {
                             num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
@@ -1554,41 +1602,13 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     interleave_pair: Option<&InterleavePairPlan>,
 ) {
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
-    // The gates below accumulate, so this buffer must start at zero — but it
-    // does not need re-zeroing here. `reduce_gate_constraints_base_batch` is
-    // the sole consumer, it runs immediately after this function on every
-    // batch, it reads every element exactly once, and it is called with
-    // `clear_as_consumed`, so it hands the buffer back all-zero. Only a change
-    // of length (a different circuit shape reaching this worker's scratch)
-    // needs the full fill. That removes a `num_constraint_rows * batch`
-    // element memset from every batch — 136 * 32 elements on the block shape,
-    // ~16k batches per proof — and pays for it with stores to lines the
-    // reduction has already pulled in and dirtied.
-    let required = num_constraint_rows * vars_batch.len();
-    if constraints_batch.len() != required {
-        constraints_batch.clear();
-        constraints_batch.resize(required, F::ZERO);
-    }
-    debug_assert!(
-        constraints_batch.iter().all(|v| *v == F::ZERO),
-        "constraint scratch must be zero on entry; the consumer clears it as it reads"
-    );
+    constraints_batch.clear();
+    constraints_batch.resize(num_constraint_rows * vars_batch.len(), F::ZERO);
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
-                // Size the buffer without re-zeroing it. `clear()` then
-                // `resize()` memset all three sub-slices on every batch, but
-                // each is fully assigned before it is read: the two
-                // `fill_interleave_gate_filter` calls below write every point of
-                // `interleave_filter` and `uninterleave_filter`, and the loop
-                // writes every point of `summed_filter`. `filters` is scratch
-                // reused across batches, so after the first batch of a worker
-                // thread this resize is a no-op and the memset is gone
-                // entirely — 3 * batch * 8 B per batch, ~12 MiB per d16 tx
-                // proof. Value-exact: no slot's read can observe the difference.
-                if filters.len() != 3 * vars_batch.len() {
-                    filters.resize(3 * vars_batch.len(), F::ZERO);
-                }
+                filters.clear();
+                filters.resize(3 * vars_batch.len(), F::ZERO);
                 let (interleave_filter, rest) = filters.split_at_mut(vars_batch.len());
                 let (uninterleave_filter, summed_filter) = rest.split_at_mut(vars_batch.len());
                 fill_interleave_gate_filter(
@@ -1856,7 +1876,7 @@ mod tests {
 
         // Hand-checked two-point fixture. For the first challenge at point zero,
         // the expected Horner chain is 7 + 3 * (13 + 3 * 5) = 91.
-        let mut terms = [
+        let terms = [
             F::from_canonical_u64(7),
             F::from_canonical_u64(11),
             F::from_canonical_u64(13),
@@ -1868,13 +1888,13 @@ mod tests {
             F::from_canonical_u64(6),
             F::from_canonical_u64(6),
         ];
-        reduce_gate_constraints_base_batch(&mut terms, 2, &alphas, &mut actual, false, false);
+        reduce_gate_constraints_base_batch(&terms, 2, &alphas, &mut actual, false);
         assert_eq!(actual[0], F::from_canonical_u64(91));
         assert_eq!(actual[2], F::from_canonical_u64(116));
 
         for batch_size in [1, 11, 31, 32] {
             let num_constraints = 7;
-            let mut terms = (0..batch_size * num_constraints)
+            let terms = (0..batch_size * num_constraints)
                 .map(|i| F::from_canonical_usize(i * 17 + 3))
                 .collect::<Vec<_>>();
             let initial = (0..batch_size * alphas.len())
@@ -1892,7 +1912,7 @@ mod tests {
             }
 
             let mut actual = initial;
-            reduce_gate_constraints_base_batch(&mut terms, batch_size, &alphas, &mut actual, false, false);
+            reduce_gate_constraints_base_batch(&terms, batch_size, &alphas, &mut actual, false);
             assert_eq!(actual, expected, "batch size {batch_size}");
         }
     }
@@ -2228,19 +2248,17 @@ mod tests {
             let mut expected_reduction = initial_reduction.clone();
             let mut actual_reduction = initial_reduction;
             reduce_gate_constraints_base_batch(
-                &mut expected_rows,
+                &expected_rows,
                 batch_size,
                 &alphas,
                 &mut expected_reduction,
                 false,
-                false,
             );
             reduce_gate_constraints_base_batch(
-                &mut actual_rows,
+                &actual_rows,
                 batch_size,
                 &alphas,
                 &mut actual_reduction,
-                false,
                 false,
             );
             for (index, (&actual, &expected)) in actual_reduction
@@ -2296,25 +2314,23 @@ mod tests {
                             full[row * batch_size + point] = next();
                         }
                     }
-                    let mut narrowed = full[..m * batch_size].to_vec();
+                    let narrowed = &full[..m * batch_size];
 
                     let mut expected = vec![F::ZERO; batch_size * alphas.len()];
                     reduce_gate_constraints_base_batch(
-                        &mut full,
+                        &full,
                         batch_size,
                         &alphas,
                         &mut expected,
                         true,
-                        false,
                     );
                     let mut actual = vec![F::ZERO; batch_size * alphas.len()];
                     reduce_gate_constraints_base_batch(
-                        &mut narrowed,
+                        narrowed,
                         batch_size,
                         &alphas,
                         &mut actual,
                         true,
-                        false,
                     );
 
                     for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {

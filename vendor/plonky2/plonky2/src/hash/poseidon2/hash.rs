@@ -4,7 +4,11 @@ use plonky2_field::ops::Square;
 
 use super::config::*;
 use crate::field::extension::{Extendable, FieldExtension};
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use crate::field::WideGoldilocksField;
 use crate::field::goldilocks_field::GoldilocksField as F;
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+use crate::field::packed::PackedField;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
 use crate::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS, RichField};
@@ -138,10 +142,7 @@ pub trait Poseidon2: PrimeField64 {
             b[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             c[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
             d[0] += Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
-            a[0] = Self::sbox_p(&a[0]);
-            b[0] = Self::sbox_p(&b[0]);
-            c[0] = Self::sbox_p(&c[0]);
-            d[0] = Self::sbox_p(&d[0]);
+            (a[0], b[0], c[0], d[0]) = Self::sbox_p_x4(&a[0], &b[0], &c[0], &d[0]);
             Self::internal_linear_layer_x4(a, b, c, d);
         }
     }
@@ -278,6 +279,16 @@ pub trait Poseidon2: PrimeField64 {
     }
 
     fn sbox_p(a: &Self) -> Self;
+
+    #[inline]
+    fn sbox_p_x4(a: &Self, b: &Self, c: &Self, d: &Self) -> (Self, Self, Self, Self) {
+        (
+            Self::sbox_p(a),
+            Self::sbox_p(b),
+            Self::sbox_p(c),
+            Self::sbox_p(d),
+        )
+    }
 
     fn sbox_p_extension<F: FieldExtension<D, BaseField = Self>, const D: usize>(a: &F) -> F;
 
@@ -543,6 +554,32 @@ impl Poseidon2 for F {
     /// lane updates across the four states. Bit-identical to four sequential
     /// `internal_linear_layer` calls.
     #[inline]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[unroll::unroll_for_loops]
+    fn internal_linear_layer_x4(
+        a: &mut [Self; WIDTH],
+        b: &mut [Self; WIDTH],
+        c: &mut [Self; WIDTH],
+        d: &mut [Self; WIDTH],
+    ) {
+        let sums = [sum_12(a), sum_12(b), sum_12(c), sum_12(d)];
+        let sums = *WideGoldilocksField::from_slice(&sums);
+        for i in 0..WIDTH {
+            let values = [a[i], b[i], c[i], d[i]];
+            let values = sums.multiply_accumulate(
+                *WideGoldilocksField::from_slice(&values),
+                WideGoldilocksField::from(F(MATRIX_DIAG_12_U64[i])),
+            );
+            let values = values.as_slice();
+            a[i] = values[0];
+            b[i] = values[1];
+            c[i] = values[2];
+            d[i] = values[3];
+        }
+    }
+
+    #[inline]
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
     fn internal_linear_layer_x4(
         a: &mut [Self; WIDTH],
         b: &mut [Self; WIDTH],
@@ -609,6 +646,19 @@ impl Poseidon2 for F {
         let a4 = a2.square();
         let a3 = *a * a2;
         a3 * a4
+    }
+
+    #[inline]
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    fn sbox_p_x4(a: &Self, b: &Self, c: &Self, d: &Self) -> (Self, Self, Self, Self) {
+        let values = [*a, *b, *c, *d];
+        let values = *WideGoldilocksField::from_slice(&values);
+        let values2 = values.square();
+        let values4 = values2.square();
+        let values3 = values * values2;
+        let values7 = values3 * values4;
+        let values7 = values7.as_slice();
+        (values7[0], values7[1], values7[2], values7[3])
     }
 
     #[inline]
@@ -898,6 +948,20 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     fn hash_no_pad(input: &[F]) -> Self::Hash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
+    }
+
+    fn hash_or_noop(input: &[F]) -> Self::Hash {
+        if input.len() <= NUM_HASH_OUT_ELTS {
+            HashOut {
+                elements: core::array::from_fn(|i| {
+                    input
+                        .get(i)
+                        .map_or(F::ZERO, |x| F::from_canonical_u64(x.to_canonical_u64()))
+                }),
+            }
+        } else {
+            Self::hash_no_pad(input)
+        }
     }
 
     fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
