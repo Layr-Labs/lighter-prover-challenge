@@ -2357,16 +2357,15 @@ fn compute_quotient_polys<
                     quotient_values_batch,
                 );
 
-                // The `1/Z_H` scaling is deliberately NOT applied here. Both
-                // consumers below apply it exactly once, after summing in the
-                // GPU contributions, so a point that receives three offloaded
-                // terms costs one multiply instead of four:
-                // `(cpu + g1 + g2 + g3) / Z_H` rather than
-                // `cpu/Z_H + g1/Z_H + g2/Z_H + g3/Z_H`. Equal by
-                // distributivity, and ~2.3M Goldilocks multiplies per d16
-                // transaction proof cheaper. Deferring unconditionally (rather
-                // than only when GPU jobs are pending) keeps the two branches
-                // from disagreeing when a launched job yields no values.
+                for (&i, quotient_values) in indices_batch
+                    .iter()
+                    .zip(quotient_values_batch.chunks_exact_mut(num_challenges))
+                {
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    quotient_values
+                        .iter_mut()
+                        .for_each(|v| *v *= denominator_inv);
+                }
             },
         );
 
@@ -2527,18 +2526,15 @@ fn compute_quotient_polys<
                     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                     {
                         if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge];
+                            value += values[start + challenge] * denominator_inv;
                         }
                         if let Some(values) = gpu_range_values {
-                            value += values[start + challenge];
+                            value += values[start + challenge] * denominator_inv;
                         }
                         if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge];
+                            value += values[start + challenge] * denominator_inv;
                         }
                     }
-                    // Single `1/Z_H` scaling for the summed contributions; see
-                    // the deferral note at the batch loop above.
-                    let value = value * denominator_inv;
                     // SAFETY: point `i` is owned by this parallel iteration,
                     // and every (challenge, point) destination is written once.
                     unsafe { *column.0.add(i) = value };
@@ -2553,13 +2549,9 @@ fn compute_quotient_polys<
             .for_each(|(chunk_i, chunk)| {
                 let base = BATCH_SIZE * chunk_i;
                 for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                    // Applies the `1/Z_H` scaling the batch loop deferred; on
-                    // this branch there is nothing to sum in first, so the
-                    // multiply count is unchanged from before the deferral.
-                    let denominator_inv = z_h_on_coset.eval_inverse(base + k);
                     for (column, &value) in column_ptrs.iter().zip(point_values) {
                         // SAFETY: `base + k` lies in this chunk's disjoint range.
-                        unsafe { *column.0.add(base + k) = value * denominator_inv };
+                        unsafe { *column.0.add(base + k) = value };
                     }
                 }
             });
@@ -2575,23 +2567,8 @@ fn compute_quotient_polys<
             // already carries the IFFT's `1/n` normalization, so each
             // coefficient takes exactly one multiply in the post-pass
             // instead of a `1/n` multiply followed by the shift-power one.
-            // `num_challenges` is 2, so this outer map can only ever occupy two
-            // threads. In the exclusive proving phases nothing else is running,
-            // which for the final block leaves ~12 cores idle through two serial
-            // 2^21 base-field inverse transforms at the very end of the run —
-            // the most serial window there is. Spread the transform itself in
-            // that case, exactly as the FRI fold and final-poly sites already do
-            // via `is_exclusive_gpu_phase`. Outside the exclusive phases the
-            // serial form is kept, because there the caller *is* nested inside a
-            // wider parallel phase. Output is byte-identical either way.
-            let values = PolynomialValues::new(column);
-            if crate::hash::poseidon2::is_exclusive_gpu_phase() {
-                values.coset_ifft_with_prescaled_powers_parallel(
-                    inverse_coset_shift_powers.as_slice(),
-                )
-            } else {
-                values.coset_ifft_with_prescaled_powers(inverse_coset_shift_powers.as_slice())
-            }
+            PolynomialValues::new(column)
+                .coset_ifft_with_prescaled_powers(inverse_coset_shift_powers.as_slice())
         })
         .collect()
 }
