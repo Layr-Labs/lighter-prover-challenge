@@ -320,6 +320,129 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        // Width-divisible batches (every production batch, n = 32) take
+        // the packed path; any other length keeps the untouched scalar
+        // path.
+        let width = <F as Packable>::Packing::WIDTH;
+        if vars_base.len() % width != 0 {
+            self.eval_accumulate_scalar(vars_base, filters, combined_gate_constraints);
+            return;
+        }
+        self.eval_accumulate_packed(vars_base, filters, combined_gate_constraints);
+    }
+
+    fn eval_unfiltered_circuit(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        vars: EvaluationTargets<D>,
+    ) -> Vec<ExtensionTarget<D>> {
+        let zero = builder.zero_extension();
+        let two = builder.two_extension();
+        let mut constraints = Vec::with_capacity(self.num_constraints());
+
+        for copy in 0..self.num_copies {
+            let access_index = vars.local_wires[self.wire_access_index(copy)];
+            let mut list_items = (0..self.vec_size())
+                .map(|i| vars.local_wires[self.wire_list_item(i, copy)])
+                .collect::<Vec<_>>();
+            let claimed_element = vars.local_wires[self.wire_claimed_element(copy)];
+            let bits = (0..self.bits)
+                .map(|i| vars.local_wires[self.wire_bit(i, copy)])
+                .collect::<Vec<_>>();
+
+            // Assert that each bit wire value is indeed boolean.
+            for &b in &bits {
+                constraints.push(builder.mul_sub_extension(b, b, b));
+            }
+
+            // Assert that the binary decomposition was correct.
+            let reconstructed_index = bits
+                .iter()
+                .rev()
+                .fold(zero, |acc, &b| builder.mul_add_extension(acc, two, b));
+            constraints.push(builder.sub_extension(reconstructed_index, access_index));
+
+            // Repeatedly fold the list, selecting the left or right item from each pair based on
+            // the corresponding bit.
+            for b in bits {
+                list_items = list_items
+                    .iter()
+                    .tuples()
+                    .map(|(&x, &y)| builder.select_ext_generalized(b, y, x))
+                    .collect()
+            }
+
+            // Check that the one remaining element after the folding is the claimed element.
+            debug_assert_eq!(list_items.len(), 1);
+            constraints.push(builder.sub_extension(list_items[0], claimed_element));
+        }
+
+        // Check the constant values.
+        constraints.extend((0..self.num_extra_constants).map(|i| {
+            builder.sub_extension(
+                vars.local_constants[i],
+                vars.local_wires[self.wire_extra_constant(i)],
+            )
+        }));
+
+        constraints
+    }
+
+    fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
+        (0..self.num_copies)
+            .map(|copy| {
+                WitnessGeneratorRef::new(
+                    RandomAccessGenerator {
+                        row,
+                        gate: *self,
+                        copy,
+                    }
+                    .adapter(),
+                )
+            })
+            .collect()
+    }
+
+    fn num_wires(&self) -> usize {
+        self.num_routed_wires() + self.num_copies * self.bits
+    }
+
+    fn num_constants(&self) -> usize {
+        self.num_extra_constants
+    }
+
+    fn degree(&self) -> usize {
+        self.bits + 1
+    }
+
+    fn num_constraints(&self) -> usize {
+        let constraints_per_copy = self.bits + 2;
+        self.num_copies * constraints_per_copy + self.num_extra_constants
+    }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::RandomAccess {
+            bits: self.bits,
+            num_ops: self.num_copies,
+            num_extra_constants: self.num_extra_constants,
+        })
+    }
+
+    fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
+        (0..self.num_extra_constants)
+            .map(|i| (i, self.wire_extra_constant(i)))
+            .collect()
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> RandomAccessGate<F, D> {
+    /// Scalar fallback: the original point-wise accumulate, kept verbatim.
+    fn eval_accumulate_scalar(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
@@ -436,108 +559,155 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         debug_assert_eq!(row, self.num_constraints());
     }
 
-    fn eval_unfiltered_circuit(
+    /// Packed point-wise accumulate for width-divisible batches. Each
+    /// lane of `Packing` holds one point, and every loop in this gate is
+    /// point-wise independent -- the bit checks, the index decomposition
+    /// and the selection fold chain across levels/rows, never across
+    /// points -- so the packed lanes compute the same field values as the
+    /// scalar path. The fused packed multiply-accumulate can differ from
+    /// the scalar form in the raw representative, never in the field
+    /// value; every consumer of the combined-constraint buffer is
+    /// congruence-preserving (the same contract as the packed vanishing
+    /// rows).
+    fn eval_accumulate_packed(
         &self,
-        builder: &mut CircuitBuilder<F, D>,
-        vars: EvaluationTargets<D>,
-    ) -> Vec<ExtensionTarget<D>> {
-        let zero = builder.zero_extension();
-        let two = builder.two_extension();
-        let mut constraints = Vec::with_capacity(self.num_constraints());
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
+
+        let wires = vars_base.local_wires;
+        let constants = vars_base.local_constants;
+        let col = |w: usize| &wires[w * n..][..n];
+        let vec_size = self.vec_size();
+        type Packing<F> = <F as Packable>::Packing;
+        let width = Packing::<F>::WIDTH;
+        let n_groups = n / width;
+        debug_assert_eq!(n % width, 0);
+        let mut row = 0;
 
         for copy in 0..self.num_copies {
-            let access_index = vars.local_wires[self.wire_access_index(copy)];
-            let mut list_items = (0..self.vec_size())
-                .map(|i| vars.local_wires[self.wire_list_item(i, copy)])
-                .collect::<Vec<_>>();
-            let claimed_element = vars.local_wires[self.wire_claimed_element(copy)];
-            let bits = (0..self.bits)
-                .map(|i| vars.local_wires[self.wire_bit(i, copy)])
-                .collect::<Vec<_>>();
-
-            // Assert that each bit wire value is indeed boolean.
-            for &b in &bits {
-                constraints.push(builder.mul_sub_extension(b, b, b));
+            // Assert that each bit wire value is indeed boolean:
+            // b * (b - 1), packed across points.
+            for i in 0..self.bits {
+                let b = col(self.wire_bit(i, copy));
+                let out = &mut combined_gate_constraints[row * n..][..n];
+                for g in 0..n_groups {
+                    let b_p = *Packing::<F>::from_slice(&b[g * width..][..width]);
+                    let f_p = *Packing::<F>::from_slice(&filters[g * width..][..width]);
+                    let acc = *Packing::<F>::from_slice(&out[g * width..][..width]);
+                    let term = b_p * (b_p - Packing::<F>::ONES);
+                    out[g * width..][..width]
+                        .copy_from_slice(acc.multiply_accumulate(term, f_p).as_slice());
+                }
+                row += 1;
             }
 
-            // Assert that the binary decomposition was correct.
-            let reconstructed_index = bits
-                .iter()
-                .rev()
-                .fold(zero, |acc, &b| builder.mul_add_extension(acc, two, b));
-            constraints.push(builder.sub_extension(reconstructed_index, access_index));
-
-            // Repeatedly fold the list, selecting the left or right item from each pair based on
-            // the corresponding bit.
-            for b in bits {
-                list_items = list_items
-                    .iter()
-                    .tuples()
-                    .map(|(&x, &y)| builder.select_ext_generalized(b, y, x))
-                    .collect()
+            // Assert that the binary decomposition was correct: the
+            // per-point chain acc = 2*acc + b is lane-wise independent.
+            let access_index = col(self.wire_access_index(copy));
+            let out = &mut combined_gate_constraints[row * n..][..n];
+            for g in 0..n_groups {
+                let mut acc = Packing::<F>::ZEROS;
+                for i in (0..self.bits).rev() {
+                    let b_p =
+                        *Packing::<F>::from_slice(&col(self.wire_bit(i, copy))[g * width..][..width]);
+                    acc = acc.doubles() + b_p;
+                }
+                let access_p = *Packing::<F>::from_slice(&access_index[g * width..][..width]);
+                let f_p = *Packing::<F>::from_slice(&filters[g * width..][..width]);
+                let acc_out = *Packing::<F>::from_slice(&out[g * width..][..width]);
+                let term = acc - access_p;
+                out[g * width..][..width]
+                    .copy_from_slice(acc_out.multiply_accumulate(term, f_p).as_slice());
             }
+            row += 1;
 
-            // Check that the one remaining element after the folding is the claimed element.
-            debug_assert_eq!(list_items.len(), 1);
-            constraints.push(builder.sub_extension(list_items[0], claimed_element));
+            // Repeatedly fold the list, selecting the left or right item
+            // from each pair based on the corresponding bit: items[k] =
+            // x + b * (y - x). The level chains are point-wise
+            // independent, so the fold runs per point-group with packed
+            // lanes.
+            let mut items_group = [MaybeUninit::<Packing<F>>::uninit(); 32];
+            let mut items_heap;
+            let items_uninit: &mut [MaybeUninit<Packing<F>>] = if vec_size / 2 <= 32 {
+                &mut items_group[..vec_size / 2]
+            } else {
+                items_heap = vec![MaybeUninit::uninit(); vec_size / 2];
+                &mut items_heap
+            };
+            for g in 0..n_groups {
+                if self.bits != 0 {
+                    let b0 = col(self.wire_bit(0, copy));
+                    let b0_p = *Packing::<F>::from_slice(&b0[g * width..][..width]);
+                    for k in 0..vec_size / 2 {
+                        let xs = col(self.wire_list_item(2 * k, copy));
+                        let ys = col(self.wire_list_item(2 * k + 1, copy));
+                        let x_p = *Packing::<F>::from_slice(&xs[g * width..][..width]);
+                        let y_p = *Packing::<F>::from_slice(&ys[g * width..][..width]);
+                        items_uninit[k].write(x_p + b0_p * (y_p - x_p));
+                    }
+                }
+                // SAFETY: with zero index bits the slice is empty;
+                // otherwise the first selector level initialized every
+                // element exactly once.
+                let items = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        items_uninit.as_mut_ptr().cast::<Packing<F>>(),
+                        vec_size / 2,
+                    )
+                };
+                let mut level_size = vec_size / 2;
+                for i in 1..self.bits {
+                    let b_i = col(self.wire_bit(i, copy));
+                    let b_p = *Packing::<F>::from_slice(&b_i[g * width..][..width]);
+                    for k in 0..level_size / 2 {
+                        let x = items[2 * k];
+                        let y = items[2 * k + 1];
+                        items[k] = x + b_p * (y - x);
+                    }
+                    level_size /= 2;
+                }
+                let claimed = col(self.wire_claimed_element(copy));
+                let claimed_p = *Packing::<F>::from_slice(&claimed[g * width..][..width]);
+                let out = &mut combined_gate_constraints[row * n..][..n];
+                let f_p = *Packing::<F>::from_slice(&filters[g * width..][..width]);
+                let acc = *Packing::<F>::from_slice(&out[g * width..][..width]);
+                let term = if self.bits == 0 {
+                    let x_p = *Packing::<F>::from_slice(
+                        &col(self.wire_list_item(0, copy))[g * width..][..width],
+                    );
+                    x_p - claimed_p
+                } else {
+                    items[0] - claimed_p
+                };
+                out[g * width..][..width]
+                    .copy_from_slice(acc.multiply_accumulate(term, f_p).as_slice());
+            }
+            row += 1;
         }
 
-        // Check the constant values.
-        constraints.extend((0..self.num_extra_constants).map(|i| {
-            builder.sub_extension(
-                vars.local_constants[i],
-                vars.local_wires[self.wire_extra_constant(i)],
-            )
-        }));
-
-        constraints
+        for i in 0..self.num_extra_constants {
+            let constant = &constants[i * n..][..n];
+            let wire = col(self.wire_extra_constant(i));
+            let out = &mut combined_gate_constraints[row * n..][..n];
+            for g in 0..n_groups {
+                let c_p = *Packing::<F>::from_slice(&constant[g * width..][..width]);
+                let w_p = *Packing::<F>::from_slice(&wire[g * width..][..width]);
+                let f_p = *Packing::<F>::from_slice(&filters[g * width..][..width]);
+                let acc = *Packing::<F>::from_slice(&out[g * width..][..width]);
+                let term = c_p - w_p;
+                out[g * width..][..width]
+                    .copy_from_slice(acc.multiply_accumulate(term, f_p).as_slice());
+            }
+            row += 1;
+        }
+        debug_assert_eq!(row, self.num_constraints());
     }
 
-    fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
-        (0..self.num_copies)
-            .map(|copy| {
-                WitnessGeneratorRef::new(
-                    RandomAccessGenerator {
-                        row,
-                        gate: *self,
-                        copy,
-                    }
-                    .adapter(),
-                )
-            })
-            .collect()
-    }
-
-    fn num_wires(&self) -> usize {
-        self.num_routed_wires() + self.num_copies * self.bits
-    }
-
-    fn num_constants(&self) -> usize {
-        self.num_extra_constants
-    }
-
-    fn degree(&self) -> usize {
-        self.bits + 1
-    }
-
-    fn num_constraints(&self) -> usize {
-        let constraints_per_copy = self.bits + 2;
-        self.num_copies * constraints_per_copy + self.num_extra_constants
-    }
-
-    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        Some(U32QuotientGate::RandomAccess {
-            bits: self.bits,
-            num_ops: self.num_copies,
-            num_extra_constants: self.num_extra_constants,
-        })
-    }
-
-    fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
-        (0..self.num_extra_constants)
-            .map(|i| (i, self.wire_extra_constant(i)))
-            .collect()
-    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>

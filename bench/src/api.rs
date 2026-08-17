@@ -1,4 +1,4 @@
-// Redraw marker 628
+// Redraw marker 629
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
@@ -252,10 +252,15 @@ impl Circuits {
         }
     }
 
-    /// Builds the final block circuit, which depends on the pre-execution and
-    /// both chain circuits but is only needed for the final proof. Callers run
-    /// this concurrently with transaction/chain proving.
+    /// Loads the final block circuit from its embedded blob when one is
+    /// compiled in, falling back to a fresh build (e.g. under
+    /// `LIGHTER_SKIP_EMBED=1`). The blob path skips the entire
+    /// `Forest`/`GeneratorWatchIndex`/sigma-polynomial construction that a
+    /// runtime build pays on every worker.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
+        if let Ok(loaded) = crate::embedded::load_block_blob() {
+            return loaded;
+        }
         // `define` reads only `common` and `verifier_only` of its three inputs
         // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
         // so the shared guard is needed only for the construction itself and is
