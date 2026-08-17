@@ -139,6 +139,12 @@ fn run_generator_worklist<
     let skip_unready = prover_data.generators_defer_until_ready;
 
     let parallel_rounds = parallel_rounds_enabled();
+    #[cfg(feature = "diagnostic_profile")]
+    let mut stats = WorklistStats {
+        skip_unready: skip_unready as usize,
+        parallel_rounds: parallel_rounds as usize,
+        ..WorklistStats::default()
+    };
     let mut buffer = GeneratedValues::empty();
 
     // The two round queues are swapped rather than reallocated. Every round used
@@ -157,6 +163,8 @@ fn run_generator_worklist<
     // Keep running generators until we fail to make progress.
     while !pending_generator_indices.is_empty() {
         next_pending_generator_indices.clear();
+        #[cfg(feature = "diagnostic_profile")]
+        stats.round(pending_generator_indices.len(), parallel_threshold);
 
         if parallel_rounds && pending_generator_indices.len() >= parallel_threshold {
             // A generator can be enqueued once per newly populated watch, and may have expired
@@ -281,10 +289,19 @@ fn run_generator_worklist<
                 continue;
             }
 
+            #[cfg(feature = "diagnostic_profile")]
+            let dispatch_started = stats.dispatch_start();
             let finished =
                 generators[generator_idx]
                     .0
                     .run_with_ready_hint(witness, &mut buffer, ready);
+            #[cfg(feature = "diagnostic_profile")]
+            stats.dispatch_end(
+                generator_idx,
+                dispatch_started,
+                buffer.target_values.len(),
+                generators.len(),
+            );
             if finished {
                 generator_is_expired[generator_idx] = true;
                 *remaining_generators -= 1;
@@ -297,8 +314,14 @@ fn run_generator_worklist<
             // touch disjoint state, so fusing the two passes deletes the per-run intermediate
             // rep Vec while preserving both the `set_target_returning_rep` call order and the
             // pending-queue push order exactly.
+            #[cfg(feature = "diagnostic_profile")]
+            let merge_started = stats.dispatch_start();
             for (t, v) in buffer.target_values.drain(..) {
                 if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                    #[cfg(feature = "diagnostic_profile")]
+                    {
+                        stats.values_new += 1;
+                    }
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
                             let watching_generator_idx = watching_generator_idx as usize;
@@ -311,6 +334,10 @@ fn run_generator_worklist<
                     }
                 }
             }
+            #[cfg(feature = "diagnostic_profile")]
+            if let Some(merge_started) = merge_started {
+                stats.merge_ns += merge_started.elapsed().as_nanos() as u64;
+            }
         }
 
         core::mem::swap(
@@ -319,7 +346,181 @@ fn run_generator_worklist<
         );
     }
 
+    #[cfg(feature = "diagnostic_profile")]
+    stats.emit(generators);
+
     Ok(())
+}
+
+/// Whether to additionally time every sequential dispatch and attribute it to
+/// the generator that ran. Env-gated on top of the feature because the two
+/// clock reads per dispatch are themselves a measurable cost; used only for
+/// one-off decomposition runs.
+#[cfg(feature = "diagnostic_profile")]
+fn worklist_id_profile() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LIGHTER_WORKLIST_IDS").is_some())
+}
+
+/// Whether to dump one stderr line per worklist round (index, queue length,
+/// dispatches, merged values, wall nanoseconds). Two clock reads per round, so
+/// the round timings themselves stay usable.
+#[cfg(feature = "diagnostic_profile")]
+fn worklist_round_profile() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("LIGHTER_WORKLIST_ROUNDS").is_some())
+}
+
+/// Diagnostic-only shape of one worklist execution: how many rounds it took,
+/// how wide they were, and how much work each dispatched. Compiled out (and
+/// never constructed) without `diagnostic_profile`.
+#[cfg(feature = "diagnostic_profile")]
+#[derive(Default)]
+struct WorklistStats {
+    rounds: usize,
+    queued: usize,
+    max_round: usize,
+    rounds_at_threshold: usize,
+    queued_at_threshold: usize,
+    dispatches: usize,
+    values: usize,
+    values_new: usize,
+    merge_ns: u64,
+    skip_unready: usize,
+    parallel_rounds: usize,
+    /// Per round: (queued, dispatches so far, values so far, start instant).
+    rounds_detail: Vec<(usize, usize, usize, u64)>,
+    round_started: Option<std::time::Instant>,
+    /// Per generator index: (dispatch count, total nanoseconds). Populated only
+    /// under `LIGHTER_WORKLIST_IDS`.
+    per_generator: Vec<(u32, u64)>,
+}
+
+#[cfg(feature = "diagnostic_profile")]
+impl WorklistStats {
+    fn round(&mut self, len: usize, parallel_threshold: usize) {
+        self.close_round();
+        self.rounds += 1;
+        self.queued += len;
+        self.max_round = self.max_round.max(len);
+        if len >= parallel_threshold {
+            self.rounds_at_threshold += 1;
+            self.queued_at_threshold += len;
+        }
+        if worklist_round_profile() {
+            self.rounds_detail
+                .push((len, self.dispatches, self.values, 0));
+            self.round_started = Some(std::time::Instant::now());
+        }
+    }
+
+    fn close_round(&mut self) {
+        if let Some(started) = self.round_started.take() {
+            let nanos = started.elapsed().as_nanos() as u64;
+            if let Some(last) = self.rounds_detail.last_mut() {
+                last.3 = nanos;
+            }
+        }
+    }
+
+    fn dump_rounds(&self) {
+        use std::io::Write;
+        if self.rounds_detail.is_empty() {
+            return;
+        }
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed").to_owned();
+        let mut out = String::new();
+        for (index, window) in self
+            .rounds_detail
+            .windows(2)
+            .chain(core::iter::once(&self.rounds_detail[self.rounds_detail.len() - 1..]))
+            .enumerate()
+        {
+            let (queued, dispatches, values, nanos) = window[0];
+            let (next_dispatches, next_values) = match window.get(1) {
+                Some(next) => (next.1, next.2),
+                None => (self.dispatches, self.values),
+            };
+            out.push_str(&format!(
+                "[worklist-round] th={name} round={index} queued={queued} dispatched={} values={} ns={nanos}\n",
+                next_dispatches - dispatches,
+                next_values - values,
+            ));
+        }
+        let _ = std::io::stderr().write_all(out.as_bytes());
+    }
+
+    fn dispatch_start(&self) -> Option<std::time::Instant> {
+        worklist_id_profile().then(std::time::Instant::now)
+    }
+
+    fn dispatch_end(
+        &mut self,
+        generator_idx: usize,
+        started: Option<std::time::Instant>,
+        values: usize,
+        generator_count: usize,
+    ) {
+        self.dispatches += 1;
+        self.values += values;
+        if let Some(started) = started {
+            if self.per_generator.is_empty() {
+                self.per_generator = vec![(0, 0); generator_count];
+            }
+            let entry = &mut self.per_generator[generator_idx];
+            entry.0 += 1;
+            entry.1 += started.elapsed().as_nanos() as u64;
+        }
+    }
+
+    fn emit<F: RichField + Extendable<D>, const D: usize>(
+        &mut self,
+        generators: &[WitnessGeneratorRef<F, D>],
+    ) {
+        self.close_round();
+        self.dump_rounds();
+        let count = |name: &str, value: usize| {
+            crate::util::profile::counter("witness", name, value as u64)
+        };
+        count("worklist_rounds", self.rounds);
+        count("worklist_queued", self.queued);
+        count("worklist_max_round", self.max_round);
+        count("worklist_rounds_at_threshold", self.rounds_at_threshold);
+        count("worklist_queued_at_threshold", self.queued_at_threshold);
+        count("worklist_dispatches", self.dispatches);
+        count("worklist_values", self.values);
+        count("worklist_values_new", self.values_new);
+        count("worklist_skip_unready", self.skip_unready);
+        count("worklist_parallel_rounds", self.parallel_rounds);
+        crate::util::profile::counter("witness", "worklist_merge_ns", self.merge_ns);
+        if self.per_generator.is_empty() {
+            return;
+        }
+        // Aggregate by generator *kind* (the `id()` prefix up to the first
+        // space or brace), then report the heaviest kinds.
+        let mut by_kind = std::collections::BTreeMap::<String, (u64, u64)>::new();
+        for (generator_idx, (calls, nanos)) in self.per_generator.iter().enumerate() {
+            if *calls == 0 {
+                continue;
+            }
+            let id = generators[generator_idx].0.id();
+            let kind = id
+                .split(['<', '{', ' ', '('])
+                .next()
+                .unwrap_or(&id)
+                .to_owned();
+            let entry = by_kind.entry(kind).or_default();
+            entry.0 += u64::from(*calls);
+            entry.1 += *nanos;
+        }
+        let mut kinds: Vec<_> = by_kind.into_iter().collect();
+        kinds.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+        for (kind, (calls, nanos)) in kinds.into_iter().take(24) {
+            crate::util::profile::counter("witness-gen-ns", &kind, nanos);
+            crate::util::profile::counter("witness-gen-calls", &kind, calls);
+        }
+    }
 }
 
 /// Seeds `inputs` into `witness` and returns, per generator, the number of distinct
@@ -565,6 +766,9 @@ pub struct PartitionFeeder<'a, 'b, F: Field> {
     generator_is_expired: &'b [bool],
     pending_generator_indices: &'b mut Vec<usize>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
+    /// Diagnostic-only count of `set_target` calls made by the input writer.
+    #[cfg(feature = "diagnostic_profile")]
+    writes: usize,
 }
 
 impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
@@ -575,6 +779,10 @@ impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
 
 impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        #[cfg(feature = "diagnostic_profile")]
+        {
+            self.writes += 1;
+        }
         if let Some(watch) = self.witness.set_target_returning_rep(target, value)? {
             if let Some(watchers) = self.generator_indices_by_watches.get(&watch) {
                 for &watching_generator_idx in watchers {
@@ -951,13 +1159,30 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         seed: impl FnOnce(&mut PartitionFeeder<'a, '_, F>) -> Result<()>,
     ) -> Result<()> {
         let mut pending_generator_indices = Vec::new();
-        seed(&mut PartitionFeeder {
-            witness: &mut self.witness,
-            unresolved_watches: &mut self.unresolved_watches,
-            generator_is_expired: &self.generator_is_expired,
-            pending_generator_indices: &mut pending_generator_indices,
-            generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
-        })?;
+        {
+            #[cfg(feature = "diagnostic_profile")]
+            let _profile_span = crate::util::profile::span("witness", "feed_seed_writes");
+            let mut feeder = PartitionFeeder {
+                witness: &mut self.witness,
+                unresolved_watches: &mut self.unresolved_watches,
+                generator_is_expired: &self.generator_is_expired,
+                pending_generator_indices: &mut pending_generator_indices,
+                generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+                #[cfg(feature = "diagnostic_profile")]
+                writes: 0,
+            };
+            seed(&mut feeder)?;
+            #[cfg(feature = "diagnostic_profile")]
+            crate::util::profile::counter("witness", "feed_target_writes", feeder.writes as u64);
+        }
+        #[cfg(feature = "diagnostic_profile")]
+        crate::util::profile::counter(
+            "witness",
+            "feed_queued_generators",
+            pending_generator_indices.len() as u64,
+        );
+        #[cfg(feature = "diagnostic_profile")]
+        let _profile_worklist = crate::util::profile::span("witness", "feed_worklist");
 
         run_generator_worklist(
             &mut self.witness,

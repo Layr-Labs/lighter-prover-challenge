@@ -538,7 +538,7 @@ fn all_wires_permutation_partial_products<
     // twice with no reuse between the passes. Fuse the two challenges into one
     // traversal; every other configuration keeps the general path unchanged.
     if num_challenges == 2 {
-        PAIRED_PERMUTATION_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        note_paired_permutation_batch();
         return two_challenge_wires_permutation_partial_products_and_zs(
             witness,
             betas,
@@ -574,6 +574,36 @@ static PAIRED_PERMUTATION_BATCHES: core::sync::atomic::AtomicUsize =
 /// two-challenge path.
 pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// Per-thread mirror of `PAIRED_PERMUTATION_BATCHES`. The process-wide static
+// cannot witness *this* caller's dispatch decision inside a test binary that
+// proves concurrently: every other test that proves at the production
+// `num_challenges == 2` bumps the same static, so an exact
+// `after == before + 1` assertion absorbs foreign increments. The dispatch
+// branch runs on the calling thread before any rayon region is entered, and a
+// libtest thread is never a rayon worker (it blocks on a latch rather than
+// stealing), so a thread-local count observes exactly the dispatches this
+// thread performed.
+#[cfg(all(test, feature = "std"))]
+std::thread_local! {
+    static PAIRED_PERMUTATION_BATCHES_ON_THREAD: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+/// One relaxed increment per dispatched batch, off any inner loop.
+#[inline]
+fn note_paired_permutation_batch() {
+    PAIRED_PERMUTATION_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    #[cfg(all(test, feature = "std"))]
+    PAIRED_PERMUTATION_BATCHES_ON_THREAD.with(|count| count.set(count.get() + 1));
+}
+
+/// Number of permutation batches *this thread* has dispatched to the fused
+/// two-challenge path.
+#[cfg(all(test, feature = "std"))]
+fn paired_permutation_batch_count_on_thread() -> usize {
+    PAIRED_PERMUTATION_BATCHES_ON_THREAD.with(core::cell::Cell::get)
 }
 
 #[inline]
@@ -1297,6 +1327,31 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
     }
 }
 
+/// Routing policy for the ExponentiationGate quotient family. `Always` is
+/// the default: the gate's quotient rows are emitted into the shared
+/// Range/U32 Metal command. `Off` keeps the family on the CPU quotient
+/// evaluator (the historical baseline), and `Exclusive` offloads only while
+/// the process-global exclusive serial phase is active. Read once per
+/// process from `LIGHTER_EXP_GPU` (`off`/`exclusive`/`always`); unset means
+/// `Always`, so `off` is the explicit opt-out.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExponentiationGpuPolicy {
+    Off,
+    Exclusive,
+    Always,
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn exponentiation_gpu_policy() -> ExponentiationGpuPolicy {
+    static POLICY: std::sync::OnceLock<ExponentiationGpuPolicy> = std::sync::OnceLock::new();
+    *POLICY.get_or_init(|| match std::env::var("LIGHTER_EXP_GPU").as_deref() {
+        Ok("off") => ExponentiationGpuPolicy::Off,
+        Ok("exclusive") => ExponentiationGpuPolicy::Exclusive,
+        _ => ExponentiationGpuPolicy::Always,
+    })
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
@@ -1614,17 +1669,35 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
+        let native = if let Some(exponentiation) =
+            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
+        {
             // The transaction circuits' 67-bit exponentiation loop is the
             // most divergent native branch in the shared Range/U32 command.
-            // Leave this one family on the existing CPU quotient evaluator:
-            // it stays out of `gate_indices`, so it is not CPU-excluded and
-            // its selector/alpha contribution remains byte-for-byte the
-            // ordinary generic path. This trades a small parallel CPU span
-            // for a shorter process-shared Metal queue tail.
-            None
-        } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
-            // The gate reads its single constant (the "one" value) as local
+            // Offloading it lengthens the process-shared Metal command but
+            // removes the corresponding span from the CPU quotient pass,
+            // which sits on the serial tail. Measured single-worker on an
+            // idle host: 12.88 -> 11.98 s medians, n=6+6, arms fully
+            // separated. `LIGHTER_EXP_GPU=off` restores the CPU-only
+            // baseline and `exclusive` offloads only while the exclusive
+            // serial phase is active. Routing-only: either path computes
+            // the identical filtered constraint contribution, so the
+            // quotient values do not depend on the policy.
+            match exponentiation_gpu_policy() {
+                ExponentiationGpuPolicy::Off => None,
+                ExponentiationGpuPolicy::Exclusive
+                    if !crate::hash::poseidon2::is_exclusive_gpu_phase() =>
+                {
+                    None
+                }
+                _ => Some((
+                    U32QuotientKind::Exponentiation,
+                    exponentiation.num_power_bits,
+                    exponentiation.num_power_bits.checked_mul(2)?.checked_add(2)?,
+                    exponentiation.num_power_bits.checked_add(1)?,
+                )),
+            }
+        } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {            // The gate reads its single constant (the "one" value) as local
             // constant 0, i.e. the column immediately after the selector
             // prefix of the constants/sigmas commitment.
             let constant_column = common_data.selectors_info.num_selectors();
@@ -3495,7 +3568,7 @@ mod permutation_pairing_tests {
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        all_wires_permutation_partial_products, paired_permutation_batch_count_on_thread,
         two_challenge_wires_permutation_partial_products_and_zs,
         wires_permutation_partial_products_and_zs,
     };
@@ -3735,8 +3808,10 @@ mod permutation_pairing_tests {
 
             // The dispatcher must route the production shape to the fused path
             // and return the same thing, and the counter must move — otherwise
-            // this test could pass while production still ran two passes.
-            let before = paired_permutation_batch_count();
+            // this test could pass while production still ran two passes. The
+            // count is per-thread: the process-wide static is shared with every
+            // other test proving concurrently at `num_challenges == 2`.
+            let before = paired_permutation_batch_count_on_thread();
             let dispatched = all_wires_permutation_partial_products(
                 &witness,
                 &betas,
@@ -3745,7 +3820,7 @@ mod permutation_pairing_tests {
                 &data.prover_only,
                 &data.common,
             );
-            let after = paired_permutation_batch_count();
+            let after = paired_permutation_batch_count_on_thread();
             assert_eq!(
                 after,
                 before + 1,
@@ -3775,7 +3850,7 @@ mod permutation_pairing_tests {
                 .iter()
                 .flat_map(|&beta| three.k_is.iter().map(move |&k_i| beta * k_i))
                 .collect();
-            let before = paired_permutation_batch_count();
+            let before = paired_permutation_batch_count_on_thread();
             let general3 = all_wires_permutation_partial_products(
                 &witness,
                 &betas3,
@@ -3785,7 +3860,7 @@ mod permutation_pairing_tests {
                 &three,
             );
             assert_eq!(
-                paired_permutation_batch_count(),
+                paired_permutation_batch_count_on_thread(),
                 before,
                 "fused path fired for num_challenges = 3"
             );
