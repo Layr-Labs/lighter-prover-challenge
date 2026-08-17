@@ -247,14 +247,29 @@ impl Circuits {
         }
     }
 
-    /// Builds the final block circuit, which depends on the pre-execution and
-    /// both chain circuits but is only needed for the final proof. Callers run
-    /// this concurrently with transaction/chain proving.
+    /// Loads the final block circuit from its embedded blob, falling back to a
+    /// fresh build when compiled with `LIGHTER_SKIP_EMBED=1` or when the blob
+    /// fails its internal commitment-cap check.
+    ///
+    /// The block circuit depends only on the pre-execution and both chain
+    /// circuits (all embedded, deterministic per binary), so it is itself
+    /// deterministic and embeddable. Building it from scratch is the dominant
+    /// CPU cost of the worker (permutation-argument forest over the whole
+    /// block circuit, generator watch index, sigma derivation); loading the
+    /// blob moves that construction to the untimed compile job.
     pub fn build_block_circuit(&self) -> (BlockTarget, CircuitData<F, C, D>) {
-        // `define` reads only `common` and `verifier_only` of its three inputs
-        // (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
-        // so the shared guard is needed only for the construction itself and is
-        // dropped before the (much longer) `build` below.
+        if let Ok(loaded) = crate::embedded::load_block_blob() {
+            return loaded;
+        }
+        self.build_block_circuit_from_scratch()
+    }
+
+    /// Builds the final block circuit from scratch. `define` reads only
+    /// `common` and `verifier_only` of its three inputs
+    /// (`handle_proofs` calls `constant_verifier_data` and `verify_proof`),
+    /// so the shared guard is needed only for the construction itself and is
+    /// dropped before the (much longer) `build` below.
+    pub fn build_block_circuit_from_scratch(&self) -> (BlockTarget, CircuitData<F, C, D>) {
         let heavy_chain_data = self
             .heavy_chain_data
             .read()
