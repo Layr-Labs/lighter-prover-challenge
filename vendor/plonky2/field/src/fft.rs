@@ -336,40 +336,10 @@ pub(crate) fn ifft_with_options_and_prescaled_postscale<F: Field>(
     root_table: Option<&FftRootTable<F>>,
     prescaled_scales: &[F],
 ) -> PolynomialCoeffs<F> {
-    ifft_prescaled_inner(poly, zero_factor, root_table, prescaled_scales, false)
-}
-
-/// [`ifft_with_options_and_prescaled_postscale`] that distributes the transform's
-/// outer stages across the worker pool.
-///
-/// Same contract as the serial form and byte-identical output — only the
-/// scheduling of the butterfly layers differs. Callers must only use it when the
-/// transform is not already nested inside a wider parallel phase, which is why
-/// it is gated on the exclusive proving phase at its one call site.
-pub(crate) fn ifft_with_options_and_prescaled_postscale_parallel<F: Field>(
-    poly: PolynomialValues<F>,
-    zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F>>,
-    prescaled_scales: &[F],
-) -> PolynomialCoeffs<F> {
-    ifft_prescaled_inner(poly, zero_factor, root_table, prescaled_scales, true)
-}
-
-fn ifft_prescaled_inner<F: Field>(
-    poly: PolynomialValues<F>,
-    zero_factor: Option<usize>,
-    root_table: Option<&FftRootTable<F>>,
-    prescaled_scales: &[F],
-    parallel: bool,
-) -> PolynomialCoeffs<F> {
     let n = poly.len();
     assert_eq!(prescaled_scales.len(), n);
     let PolynomialValues { values: mut buffer } = poly;
-    if parallel {
-        fft_dispatch_parallel(&mut buffer, zero_factor, root_table);
-    } else {
-        fft_dispatch(&mut buffer, zero_factor, root_table);
-    }
+    fft_dispatch(&mut buffer, zero_factor, root_table);
 
     // Same reversal and same write order as the two-multiply post-pass.
     buffer[0] *= prescaled_scales[0];
