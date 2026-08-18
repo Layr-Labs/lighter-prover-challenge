@@ -49,109 +49,6 @@ pub(crate) enum BatchLayout {
     PolyMajor,
 }
 
-/// Optional compact copy of the even LDE rows of a column-major commitment
-/// (row `k` of the companion is row `2k` of the commitment), retained in a
-/// shared Metal buffer so the half-domain quotient kernels read contiguous
-/// columns instead of a stride-2 gather over the full store. Filled either
-/// by the LDE write (`from_coeffs_with_even_companion`) or lazily from an
-/// already-retained full store (`get_or_fill_even_rows`) — the latter is
-/// how deserialized `constants_sigmas` blobs grow a companion: the values
-/// are circuit-fixed, so one fill is reused for every proof.
-/// Absent on non-Metal targets.
-pub struct EvenColumns<F> {
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
-    _phantom: core::marker::PhantomData<F>,
-}
-
-impl<F> Default for EvenColumns<F> {
-    fn default() -> Self {
-        Self {
-            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            inner: std::sync::OnceLock::new(),
-            _phantom: core::marker::PhantomData,
-        }
-    }
-}
-
-// The companion is a derived cache of the commitment's own LDE, so it does
-// not participate in equality; two batches with identical polynomials and
-// trees are equal whether or not either retained a companion.
-impl<F> PartialEq for EvenColumns<F> {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-impl<F> Eq for EvenColumns<F> {}
-impl<F> core::fmt::Debug for EvenColumns<F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("EvenColumns")
-    }
-}
-
-impl<F> EvenColumns<F> {
-    /// Eager companion produced alongside the LDE fill.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn from_ready(
-        columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
-    ) -> Self {
-        let inner = std::sync::OnceLock::new();
-        let _ = inner.set(columns);
-        Self {
-            inner,
-            _phantom: core::marker::PhantomData,
-        }
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn get(&self) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
-        self.inner.get().and_then(Option::as_ref)
-    }
-
-    /// Derive the even-row companion from a full-domain Metal column store.
-    ///
-    /// `companion[j][k] = full[j][2k]`. The kernel indexes both the wires
-    /// companion and this buffer with stride `wires.rows`, so the compact
-    /// constants must have the same row count as the compact wires. A
-    /// degree-`< 4n` polynomial is determined by its `4n` even-coset
-    /// samples; copying those samples does not change any value the
-    /// full-domain kernel would have read at those rows.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn get_or_fill_even_rows(
-        &self,
-        full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>>
-    where
-        F: crate::hash::hash_types::RichField,
-    {
-        self.inner
-            .get_or_init(|| fill_even_companion_from_full(full))
-            .as_ref()
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
-    full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
-    if full.rows() < 2 || full.rows() % 2 != 0 || full.cols() == 0 {
-        return None;
-    }
-    let half = full.rows() / 2;
-    let mut companion =
-        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(full.cols(), half)?;
-    let dests = companion.columns_mut()?;
-    dests.into_par_iter().enumerate().for_each(|(j, dest)| {
-        let src = full.col(j);
-        debug_assert_eq!(src.len(), half * 2);
-        debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
-        }
-    });
-    Some(companion)
-}
-
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -161,8 +58,6 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
     pub degree_log: usize,
     pub rate_bits: usize,
     pub blinding: bool,
-    /// See [`EvenColumns`].
-    pub even_columns: EvenColumns<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
@@ -175,7 +70,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
-            even_columns: EvenColumns::default(),
         }
     }
 }
@@ -215,7 +109,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     degree_log: log2_strict(degree),
                     rate_bits,
                     blinding,
-                    even_columns: EvenColumns::default(),
                 };
             }
         }
@@ -245,33 +138,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        Self::from_coeffs_with_even_companion(
-            polynomials,
-            rate_bits,
-            blinding,
-            cap_height,
-            timing,
-            fft_root_table,
-            false,
-        )
-    }
-
-    /// [`Self::from_coeffs`], additionally retaining the compact even-row
-    /// companion (see [`EvenColumns`]) when `want_even_companion` is set and
-    /// the commitment lands in retained shared column storage. Values and
-    /// tree are identical either way; the companion is a pure read-only copy.
-    pub fn from_coeffs_with_even_companion(
-        polynomials: Vec<PolynomialCoeffs<F>>,
-        rate_bits: usize,
-        blinding: bool,
-        cap_height: usize,
-        timing: &mut TimingTree,
-        fft_root_table: Option<&FftRootTable<F>>,
-        want_even_companion: bool,
-    ) -> Self {
         let degree = polynomials[0].len();
-        #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-        let _ = want_even_companion;
 
         if GPU_NTT_COMMITMENTS && !blinding {
             let coeff_columns: Vec<&[F]> = polynomials
@@ -294,7 +161,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     degree_log: log2_strict(degree),
                     rate_bits,
                     blinding,
-                    even_columns: EvenColumns::default(),
                 };
             }
         }
@@ -314,44 +180,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
-                // Compact even-row companion (Metal only, on request): the
-                // fill below writes row `2k` of every column into row `k` of
-                // the companion right after that column's FFT, while the
-                // column is still cache-resident.
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
-                    crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
-                        polynomials.len(),
-                        lde_len / 2,
-                    )
-                } else {
-                    None
-                };
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs: Option<Vec<usize>> = even_companion.as_mut().and_then(|companion| {
-                    companion
-                        .columns_mut()
-                        .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
-                });
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs = &even_ptrs;
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let half_len = lde_len / 2;
-                let copy_even = |_column: usize, _destination: &[F]| {
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    if let Some(ptrs) = even_ptrs {
-                        // SAFETY: each column index is written by exactly one
-                        // closure invocation (columns are disjoint), the
-                        // companion outlives the fill, and `F` is plain data.
-                        let out = unsafe {
-                            core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
-                        };
-                        for (k, slot) in out.iter_mut().enumerate() {
-                            *slot = _destination[2 * k];
-                        }
-                    }
-                };
-                let copy_even = &copy_even;
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
@@ -381,7 +209,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
                                 },
                             );
                         },
@@ -399,16 +226,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
-                        }
                     };
                 }
                 let initialized = timed!(
@@ -419,7 +236,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &polynomials,
                         rate_bits,
                         fft_root_table,
-                        copy_even,
                     )
                 );
                 if initialized {
@@ -434,16 +250,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
-                        }
                     };
                 }
             }
@@ -467,7 +273,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             degree_log: log2_strict(degree),
             rate_bits,
             blinding,
-            even_columns: EvenColumns::default(),
         }
     }
 
@@ -537,7 +342,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         polynomials: &[PolynomialCoeffs<F>],
         rate_bits: usize,
         fft_root_table: Option<&FftRootTable<F>>,
-        copy_even: &(dyn Fn(usize, &[F]) + Sync),
     ) -> bool {
         let degree = polynomials[0].len();
         let lde_len = degree << rate_bits;
@@ -551,8 +355,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         destinations
             .into_par_iter()
             .zip(polynomials.par_iter())
-            .enumerate()
-            .for_each(|(column, (destination, polynomial))| {
+            .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
                 // Fused copy-and-scale: the unscaled coefficient image that
                 // `copy_from_slice` used to materialize here is never observed —
@@ -575,7 +378,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
                 fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
-                copy_even(column, destination);
             });
         true
     }
@@ -1267,7 +1069,6 @@ mod tests {
                         &polynomials,
                         rate_bits,
                         root_table,
-                        &|_, _| {},
                     ));
 
                     for (column, expected) in expected.iter().enumerate() {
