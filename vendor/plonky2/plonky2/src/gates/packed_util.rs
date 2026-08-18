@@ -56,11 +56,19 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        // Evaluate two `Packing` vectors in lockstep (Plonky3 PR #1977): one packed
+        // vector per constraint expression forms a single serial dependency chain
+        // through the ~10-cycle packed multiply kernels, leaving the out-of-order
+        // core starved; the 2x-wide lockstep packing doubles the number of
+        // independent chains. Only this quotient accumulate path widens — the FFT
+        // and everything else keeps `Packing`.
+        type P2<F> = <F as Packable>::PackingX2;
+
         let n = vars_batch.len();
         assert_eq!(filters.len(), n);
         let num_constraints = self.num_constraints();
         assert!(combined_gate_constraints.len() >= num_constraints * n);
-        let width = <<F as Packable>::Packing as PackedField>::WIDTH;
+        let width = <P2<F> as PackedField>::WIDTH;
 
         // Scratch for one lane group's constraint block. Batches are 32 points, so for
         // typical gates this is at most a few KiB; keep it on the stack when it fits.
@@ -92,7 +100,7 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
             &mut scratch_heap
         };
 
-        let (vars_packed_iter, vars_leftovers_iter) = vars_batch.pack::<<F as Packable>::Packing>();
+        let (vars_packed_iter, vars_leftovers_iter) = vars_batch.pack::<P2<F>>();
         let leftovers_start = n - vars_leftovers_iter.len();
         for (i, vars_packed) in vars_packed_iter.enumerate() {
             let offset = width * i;
@@ -107,11 +115,11 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
             // documents that it "deliberately retains the scalar field's
             // eight-byte alignment so that a scalar slice can be reinterpreted as
             // packed values"; `from_slice` also asserts len == WIDTH.
-            let filter = *<F as Packable>::Packing::from_slice(&filters[offset..offset + width]);
+            let filter = *P2::<F>::from_slice(&filters[offset..offset + width]);
             for j in 0..num_constraints {
                 let combined = &mut combined_gate_constraints[j * n + offset..][..width];
-                let acc = *<F as Packable>::Packing::from_slice(combined);
-                let row = *<F as Packable>::Packing::from_slice(
+                let acc = *P2::<F>::from_slice(combined);
+                let row = *P2::<F>::from_slice(
                     &scratch[j * width..(j + 1) * width],
                 );
                 combined.copy_from_slice(acc.multiply_accumulate(row, filter).as_slice());

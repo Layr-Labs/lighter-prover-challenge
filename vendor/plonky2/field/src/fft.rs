@@ -473,7 +473,13 @@ fn fft_classic_simd_with<P, M>(
 
     // We've already done the first lg_packed_width (if they were required) iterations.
     let s = max(r, lg_packed_width);
-    fft_classic_simd_layers::<P, M>(packed_values, s, lg_n, root_table);
+    // Once per transform: the quadratic-extension row scans for layers
+    // s..lg_n, hoisted out of the per-layer kernels.
+    #[cfg(target_arch = "aarch64")]
+    let ext_mask = ext_rows_base_subfield_mask::<P>(root_table, s, lg_n);
+    #[cfg(not(target_arch = "aarch64"))]
+    let ext_mask: Option<u64> = None;
+    fft_classic_simd_layers_masked::<P, M>(packed_values, s, lg_n, root_table, ext_mask);
 }
 
 /// Parallel sibling of `fft_classic_simd_with`. The packed-width prefix is
@@ -512,7 +518,11 @@ fn fft_classic_simd_with_parallel<P, M>(
     }
 
     let s = max(r, lg_packed_width);
-    fft_classic_simd_layers_parallel::<P, M>(packed_values, s, lg_n, root_table);
+    #[cfg(target_arch = "aarch64")]
+    let ext_mask = ext_rows_base_subfield_mask::<P>(root_table, s, lg_n);
+    #[cfg(not(target_arch = "aarch64"))]
+    let ext_mask: Option<u64> = None;
+    fft_classic_simd_layers_parallel::<P, M>(packed_values, s, lg_n, root_table, ext_mask);
 }
 
 #[inline(always)]
@@ -1013,7 +1023,10 @@ fn fft_classic_simd_single_layer_neon_w4(
 /// `(a0 + a1*u) * (b0 + b1*u) = (a0*b0 + 7*a1*b1) + (a0*b1 + a1*b0)*u`.
 /// Production FRI twiddle rows are almost entirely base-subfield values
 /// `[w, 0]`, for which the product is `[w*a0, w*a1]` — two base multiplications
-/// instead of four. A single row-level scan picks that fast path (one paired
+/// instead of four. The caller passes `base_subfield`, the result of the
+/// row-level raw-limb scan (see [`ext_row_base_subfield`]), hoisted so that
+/// running the same layer over many cache blocks or parallel chunks scans the
+/// immutable row once instead of once per sub-slice (one paired
 /// `NeonGoldilocksField` mul hides the scalar latency); otherwise the general
 /// four-product form runs. The butterfly `u + t` / `u - t` reductions always
 /// run as two-lane vector adds/subs reproducing `impl Add/Sub for
@@ -1029,6 +1042,7 @@ fn fft_classic_simd_single_layer_neon_ext(
     omega_row: &[crate::extension::quadratic::QuadraticExtension<
         crate::goldilocks_field::GoldilocksField,
     >],
+    base_subfield: bool,
 ) {
     use core::arch::aarch64::*;
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
@@ -1040,9 +1054,11 @@ fn fft_classic_simd_single_layer_neon_ext(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    debug_assert_eq!(
+        base_subfield,
+        omega_row[..half].iter().all(|w| w.0[1].0 == 0),
+        "hoisted base-subfield flag must equal the row scan"
+    );
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
@@ -1087,6 +1103,71 @@ fn fft_classic_simd_single_layer_neon_ext(
     }
 }
 
+/// The exact row scan `fft_classic_simd_single_layer_neon_ext` dispatches on:
+/// whether every twiddle in `root_table[lg_half_m][..1 << lg_half_m]` has a
+/// raw-zero high limb. A pure function of the immutable row, so it can be
+/// computed once and reused for every sub-slice of the same layer.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn ext_row_base_subfield(
+    row: &[crate::extension::quadratic::QuadraticExtension<
+        crate::goldilocks_field::GoldilocksField,
+    >],
+    lg_half_m: usize,
+) -> bool {
+    let half = 1usize << lg_half_m;
+    row[..half].iter().all(|w| w.0[1].0 == 0)
+}
+
+/// Bitmask of [`ext_row_base_subfield`] over `root_table` rows
+/// `start..end` (bit `lg_half_m` set iff that row is entirely base-subfield
+/// in raw representation), or `None` unless `P` is exactly
+/// `QuadraticExtension<GoldilocksField>`. Computed once per transform (or
+/// once per cache-block phase) so the per-layer kernels never rescan the
+/// same immutable row per block or per parallel chunk. The mask borrows
+/// nothing and is keyed by nothing: it lives only for the duration of one
+/// call tree over one `&FftRootTable`, so there is no cross-table reuse to
+/// go stale.
+#[cfg(target_arch = "aarch64")]
+fn ext_rows_base_subfield_mask<P: PackedField>(
+    root_table: &FftRootTable<P::Scalar>,
+    start: usize,
+    end: usize,
+) -> Option<u64> {
+    if core::any::TypeId::of::<P>()
+        != core::any::TypeId::of::<
+            crate::extension::quadratic::QuadraticExtension<
+                crate::goldilocks_field::GoldilocksField,
+            >,
+        >()
+    {
+        return None;
+    }
+    debug_assert!(end <= 64);
+    let mut mask = 0u64;
+    for lg_half_m in start..end.min(root_table.len()) {
+        // SAFETY: the `TypeId` compare proves `P` is exactly
+        // `QuadraticExtension<GoldilocksField>`, whose `PackedField::Scalar`
+        // is itself, so each row already holds that element type (a single
+        // `[GoldilocksField; 2]` field, no padding); only the generic
+        // spelling differs.
+        let row = unsafe {
+            let row = &root_table[lg_half_m];
+            core::slice::from_raw_parts(
+                row.as_ptr()
+                    .cast::<crate::extension::quadratic::QuadraticExtension<
+                        crate::goldilocks_field::GoldilocksField,
+                    >>(),
+                row.len(),
+            )
+        };
+        if ext_row_base_subfield(row, lg_half_m) {
+            mask |= 1u64 << lg_half_m;
+        }
+    }
+    Some(mask)
+}
+
 #[inline(always)]
 fn fft_classic_simd_single_layer_with<P, M>(
     packed_values: &mut [P],
@@ -1097,6 +1178,32 @@ fn fft_classic_simd_single_layer_with<P, M>(
     P: PackedField,
     M: FftTwiddleMul<P>,
 {
+    fft_classic_simd_single_layer_with_hint::<P, M>(
+        packed_values,
+        lg_half_m,
+        lg_packed_width,
+        root_table,
+        None,
+    )
+}
+
+/// [`fft_classic_simd_single_layer_with`] with an optional precomputed
+/// base-subfield flag for the quadratic-extension NEON arm. `Some(b)` must
+/// equal [`ext_row_base_subfield`] of this layer's row (bit `lg_half_m` of
+/// [`ext_rows_base_subfield_mask`]); `None` performs the scan here, exactly
+/// as before the hoist.
+#[inline(always)]
+fn fft_classic_simd_single_layer_with_hint<P, M>(
+    packed_values: &mut [P],
+    lg_half_m: usize,
+    lg_packed_width: usize,
+    root_table: &FftRootTable<P::Scalar>,
+    ext_base: Option<bool>,
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
+    let _ = ext_base;
     // Base-field fast path: the reduction runs in vector registers. Guarded on
     // exact type identity, the same way `fft_zero_padded_cache_blocks` guards
     // its rate-8 specialisation. Every other instantiation -- scalar
@@ -1179,7 +1286,9 @@ fn fft_classic_simd_single_layer_with<P, M>(
                 row.len(),
             )
         };
-        fft_classic_simd_single_layer_neon_ext(ext_values, lg_half_m, omega_row);
+        let base_subfield =
+            ext_base.unwrap_or_else(|| ext_row_base_subfield(omega_row, lg_half_m));
+        fft_classic_simd_single_layer_neon_ext(ext_values, lg_half_m, omega_row, base_subfield);
         return;
     }
 
@@ -1318,6 +1427,24 @@ fn fft_classic_simd_layers<P, M>(
     P: PackedField,
     M: FftTwiddleMul<P>,
 {
+    fft_classic_simd_layers_masked::<P, M>(packed_values, start, end, root_table, None)
+}
+
+/// [`fft_classic_simd_layers`] with an optional precomputed
+/// [`ext_rows_base_subfield_mask`] covering `start..end`, so the per-layer
+/// quadratic-extension kernel does not rescan the same immutable twiddle row
+/// once per cache block.
+#[inline(always)]
+fn fft_classic_simd_layers_masked<P, M>(
+    packed_values: &mut [P],
+    start: usize,
+    end: usize,
+    root_table: &FftRootTable<P::Scalar>,
+    ext_mask: Option<u64>,
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
     let lg_packed_width = log2_strict(P::WIDTH);
 
     #[cfg(target_arch = "aarch64")]
@@ -1377,11 +1504,12 @@ fn fft_classic_simd_layers<P, M>(
     }
 
     for lg_half_m in start..end {
-        fft_classic_simd_single_layer_with::<P, M>(
+        fft_classic_simd_single_layer_with_hint::<P, M>(
             packed_values,
             lg_half_m,
             lg_packed_width,
             root_table,
+            ext_mask.map(|mask| (mask >> lg_half_m) & 1 == 1),
         );
     }
 }
@@ -1396,30 +1524,106 @@ fn fft_classic_simd_layers_parallel<P, M>(
     start: usize,
     end: usize,
     root_table: &FftRootTable<P::Scalar>,
+    ext_mask: Option<u64>,
 ) where
     P: PackedField,
     M: FftTwiddleMul<P>,
 {
     let lg_packed_width = log2_strict(P::WIDTH);
     let scalar_len = packed_values.len() * P::WIDTH;
+
+    // Match the serial base-field schedule: pair consecutive layers before
+    // handing independent radix-4 blocks to Rayon. Besides halving the
+    // number of full-buffer passes, this coarsens each Rayon task enough to
+    // amortize scheduling without sharing any input or output between tasks.
+    // The `WideGoldilocksField` identity gate subsumes the extension-mask
+    // concern exactly as in `fft_classic_simd_layers_masked`'s fused arm:
+    // reaching it proves the scalar type is base `GoldilocksField`, so the
+    // base two-layer kernel is the full multiplication for every row.
+    #[cfg(target_arch = "aarch64")]
+    let start = if start + 2 <= end
+        && scalar_len >= FUSED_PAIR_MIN_SCALARS
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
+            >()
+    {
+        let mut lg_half_m = start;
+        {
+            // SAFETY: the TypeId check proves the same representation facts
+            // as in `fft_classic_simd_layers_masked`: the packed buffer is
+            // exactly a contiguous `GoldilocksField` slice, and both root
+            // rows contain that scalar type. Each parallel chunk is one
+            // complete 4*q block, so chunks are disjoint and the fused
+            // kernel cannot cross a task boundary.
+            let scalars = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    scalar_len,
+                )
+            };
+            while lg_half_m + 2 <= end {
+                let scalar_block_len = 1usize << (lg_half_m + 2);
+                let block_count = scalar_len / scalar_block_len;
+                let w1_row = unsafe {
+                    let row = &root_table[lg_half_m];
+                    core::slice::from_raw_parts(
+                        row.as_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    let row = &root_table[lg_half_m + 1];
+                    core::slice::from_raw_parts(
+                        row.as_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                if scalar_len >= PARALLEL_FFT_MIN_SCALARS && block_count >= 2 {
+                    MaybeParChunksMut::par_chunks_mut(scalars, scalar_block_len).for_each(
+                        |block| {
+                            fft_classic_simd_two_layers_neon_w4(block, lg_half_m, w1_row, w2_row);
+                        },
+                    );
+                } else {
+                    fft_classic_simd_two_layers_neon_w4(scalars, lg_half_m, w1_row, w2_row);
+                }
+                lg_half_m += 2;
+            }
+        }
+        lg_half_m
+    } else {
+        start
+    };
+
     for lg_half_m in start..end {
         let packed_m = 1usize << (lg_half_m + 1 - lg_packed_width);
         let block_count = packed_values.len() / packed_m;
+        // Hoisted once per layer: every parallel chunk of this layer shares
+        // the same immutable twiddle row, so the extension kernel's row scan
+        // must not repeat per chunk.
+        let ext_base = ext_mask.map(|mask| (mask >> lg_half_m) & 1 == 1);
         if scalar_len >= PARALLEL_FFT_MIN_SCALARS && block_count >= 2 {
             MaybeParChunksMut::par_chunks_mut(packed_values, packed_m).for_each(|block| {
-                fft_classic_simd_single_layer_with::<P, M>(
+                fft_classic_simd_single_layer_with_hint::<P, M>(
                     block,
                     lg_half_m,
                     lg_packed_width,
                     root_table,
+                    ext_base,
                 );
             });
         } else {
-            fft_classic_simd_single_layer_with::<P, M>(
+            fft_classic_simd_single_layer_with_hint::<P, M>(
                 packed_values,
                 lg_half_m,
                 lg_packed_width,
                 root_table,
+                ext_base,
             );
         }
     }
@@ -1530,6 +1734,14 @@ fn fft_zero_padded_cache_blocks<P, M>(
     let packed_values = P::pack_slice_mut(values);
     let omega_table = P::pack_slice(&root_table[r]);
 
+    // Once per phase, not once per block: every block runs the same layers
+    // r+1..lg_block_n over the same immutable twiddle rows, so the extension
+    // kernel's per-row scan is hoisted above the block loop.
+    #[cfg(target_arch = "aarch64")]
+    let ext_mask = ext_rows_base_subfield_mask::<P>(root_table, r + 1, lg_block_n);
+    #[cfg(not(target_arch = "aarch64"))]
+    let ext_mask: Option<u64> = None;
+
     // Expand blocks from the end of the buffer so their output cannot clobber unread prefix
     // coefficients. Complete every block-local layer immediately while the block is still hot.
     for block in (0..num_blocks).rev() {
@@ -1571,11 +1783,12 @@ fn fft_zero_padded_cache_blocks<P, M>(
             packed_repeat,
             omega_table,
         );
-        fft_classic_simd_layers::<P, M>(
+        fft_classic_simd_layers_masked::<P, M>(
             &mut packed_values[destination..destination + packed_block_len],
             r + 1,
             lg_block_n,
             root_table,
+            ext_mask,
         );
     }
 }
