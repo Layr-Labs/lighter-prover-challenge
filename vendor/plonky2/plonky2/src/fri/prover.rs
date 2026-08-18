@@ -21,8 +21,6 @@ use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
 
-const FRI_FOLD_ARITY16_BATCH_WIDTH: usize = 8;
-
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
@@ -124,68 +122,6 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
-/// Production arity-16 folding dispatcher. Apple AArch64 Goldilocks ext2
-/// batches independent rows; every other target/field keeps the old map.
-fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
-    terms: &[F::Extension],
-    beta: F::Extension,
-    beta_powers: &[F::Extension; 16],
-) -> Vec<F::Extension> {
-    assert_eq!(terms.len() % 16, 0);
-
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-    {
-        use core::any::TypeId;
-
-        use crate::field::extension::quadratic::QuadraticExtension;
-        use crate::field::goldilocks_extensions::ext2_fri_fold_arity16_batch;
-        use crate::field::goldilocks_field::GoldilocksField;
-
-        type GoldilocksExt2 = QuadraticExtension<GoldilocksField>;
-        if TypeId::of::<F::Extension>() == TypeId::of::<GoldilocksExt2>() {
-            let mut folded = vec![F::Extension::ZERO; terms.len() / 16];
-            // SAFETY: TypeId equality proves all three element types exactly.
-            let terms_ext2 = unsafe {
-                core::slice::from_raw_parts(
-                    terms.as_ptr().cast::<GoldilocksExt2>(),
-                    terms.len(),
-                )
-            };
-            let powers_ext2 = unsafe {
-                &*(beta_powers as *const [F::Extension; 16]
-                    as *const [GoldilocksExt2; 16])
-            };
-            let folded_len = folded.len();
-            let folded_ext2 = unsafe {
-                core::slice::from_raw_parts_mut(
-                    folded.as_mut_ptr().cast::<GoldilocksExt2>(),
-                    folded_len,
-                )
-            };
-            folded_ext2
-                .par_chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
-                .enumerate()
-                .for_each(|(batch, output)| {
-                    let start = batch * FRI_FOLD_ARITY16_BATCH_WIDTH * 16;
-                    ext2_fri_fold_arity16_batch(
-                        &terms_ext2[start..start + output.len() * 16],
-                        powers_ext2,
-                        output,
-                    );
-                });
-            return folded;
-        }
-    }
-
-    terms
-        .par_chunks_exact(16)
-        .map(|chunk| {
-            let row = chunk.try_into().unwrap();
-            F::fri_fold_arity16(row, beta, beta_powers)
-        })
-        .collect()
-}
-
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     mut values: PolynomialValues<F::Extension>,
@@ -234,17 +170,18 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         } else {
             None
         };
-        let mut folded = match &beta_powers_16 {
-            Some(beta_powers) => fri_fold_arity16_chunks::<F, D>(
-                &coeffs.coeffs[..live_chunks * arity],
-                beta,
-                beta_powers,
-            ),
-            None => coeffs.coeffs[..live_chunks * arity]
-                .par_chunks_exact(arity)
-                .map(|chunk| reduce_with_powers(chunk, beta))
-                .collect::<Vec<_>>(),
-        };
+        let mut folded = coeffs.coeffs[..live_chunks * arity]
+            .par_chunks_exact(arity)
+            .map(|chunk| match &beta_powers_16 {
+                Some(beta_powers) => {
+                    let terms: &[F::Extension; 16] = chunk
+                        .try_into()
+                        .expect("arity-16 FRI chunk must contain 16 terms");
+                    F::fri_fold_arity16(terms, beta, beta_powers)
+                }
+                None => reduce_with_powers(chunk, beta),
+            })
+            .collect::<Vec<_>>();
         // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
         // tail. Zeros are actually *read as values* only where the next
         // round's exact-`arity` chunking can reach past the live support —
@@ -504,7 +441,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::field::types::{Field, PrimeField64};
     use crate::fri::reduction_strategies::FriReductionStrategy;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
 
@@ -534,82 +471,6 @@ mod tests {
             for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
             }
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-    fn assert_arity16_batch_matches_scalar_raw(
-        terms: &[<GoldilocksField as Extendable<2>>::Extension],
-        beta: <GoldilocksField as Extendable<2>>::Extension,
-    ) {
-        type F = GoldilocksField;
-        type FE = <F as Extendable<2>>::Extension;
-        let mut powers = [FE::ONE; 16];
-        for i in 1..16 {
-            powers[i] = powers[i - 1] * beta;
-        }
-        let expected = terms
-            .chunks_exact(16)
-            .map(|chunk| {
-                <F as Extendable<2>>::fri_fold_arity16(chunk.try_into().unwrap(), beta, &powers)
-            })
-            .collect::<Vec<_>>();
-        let actual = fri_fold_arity16_chunks::<F, 2>(terms, beta, &powers);
-        assert_eq!(actual.len(), expected.len());
-        for (row, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-            let actual: [F; 2] = actual.to_basefield_array();
-            let expected: [F; 2] = expected.to_basefield_array();
-            for limb in 0..2 {
-                assert_eq!(actual[limb].0, expected[limb].0,
-                    "raw mismatch at row {row}, limb {limb}");
-            }
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-    #[test]
-    fn fri_fold_arity16_apple_batch_matches_scalar_canonical_raw() {
-        type F = GoldilocksField;
-        type FE = <F as Extendable<2>>::Extension;
-        let beta = FE::from_basefield_array([
-            F::from_canonical_u64(0x1234_5678_9abc_def0),
-            F::from_canonical_u64(0x0fed_cba9_8765_4321),
-        ]);
-        for rows in [1, 2, 3, 7, 8, 9, 16, 19] {
-            let terms = (0..rows * 16)
-                .map(|i| {
-                    let x = (i as u64)
-                        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                        .wrapping_add(0xd1b5_4a32_d192_ed03);
-                    FE::from_basefield_array([
-                        F::from_canonical_u64(x % F::ORDER),
-                        F::from_canonical_u64(x.rotate_left(23) % F::ORDER),
-                    ])
-                })
-                .collect::<Vec<_>>();
-            assert_arity16_batch_matches_scalar_raw(&terms, beta);
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-    #[test]
-    fn fri_fold_arity16_apple_batch_matches_scalar_noncanonical_raw_tails() {
-        type F = GoldilocksField;
-        type FE = <F as Extendable<2>>::Extension;
-        let raw = [0, 1, F::ORDER - 1, F::ORDER, F::ORDER + 1,
-            1 << 32, u64::MAX - 1, u64::MAX];
-        let beta = FE::from_basefield_array([
-            GoldilocksField(u64::MAX),
-            GoldilocksField(F::ORDER),
-        ]);
-        for rows in [1, 3, 7, 8, 9, 17] {
-            let terms = (0..rows * 16)
-                .map(|i| FE::from_basefield_array([
-                    GoldilocksField(raw[i % raw.len()]),
-                    GoldilocksField(raw[(i * 5 + 3) % raw.len()]),
-                ]))
-                .collect::<Vec<_>>();
-            assert_arity16_batch_matches_scalar_raw(&terms, beta);
         }
     }
 

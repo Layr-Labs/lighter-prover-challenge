@@ -102,15 +102,21 @@ fn profile_command_buffer(
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
-/// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
-/// shader cache does not pay the MSL front end. Regenerate whenever
-/// `poseidon2.metal` changes (see `MetalShared::new`); the
-/// `metallib_matches_shader_source` test enforces it.
+/// The ranked M4 Pro library, including its device-specific machine-code
+/// slice. This artifact is intentionally frozen: regenerating it anywhere
+/// other than the ranked host gives back the cold-start win supplied by that
+/// slice. New optional kernels live in [`SHADER_PAIR_METALLIB`] instead.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
-/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
+/// `poseidon2.metal` precompiled to portable AIR for the optional paired-absorb
+/// pipeline. Loading this second library never changes construction of the ten
+/// ranked M4 pipelines above, and failure simply disables the optimization.
+const SHADER_PAIR_METALLIB: &[u8] = include_bytes!("poseidon2-pair.metallib");
+
+/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_PAIR_METALLIB`] was built
+/// from.
 const SHADER_SOURCE_SHA256: &str =
-    "e01a1ceb60d512573fc7dcafdf773651a4346d5c396a5cc20d0167cfa52e2da9";
+    "064e4462355316a47c8d72a7381998b93a22b2c753ef80f02b2104caac19bcb8";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -190,7 +196,7 @@ fn note_pipeline_settled() {
     use std::sync::atomic::Ordering;
 
     let settled = PIPELINES_SETTLED.fetch_add(1, Ordering::AcqRel) + 1;
-    if settled as usize != METALLIB_REQUIRED_KERNELS.len() {
+    if settled as usize != TOTAL_PIPELINE_COUNT {
         return;
     }
     let lowering_us = PIPELINE_PHASE_START
@@ -305,10 +311,10 @@ fn build_pipeline(
         .map_err(|error| format!("{name} pipeline creation failed: {error}"))
 }
 
-/// Every kernel the shader defines. The prebuilt library is trusted only if all
-/// of them resolve, so a stale or truncated artifact falls back to compiling the
-/// source. This deliberately includes the lazily-built gate-quotient kernels:
-/// they are absent from the eager path but must still be present in the AIR.
+/// Every kernel in the frozen ranked artifact. It is trusted only if all of
+/// them resolve, so a stale or truncated artifact falls back to compiling the
+/// source. The paired kernel is intentionally absent; see
+/// [`SHADER_PAIR_METALLIB`].
 const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
@@ -321,6 +327,9 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "range_check_gate_quotient",
     "permutation_quotient",
 ];
+const PAIR_METALLIB_REQUIRED_KERNELS: [&str; 1] = ["poseidon2_absorb_pair_pass"];
+const TOTAL_PIPELINE_COUNT: usize =
+    METALLIB_REQUIRED_KERNELS.len() + PAIR_METALLIB_REQUIRED_KERNELS.len();
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
@@ -386,11 +395,7 @@ struct MetalShared {
     /// Buffers backing live level-order digest stores return here after the
     /// proof has extracted its sparse Merkle paths.
     digest_output_pool: Arc<Mutex<DigestOutputPool>>,
-    /// Regular tree builders wait here; serial-critical spine builders use a
-    /// separate condition variable so releasing one singleton set never has
-    /// to broadcast just to reach the priority class.
     available: Condvar,
-    spine_available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
     ntt_roots: Mutex<HashMap<u32, NttRoots>>,
@@ -704,296 +709,6 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
-}
-
-/// The Range/U32 shader keeps one shared selector-product base per selected
-/// group in thread-local storage. Production selector groups are small; the
-/// fixed bound keeps malformed or unusually fragmented circuits on the
-/// existing per-spec filter path instead of increasing register pressure for
-/// every quotient thread.
-const MAX_SHARED_SELECTOR_PLANS: usize = 8;
-const MAX_SHARED_SELECTOR_GROUP_GATES: usize = 64;
-const SELECTOR_PLAN_HEADER_WORDS: usize = 5;
-const MAX_SELECTOR_PLAN_WORDS: usize = 4096 / size_of::<u32>();
-
-/// GPU-side selector-product plan encoded as u32 words.
-///
-/// Layout:
-/// - one plan id plus one per quotient spec (`0` means use the generic path),
-/// - one record offset per plan,
-/// - variable records: selector column, group start/end, UNUSED flag, active
-///   gate count, then the active gate labels in ascending spec order.
-///
-/// The shader forms the product of all *inactive* group factors (and the
-/// optional UNUSED factor) once per quotient point. Each participating spec
-/// then appends the other active factors. No inversions are used, so selector
-/// values equal to gate labels remain exact zero-factor cases.
-#[derive(Clone, Debug, Default)]
-struct SelectorFilterPlan {
-    words: Vec<u32>,
-    plan_count: usize,
-    planned_specs: usize,
-}
-
-#[derive(Debug)]
-struct SelectorPlanCandidate {
-    selector_column: usize,
-    group: core::ops::Range<usize>,
-    include_unused_selector: bool,
-    members: Vec<(usize, usize)>, // (flat spec index, gate index)
-    duplicate_gate: bool,
-    saved_factor_products: usize,
-}
-
-impl SelectorFilterPlan {
-    fn disabled() -> Self {
-        // Metal's setBytes API requires a non-empty source even though a zero
-        // plan count makes the shader ignore the contents.
-        Self {
-            words: vec![0],
-            plan_count: 0,
-            planned_specs: 0,
-        }
-    }
-}
-
-/// Builds the immutable shape plan consumed by the live Range/U32 Metal
-/// kernel. Failure to specialize is deliberately non-fatal: all records stay
-/// mapped to zero and retain the previous gate-local selector loop.
-fn build_selector_filter_plan(
-    specs: &[RangeCheckQuotientSpec],
-    u32_specs: &[U32QuotientSpec],
-) -> SelectorFilterPlan {
-    let spec_count = match specs.len().checked_add(u32_specs.len()) {
-        Some(count) if count > 0 => count,
-        _ => return SelectorFilterPlan::disabled(),
-    };
-    let mut candidates = Vec::<SelectorPlanCandidate>::new();
-    let mut add_spec = |flat_index: usize,
-                        selector_column: usize,
-                        gate_index: usize,
-                        group: &core::ops::Range<usize>,
-                        include_unused_selector: bool| {
-        let candidate = candidates.iter_mut().find(|candidate| {
-            candidate.selector_column == selector_column
-                && candidate.group == *group
-                && candidate.include_unused_selector == include_unused_selector
-        });
-        let candidate = match candidate {
-            Some(candidate) => candidate,
-            None => {
-                candidates.push(SelectorPlanCandidate {
-                    selector_column,
-                    group: group.clone(),
-                    include_unused_selector,
-                    members: Vec::new(),
-                    duplicate_gate: false,
-                    saved_factor_products: 0,
-                });
-                candidates.last_mut().expect("candidate was just inserted")
-            }
-        };
-        if candidate
-            .members
-            .iter()
-            .any(|&(_, existing_gate)| existing_gate == gate_index)
-        {
-            candidate.duplicate_gate = true;
-        }
-        candidate.members.push((flat_index, gate_index));
-    };
-    for (flat_index, spec) in specs.iter().enumerate() {
-        add_spec(
-            flat_index,
-            spec.selector_column,
-            spec.gate_index,
-            &spec.group,
-            spec.include_unused_selector,
-        );
-    }
-    for (u32_index, spec) in u32_specs.iter().enumerate() {
-        add_spec(
-            specs.len() + u32_index,
-            spec.selector_column,
-            spec.gate_index,
-            &spec.group,
-            spec.include_unused_selector,
-        );
-    }
-
-    let mut eligible = Vec::new();
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        let group_len = candidate.group.len();
-        let active = candidate.members.len();
-        if candidate.duplicate_gate
-            || active < 2
-            || group_len > MAX_SHARED_SELECTOR_GROUP_GATES
-            || active > group_len
-            || candidate.group.start > candidate.group.end
-            || candidate.selector_column > u32::MAX as usize
-            || candidate.group.end > u32::MAX as usize
-            || candidate
-                .members
-                .iter()
-                .any(|&(_, gate)| !candidate.group.contains(&gate) || gate > u32::MAX as usize)
-        {
-            continue;
-        }
-        let unused = usize::from(candidate.include_unused_selector);
-        let Some(local_factors) = active
-            .checked_mul(group_len.saturating_sub(1).saturating_add(unused))
-        else {
-            continue;
-        };
-        let Some(shared_factors) = group_len
-            .checked_sub(active)
-            .and_then(|inactive| inactive.checked_add(unused))
-            .and_then(|base| active.checked_mul(active - 1).and_then(|cross| base.checked_add(cross)))
-        else {
-            continue;
-        };
-        if shared_factors >= local_factors {
-            continue;
-        }
-        candidate.saved_factor_products = local_factors - shared_factors;
-        eligible.push(index);
-    }
-    eligible.sort_by(|&left, &right| {
-        candidates[right]
-            .saved_factor_products
-            .cmp(&candidates[left].saved_factor_products)
-            .then_with(|| left.cmp(&right))
-    });
-    eligible.truncate(MAX_SHARED_SELECTOR_PLANS);
-
-    while !eligible.is_empty() {
-        let record_words = eligible.iter().try_fold(0usize, |total, &index| {
-            total.checked_add(SELECTOR_PLAN_HEADER_WORDS + candidates[index].members.len())
-        });
-        let total_words = record_words.and_then(|records| {
-            spec_count
-                .checked_add(eligible.len())
-                .and_then(|header| header.checked_add(records))
-        });
-        if total_words.is_some_and(|words| words <= MAX_SELECTOR_PLAN_WORDS) {
-            break;
-        }
-        eligible.pop();
-    }
-    if eligible.is_empty() {
-        return SelectorFilterPlan::disabled();
-    }
-
-    let plan_count = eligible.len();
-    let mut words = vec![0u32; spec_count + plan_count];
-    let mut planned_specs = 0usize;
-    for (plan_index, &candidate_index) in eligible.iter().enumerate() {
-        let candidate = &candidates[candidate_index];
-        let Ok(record_offset) = u32::try_from(words.len()) else {
-            return SelectorFilterPlan::disabled();
-        };
-        words[spec_count + plan_index] = record_offset;
-        words.extend([
-            candidate.selector_column as u32,
-            candidate.group.start as u32,
-            candidate.group.end as u32,
-            candidate.include_unused_selector as u32,
-            candidate.members.len() as u32,
-        ]);
-        for &(flat_index, gate_index) in &candidate.members {
-            words[flat_index] = (plan_index + 1) as u32;
-            words.push(gate_index as u32);
-            planned_specs += 1;
-        }
-    }
-    SelectorFilterPlan {
-        words,
-        plan_count,
-        planned_specs,
-    }
-}
-
-/// Defense in depth for the bytes bound to the shader. The public launcher
-/// only produces plans through [`build_selector_filter_plan`], but validating
-/// the flattened representation here keeps future call-site changes from
-/// turning an offset bug into an out-of-bounds GPU read.
-fn selector_filter_plan_is_valid(
-    words: &[u32],
-    metadata: &[u32],
-    spec_count: usize,
-    plan_count: usize,
-) -> bool {
-    if plan_count == 0 {
-        return !words.is_empty();
-    }
-    if plan_count > MAX_SHARED_SELECTOR_PLANS
-        || words.len() > MAX_SELECTOR_PLAN_WORDS
-        || metadata.len() != spec_count.saturating_mul(10)
-        || words.len() < spec_count.saturating_add(plan_count)
-        || words[..spec_count]
-            .iter()
-            .any(|&plan| plan as usize > plan_count)
-    {
-        return false;
-    }
-
-    for plan_index in 0..plan_count {
-        let offset = words[spec_count + plan_index] as usize;
-        let Some(header_end) = offset.checked_add(SELECTOR_PLAN_HEADER_WORDS) else {
-            return false;
-        };
-        if offset < spec_count + plan_count || header_end > words.len() {
-            return false;
-        }
-        let selector_column = words[offset];
-        let group_start = words[offset + 1];
-        let group_end = words[offset + 2];
-        let include_unused = words[offset + 3];
-        let active = words[offset + 4] as usize;
-        let Some(record_end) = header_end.checked_add(active) else {
-            return false;
-        };
-        if include_unused > 1
-            || active < 2
-            || group_start >= group_end
-            || (group_end - group_start) as usize > MAX_SHARED_SELECTOR_GROUP_GATES
-            || record_end > words.len()
-        {
-            return false;
-        }
-        let gates = &words[header_end..record_end];
-        if gates
-            .iter()
-            .enumerate()
-            .any(|(index, &gate)| {
-                gate < group_start
-                    || gate >= group_end
-                    || gates[..index].contains(&gate)
-            })
-        {
-            return false;
-        }
-        let mut mapped = 0usize;
-        for (flat_index, &mapped_plan) in words[..spec_count].iter().enumerate() {
-            if mapped_plan as usize != plan_index + 1 {
-                continue;
-            }
-            mapped += 1;
-            let record = &metadata[flat_index * 10..flat_index * 10 + 10];
-            if record[0] != selector_column
-                || record[2] != group_start
-                || record[3] != group_end
-                || record[4] != include_unused
-                || !gates.contains(&record[1])
-            {
-                return false;
-            }
-        }
-        if mapped != active {
-            return false;
-        }
-    }
-    true
 }
 
 /// Bounded exact-size cache of shared column-store buffers.
@@ -1713,6 +1428,7 @@ static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB_PAIR_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1733,6 +1449,11 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.try_get()
 }
 
+fn absorb_pair_pipeline() -> Option<&'static ComputePipelineState> {
+    // Optional for the same reason as the single-pass streamed pipeline.
+    ABSORB_PAIR_PIPELINE.try_get()
+}
+
 /// Starts the two gate-quotient pipeline builds on detached threads.
 ///
 /// One thread each rather than one for both: they are the two slowest kernels
@@ -1742,10 +1463,53 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
 /// Scheduling only. The pipelines are the same objects the blocking build
 /// produced, lowered from the same library, so nothing they later compute can
 /// differ; only the instant at which they become available does.
+fn spawn_optional_pipeline(
+    device: &Device,
+    library: Option<&metal::Library>,
+    archive: Option<&BinaryArchive>,
+    name: &'static str,
+    slot: &'static LazyPipeline,
+) {
+    let Some(library) = library else {
+        let _ = slot.built.set(None);
+        note_pipeline_settled();
+        return;
+    };
+    let device = device.clone();
+    let library = library.clone();
+    let archive = archive.cloned();
+    let spawned = std::thread::Builder::new()
+        .name(format!("poseidon2-metal-{name}"))
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                build_pipeline(&device, &library, archive.as_ref(), name).ok()
+            });
+            if pipeline.is_none() {
+                log::debug!("{name} pipeline unavailable; using its fallback");
+            }
+            let _ = slot.built.set(pipeline);
+            note_pipeline_settled();
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = slot.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        // No thread means nothing will ever populate the slot; settle it now
+        // so readers fall back instead of looking for a build in flight.
+        Err(_) => {
+            let _ = slot.built.set(None);
+            note_pipeline_settled();
+        }
+    }
+}
+
 fn spawn_optional_pipelines(
     device: &Device,
     library: &metal::Library,
     archive: Option<&BinaryArchive>,
+    pair_library: Option<&metal::Library>,
 ) {
     for (name, slot) in [
         ("poseidon2_gate_quotient", &POSEIDON_GATE_QUOTIENT_PIPELINE),
@@ -1756,35 +1520,18 @@ fn spawn_optional_pipelines(
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
     ] {
-        let device = device.clone();
-        let library = library.clone();
-        let archive = archive.cloned();
-        let spawned = std::thread::Builder::new()
-            .name(format!("poseidon2-metal-{name}"))
-            .spawn(move || {
-                let pipeline = autoreleasepool(|| {
-                    build_pipeline(&device, &library, archive.as_ref(), name).ok()
-                });
-                if pipeline.is_none() {
-                    log::debug!("{name} pipeline unavailable; evaluating those gates on the CPU");
-                }
-                let _ = slot.built.set(pipeline);
-                note_pipeline_settled();
-            });
-        match spawned {
-            Ok(handle) => {
-                if let Ok(mut builder) = slot.builder.lock() {
-                    *builder = Some(handle);
-                }
-            }
-            // No thread means nothing will ever populate the slot; settle it now
-            // so readers fall back instead of looking for a build in flight.
-            Err(_) => {
-                let _ = slot.built.set(None);
-                note_pipeline_settled();
-            }
-        }
+        spawn_optional_pipeline(device, Some(library), archive, name, slot);
     }
+    // The ranked archive predates the pair kernel and must not be queried for
+    // it. A separate AIR library lowers in the background; any failure leaves
+    // the established single-pass path untouched.
+    spawn_optional_pipeline(
+        device,
+        pair_library,
+        None,
+        "poseidon2_absorb_pair_pass",
+        &ABSORB_PAIR_PIPELINE,
+    );
 }
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
@@ -2610,22 +2357,6 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         }
     }
 
-    let selector_filter_plan = build_selector_filter_plan(specs, u32_specs);
-    debug_assert!(selector_filter_plan_is_valid(
-        &selector_filter_plan.words,
-        &metadata,
-        spec_count,
-        selector_filter_plan.plan_count,
-    ));
-    if selector_filter_plan.plan_count != 0 {
-        log::debug!(
-            "Metal Range/U32 selector sharing active: plans={}, specs={}/{}",
-            selector_filter_plan.plan_count,
-            selector_filter_plan.planned_specs,
-            spec_count,
-        );
-    }
-
     let context = shared_context()?;
     match context.start_range_check_gate_quotient(
         wires,
@@ -2637,8 +2368,6 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         u32_specs.len(),
         &alpha_powers,
         alpha_stride,
-        &selector_filter_plan.words,
-        selector_filter_plan.plan_count,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -2687,6 +2416,84 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
+#[cfg(test)]
+static FORCE_SINGLE_ABSORB: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static FORCE_STREAM_ADMISSION: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static LAST_STREAMED_ABSORB_DISPATCHES: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static STREAMED_TEST_POLICY: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+struct ForceSingleAbsorbGuard;
+#[cfg(test)]
+struct ForceStreamAdmissionGuard;
+
+#[cfg(test)]
+impl Drop for ForceSingleAbsorbGuard {
+    fn drop(&mut self) {
+        FORCE_SINGLE_ABSORB.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForceStreamAdmissionGuard {
+    fn drop(&mut self) {
+        FORCE_STREAM_ADMISSION.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+fn force_single_absorb_for_tests() -> ForceSingleAbsorbGuard {
+    FORCE_SINGLE_ABSORB.store(true, core::sync::atomic::Ordering::Release);
+    ForceSingleAbsorbGuard
+}
+
+#[cfg(test)]
+fn force_stream_admission_for_tests() -> ForceStreamAdmissionGuard {
+    FORCE_STREAM_ADMISSION.store(true, core::sync::atomic::Ordering::Release);
+    ForceStreamAdmissionGuard
+}
+
+#[cfg(test)]
+fn last_streamed_absorb_dispatches_for_tests() -> usize {
+    LAST_STREAMED_ABSORB_DISPATCHES.load(core::sync::atomic::Ordering::Acquire)
+}
+
+fn selected_absorb_pair_pipeline() -> Option<&'static ComputePipelineState> {
+    #[cfg(test)]
+    if FORCE_SINGLE_ABSORB.load(core::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    absorb_pair_pipeline()
+}
+
+fn stream_admission_forced() -> bool {
+    #[cfg(test)]
+    {
+        return FORCE_STREAM_ADMISSION.load(core::sync::atomic::Ordering::Acquire);
+    }
+    #[cfg(not(test))]
+    false
+}
+
+/// Settles every submitted item even after one reports failure. Metal command
+/// buffers are all committed before the wait phase, so short-circuiting would
+/// release their shared buffers to a fallback while later commands still use
+/// them.
+fn settle_all<T>(items: &[T], mut settle: impl FnMut(&T) -> bool) -> bool {
+    let mut all_ok = true;
+    for item in items {
+        let item_ok = settle(item);
+        all_ok &= item_ok;
+    }
+    all_ok
+}
+
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
 /// the GPU absorbs each group while the CPU fills the next. Only used inside
@@ -2721,7 +2528,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // narrower pipelined commitments still wait for an idle stream, because
     // moving all of them costs the pipeline more latency than the serial path
     // gains. See the note in `gpu_worthwhile`: these two rules are one change.
-    let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+    let stream_admitted = if stream_admission_forced() {
+        true
+    } else if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
         leaf_count >= 1 << 20
     } else {
         leaf_count >= 1 << 19
@@ -2740,7 +2549,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         return None;
     }
     let context = ready_context(leaf_width, leaf_count)?;
-    let pipeline = absorb_pass_pipeline()?;
+    let single_pipeline = absorb_pass_pipeline()?;
+    let pair_pipeline = selected_absorb_pair_pipeline();
     log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
 
     let cap_count = 1usize << cap_height;
@@ -2775,21 +2585,54 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // order, and each pass is committed before the next group''s fill starts.
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
+    // Dispatch group zero immediately so its GPU work overlaps the CPU fill of
+    // groups one and two. Pair only after that warm start; pairing from group
+    // zero delays the first commit by one full CPU column group and measured
+    // slower even though it issues the same number of total commands at the
+    // production 11-group width.
+    let dispatch_count = if pair_pipeline.is_some() {
+        1 + (groups - 1).div_ceil(2)
+    } else {
+        groups
+    };
+    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(dispatch_count);
+    #[cfg(feature = "diagnostic_profile")]
+    let mut paired_command_count = 0usize;
+    #[cfg(feature = "diagnostic_profile")]
+    let mut single_command_count = 0usize;
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
-        {
+    for dispatch_index in 0..dispatch_count {
+        let (first_group, group_count, use_pair) = if pair_pipeline.is_some() {
+            if dispatch_index == 0 {
+                (0, 1, false)
+            } else {
+                let first_group = 1 + (dispatch_index - 1) * 2;
+                let group_count = (groups - first_group).min(2);
+                (first_group, group_count, group_count == 2)
+            }
+        } else {
+            (dispatch_index, 1, false)
+        };
+        let col_start = first_group * 8;
+        let first_chunk = (leaf_width - col_start).min(8);
+        let second_chunk = if group_count == 2 {
+            (leaf_width - col_start - first_chunk).min(8)
+        } else {
+            0
+        };
+        for group_offset in 0..group_count {
+            let group = first_group + group_offset;
+            let group_col_start = group * 8;
+            let chunk = (leaf_width - group_col_start).min(8);
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
             // whose pass was already committed, after their fill completed.
             let mut slices: Vec<&mut [F]> = (0..chunk)
                 .map(|k| unsafe {
                     slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        base.add((group_col_start + k) * leaf_count).cast::<F>(),
                         leaf_count,
                     )
                 })
@@ -2801,6 +2644,18 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
             fill_group(group, &mut slices);
         }
+        let pipeline = if use_pair {
+            pair_pipeline.expect("paired dispatch requires paired pipeline")
+        } else {
+            single_pipeline
+        };
+        #[cfg(feature = "diagnostic_profile")]
+        if use_pair {
+            paired_command_count += 1;
+        } else {
+            single_command_count += 1;
+        }
+        let final_dispatch = dispatch_index == dispatch_count - 1;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2812,9 +2667,15 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 4, leaf_count as u32);
             set_u32(encoder, 5, leaf_count.ilog2());
             set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
+            set_u32(encoder, 7, first_chunk as u32);
+            if use_pair {
+                set_u32(encoder, 8, second_chunk as u32);
+                set_u32(encoder, 9, (first_group == 0) as u32);
+                set_u32(encoder, 10, final_dispatch as u32);
+            } else {
+                set_u32(encoder, 8, (first_group == 0) as u32);
+                set_u32(encoder, 9, final_dispatch as u32);
+            }
             dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
@@ -2824,7 +2685,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // second command buffer with one encoder per level. Identical
             // shaders, dispatch counts and buffer offsets; strictly fewer
             // command buffers and encoders.
-            if group == groups - 1 {
+            if final_dispatch {
                 let mut level_offset = 0usize;
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
@@ -2863,19 +2724,53 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            profile_command_buffer(
+                command_buffer,
+                if use_pair {
+                    "merkle_absorb_pair"
+                } else {
+                    "merkle_absorb"
+                },
+                (leaf_count * (first_chunk + second_chunk)) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
         absorb_commands.push(command_buffer);
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
+    #[cfg(test)]
+    LAST_STREAMED_ABSORB_DISPATCHES.store(
+        absorb_commands.len(),
+        core::sync::atomic::Ordering::Release,
+    );
+    #[cfg(feature = "diagnostic_profile")]
+    {
+        crate::util::profile::counter(
+            "merkle_absorb",
+            "paired_pipeline_ready",
+            pair_pipeline.is_some() as u64,
+        );
+        crate::util::profile::counter(
+            "merkle_absorb",
+            "paired_commands",
+            paired_command_count as u64,
+        );
+        crate::util::profile::counter(
+            "merkle_absorb",
+            "single_commands",
+            single_command_count as u64,
+        );
+    }
+
+    let all_ok = settle_all(&absorb_commands, |command_buffer| {
         command_buffer.wait_until_completed();
         command_buffer.status() == MTLCommandBufferStatus::Completed
     });
     drop(job);
     if !all_ok {
+        #[cfg(feature = "diagnostic_profile")]
+        crate::util::profile::counter("merkle_absorb", "streamed_fallback", 1);
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
         return None;
     }
@@ -3064,13 +2959,10 @@ impl MetalShared {
             // `MTLBinaryArchive` is not.
             //
             // Any failure falls back to compiling the source, so a runtime that
-            // rejects this AIR version behaves exactly as before. The function
-            // probe is what makes the fallback safe against a STALE artifact:
-            // regenerate with
-            //   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
-            //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
-            // and `metallib_matches_shader_source` fails the test run if you
-            // forget.
+            // rejects this artifact behaves exactly as before. The function
+            // probe makes the fallback safe against a stale/truncated artifact.
+            // Do not regenerate the ranked library on another device: its M4
+            // machine-code slice is guarded byte-for-byte by a test below.
             let library = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
@@ -3087,6 +2979,18 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
+            // Optional and deliberately separate from the ranked M4 artifact.
+            // This portable AIR library may need background AIR->ISA lowering,
+            // but it can neither invalidate nor delay the ten existing M4
+            // pipelines. Failure only disables paired absorb.
+            let pair_library = device
+                .new_library_with_data(SHADER_PAIR_METALLIB)
+                .ok()
+                .filter(|library| {
+                    PAIR_METALLIB_REQUIRED_KERNELS
+                        .iter()
+                        .all(|name| library.get_function(name, None).is_ok())
+                });
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -3193,8 +3097,8 @@ impl MetalShared {
                         .expect("ifft finalize pipeline thread panicked"),
                 )
             });
-            // Everything the context blocks on is now built; the four optional
-            // kernels below land on their own threads.
+            // Everything the context blocks on is now built; the four original
+            // optional kernels plus paired absorb land on their own threads.
             PIPELINE_BLOCKING_US.store(
                 PIPELINE_PHASE_START
                     .get()
@@ -3214,7 +3118,12 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library, archive.as_ref());
+            spawn_optional_pipelines(
+                &device,
+                &library,
+                archive.as_ref(),
+                pair_library.as_ref(),
+            );
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3248,7 +3157,6 @@ impl MetalShared {
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
-                spine_available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
@@ -3363,22 +3271,11 @@ impl MetalShared {
         u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
-        selector_filter_plan: &[u32],
-        selector_filter_plan_count: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        let spec_count = range_count
-            .checked_add(u32_count)
-            .ok_or("RangeCheck gate quotient spec count overflow")?;
-        if metadata.len() != spec_count * 10
+        if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
-            || !selector_filter_plan_is_valid(
-                selector_filter_plan,
-                metadata,
-                spec_count,
-                selector_filter_plan_count,
-            )
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
@@ -3407,18 +3304,12 @@ impl MetalShared {
                 size_of_val(metadata) as NSUInteger,
                 metadata.as_ptr().cast::<c_void>(),
             );
-            encoder.set_bytes(
-                11,
-                size_of_val(selector_filter_plan) as NSUInteger,
-                selector_filter_plan.as_ptr().cast::<c_void>(),
-            );
             set_u32(encoder, 5, wires.rows as u32);
             set_u32(encoder, 6, quotient_rows as u32);
             set_u32(encoder, 7, step as u32);
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            set_u32(encoder, 12, selector_filter_plan_count as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -3562,12 +3453,7 @@ impl MetalShared {
             if spine {
                 pool.spine_waiters += 1;
             }
-            let available = if spine {
-                &self.spine_available
-            } else {
-                &self.available
-            };
-            match available.wait(pool) {
+            match self.available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
                     if spine {
@@ -3593,17 +3479,23 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // A released singleton set can satisfy one waiter. Spine and regular
-        // builders sleep on distinct condition variables, so the priority
-        // class can be targeted directly without waking every regular waiter
-        // and making them re-contend for the mutex only to sleep again.
+        // With a spine waiter queued, whichever non-spine waiter the OS would
+        // hand a `notify_one` to would just re-block, so the wake must reach
+        // the spine thread. Otherwise, a released singleton set can satisfy
+        // only one waiter and broadcasting just creates mutex contention.
+        // slow-host band; this comment changes no executable behavior.
         if pool.waiters == 0 {
             return;
         }
-        if pool.spine_waiters != 0 {
-            self.spine_available.notify_one();
-        } else {
+        if pool.spine_waiters == 0 {
+            // All sleepers are interchangeable non-spine jobs. One released
+            // set can satisfy exactly one of them, so waking the rest only
+            // makes them contend for the mutex and go back to sleep. Keep the
+            // broadcast solely for the priority case below, where the OS may
+            // otherwise wake a non-spine waiter ahead of the chain spine.
             self.available.notify_one();
+        } else {
+            self.available.notify_all();
         }
     }
 
@@ -3984,7 +3876,6 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
-                set_u32(leaf_encoder, 6, 0);
                 dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
@@ -4249,7 +4140,6 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
-            set_u32(leaf_encoder, 6, 0);
             dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
@@ -4463,19 +4353,11 @@ impl MetalShared {
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
             if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
-            encoder.set_bytes(
-                5,
-                size_of::<u32>() as NSUInteger,
-                (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
-            );
-            if !matches!(&source, LeafSource::Rows(_)) {
-                let canonicalize_in_place = u32::from(matches!(&source, LeafSource::Shared(_)));
                 encoder.set_bytes(
-                    6,
+                    5,
                     size_of::<u32>() as NSUInteger,
-                    (&canonicalize_in_place as *const u32).cast::<c_void>(),
+                    (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
-            }
             }
             dispatch(encoder, leaf_pipeline, leaf_count);
 
@@ -4696,13 +4578,66 @@ mod tests {
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
-    /// The prebuilt AIR library is only sound while it is the compiled form of
-    /// the MSL we ship. Nothing in the type system ties the two together, so
-    /// this pins the source bytes: edit `poseidon2.metal` without regenerating
-    /// `poseidon2.metallib` and this fails loudly instead of silently proving
-    /// with stale kernels.
     #[test]
-    fn metallib_matches_shader_source() {
+    fn command_settlement_does_not_short_circuit_after_failure() {
+        let statuses = [true, false, true];
+        let mut settled = 0;
+        let all_ok = settle_all(&statuses, |status| {
+            settled += 1;
+            *status
+        });
+        assert!(!all_ok);
+        assert_eq!(settled, statuses.len());
+    }
+
+    /// The ranked M4 Pro path depends on the device-specific machine-code
+    /// slice embedded in this exact artifact. Regenerating it on a different
+    /// Mac produces a valid metallib but silently discards that fast path.
+    #[test]
+    fn ranked_m4_metallib_is_preserved_byte_for_byte() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/hash/poseidon2/poseidon2.metallib"
+        );
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", path])
+            .output()
+            .expect("shasum must be available to verify the ranked metallib");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(
+            digest,
+            "39c066b3c3ffa6e4518cd069156085b8c9ab60f22ec22c2b463af46a4c452574",
+            "poseidon2.metallib lost the ranked M4 Pro machine-code slice; keep it unchanged and put new optional kernels in a separate artifact"
+        );
+    }
+
+    #[test]
+    fn ranked_m4_pipeline_archive_is_preserved_byte_for_byte() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/hash/poseidon2/poseidon2-pipelines.metalarchive"
+        );
+        let output = std::process::Command::new("/usr/bin/shasum")
+            .args(["-a", "256", path])
+            .output()
+            .expect("shasum must be available to verify the ranked archive");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(
+            digest,
+            "9348c8d46b37c8236c8c3bc537ea35b4dcc908d6119a6fa2aca8ef4efa62aa53",
+            "poseidon2-pipelines.metalarchive lost the ranked M4 Pro machine-code entries"
+        );
+    }
+
+    /// The portable paired-kernel AIR library is only sound while it is the
+    /// compiled form of the MSL we ship. The frozen ranked metallib has its own
+    /// byte-for-byte guard above.
+    #[test]
+    fn pair_metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
         let output = std::process::Command::new("/usr/bin/shasum")
             .args(["-a", "256", &format!("{dir}/poseidon2.metal")])
@@ -4713,9 +4648,9 @@ mod tests {
         let digest = digest.split_whitespace().next().expect("empty shasum output");
         assert_eq!(
             digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
-             xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
+            "poseidon2.metal changed but poseidon2-pair.metallib was not regenerated. Run:\n  \
+             xcrun -sdk macosx metal -O2 -c poseidon2.metal -o poseidon2-pair.air\n  \
+             xcrun -sdk macosx metallib poseidon2-pair.air -o poseidon2-pair.metallib\n\
              then update SHADER_SOURCE_SHA256 to {digest}."
         );
     }
@@ -4735,6 +4670,22 @@ mod tests {
             assert!(
                 library.get_function(name, None).is_ok(),
                 "prebuilt metallib is missing kernel {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_metallib_loads_and_exposes_paired_absorb() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let library = device
+            .new_library_with_data(SHADER_PAIR_METALLIB)
+            .expect("paired-absorb metallib must load");
+        for name in PAIR_METALLIB_REQUIRED_KERNELS {
+            assert!(
+                library.get_function(name, None).is_ok(),
+                "paired-absorb metallib is missing kernel {name}"
             );
         }
     }
@@ -5311,130 +5262,6 @@ mod tests {
     }
 
     #[test]
-    fn selector_filter_plan_is_cross_family_zero_safe_and_guarded() {
-        type F = GoldilocksField;
-
-        let range_specs = vec![RangeCheckQuotientSpec {
-            selector_column: 2,
-            gate_index: 2,
-            group: 2..6,
-            include_unused_selector: true,
-            num_ops: 4,
-            bit_size: 16,
-        }];
-        let u32_specs = vec![
-            U32QuotientSpec {
-                selector_column: 2,
-                gate_index: 3,
-                group: 2..6,
-                include_unused_selector: true,
-                num_ops: 2,
-                kind: U32QuotientKind::Arithmetic,
-            },
-            U32QuotientSpec {
-                selector_column: 2,
-                gate_index: 5,
-                group: 2..6,
-                include_unused_selector: true,
-                num_ops: 4,
-                kind: U32QuotientKind::Subtraction { result_limbs: 16 },
-            },
-            // A singleton in a different group must retain the generic path.
-            U32QuotientSpec {
-                selector_column: 3,
-                gate_index: 8,
-                group: 7..10,
-                include_unused_selector: true,
-                num_ops: 4,
-                kind: U32QuotientKind::Subtraction { result_limbs: 8 },
-            },
-        ];
-        let plan = build_selector_filter_plan(&range_specs, &u32_specs);
-        assert_eq!(plan.plan_count, 1);
-        assert_eq!(plan.planned_specs, 3);
-        assert_eq!(plan.words[..4], [1, 1, 1, 0]);
-
-        let mut metadata = Vec::new();
-        for (selector, gate, start, end, unused) in [
-            (2, 2, 2, 6, 1),
-            (2, 3, 2, 6, 1),
-            (2, 5, 2, 6, 1),
-            (3, 8, 7, 10, 1),
-        ] {
-            metadata.extend([selector, gate, start, end, unused, 0, 0, 0, 0, 0]);
-        }
-        assert!(selector_filter_plan_is_valid(
-            &plan.words,
-            &metadata,
-            4,
-            plan.plan_count,
-        ));
-
-        let record_offset = plan.words[4] as usize;
-        let group = plan.words[record_offset + 1] as usize
-            ..plan.words[record_offset + 2] as usize;
-        let active_count = plan.words[record_offset + 4] as usize;
-        let active = &plan.words[record_offset + SELECTOR_PLAN_HEADER_WORDS
-            ..record_offset + SELECTOR_PLAN_HEADER_WORDS + active_count];
-        assert_eq!(active, [2, 3, 5]);
-
-        // Gate labels, the inactive label, UNUSED, arbitrary canonical values,
-        // and a deliberately noncanonical u64 representative cover every zero
-        // placement and the raw-input contract used by retained LDE columns.
-        for selector in [
-            F::from_canonical_u64(0),
-            F::from_canonical_u64(2),
-            F::from_canonical_u64(3),
-            F::from_canonical_u64(4),
-            F::from_canonical_u64(5),
-            F::from_canonical_usize(UNUSED_SELECTOR),
-            F::from_canonical_u64(0x1234_5678_9abc_def0 % F::ORDER),
-            GoldilocksField(F::ORDER + 7),
-        ] {
-            let mut shared_base = F::ONE;
-            for gate in group.clone().filter(|gate| !active.contains(&(*gate as u32))) {
-                shared_base *= F::from_canonical_usize(gate) - selector;
-            }
-            shared_base *= F::from_canonical_usize(UNUSED_SELECTOR) - selector;
-            for &gate in active {
-                let mut planned = shared_base;
-                for &other in active.iter().filter(|&&other| other != gate) {
-                    planned *= F::from_canonical_usize(other as usize) - selector;
-                }
-                let generic = group
-                    .clone()
-                    .filter(|&other| other != gate as usize)
-                    .chain(core::iter::once(UNUSED_SELECTOR))
-                    .fold(F::ONE, |filter, other| {
-                        filter * (F::from_canonical_usize(other) - selector)
-                    });
-                assert_eq!(
-                    planned.to_canonical_u64(),
-                    generic.to_canonical_u64(),
-                    "gate={gate}, selector_raw={:#018x}",
-                    selector.to_noncanonical_u64(),
-                );
-            }
-        }
-
-        let mut corrupt = plan.words.clone();
-        corrupt[record_offset + SELECTOR_PLAN_HEADER_WORDS] = 6;
-        assert!(!selector_filter_plan_is_valid(
-            &corrupt,
-            &metadata,
-            4,
-            plan.plan_count,
-        ));
-
-        // Duplicate records for one gate are unsupported by the shared plan;
-        // they stay on the original local-filter path instead of changing the
-        // leave-one-out multiplicity.
-        let duplicate_specs = vec![u32_specs[0].clone(), u32_specs[0].clone()];
-        let duplicate_plan = build_selector_filter_plan(&[], &duplicate_specs);
-        assert_eq!(duplicate_plan.plan_count, 0);
-    }
-
-    #[test]
     fn metal_range_check_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
         const WIRE_COLUMNS: usize = 136;
@@ -5449,23 +5276,23 @@ mod tests {
             RangeCheckQuotientSpec {
                 selector_column: 0,
                 gate_index: 2,
-                group: 1..10,
+                group: 1..4,
                 include_unused_selector: true,
                 num_ops: 15,
                 bit_size: 16,
             },
             RangeCheckQuotientSpec {
-                selector_column: 0,
+                selector_column: 1,
                 gate_index: 5,
-                group: 1..10,
+                group: 4..7,
                 include_unused_selector: true,
                 num_ops: 8,
                 bit_size: 32,
             },
             RangeCheckQuotientSpec {
-                selector_column: 0,
+                selector_column: 2,
                 gate_index: 8,
-                group: 1..10,
+                group: 7..10,
                 include_unused_selector: true,
                 num_ops: 5,
                 bit_size: 48,
@@ -5479,10 +5306,6 @@ mod tests {
                 bit_size: 15,
             },
         ];
-        let production_plan = build_selector_filter_plan(&specs, &[]);
-        assert_eq!(production_plan.plan_count, 1);
-        assert_eq!(production_plan.planned_specs, 3);
-        assert_eq!(production_plan.words[..3], [1, 1, 1]);
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -5498,20 +5321,19 @@ mod tests {
                     *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
                 }
             }
-            let mut constants_columns = constants.columns_mut().expect("unique selector columns");
-            let mut initialized = vec![false; constants_columns.len()];
-            for spec in &specs {
-                if initialized[spec.selector_column] {
-                    continue;
-                }
-                initialized[spec.selector_column] = true;
-                let column = &mut constants_columns[spec.selector_column];
+            let constants_columns = constants.columns_mut().expect("unique selector columns");
+            for (spec, column) in specs.iter().zip(constants_columns) {
+                let other_gate = spec
+                    .group
+                    .clone()
+                    .find(|&gate| gate != spec.gate_index)
+                    .unwrap();
                 for row in 0..full_rows {
                     column[row] = match (row / step) & 3 {
                         0 => F::from_canonical_usize(spec.gate_index),
-                        1 => F::from_canonical_usize(spec.group.start + 1),
+                        1 => F::from_canonical_usize(other_gate),
                         2 => F::from_canonical_usize(UNUSED_SELECTOR),
-                        _ => GoldilocksField(rng.next_u64()),
+                        _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
                     };
                 }
             }
@@ -5579,11 +5401,6 @@ mod tests {
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
-                    actual.to_noncanonical_u64(),
-                    expected.to_canonical_u64(),
-                    "RangeCheck raw canonical output mismatch at word {i}, step {step}"
-                );
-                assert_eq!(
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "RangeCheck gate quotient mismatch at word {i}, step {step}"
@@ -5605,15 +5422,15 @@ mod tests {
             U32QuotientSpec {
                 selector_column: 0,
                 gate_index: 2,
-                group: 1..10,
+                group: 1..4,
                 include_unused_selector: true,
                 num_ops: 3,
                 kind: U32QuotientKind::Arithmetic,
             },
             U32QuotientSpec {
-                selector_column: 0,
+                selector_column: 1,
                 gate_index: 5,
-                group: 1..10,
+                group: 4..7,
                 include_unused_selector: true,
                 num_ops: 6,
                 kind: U32QuotientKind::Subtraction { result_limbs: 16 },
@@ -5622,9 +5439,9 @@ mod tests {
             // with a different limb count, so they exercise the same branch
             // at both ends of the supported width range.
             U32QuotientSpec {
-                selector_column: 0,
+                selector_column: 2,
                 gate_index: 8,
-                group: 1..10,
+                group: 7..10,
                 include_unused_selector: true,
                 num_ops: 9,
                 kind: U32QuotientKind::Subtraction { result_limbs: 8 },
@@ -5708,10 +5525,6 @@ mod tests {
                 constant_base: addition_constant_base,
             },
         });
-        let production_plan = build_selector_filter_plan(&[], &specs);
-        assert!(production_plan.plan_count >= 1);
-        assert!(production_plan.planned_specs >= 3);
-        assert_eq!(production_plan.words[..3], [1, 1, 1]);
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -5727,27 +5540,29 @@ mod tests {
                     *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
                 }
             }
-            let mut constants_columns = constants.columns_mut().expect("unique selector columns");
-            let mut initialized = vec![false; constants_columns.len()];
-            for spec in &specs {
-                if initialized[spec.selector_column] {
-                    continue;
-                }
-                initialized[spec.selector_column] = true;
-                let column = &mut constants_columns[spec.selector_column];
+            for (spec, column) in specs
+                .iter()
+                .zip(constants.columns_mut().expect("unique selector columns"))
+            {
+                let other_gate = spec
+                    .group
+                    .clone()
+                    .find(|&gate| gate != spec.gate_index)
+                    .unwrap();
                 for row in 0..full_rows {
                     column[row] = match (row / step) & 3 {
                         0 => F::from_canonical_usize(spec.gate_index),
-                        1 => F::from_canonical_usize(spec.group.start + 1),
+                        1 => F::from_canonical_usize(other_gate),
                         2 => F::from_canonical_usize(UNUSED_SELECTOR),
-                        _ => GoldilocksField(rng.next_u64()),
+                        _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
                     };
                 }
             }
+            let mut constant_columns = constants.columns_mut().expect("unique constant columns");
             for row in 0..full_rows {
-                constants_columns[addition_constant_base][row] =
+                constant_columns[addition_constant_base][row] =
                     F::from_canonical_u64(3 + (row % 19) as u64);
-                constants_columns[addition_constant_base + 1][row] =
+                constant_columns[addition_constant_base + 1][row] =
                     F::from_canonical_u64(5 + (row % 23) as u64);
             }
 
@@ -5948,11 +5763,6 @@ mod tests {
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
-                    actual.to_noncanonical_u64(),
-                    expected.to_canonical_u64(),
-                    "U32 raw canonical output mismatch at word {i}, step {step}"
-                );
-                assert_eq!(
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "U32 gate quotient mismatch at word {i}, step {step}"
@@ -5963,11 +5773,11 @@ mod tests {
 
     // Differential coverage for the byte-decomposition and EdDSA quintic
     // gates evaluated in the same union job as production RangeCheck,
-    // width-generic subtraction and add-many specs. The shared stores are
-    // initially filled with random canonical values plus the twelve raw
-    // boundary representatives, then passed through the same in-place
-    // canonicalizing commitment read that establishes the production
-    // MetalColumns invariant before any quotient kernel consumes them.
+    // width-generic subtraction and add-many specs. Wire columns mix random
+    // canonical values with a rotating window of the twelve raw boundary
+    // representatives (including noncanonical encodings at and above the
+    // field order) from the packed-field differential suite, so every kernel
+    // operation sees the carry-boundary cases.
     #[test]
     fn metal_byte_and_quintic_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
@@ -6171,20 +5981,6 @@ mod tests {
                     }
                 }
             }
-
-            context
-                .build(LeafSource::Shared(&wires), WIRE_COLUMNS, full_rows, 0)
-                .expect("wire commitment must establish canonical columns");
-            context
-                .build(
-                    LeafSource::Shared(&constants),
-                    shapes.len() + 3,
-                    full_rows,
-                    0,
-                )
-                .expect("constant commitment must establish canonical columns");
-            assert!(wires.raw().iter().all(|&value| value < F::ORDER));
-            assert!(constants.raw().iter().all(|&value| value < F::ORDER));
 
             let mut expected = vec![F::ZERO; QUOTIENT_ROWS * 2];
             let two = F::from_canonical_u64(2);
@@ -7469,11 +7265,6 @@ kernel void goldilocks_mul_bench_native(
                     .build(LeafSource::Shared(&shared), cols, rows, cap_height)
                     .unwrap();
 
-                assert!(
-                    shared.raw().iter().all(|&value| value < GoldilocksField::ORDER),
-                    "shared-column hashing must establish the canonical MetalColumns invariant"
-                );
-
                 assert_tree_raw_eq(&direct, &staged, cols, cap_height);
                 assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
             }
@@ -7483,48 +7274,157 @@ kernel void goldilocks_mul_bench_native(
     #[test]
     fn streamed_merkle_keeps_digests_resident_and_matches_classic() {
         type F = GoldilocksField;
-        struct ExclusiveReset;
-        impl Drop for ExclusiveReset {
-            fn drop(&mut self) {
-                set_exclusive_gpu_phase(false);
-            }
-        }
-
+        let _test_policy = STREAMED_TEST_POLICY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let context = shared_context().expect("Metal context");
-        let rows = 1usize << 20;
-        // 17 columns is three absorb groups with a *partial* final group, so
-        // the group that now carries the parent ladder is the short one.
-        let cols = 17;
+        let _force_stream = force_stream_admission_for_tests();
+        let rows = 1usize << 10;
+        let cap_height = 4;
+        // Production polls without blocking. This focused availability test
+        // joins the background builders to avoid racing a cold Metal compiler.
+        assert!(ABSORB_PASS_PIPELINE.get().is_some(), "absorb pipeline");
+        assert!(
+            ABSORB_PAIR_PIPELINE.get().is_some(),
+            "paired absorb pipeline"
+        );
+
+        // Cover exact pairs, odd group counts, partial final groups, and the
+        // 82-column production commitment (11 groups -> 6 dispatches).
+        for cols in [16usize, 17, 24, 31, 64, 82] {
+            let columns = context
+                .allocate_columns::<F>(rows, cols)
+                .expect("shared columns");
+            let paired = build_merkle_tree_shared_streamed(
+                &columns,
+                cap_height,
+                &|group, destinations| {
+                    for (index, destination) in destinations.iter_mut().enumerate() {
+                        destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    }
+                },
+            )
+            .expect("paired streamed tree");
+            assert!(paired.0.nodes.is_shared());
+            assert_eq!(
+                last_streamed_absorb_dispatches_for_tests(),
+                1 + (cols.div_ceil(8) - 1).div_ceil(2),
+                "paired dispatch count for {cols} columns"
+            );
+
+            let single = {
+                let _force_single = force_single_absorb_for_tests();
+                let tree = build_merkle_tree_shared_streamed(
+                    &columns,
+                    cap_height,
+                    &|group, destinations| {
+                        for (index, destination) in destinations.iter_mut().enumerate() {
+                            destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                        }
+                    },
+                )
+                .expect("single-pass streamed tree");
+                assert_eq!(
+                    last_streamed_absorb_dispatches_for_tests(),
+                    cols.div_ceil(8),
+                    "single dispatch count for {cols} columns"
+                );
+                tree
+            };
+
+            let classic = context
+                .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+                .expect("classic tree");
+            assert_eq!(paired, single, "paired vs single for {cols} columns");
+            assert_eq!(paired, classic, "paired vs classic for {cols} columns");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual focused paired-absorb benchmark"]
+    fn benchmark_paired_streamed_absorb() {
+        type F = GoldilocksField;
+        let _test_policy = STREAMED_TEST_POLICY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let context = shared_context().expect("Metal context");
+        let _force_stream = force_stream_admission_for_tests();
+        let rows = 1usize << 19;
+        let cols = 82usize;
         let cap_height = 4;
         let columns = context
             .allocate_columns::<F>(rows, cols)
             .expect("shared columns");
-        set_exclusive_gpu_phase(true);
-        let _reset = ExclusiveReset;
-        assert!(is_exclusive_gpu_phase());
         assert!(ABSORB_PASS_PIPELINE.get().is_some(), "absorb pipeline");
-        let streamed = build_merkle_tree_shared_streamed(
-            &columns,
-            cap_height,
-            &|group, destinations| {
-                for (index, destination) in destinations.iter_mut().enumerate() {
-                    let value = (group * 8 + index + 1) as u64;
-                    let raw = if index & 1 == 0 { value } else { F::ORDER + value };
-                    destination.fill(F::from_noncanonical_u64(raw));
-                }
-            },
-        )
-        .expect("streamed tree");
-        assert!(streamed.0.nodes.is_shared());
-        for column in 0..cols {
-            assert!(columns.col(column)[0].0 < F::ORDER);
-            assert!(columns.col(column)[rows - 1].0 < F::ORDER);
-        }
+        assert!(
+            ABSORB_PAIR_PIPELINE.get().is_some(),
+            "paired absorb pipeline"
+        );
 
-        let classic = context
-            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
-            .expect("classic tree");
-        assert_eq!(streamed, classic);
+        let build_with_fill = |force_single: bool| {
+            let _single = force_single.then(force_single_absorb_for_tests);
+            build_merkle_tree_shared_streamed(
+                &columns,
+                cap_height,
+                &|group, destinations| {
+                    for (index, destination) in destinations.iter_mut().enumerate() {
+                        destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    }
+                },
+            )
+            .expect("streamed tree")
+        };
+
+        // Populate once and prove both kernels agree before timing. The timed
+        // closure is intentionally a no-op so the benchmark isolates Metal
+        // submission, absorb and parent hashing from synthetic memory fill.
+        let paired_tree = build_with_fill(false);
+        let single_tree = build_with_fill(true);
+        assert_eq!(paired_tree, single_tree);
+        drop((paired_tree, single_tree));
+
+        let build_prefilled = |force_single: bool| {
+            let _single = force_single.then(force_single_absorb_for_tests);
+            let started = Instant::now();
+            drop(
+                build_merkle_tree_shared_streamed(&columns, cap_height, &|_, _| {})
+                    .expect("prefilled streamed tree"),
+            );
+            let elapsed = started.elapsed();
+            let expected_dispatches = if force_single {
+                cols.div_ceil(8)
+            } else {
+                1 + (cols.div_ceil(8) - 1).div_ceil(2)
+            };
+            assert_eq!(
+                last_streamed_absorb_dispatches_for_tests(),
+                expected_dispatches
+            );
+            elapsed
+        };
+
+        // ABBA BAAB balances drift in either direction and retains individual
+        // samples for inspection rather than hiding them in one ordered sum.
+        let mut paired_samples = Vec::new();
+        let mut single_samples = Vec::new();
+        for force_single in [false, true, true, false, true, false, false, true] {
+            let elapsed = build_prefilled(force_single);
+            if force_single {
+                single_samples.push(elapsed);
+            } else {
+                paired_samples.push(elapsed);
+            }
+        }
+        let single: Duration = single_samples.iter().copied().sum();
+        let paired: Duration = paired_samples.iter().copied().sum();
+        println!(
+            "82 x 2^19 prefilled streamed commitment: single {:?} = {:?}, paired {:?} = {:?}, speedup {:.3}x",
+            single_samples,
+            single,
+            paired_samples,
+            paired,
+            single.as_secs_f64() / paired.as_secs_f64()
+        );
     }
 
     #[test]
