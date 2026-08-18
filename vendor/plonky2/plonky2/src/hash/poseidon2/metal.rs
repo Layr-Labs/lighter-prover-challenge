@@ -358,11 +358,14 @@ const MAX_BUFFER_SETS: usize = 1;
 const MAX_DETACHED_READBACKS: usize = 2;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
-/// Reuse only the recurring transaction/chain quotient outputs. The final
-/// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
-/// peak unified-memory pressure.
+/// Reuse only the recurring transaction/chain quotient outputs. Poseidon,
+/// Range/U32, and permutation launch together and keep three equal outputs
+/// live through the CPU quotient sweep, so all three slots are required to
+/// avoid one fresh shared-buffer allocation on every recurring proof. The
+/// final block's one-off 32 MiB outputs remain uncached so the pool cannot
+/// amplify peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 3;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
@@ -1113,7 +1116,7 @@ impl QuotientOutputPool {
         Some(self.free.swap_remove(index))
     }
 
-    /// Retains at most the two largest recurring-size buffers. A larger buffer
+    /// Retains at most the three largest recurring-size buffers. A larger buffer
     /// can service every smaller quotient shape, while final-proof outputs are
     /// rejected by the size cap before they reach the cache.
     fn recycle(&mut self, buffer: Buffer) {
@@ -4529,10 +4532,19 @@ mod tests {
         assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
         let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
         lengths.sort_unstable();
-        assert_eq!(lengths, vec![4 * mib, 8 * mib]);
+        assert_eq!(lengths, vec![2 * mib, 4 * mib, 8 * mib]);
+
+        // Once full, preserve the three largest reusable shapes.
+        pool.recycle(buffer(1 * mib));
+        pool.recycle(buffer(6 * mib));
+        let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
+        lengths.sort_unstable();
+        assert_eq!(lengths, vec![4 * mib, 6 * mib, 8 * mib]);
 
         let four = pool.take_best_fit(3 * mib).expect("4 MiB best fit");
         assert_eq!(four.length(), 4 * mib);
+        let six = pool.take_best_fit(1).expect("6 MiB best fit");
+        assert_eq!(six.length(), 6 * mib);
         let eight = pool.take_best_fit(1).expect("remaining 8 MiB buffer");
         assert_eq!(eight.length(), 8 * mib);
         assert!(pool.take_best_fit(1).is_none());
