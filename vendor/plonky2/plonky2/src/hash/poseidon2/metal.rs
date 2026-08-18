@@ -727,6 +727,39 @@ static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
     total_bytes: 0,
 });
 
+/// Default to preserving a reusable buffer across the pool's tiny critical
+/// sections. Setting this to `try` restores the old opportunistic locking for
+/// same-binary A/B measurements.
+const COLUMN_STORE_POOL_LOCK_ENV: &str = "LIGHTER_METAL_COLUMN_STORE_POOL_LOCK";
+static BLOCK_ON_COLUMN_STORE_POOL: LazyLock<bool> = LazyLock::new(|| {
+    !std::env::var(COLUMN_STORE_POOL_LOCK_ENV)
+        .is_ok_and(|value| value.eq_ignore_ascii_case("try"))
+});
+
+/// Acquire a pool mutex according to `block_on_contention`. Blocking locks
+/// recover from poisoning: a panic cannot invalidate the pool's byte-count
+/// invariant because every mutation is performed only after all fallible
+/// operations in `take_best_fit` and `recycle`.
+fn column_store_pool_guard_with_policy<T>(
+    pool: &Mutex<T>,
+    block_on_contention: bool,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    if block_on_contention {
+        Some(
+            pool.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    } else {
+        pool.try_lock().ok()
+    }
+}
+
+fn column_store_pool_guard() -> Option<std::sync::MutexGuard<'static, ColumnStorePool>> {
+    // The `try` A/B mode deliberately retains the old miss-on-contention
+    // behavior. Production/default mode always returns a guard.
+    column_store_pool_guard_with_policy(&COLUMN_STORE_POOL, *BLOCK_ON_COLUMN_STORE_POOL)
+}
+
 impl ColumnStorePool {
     /// Smallest free buffer that fits `bytes`. The recurring shapes match
     /// their own previous allocation exactly; best-fit additionally tolerates
@@ -911,12 +944,13 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
-/// device allocation. Misses (including lock contention) fall through to the
-/// allocator; the pool is a best-effort page-warm cache, never a correctness
-/// dependency.
+/// device allocation. The default lock policy waits through the pool's small
+/// bookkeeping critical section rather than turning contention into a massive
+/// fresh allocation; `LIGHTER_METAL_COLUMN_STORE_POOL_LOCK=try`
+/// restores the old opportunistic behavior for A/B measurements.
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
+        if let Some(mut pool) = column_store_pool_guard() {
             if let Some(buffer) = pool.take_best_fit(bytes) {
                 return buffer;
             }
@@ -931,15 +965,15 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
 
 /// Owns one column-store buffer for the lifetime of all `MetalColumns`
 /// handles over it; the last handle's drop returns the buffer to the pool
-/// (same pattern as `MetalDigestInner`). `try_lock`: on contention the
-/// buffer simply drops.
+/// (same pattern as `MetalDigestInner`). Waiting here is safe: pool operations
+/// neither acquire another lock nor run code that can drop a `ColumnStoreLease`.
 struct ColumnStoreLease {
     buffer: Buffer,
 }
 
 impl Drop for ColumnStoreLease {
     fn drop(&mut self) {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
+        if let Some(mut pool) = column_store_pool_guard() {
             pool.recycle(self.buffer.clone());
         }
     }
@@ -4356,6 +4390,70 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+
+    #[test]
+    fn column_store_pool_lock_policy_waits_or_misses_as_requested() {
+        let pool = Arc::new(Mutex::new(()));
+        let held = pool.lock().unwrap();
+
+        // This is the old A/B policy: contention is an immediate cache miss.
+        assert!(column_store_pool_guard_with_policy(&pool, false).is_none());
+
+        // The default policy must wait, then acquire the same mutex after its
+        // current tiny critical section completes.
+        let worker_pool = Arc::clone(&pool);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = column_store_pool_guard_with_policy(&worker_pool, true).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(held);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn column_store_pool_blocking_lock_recovers_poison() {
+        let pool = Arc::new(Mutex::new(()));
+        let poisoner_pool = Arc::clone(&pool);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoner_pool.lock().unwrap();
+                panic!("poison test mutex");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(column_store_pool_guard_with_policy(&pool, true).is_some());
+    }
+
+    #[test]
+    fn column_store_pool_reuses_buffer_ownership() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = autoreleasepool(|| {
+            device.new_buffer(4096, MTLResourceOptions::StorageModeShared)
+        });
+        let contents = buffer.contents();
+        let length = buffer.length();
+        let mut pool = ColumnStorePool {
+            free: Vec::new(),
+            total_bytes: 0,
+        };
+        pool.recycle(buffer);
+        assert_eq!(pool.total_bytes, length);
+        assert_eq!(pool.free.len(), 1);
+
+        let reused = pool.take_best_fit(length).unwrap();
+        assert_eq!(reused.contents(), contents);
+        assert_eq!(pool.total_bytes, 0);
+        assert!(pool.free.is_empty());
+    }
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
