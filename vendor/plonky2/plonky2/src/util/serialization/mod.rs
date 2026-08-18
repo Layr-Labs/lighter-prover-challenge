@@ -776,6 +776,7 @@ pub trait Read {
             degree_log,
             rate_bits,
             blinding,
+            even_columns: Default::default(),
         })
     }
 
