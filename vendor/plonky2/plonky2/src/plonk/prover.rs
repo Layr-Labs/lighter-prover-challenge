@@ -1366,6 +1366,15 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+#[cfg(any(
+    test,
+    all(feature = "std", target_arch = "aarch64", target_os = "macos")
+))]
+fn prepare_range_filter_scratch<F: Field>(filters: &mut Vec<F>, len: usize) {
+    filters.resize(len, F::ONE);
+    filters.fill(F::ONE);
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1447,11 +1456,11 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     let num_gates = gates.len();
     out.par_chunks_mut(2 * ROWS_PER_CHUNK)
         .enumerate()
-        .for_each(|(chunk_i, chunk)| {
+        .for_each_init(Vec::new, |filters, (chunk_i, chunk)| {
             let row0 = chunk_i * ROWS_PER_CHUNK;
             let rows = chunk.len() / 2;
             // Filters for this chunk, gate-major: filters[g * ROWS_PER_CHUNK + r].
-            let mut filters = vec![F::ONE; num_gates * ROWS_PER_CHUNK];
+            prepare_range_filter_scratch(filters, num_gates * ROWS_PER_CHUNK);
             let mut factors = [F::ZERO; MAX_GROUP];
             let mut prefix = [F::ONE; MAX_GROUP + 1];
             let mut suffix = [F::ONE; MAX_GROUP + 1];
@@ -1476,7 +1485,7 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                 }
             }
             // Accumulate gate-major so each pass streams one source array.
-            let mut acc = vec![F::ZERO; 2 * ROWS_PER_CHUNK];
+            chunk.fill(F::ZERO);
             for g in 0..num_gates {
                 let f = &filters[g * ROWS_PER_CHUNK..g * ROWS_PER_CHUNK + rows];
                 let odd0 = &odd[g * 2];
@@ -1491,11 +1500,10 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                         (odd0[i >> 1], odd1[i >> 1])
                     };
                     let filter = f[r];
-                    acc[2 * r] += filter * sv0;
-                    acc[2 * r + 1] += filter * sv1;
+                    chunk[2 * r] += filter * sv0;
+                    chunk[2 * r + 1] += filter * sv1;
                 }
             }
-            chunk.copy_from_slice(&acc[..2 * rows]);
         });
     out
 }
@@ -2065,18 +2073,17 @@ fn start_gpu_range_check_gate_quotient<
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
-    // Circuit-fixed constants/sigmas live in a deserialized Metal store
-    // with no companion. One even-row copy lets constant-reading deg<=4
-    // gates join the half-domain job: the shader strides both buffers by
-    // `wires.rows`, so the compact constants must match the compact wires.
-    let even_constants = prover_data
-        .constants_sigmas_commitment
-        .even_columns
-        .get_or_fill_even_rows(constants);
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
+        // Circuit-fixed constants/sigmas live in a deserialized Metal store
+        // with no companion. Only derive their even rows after confirming that
+        // this proof retained matching even wires and can actually split.
+        let even_constants = prover_data
+            .constants_sigmas_commitment
+            .even_columns
+            .get_or_fill_even_rows(constants);
         // Without a constants companion, kinds that read gate constants
         // stay on the full-domain dispatch (the kernel would otherwise
         // index `col * half_rows + k` into a full-stride store).
@@ -3296,7 +3303,7 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{precomputed, prepare_range_filter_scratch, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
@@ -3334,6 +3341,22 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    #[test]
+    fn range_filter_scratch_is_reset_without_reallocation() {
+        let mut scratch = Vec::with_capacity(64);
+        scratch.resize(64, F::ZERO);
+        let allocation = scratch.as_ptr();
+        let poison = F::from_canonical_u64(0x1234_5678_9abc_def0);
+
+        for len in [17, 33, 8, 64] {
+            scratch.fill(poison);
+            prepare_range_filter_scratch(&mut scratch, len);
+            assert_eq!(scratch.as_ptr(), allocation);
+            assert_eq!(scratch.len(), len);
+            assert!(scratch.iter().all(|&value| value == F::ONE));
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
