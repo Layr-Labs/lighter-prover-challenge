@@ -2375,9 +2375,18 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
+/// Maximum committed-but-unretired absorb passes a streamed build keeps on
+/// the single command queue; see the backpressure note in
+/// [`build_merkle_tree_shared_streamed`]. Two passes are the minimum that
+/// never lets the GPU drain between the gate's wake-up and the next commit;
+/// three adds one pass of slack for scheduler jitter at ~7 ms/pass cost to
+/// the bound.
+const STREAMED_ABSORB_WINDOW: usize = 2;
+
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
+/// the GPU absorbs each pair of eight-column groups (one command buffer, two
+/// ordered absorb passes) while the CPU fills the next pair. Only used inside
 /// exclusive proving phases (nothing else contends for the GPU stream) and
 /// for large wide trees, where the overlap converts the previously serial
 /// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
@@ -2458,23 +2467,34 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
+    // Pair-wise fill + absorb. Two eight-column groups advance per iteration:
+    // the CPU fills both groups of pair p+1 in one sixteen-column parallel
+    // pass while the GPU absorbs pair p. Commands on one queue execute in
+    // submission order, and each pair''s command buffer is committed before the
+    // next pair''s fill starts. Relative to the one-group stream this halves
+    // the command buffers (and the commit/schedule round trips on the single
+    // serialized queue) and widens each CPU fill from eight to sixteen
+    // independent column FFTs, which load-balances better across the worker
+    // pool than eight did. Value-exact: the absorb passes run with exactly the
+    // same parameters in exactly the same order as before — only their
+    // grouping into command buffers changes — and the fill closure computes
+    // each column identically, keyed only by absolute column index.
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    // Filled by the final group's encoder, which now carries the parent ladder
+    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups.div_ceil(2));
+    // Filled by the final pair's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
+    let mut group = 0usize;
+    while group < groups {
+        let pair_len = (groups - group).min(2);
         let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
+        let cols = (leaf_width - col_start).min(8 * pair_len);
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
-            // of the shared buffer; the GPU only reads columns of groups
-            // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
+            // of the shared buffer; the GPU only reads columns of pairs
+            // whose passes were already committed, after their fill completed.
+            let mut slices: Vec<&mut [F]> = (0..cols)
                 .map(|k| unsafe {
                     slice::from_raw_parts_mut(
                         base.add((col_start + k) * leaf_count).cast::<F>(),
@@ -2489,21 +2509,54 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
             fill_group(group, &mut slices);
         }
+        // Backpressure: the CPU fill (~2 ms/group) outruns the GPU absorb
+        // (~4-7 ms/pass), so an unthrottled loop parks an ever-growing run of
+        // committed-but-unexecuted passes on the process's single FIFO queue.
+        // That backlog is pure queue depth — it does not make this build
+        // finish any earlier (its passes are a linear chain on one queue) —
+        // but every serial-critical spine tree committed meanwhile lands
+        // behind ALL of it, which is the measured chain-step starvation.
+        // Bounding the in-flight run to `STREAMED_ABSORB_WINDOW` command buffers
+        // (= 2N absorb passes under the paired fill above) keeps
+        // the GPU saturated from this stream (the window always holds several
+        // passes of work, far more than the sub-millisecond commit
+        // turnaround) while capping what any other command buffer can queue
+        // behind. The tail wait below then finds all but the last window
+        // already retired, so this moves the wait, it does not add one.
+        if absorb_commands.len() >= STREAMED_ABSORB_WINDOW {
+            #[cfg(feature = "diagnostic_profile")]
+            let _gate = crate::util::profile::span("wait", "streamed_absorb_gate");
+            absorb_commands[absorb_commands.len() - STREAMED_ABSORB_WINDOW]
+                .wait_until_completed();
+        }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            let state_resource: &metal::ResourceRef = state_buffer;
+            for sub in 0..pair_len {
+                let sub_group = group + sub;
+                let sub_col_start = sub_group * 8;
+                let sub_chunk = (leaf_width - sub_col_start).min(8);
+                if sub > 0 {
+                    // The second absorb pass resumes the sponge state the
+                    // first one wrote. Dispatches inside one encoder may
+                    // overlap, so order the pair with the same resource
+                    // barrier the parent ladder below already uses.
+                    encoder.memory_barrier_with_resources(&[state_resource]);
+                }
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, sub_col_start as u32);
+                set_u32(encoder, 7, sub_chunk as u32);
+                set_u32(encoder, 8, (sub_group == 0) as u32);
+                set_u32(encoder, 9, (sub_group == groups - 1) as u32);
+                dispatch(encoder, pipeline, leaf_count);
+            }
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2512,7 +2565,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // second command buffer with one encoder per level. Identical
             // shaders, dispatch counts and buffer offsets; strictly fewer
             // command buffers and encoders.
-            if group == groups - 1 {
+            if group + pair_len == groups {
                 let mut level_offset = 0usize;
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
@@ -2551,11 +2604,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * cols) as u64);
             command_buffer.commit();
             command_buffer.to_owned()
         });
         absorb_commands.push(command_buffer);
+        group += pair_len;
     }
 
     let all_ok = absorb_commands.iter().all(|command_buffer| {
@@ -4039,6 +4093,21 @@ impl MetalShared {
     ) -> Result<TreeReadback<'_, F>, String> {
         let cap_count = 1usize << cap_height;
 
+        // Encode-order priority for the serial-critical spine shapes (same
+        // predicate as the buffer-set priority in `build`): claim the queue
+        // position now, before the staging copy, output allocation and
+        // encoding, so chunk absorb passes committed during that host-side
+        // window land behind this tree instead of ahead of it. `enqueue`
+        // only fixes FIFO order — nothing executes until the unconditional
+        // `commit` below, which this function reaches without any fallible
+        // step in between, so the queue can never be left waiting on an
+        // uncommitted reservation.
+        let command_buffer: CommandBuffer =
+            autoreleasepool(|| self.queue.new_command_buffer().to_owned());
+        if leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent() {
+            command_buffer.enqueue();
+        }
+
         let needs_staging = !matches!(&source, LeafSource::Shared(_));
         if needs_staging
             && set.input.as_ref().map_or(true, |buffer| {
@@ -4107,7 +4176,7 @@ impl MetalShared {
         let output_buffer = set.output.as_ref().unwrap();
 
         let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        autoreleasepool(|| {
             let leaf_count_u32 = leaf_count as u32;
             let leaf_width_u32 = leaf_width as u32;
             let log_leaf_count_u32 = leaf_count.ilog2();
@@ -4115,7 +4184,6 @@ impl MetalShared {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
-            let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(leaf_pipeline);
             encoder.set_buffer(0, Some(input_buffer), 0);
@@ -4183,12 +4251,11 @@ impl MetalShared {
 
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
-                command_buffer,
+                &command_buffer,
                 "merkle_tree",
                 (leaf_count * leaf_width) as u64,
             );
             command_buffer.commit();
-            command_buffer.to_owned()
         });
 
         command_buffer.wait_until_completed();
@@ -4226,7 +4293,7 @@ fn dispatch2d(
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(64)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -6993,33 +7060,38 @@ kernel void goldilocks_mul_bench_native(
 
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
-        // 17 columns is three absorb groups with a *partial* final group, so
-        // the group that now carries the parent ladder is the short one.
-        let cols = 17;
         let cap_height = 4;
-        let columns = context
-            .allocate_columns::<F>(rows, cols)
-            .expect("shared columns");
         set_exclusive_gpu_phase(true);
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
         assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
-        let streamed = build_merkle_tree_shared_streamed(
-            &columns,
-            cap_height,
-            &|group, destinations| {
-                for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
-                }
-            },
-        )
-        .expect("streamed tree");
-        assert!(streamed.0.nodes.is_shared());
+        // 16 columns is one full pair whose *second* barrier-separated absorb
+        // pass carries the parent ladder inside the same encoder
+        // (barrier -> absorb -> ladder) — the pair path's novel instruction
+        // sequence. 17 columns is three absorb groups with a *partial* lone
+        // final group, so the ladder rides a single-pass command buffer and
+        // the short group is the one that carries it.
+        for cols in [16usize, 17] {
+            let columns = context
+                .allocate_columns::<F>(rows, cols)
+                .expect("shared columns");
+            let streamed = build_merkle_tree_shared_streamed(
+                &columns,
+                cap_height,
+                &|group, destinations| {
+                    for (index, destination) in destinations.iter_mut().enumerate() {
+                        destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    }
+                },
+            )
+            .expect("streamed tree");
+            assert!(streamed.0.nodes.is_shared());
 
-        let classic = context
-            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
-            .expect("classic tree");
-        assert_eq!(streamed, classic);
+            let classic = context
+                .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+                .expect("classic tree");
+            assert_eq!(streamed, classic, "cols={cols}");
+        }
     }
 
     #[test]

@@ -134,6 +134,15 @@ fn light_tx_proof_window() -> usize {
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
+/// Capacity of each path's finished-witness queue between the serial witness
+/// chain thread and the spawn loop. The chain may run at most this many
+/// finished witnesses ahead of the spawn loop (plus the one it is generating),
+/// bounding the memory held in ready-but-unspawned wires partitions. During
+/// the ramp the loop consumes witnesses the moment they exist, so the bound
+/// never binds there; it only stops the chain from racing ahead of a slow
+/// proof window in steady state, where extra lookahead buys nothing.
+const TX_WITNESS_QUEUE_BOUND: usize = 2;
+
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
@@ -210,7 +219,7 @@ fn mark_spine_thread_latency_critical() {}
 /// preempted while every other tree build queues behind it — a classic
 /// priority inversion at the pipeline's one serialized station. Best-effort.
 #[cfg(target_os = "macos")]
-fn mark_thread_user_initiated() {
+pub(crate) fn mark_thread_user_initiated() {
     #[allow(non_camel_case_types)]
     type qos_class_t = u32;
     unsafe extern "C" {
@@ -222,7 +231,27 @@ fn mark_thread_user_initiated() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mark_thread_user_initiated() {}
+pub(crate) fn mark_thread_user_initiated() {}
+
+/// Marks the calling thread `QOS_CLASS_USER_INITIATED` with relative
+/// priority -1: same class as the tx-proof buffer-set holders above (P-core
+/// preference, ranked above default QoS) but strictly below their relative 0,
+/// so a pool worker can never preempt the thread holding the single GPU
+/// buffer set. Used for the global rayon pool workers. Best-effort.
+#[cfg(target_os = "macos")]
+pub(crate) fn mark_thread_user_initiated_below() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x19, -1);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn mark_thread_user_initiated_below() {}
 
 /// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
 /// walks prefer E-cores instead of competing with the light pipeline's
@@ -531,64 +560,81 @@ fn prove_path(
         pre_output.new_validium_root,
         old_account_delta_tree_root,
     );
-    let mut jump = JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
-    // Recorded on this path's first chunk and replayed for the rest; failing
-    // closed and retiring itself if the writer's target sequence ever changes.
-    let mut tx_seed_layout = None;
-    let mut chunks = chunks.into_iter();
-    let (mut current_chunk_index, first_txs) =
-        chunks.next().expect("transaction path must not be empty");
-    let (mut current_witness, next_jump) = generate_tx_witness(
-        path,
-        current_chunk_index,
-        first_txs,
-        tx_data,
-        tx_target,
-        created_at,
-        state_metadata_hash,
-        jump,
-        &mut tx_seed_layout,
-    );
-    jump = next_jump;
-
+    let initial_jump =
+        JumpState::initial(pre_output.new_state_root, old_account_delta_tree_root);
+    let total_chunks = chunks.len() as u64;
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
+        // The witness chain is inherently serial — chunk N+1's witness seeds
+        // chunk N's `new_jump`, so the chunks can never generate in parallel —
+        // but nothing about the *spawn loop* is part of that chain. Running the
+        // chain inline in the loop stalled witness N+2 behind the loop's
+        // proof-window join, so tx proofs spawned at the witness cadence plus
+        // the join wait. This dedicated thread runs the identical serial chain
+        // back-to-back and hands finished witnesses over a small bounded
+        // queue: the spawn loop never computes a witness, and the chain never
+        // waits on a proof join. The bound caps ready-but-unspawned witnesses
+        // (each holds a full wires partition, ~tens of MiB) so the chain
+        // cannot run away from a slow proof window.
+        let (witness_send, witness_recv) =
+            std::sync::mpsc::sync_channel(TX_WITNESS_QUEUE_BOUND);
+        std::thread::Builder::new()
+            .name(format!("{path:?}-tx-witness-chain"))
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                // The chain paces the whole pipeline — every tx proof waits on
+                // its witness — so a default-QoS chain preempted by proof
+                // workers would be a priority inversion at the pipeline's
+                // source station.
+                mark_thread_user_initiated();
+                // Recorded on this path's first chunk and replayed for the
+                // rest; failing closed and retiring itself if the writer's
+                // target sequence ever changes.
+                let mut tx_seed_layout = None;
+                let mut jump = initial_jump;
+                for (chunk_index, txs) in chunks {
+                    let (witness, next_jump) = generate_tx_witness(
+                        path,
+                        chunk_index,
+                        txs,
+                        tx_data,
+                        tx_target,
+                        created_at,
+                        state_metadata_hash,
+                        jump,
+                        &mut tx_seed_layout,
+                    );
+                    jump = next_jump;
+                    // The receiver only disappears if the spawn loop is
+                    // unwinding; stop generating instead of panicking over
+                    // its panic.
+                    if witness_send.send((chunk_index, witness)).is_err() {
+                        break;
+                    }
+                }
+                // `witness_send` drops here: the spawn loop's `recv` observes
+                // the disconnect after draining the queue and exits its loop.
+            })
+            .expect("transaction witness chain thread must start");
+
         let mut chain: Option<ChainState<'_>> = None;
-        let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
         let mut current_step = 0u64;
 
         loop {
-            if let Some((chain_step, tx_proof)) = pending_tx.take() {
-                // The predecessor handle moves into the chain thread, which waits for it only
-                // after its tx-proof-side witness generation: the path thread never blocks here.
-                let previous = chain.take();
-                // This step is now runnable (its tx proof exists); while the
-                // count of runnable-but-unproven steps is high, the chain is
-                // the laggard and its GPU trees take priority (see
-                // spine_backlog_add). Decremented inside chain_step_proof.
-                plonky2::hash::poseidon2::spine_backlog_add(1);
-                let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
-                    .stack_size(PROVER_THREAD_STACK_BYTES)
-                    .spawn_scoped(scope, move || {
-                        chain_step_proof(
-                            path,
-                            chain_target,
-                            chain_data,
-                            chain_step,
-                            previous,
-                            base,
-                            dummy_proof,
-                            &tx_proof,
-                        )
-                    })
-                    .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
-            }
-
-            let witness = current_witness;
+            let (current_chunk_index, witness) = {
+                #[cfg(feature = "diagnostic_profile")]
+                let _recv_wait = plonky2::util::profile::span("wait", "tx_witness_recv");
+                match witness_recv.recv() {
+                    Ok(next) => next,
+                    // The witness chain has retired: every chunk's witness has
+                    // been received and spawned. (If the chain thread
+                    // panicked, the scope re-raises its panic once this loop
+                    // unwinds past the drain.)
+                    Err(std::sync::mpsc::RecvError) => break,
+                }
+            };
             let proof_handle = std::thread::Builder::new()
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -599,22 +645,6 @@ fn prove_path(
                     prove_tx_witness(path, current_chunk_index, tx_data, witness)
                 })
                 .expect("transaction proof pipeline thread must start");
-
-            let next_witness = chunks.next().map(|(chunk_index, txs)| {
-                let (witness, next_jump) = generate_tx_witness(
-                    path,
-                    chunk_index,
-                    txs,
-                    tx_data,
-                    tx_target,
-                    created_at,
-                    state_metadata_hash,
-                    jump,
-                    &mut tx_seed_layout,
-                );
-                jump = next_jump;
-                (chunk_index, witness)
-            });
 
             in_flight.push_back((current_step, proof_handle));
             #[cfg(feature = "diagnostic_profile")]
@@ -636,50 +666,65 @@ fn prove_path(
                 } else {
                     1
                 };
-            if in_flight.len() >= max_in_flight {
-                let (proof_step, proof_handle) = in_flight
+            // Taper the window against remaining chunk supply. A constant
+            // window pays for its depth twice at the tail: when the chunk
+            // supply runs dry, every still-outstanding tx proof serializes
+            // through the drain's one-join-one-chain-step loop at the chain
+            // cadence. Shrinking the allowed depth over the last ~window-size
+            // chunks joins those proofs (and spawns their chain steps) while
+            // later chunks are still proving, so the supply and the in-flight
+            // queue run dry together and the path enters its drain with a
+            // single outstanding proof — which the drain must still join
+            // itself, so the exclusive-GPU claim below keeps its trigger.
+            // `remaining + 2` leaves the depth untouched until the last
+            // window-size chunks are admitted (ramp and steady state see
+            // exactly the constant window), then steps it down one per chunk.
+            let remaining_chunks = total_chunks - (current_step + 1);
+            let max_in_flight = max_in_flight.min(remaining_chunks as usize + 2);
+            while in_flight.len() >= max_in_flight {
+                let (chain_step, proof_handle) = in_flight
                     .pop_front()
                     .expect("transaction proof window must not be empty");
-                #[cfg(feature = "diagnostic_profile")]
-                let _join_wait = plonky2::util::profile::span("wait", "tx_proof_window_join");
-                let tx_proof = proof_handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                pending_tx = Some((proof_step, tx_proof));
+                let tx_proof = {
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _join_wait =
+                        plonky2::util::profile::span("wait", "tx_proof_window_join");
+                    proof_handle
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                };
+                // The joined step is now runnable (its tx proof exists); spawn
+                // its chain step immediately — this is where the old loop's
+                // `pending_tx` hand-off to the next iteration landed
+                // temporally, minus the witness generation that used to sit
+                // between the join and the next iteration. The predecessor
+                // handle moves into the chain thread, which waits for it only
+                // after its tx-proof-side witness generation: the path thread
+                // never blocks here. While the count of runnable-but-unproven
+                // steps is high, the chain is the laggard and its GPU trees
+                // take priority (see spine_backlog_add). Decremented inside
+                // chain_step_proof.
+                plonky2::hash::poseidon2::spine_backlog_add(1);
+                let previous = chain.take();
+                let handle = std::thread::Builder::new()
+                    .name(format!("{path:?}-chain-step-{chain_step}"))
+                    .stack_size(PROVER_THREAD_STACK_BYTES)
+                    .spawn_scoped(scope, move || {
+                        chain_step_proof(
+                            path,
+                            chain_target,
+                            chain_data,
+                            chain_step,
+                            previous,
+                            base,
+                            dummy_proof,
+                            &tx_proof,
+                        )
+                    })
+                    .expect("chain step pipeline thread must start");
+                chain = Some(ChainState::InFlight(handle));
             }
             current_step += 1;
-
-            match next_witness {
-                Some((chunk_index, witness)) => {
-                    current_chunk_index = chunk_index;
-                    current_witness = witness;
-                }
-                None => break,
-            }
-        }
-
-        if let Some((chain_step, tx_proof)) = pending_tx.take() {
-            // This post-loop step is runnable and decrements the global
-            // backlog in `chain_step_proof`, exactly like both spawn loops.
-            plonky2::hash::poseidon2::spine_backlog_add(1);
-            let previous = chain.take();
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous,
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                    )
-                })
-                .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
         }
         // Past this point the pipeline spawns no new chunk work: the drain
         // below is the strictly sequential chain tail, so its mid-size
@@ -929,7 +974,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -962,12 +1006,21 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                pre_proof_ref,
+                                &pre_proof,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
+                    // Early pre-proof release (exp41 port): the pre-execution
+                    // proof's buffers are large and are consumed only by the
+                    // early witness feed above. Every remaining stage of this
+                    // lane and of the light path uses `pre_output`, `pending`
+                    // and the finished proofs — never this proof. Dropping it
+                    // now relieves that memory before the heavy/extensions
+                    // release and the late final-block witness, instead of
+                    // holding it across the rest of the pipeline.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
