@@ -41,6 +41,31 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
+//
+// Arena count: the worker spawns one short-lived scoped thread per chunk
+// proof and per chain step (100+ per block, 500+ per worker), each recycling
+// the same witness/coefficient allocation shapes. With jemalloc's default
+// arena count near four times the CPU count, successive threads land in
+// different arenas and miss the extents the previous thread just freed.
+// `narenas:4` keeps the rotating thread->arena assignment dense so a freed
+// extent is reused by one of the next few threads instead of being split and
+// decayed. This changes allocator placement only; sizes, lifetimes, byte
+// contents, and computed values are untouched.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static std::os::raw::c_char> = Some(unsafe {
+    #[allow(dead_code)]
+    union U {
+        x: &'static [u8],
+        y: &'static std::os::raw::c_char,
+    }
+    U {
+        x: b"narenas:4\0",
+    }
+    .y
+});
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 // The serialized proof measures ~196 KB at the ranked circuit shapes, so the
 // prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
