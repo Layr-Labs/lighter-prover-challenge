@@ -1041,7 +1041,7 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 64;
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
@@ -1405,6 +1405,18 @@ fn start_gpu_range_check_gate_quotient<
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
             if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+                continue;
+            }
+            // The quintic multiplication and squaring families are the two
+            // most register-heavy branches in the shared Range/U32 kernel.
+            // Evaluate them on the already-active CPU quotient workers while
+            // the GPU handles the remaining families. This shortens the
+            // serialized Metal queue without adding a new proving phase.
+            if matches!(
+                u32_gate,
+                U32QuotientGate::QuinticMultiplication { .. }
+                    | U32QuotientGate::QuinticSquaring { .. }
+            ) {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {

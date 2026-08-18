@@ -1,4 +1,4 @@
-// Redraw marker 628
+// Candidate marker iamgoatedaf-sol-top1-quintic-cpu-private-state-mid8-parent64-r7
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
