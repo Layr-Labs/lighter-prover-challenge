@@ -1500,132 +1500,6 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     out
 }
 
-/// Standalone timing harness for the range/u32 quotient kernel variants on a
-/// quiet GPU (no proofs in flight): builds a random wires commitment of the
-/// circuit's shape through the production path (with even-row companion) and
-/// prints per-variant minimum wall times. Diagnostics only; never used by the
-/// prover.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-pub fn range_quotient_microbench<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    prover_data: &ProverOnlyCircuitData<F, C, D>,
-    reps: usize,
-) {
-    use crate::gates::gate::U32QuotientGate;
-    let degree = 1usize << common_data.degree_bits();
-    let rate_bits = common_data.config.fri_config.rate_bits;
-    let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
-    let step = 1 << (rate_bits - quotient_degree_bits);
-    let lde_size = degree << rate_bits;
-    let quotient_rows = lde_size / step;
-    let num_wires = common_data.config.num_wires;
-    let mut timing = TimingTree::default();
-    let mk_wires = || {
-        (0..num_wires)
-            .map(|_| PolynomialCoeffs::new(F::rand_vec(degree)))
-            .collect::<Vec<_>>()
-    };
-    // Companion fill cost.
-    let t = std::time::Instant::now();
-    let _plain = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
-        mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_ref(), false);
-    let plain_ms = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
-    let wires_commitment = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
-        mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_ref(), true);
-    let comp_ms = t.elapsed().as_secs_f64() * 1e3;
-    eprintln!("[qmb] degree_bits={} lde={} wires commit: plain {plain_ms:.1} ms, with companion {comp_ms:.1} ms, companion present={}",
-        common_data.degree_bits(), lde_size, wires_commitment.even_columns.get().is_some());
-    let alphas = vec![F::rand(), F::rand()];
-    // Reuse the production spec builder through the split-disabled and
-    // split-enabled entry points; time by finishing each job.
-    let time = |name: &str, f: &dyn Fn() -> Option<f64>| {
-        let mut best = f64::MAX;
-        for _ in 0..reps {
-            if let Some(v) = f() { best = best.min(v); }
-        }
-        eprintln!("[qmb]   {name}: {best:.2} ms");
-    };
-    // Whole (as production without split): call start_gpu_... with split disabled is env-based;
-    // instead build the jobs directly.
-    let wires = wires_commitment.merkle_tree.shared_columns().expect("metal wires");
-    let even = wires_commitment.even_columns.get();
-    let constants = prover_data.constants_sigmas_commitment.merkle_tree.shared_columns().expect("metal constants");
-    // Build specs exactly as start_gpu_range_check_gate_quotient does, by calling it (split may be on).
-    let Some((_gates, jobs)) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas) else {
-        eprintln!("[qmb] range job declined"); return;
-    };
-    drop(jobs);
-    // Extract specs by re-running the spec collection: simplest is to re-implement minimal
-    // collection here via the same helper closure used in production. To avoid duplication we
-    // just time via the public entry points with the env switch:
-    let _ = U32QuotientGate::Arithmetic { num_ops: 0 };
-    let run_whole = |q: usize, st: usize| -> Option<f64> {
-        let t = std::time::Instant::now();
-        // Whole job = production path with split disabled: emulate by calling metal directly
-        // through start_gpu_range_check_gate_quotient with LIGHTER_QSPLIT=0 semantics is not
-        // possible per-call; so we rely on the caller running this harness twice (QSPLIT=0/1).
-        let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, q, st, &alphas)?;
-        match &jobs {
-            RangeQuotientJobs::Whole(job) => { job.finish().ok()?; }
-            RangeQuotientJobs::Split { low, high, .. } => { low.finish().ok()?; if let Some(h) = high { h.finish().ok()?; } }
-        }
-        Some(t.elapsed().as_secs_f64() * 1e3)
-    };
-    time(&format!("production range job (split={}) full rows", range_quotient_split_enabled()), &|| run_whole(quotient_rows, step));
-    // Split pieces individually + CPU extension.
-    if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high })) =
-        start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)
-    {
-        let _ = (wires, even);
-        low.finish().ok();
-        if let Some(h) = &high { h.finish().ok(); }
-        time("  low job only (re-dispatched)", &|| {
-            let t = std::time::Instant::now();
-            let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)?;
-            if let RangeQuotientJobs::Split { low, .. } = &jobs { low.finish().ok()?; }
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        let low_values = low.finish().unwrap();
-        time("  CPU extension FFTs only (30 tasks)", &|| {
-            let t = std::time::Instant::now();
-            let half = low_rows;
-            let omega = F::primitive_root_of_unity(log2_strict(lde_size));
-            let omega_powers = precomputed::shift_powers::<F>(omega, half);
-            let odd: Vec<Vec<F>> = (0..low_gates.len() * 2).into_par_iter().map(|tt| {
-                let g = tt / 2; let c = tt % 2; let base = g * half * 2;
-                let values: Vec<F> = (0..half).map(|k| low_values[base + k * 2 + c]).collect();
-                PolynomialValues::new(values).coset_ifft_with_powers(&omega_powers).fft().values
-            }).collect();
-            core::hint::black_box(&odd);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        time("  single IFFT+FFT 2^18 (1 thread)", &|| {
-            let half = low_rows;
-            let omega = F::primitive_root_of_unity(log2_strict(lde_size));
-            let omega_powers = precomputed::shift_powers::<F>(omega, half);
-            let values: Vec<F> = (0..half).map(|k| low_values[k * 2]).collect();
-            let t = std::time::Instant::now();
-            let v = PolynomialValues::new(values).coset_ifft_with_powers(&omega_powers).fft().values;
-            core::hint::black_box(&v);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        time("  CPU extend+combine", &|| {
-            let t = std::time::Instant::now();
-            let out = extend_and_combine_low_range_quotient(low_values, &low_gates, low_rows, lde_size, constants);
-            core::hint::black_box(&out);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        eprintln!("[qmb]   low gates={} high={}", low_gates.len(), high.is_some());
-    }
-}
-
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -2915,10 +2789,14 @@ fn compute_quotient_polys<
                 debug_assert_eq!(values.len(), quotient_values.len());
                 Some(values)
             }
-            RangeQuotientJobs::Split { low, high, .. } => {
+            RangeQuotientJobs::Split {
+                low: _low_job,
+                high,
+                ..
+            } => {
                 match low_extension_result {
                     Ok(values) => gpu_range_low_values = values,
-                    Err(error) => range_fallback!(low, error),
+                    Err(error) => range_fallback!(_low_job, error),
                 }
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 match high {
@@ -3291,8 +3169,13 @@ mod quotient_layout_tests {
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{
+        extend_and_combine_low_range_quotient, gpu_poseidon_quotient_stats,
+        LowDegreeRangeGate, COMPARE_GPU_QUOTIENT,
+    };
     use crate::field::goldilocks_field::GoldilocksField;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::field::polynomial::PolynomialCoeffs;
     use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
@@ -3340,6 +3223,80 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    #[test]
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn half_domain_extension_and_selector_combine_matches_full_domain() {
+        const FULL_ROWS: usize = 32;
+        const HALF_ROWS: usize = FULL_ROWS / 2;
+        const GATES: usize = 2;
+        const CHALLENGES: usize = 2;
+
+        let mut constants = crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
+            1,
+            FULL_ROWS,
+        )
+        .expect("Metal test allocation");
+        let selector = constants
+            .columns_mut()
+            .expect("shared selector columns")
+            .into_iter()
+            .next()
+            .expect("selector column");
+        for (row, value) in selector.iter_mut().enumerate() {
+            *value = F::from_canonical_usize(row % 3);
+        }
+
+        let gates = (0..GATES)
+            .map(|gate_index| LowDegreeRangeGate {
+                gate_index,
+                selector_column: 0,
+                group: 0..GATES,
+                include_unused_selector: false,
+            })
+            .collect::<Vec<_>>();
+        let mut low = vec![F::ZERO; GATES * HALF_ROWS * CHALLENGES];
+        let mut full = vec![vec![vec![F::ZERO; FULL_ROWS]; CHALLENGES]; GATES];
+        for gate in 0..GATES {
+            for challenge in 0..CHALLENGES {
+                let mut coeffs = vec![F::ZERO; FULL_ROWS];
+                for (degree, coefficient) in coeffs.iter_mut().take(8).enumerate() {
+                    *coefficient = F::from_canonical_usize(
+                        1 + gate * 31 + challenge * 17 + degree * 7,
+                    );
+                }
+                let values = PolynomialCoeffs::new(coeffs)
+                    .coset_fft(F::coset_shift())
+                    .values;
+                full[gate][challenge].copy_from_slice(&values);
+                let base = gate * HALF_ROWS * CHALLENGES;
+                for row in 0..HALF_ROWS {
+                    low[base + row * CHALLENGES + challenge] = values[2 * row];
+                }
+            }
+        }
+
+        let actual = extend_and_combine_low_range_quotient(
+            &low,
+            &gates,
+            HALF_ROWS,
+            FULL_ROWS,
+            &constants,
+        );
+        let selector = constants.col(0);
+        let mut expected = vec![F::ZERO; FULL_ROWS * CHALLENGES];
+        for row in 0..FULL_ROWS {
+            for challenge in 0..CHALLENGES {
+                for gate in 0..GATES {
+                    let other_gate = 1 - gate;
+                    let filter = F::from_canonical_usize(other_gate) - selector[row];
+                    expected[row * CHALLENGES + challenge] +=
+                        filter * full[gate][challenge][row];
+                }
+            }
+        }
+        assert_eq!(actual, expected);
     }
 
     /// B1/B2/D1 differential gate: within a single prove call — same witness,

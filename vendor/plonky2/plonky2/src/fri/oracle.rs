@@ -1266,6 +1266,7 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
+            even_columns: Default::default(),
         };
         let column_batch: PolynomialBatch<F, C, D> = PolynomialBatch {
             polynomials: Vec::new(),
@@ -1273,6 +1274,7 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
+            even_columns: Default::default(),
         };
 
         for step in [1usize, 2, 4] {

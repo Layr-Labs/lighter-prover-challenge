@@ -184,6 +184,19 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+    /// Gate-major selector filters produced once per selector group with
+    /// shared prefix/suffix products. Only gates selected by
+    /// `shared_gate_filter_plan` have initialized rows.
+    pub shared_gate_filters: Vec<F>,
+    /// One batch-width suffix product used while constructing a selector
+    /// group's shared filters.
+    pub selector_filter_suffix: Vec<F>,
+    /// Reused sum of the two filters consumed by the dense interleave pair.
+    pub interleave_summed_filter: Vec<F>,
+    /// Proof-local decision: a set bit means that gate's selector filter is
+    /// cheaper to obtain from its group's shared prefix/suffix pass than from
+    /// the gate-local product. Initialized once per Rayon worker.
+    pub shared_gate_filter_plan: Vec<bool>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -316,6 +329,163 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
         for (filter, &selector) in output.iter_mut().zip(selector_col) {
             *filter *= constant - selector;
         }
+    }
+}
+
+/// Whether a selector group saves field operations when its active gates share
+/// one prefix/suffix pass.
+///
+/// A gate-local filter with `f` factors performs `f` subtractions and
+/// `f - 1` multiplications. For a group of `g` gates, the shared construction
+/// performs two `g - 1` factor passes, one multiplication per requested output,
+/// and (when there is more than one selector column) one common unused-selector
+/// subtraction. The estimate exactly matches the loops in
+/// [`fill_shared_selector_group_filters`]; strict inequality keeps small or
+/// heavily-offloaded groups on the existing path.
+#[inline]
+fn shared_selector_group_is_cheaper(
+    group_len: usize,
+    active_gates: usize,
+    include_unused_selector: bool,
+) -> bool {
+    if group_len == 0 || active_gates < 2 {
+        return false;
+    }
+    let unused = usize::from(include_unused_selector);
+    let factors_per_gate = group_len - 1 + unused;
+    if factors_per_gate == 0 {
+        return false;
+    }
+    let local_ops = active_gates * (2 * factors_per_gate - 1);
+    let shared_ops = 4 * (group_len - 1) + unused + active_gates;
+    shared_ops < local_ops
+}
+
+/// Selects the CPU-owned gates whose selector filters should share their
+/// group's factor products. The plan depends only on the circuit shape and the
+/// proof's already-computed CPU gate list, so each worker derives it once and
+/// reuses it for every quotient batch it receives.
+fn prepare_shared_gate_filter_plan<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    cpu_gate_indices: &[usize],
+    plan: &mut Vec<bool>,
+) {
+    plan.clear();
+    plan.resize(common_data.gates.len(), false);
+    let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
+    for group in &common_data.selectors_info.groups {
+        let active_gates = cpu_gate_indices
+            .iter()
+            .filter(|&&gate| group.contains(&gate))
+            .count();
+        if shared_selector_group_is_cheaper(
+            group.len(),
+            active_gates,
+            include_unused_selector,
+        ) {
+            for &gate in cpu_gate_indices {
+                if group.contains(&gate) {
+                    plan[gate] = true;
+                }
+            }
+        }
+    }
+}
+
+/// Computes selected gate filters for one selector group with shared
+/// prefix/suffix products.
+///
+/// For gate `i` this writes
+/// `prod(j - s, j in group, j != i) * (UNUSED_SELECTOR - s)?`, exactly the
+/// polynomial used by `Gate::eval_filtered_base_batch`. Prefixes contain the
+/// factors below `i`; the descending suffix contains those above it and the
+/// optional unused-selector factor. This changes association only, so the
+/// result is the same field element while each group factor is formed a
+/// constant number of times instead of once per active gate.
+fn fill_shared_selector_group_filters<F: Field>(
+    selector_col: &[F],
+    group: core::ops::Range<usize>,
+    include_unused_selector: bool,
+    active_gate_plan: &[bool],
+    gate_filters: &mut [F],
+    suffix: &mut [F],
+) {
+    let batch_size = selector_col.len();
+    debug_assert!(!group.is_empty());
+    debug_assert_eq!(suffix.len(), batch_size);
+    debug_assert_eq!(gate_filters.len(), active_gate_plan.len() * batch_size);
+
+    let first = group.start;
+    gate_filters[first * batch_size..(first + 1) * batch_size].fill(F::ONE);
+    for gate in first + 1..group.end {
+        let factor_constant = F::from_canonical_usize(gate - 1);
+        let split = gate * batch_size;
+        let (prefixes, rest) = gate_filters.split_at_mut(split);
+        let previous = &prefixes[(gate - 1) * batch_size..gate * batch_size];
+        let current = &mut rest[..batch_size];
+        for point in 0..batch_size {
+            current[point] = previous[point] * (factor_constant - selector_col[point]);
+        }
+    }
+
+    if include_unused_selector {
+        let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+        for (value, &selector) in suffix.iter_mut().zip(selector_col) {
+            *value = unused - selector;
+        }
+    } else {
+        suffix.fill(F::ONE);
+    }
+
+    for gate in group.clone().rev() {
+        if active_gate_plan[gate] {
+            let output = &mut gate_filters[gate * batch_size..(gate + 1) * batch_size];
+            for (filter, &tail) in output.iter_mut().zip(suffix.iter()) {
+                *filter *= tail;
+            }
+        }
+        if gate != first {
+            let factor_constant = F::from_canonical_usize(gate);
+            for (tail, &selector) in suffix.iter_mut().zip(selector_col) {
+                *tail *= factor_constant - selector;
+            }
+        }
+    }
+}
+
+/// Fills every selector group selected by `plan`. The output is gate-major:
+/// gate `i` owns `i * batch_size..(i + 1) * batch_size`.
+fn fill_shared_gate_filters<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    plan: &[bool],
+    gate_filters: &mut Vec<F>,
+    suffix: &mut Vec<F>,
+) {
+    let batch_size = vars_batch.len();
+    debug_assert_eq!(plan.len(), common_data.gates.len());
+    if gate_filters.len() != common_data.gates.len() * batch_size {
+        gate_filters.resize(common_data.gates.len() * batch_size, F::ZERO);
+    }
+    if suffix.len() != batch_size {
+        suffix.resize(batch_size, F::ZERO);
+    }
+
+    let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
+    for (selector_index, group) in common_data.selectors_info.groups.iter().enumerate() {
+        if !plan[group.clone()].iter().any(|&active| active) {
+            continue;
+        }
+        let selector_col =
+            &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+        fill_shared_selector_group_filters(
+            selector_col,
+            group.clone(),
+            include_unused_selector,
+            plan,
+            gate_filters,
+            suffix,
+        );
     }
 }
 
@@ -667,6 +837,10 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         &mut scratch.constraint_terms_batch,
         cpu_gate_indices,
         &mut scratch.gate_filters,
+        &mut scratch.shared_gate_filters,
+        &mut scratch.selector_filter_suffix,
+        &mut scratch.interleave_summed_filter,
+        &mut scratch.shared_gate_filter_plan,
         cpu_num_gate_constraints,
         interleave_pair,
     );
@@ -1530,12 +1704,20 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         .filter(|i| !excluded_gate_indices.contains(i))
         .collect::<Vec<_>>();
     let mut filters = Vec::with_capacity(vars_batch.len());
+    let mut shared_gate_filters = Vec::new();
+    let mut selector_filter_suffix = Vec::new();
+    let mut interleave_summed_filter = Vec::new();
+    let mut shared_gate_filter_plan = Vec::new();
     evaluate_gate_constraints_base_batch_into_cpu_gates(
         common_data,
         vars_batch,
         constraints_batch,
         &cpu_gate_indices,
         &mut filters,
+        &mut shared_gate_filters,
+        &mut selector_filter_suffix,
+        &mut interleave_summed_filter,
+        &mut shared_gate_filter_plan,
         num_constraint_rows,
         None,
     );
@@ -1550,6 +1732,10 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     constraints_batch: &mut Vec<F>,
     cpu_gate_indices: &[usize],
     filters: &mut Vec<F>,
+    shared_gate_filters: &mut Vec<F>,
+    selector_filter_suffix: &mut Vec<F>,
+    interleave_summed_filter: &mut Vec<F>,
+    shared_gate_filter_plan: &mut Vec<bool>,
     num_constraint_rows: usize,
     interleave_pair: Option<&InterleavePairPlan>,
 ) {
@@ -1573,9 +1759,52 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
         constraints_batch.iter().all(|v| *v == F::ZERO),
         "constraint scratch must be zero on entry; the consumer clears it as it reads"
     );
+    if filters.len() != vars_batch.len() {
+        filters.resize(vars_batch.len(), F::ZERO);
+    }
+    if shared_gate_filter_plan.len() != common_data.gates.len() {
+        prepare_shared_gate_filter_plan(
+            common_data,
+            cpu_gate_indices,
+            shared_gate_filter_plan,
+        );
+    }
+    fill_shared_gate_filters(
+        common_data,
+        vars_batch,
+        shared_gate_filter_plan,
+        shared_gate_filters,
+        selector_filter_suffix,
+    );
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
+                if shared_gate_filter_plan[plan.interleave_index]
+                    && shared_gate_filter_plan[plan.uninterleave_index]
+                {
+                    let batch_size = vars_batch.len();
+                    let interleave_filter = &shared_gate_filters
+                        [plan.interleave_index * batch_size..(plan.interleave_index + 1) * batch_size];
+                    let uninterleave_filter = &shared_gate_filters[plan.uninterleave_index
+                        * batch_size
+                        ..(plan.uninterleave_index + 1) * batch_size];
+                    if interleave_summed_filter.len() != batch_size {
+                        interleave_summed_filter.resize(batch_size, F::ZERO);
+                    }
+                    for point in 0..batch_size {
+                        interleave_summed_filter[point] =
+                            interleave_filter[point] + uninterleave_filter[point];
+                    }
+                    eval_interleave_pair_dense_fused(
+                        vars_batch.local_wires,
+                        batch_size,
+                        interleave_filter,
+                        uninterleave_filter,
+                        interleave_summed_filter,
+                        constraints_batch,
+                    );
+                    continue;
+                }
                 // Size the buffer without re-zeroing it. `clear()` then
                 // `resize()` memset all three sub-slices on every batch, but
                 // each is fully assigned before it is read: the two
@@ -1621,17 +1850,32 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
             }
         }
         let gate = &common_data.gates[i];
-        let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
-            vars_batch,
-            i,
-            selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
-            common_data.selectors_info.num_selectors(),
-            common_data.num_lookup_selectors,
-            filters,
-            constraints_batch,
-        );
+        if shared_gate_filter_plan[i] {
+            let batch_size = vars_batch.len();
+            let filter = &shared_gate_filters[i * batch_size..(i + 1) * batch_size];
+            let mut unfiltered_vars = vars_batch;
+            unfiltered_vars.remove_prefix(
+                common_data.selectors_info.num_selectors()
+                    + common_data.num_lookup_selectors,
+            );
+            gate.0.eval_unfiltered_base_batch_accumulate(
+                unfiltered_vars,
+                filter,
+                constraints_batch,
+            );
+        } else {
+            let selector_index = common_data.selectors_info.selector_indices[i];
+            gate.0.eval_filtered_base_batch(
+                vars_batch,
+                i,
+                selector_index,
+                common_data.selectors_info.groups[selector_index].clone(),
+                common_data.selectors_info.num_selectors(),
+                common_data.num_lookup_selectors,
+                filters,
+                constraints_batch,
+            );
+        }
     }
 }
 
@@ -1847,6 +2091,83 @@ mod tests {
     use plonky2_field::types::PrimeField64;
 
     use super::*;
+
+    #[test]
+    fn shared_selector_filters_match_gate_local_products() {
+        type F = GoldilocksField;
+
+        for batch_size in [1usize, 7, 32] {
+            let selector_col = (0..batch_size)
+                .map(|point| {
+                    // Include exact gate labels, the unused sentinel and
+                    // ordinary off-domain values so zero and nonzero factors
+                    // are both covered.
+                    F::from_canonical_usize(match point % 5 {
+                        0 => 2,
+                        1 => 5,
+                        2 => UNUSED_SELECTOR,
+                        _ => 17 * point + 11,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let group = 2..8;
+            let gate_count = 10;
+
+            for include_unused_selector in [false, true] {
+                for active_pattern in [0usize, 1] {
+                    let active = (0..gate_count)
+                        .map(|gate| group.contains(&gate) && (gate + active_pattern) % 2 == 0)
+                        .collect::<Vec<_>>();
+                    let mut actual = vec![F::ZERO; gate_count * batch_size];
+                    let mut suffix = vec![F::ZERO; batch_size];
+                    fill_shared_selector_group_filters(
+                        &selector_col,
+                        group.clone(),
+                        include_unused_selector,
+                        &active,
+                        &mut actual,
+                        &mut suffix,
+                    );
+
+                    for gate in group.clone().filter(|&gate| active[gate]) {
+                        for (point, &selector) in selector_col.iter().enumerate() {
+                            let mut factors = group
+                                .clone()
+                                .filter(|&other| other != gate)
+                                .chain(include_unused_selector.then_some(UNUSED_SELECTOR));
+                            let expected = match factors.next() {
+                                Some(first) => {
+                                    let mut value = F::from_canonical_usize(first) - selector;
+                                    for factor in factors {
+                                        value *= F::from_canonical_usize(factor) - selector;
+                                    }
+                                    value
+                                }
+                                None => F::ONE,
+                            };
+                            let actual = actual[gate * batch_size + point];
+                            assert_eq!(
+                                actual.to_canonical_u64(),
+                                expected.to_canonical_u64(),
+                                "gate {gate}, point {point}, unused={include_unused_selector}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_selector_filter_plan_keeps_small_groups_local() {
+        assert!(!shared_selector_group_is_cheaper(1, 1, false));
+        assert!(!shared_selector_group_is_cheaper(2, 2, true));
+        assert!(!shared_selector_group_is_cheaper(3, 3, false));
+        assert!(shared_selector_group_is_cheaper(3, 3, true));
+        assert!(shared_selector_group_is_cheaper(4, 4, false));
+        assert!(shared_selector_group_is_cheaper(8, 6, true));
+        assert!(!shared_selector_group_is_cheaper(8, 1, true));
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
