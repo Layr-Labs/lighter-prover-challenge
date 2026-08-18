@@ -111,7 +111,23 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // 500-active-tx ranked fixture, so a window-depth effect is structurally
 // understated locally. Per the file's own guidance the ranked draw, not the
 // local number, settles it.
-const LIGHT_TX_PROOF_WINDOW: usize = 6;
+// Retuned 6 -> 3 for the *scored* configuration, which runs five concurrent
+// workers; the depth-6 evidence recorded above was gathered one worker at a
+// time, and a single local `prove` shares neither the GPU nor memory with
+// anything, so it cannot observe the contention that sets this optimum.
+//
+// Measured with two concurrent workers on this base, wall time until both
+// finish: depth 6 = 66.69 s, depth 4 = 54.86 s, depth 3 = 50.72 s,
+// depth 2 = 53.82 s. Depth 2 being worse than depth 3 makes this an interior
+// optimum rather than "less parallelism is always better" — consistent with the
+// mechanism being allocator/fault churn from concurrent proof allocations
+// (five workers at ~8-9 GiB each against a 48 GiB host, with the ~9.5 GiB
+// collapse noted above).
+//
+// A depth-4 version of this change was promoted earlier (30.9437345321302) and
+// then dropped in a later rebase; this re-applies it, retuned for the current
+// base, where the optimum has moved from 4 to 3.
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
