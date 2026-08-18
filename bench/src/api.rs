@@ -1,4 +1,4 @@
-// Redraw marker 628
+// Redraw marker btw8-stream2e17-homalenderrr-1787034619885
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
