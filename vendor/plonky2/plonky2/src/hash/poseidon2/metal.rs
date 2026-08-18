@@ -2098,10 +2098,14 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
     // The wires store may be a compact even-row copy. The kernel indexes
-    // both buffers with `lde_rows = wires.rows` (`col * wires.rows + row`).
-    // Constant-reading gates therefore require a matching even-row constants
-    // companion; selector-only / unfiltered gates tolerate a taller full
-    // store (`constants.rows >= wires.rows`) because they do not load it.
+    // both buffers with `lde_rows = wires.rows` (`col * wires.rows + row`)
+    // and `source_row = gid * step`. Half-domain uses `step=1` on the
+    // even-companion (4n rows). Quarter-domain uses `step=2` on the same
+    // companion: `gid * 2` walks even-companion even rows = full rows
+    // 0,4,8,… . Constant-reading gates therefore require a matching
+    // even-row constants companion; selector-only / unfiltered gates
+    // tolerate a taller full store (`constants.rows >= wires.rows`)
+    // because they do not load it.
     if groups.is_empty()
         || F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()

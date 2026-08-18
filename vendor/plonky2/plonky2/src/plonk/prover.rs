@@ -1309,6 +1309,7 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
 /// `S_g`, and field arithmetic is exact, so every quotient row is the field
 /// element the full-domain kernel computes.
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[derive(Clone)]
 pub(crate) struct LowDegreeRangeGate {
     gate_index: usize,
     selector_column: usize,
@@ -1320,10 +1321,15 @@ pub(crate) struct LowDegreeRangeGate {
 pub(crate) enum RangeQuotientJobs<F: RichField> {
     /// Every advertised gate in one full-domain dispatch (the original path).
     Whole(crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>),
-    /// Degree <= 4 gates on the half domain (per-gate, unfiltered) plus the
-    /// remaining higher-degree gates on the full domain (filtered, as before).
+    /// Degree-2 gates on the quarter domain (every 4th LDE row), remaining
+    /// degree <= 4 on the half domain, higher-degree on the full domain.
+    /// `quarter` / `low` are absent when that bucket is empty. At least one
+    /// of them is present whenever this variant is constructed.
     Split {
-        low: crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
+        quarter: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
+        quarter_gates: Vec<LowDegreeRangeGate>,
+        quarter_rows: usize,
+        low: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
         low_gates: Vec<LowDegreeRangeGate>,
         low_rows: usize,
         high: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
@@ -1500,6 +1506,53 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     out
 }
 
+/// Lift GPU quarter-domain samples (every 4th full LDE row = even rows of
+/// the even-companion) onto the half-domain layout the combiner already
+/// understands. `S_g` for a degree-2 gate has `deg < 2n`, so the 2n-point
+/// coset `shift · ⟨ω⁴⟩` determines it; the IFFT / `ω_e^i` / FFT identity
+/// is the half-domain one with the even-companion as the "full" grid.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn extend_quarter_to_half_range_quotient<F: RichField>(
+    quarter: &[F],
+    n_gates: usize,
+    quarter_rows: usize,
+) -> Vec<F> {
+    let half_rows = quarter_rows * 2;
+    debug_assert_eq!(quarter.len(), n_gates * quarter_rows * 2);
+    let lde_bits = log2_strict(half_rows);
+    let omega = F::primitive_root_of_unity(lde_bits);
+    let omega_powers = precomputed::shift_powers::<F>(omega, quarter_rows);
+    let odd: Vec<Vec<F>> = (0..n_gates * 2)
+        .into_par_iter()
+        .map(|t| {
+            let g = t / 2;
+            let c = t % 2;
+            let base = g * quarter_rows * 2;
+            let values: Vec<F> = (0..quarter_rows).map(|k| quarter[base + k * 2 + c]).collect();
+            PolynomialValues::new(values)
+                .coset_ifft_with_powers(&omega_powers)
+                .fft()
+                .values
+        })
+        .collect();
+    let mut out = vec![F::ZERO; n_gates * half_rows * 2];
+    for g in 0..n_gates {
+        let qbase = g * quarter_rows * 2;
+        let hbase = g * half_rows * 2;
+        let odd0 = &odd[g * 2];
+        let odd1 = &odd[g * 2 + 1];
+        for k in 0..quarter_rows {
+            let even_row = 2 * k;
+            let odd_row = even_row + 1;
+            out[hbase + even_row * 2] = quarter[qbase + k * 2];
+            out[hbase + even_row * 2 + 1] = quarter[qbase + k * 2 + 1];
+            out[hbase + odd_row * 2] = odd0[k];
+            out[hbase + odd_row * 2 + 1] = odd1[k];
+        }
+    }
+    out
+}
+
 /// Standalone timing harness for the range/u32 quotient kernel variants on a
 /// quiet GPU (no proofs in flight): builds a random wires commitment of the
 /// circuit's shape through the production path (with even-row companion) and
@@ -1574,25 +1627,33 @@ pub fn range_quotient_microbench<
         let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, q, st, &alphas)?;
         match &jobs {
             RangeQuotientJobs::Whole(job) => { job.finish().ok()?; }
-            RangeQuotientJobs::Split { low, high, .. } => { low.finish().ok()?; if let Some(h) = high { h.finish().ok()?; } }
+            RangeQuotientJobs::Split { quarter, low, high, .. } => {
+                if let Some(q) = quarter { q.finish().ok()?; }
+                if let Some(l) = low { l.finish().ok()?; }
+                if let Some(h) = high { h.finish().ok()?; }
+            }
         }
         Some(t.elapsed().as_secs_f64() * 1e3)
     };
     time(&format!("production range job (split={}) full rows", range_quotient_split_enabled()), &|| run_whole(quotient_rows, step));
     // Split pieces individually + CPU extension.
-    if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high })) =
+    if let Some((_g, RangeQuotientJobs::Split { quarter, low, low_gates, low_rows, high, .. })) =
         start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)
     {
         let _ = (wires, even);
-        low.finish().ok();
+        if let Some(q) = &quarter { q.finish().ok(); }
+        if let Some(l) = &low { l.finish().ok(); }
         if let Some(h) = &high { h.finish().ok(); }
         time("  low job only (re-dispatched)", &|| {
             let t = std::time::Instant::now();
             let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)?;
-            if let RangeQuotientJobs::Split { low, .. } = &jobs { low.finish().ok()?; }
+            if let RangeQuotientJobs::Split { low, quarter, .. } = &jobs {
+                if let Some(q) = quarter { q.finish().ok()?; }
+                if let Some(l) = low { l.finish().ok()?; }
+            }
             Some(t.elapsed().as_secs_f64() * 1e3)
         });
-        let low_values = low.finish().unwrap();
+        let low_values = low.and_then(|l| l.finish().ok()).unwrap_or_default();
         time("  CPU extension FFTs only (30 tasks)", &|| {
             let t = std::time::Instant::now();
             let half = low_rows;
@@ -2059,16 +2120,17 @@ fn start_gpu_range_check_gate_quotient<
     // These gate rows share the same alpha positions as every other gate.
     // Only the permutation/Z prefix precedes the combined gate-row block.
     let alpha_offset = common_data.config.num_challenges * (common_data.num_partial_products + 2);
-    // Half-domain split: every gate of degree <= 4 is dispatched alone,
-    // unfiltered (group `g..g+1`, no UNUSED factor => filter == 1), on every
-    // other row; the rest keep the full-domain filtered dispatch. Falls back
-    // to the whole-domain job if the multi launch is declined.
+    // Domain split: degree <= 2 alone, unfiltered, on every 4th LDE row
+    // (even-companion + shader `step=2`); remaining degree <= 4 on every
+    // other row (`step=1` on the same companion); the rest stay filtered
+    // on the full domain. Falls back to the whole-domain job if a wanted
+    // multi launch is declined (so CPU exclusion stays honest).
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
     // Circuit-fixed constants/sigmas live in a deserialized Metal store
     // with no companion. One even-row copy lets constant-reading deg<=4
-    // gates join the half-domain job: the shader strides both buffers by
-    // `wires.rows`, so the compact constants must match the compact wires.
+    // gates join the compact-domain jobs: the shader strides both buffers
+    // by `wires.rows`, so the compact constants must match the compact wires.
     let even_constants = prover_data
         .constants_sigmas_commitment
         .even_columns
@@ -2089,23 +2151,55 @@ fn start_gpu_range_check_gate_quotient<
             )
         };
         let split_constant_readers = even_constants.is_some();
+        let quarter_ok = quotient_rows % 4 == 0 && quotient_rows >= 8;
+        let mut quarter_groups = Vec::new();
+        let mut quarter_gates = Vec::new();
         let mut low_groups = Vec::new();
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
         let mut high_u32_specs = Vec::new();
-        for (spec, &degree) in specs.iter().zip(&spec_degrees) {
-            if degree <= 4 {
-                let mut alone = spec.clone();
-                alone.group = spec.gate_index..spec.gate_index + 1;
-                alone.include_unused_selector = false;
-                low_groups.push((vec![alone], Vec::new()));
-                low_gates.push(LowDegreeRangeGate {
-                    gate_index: spec.gate_index,
-                    selector_column: spec.selector_column,
-                    group: spec.group.clone(),
-                    include_unused_selector: spec.include_unused_selector,
-                });
+        let push_range = |degree: usize,
+                          spec: &crate::hash::poseidon2::metal::RangeCheckQuotientSpec,
+                          qg: &mut Vec<(
+                              Vec<crate::hash::poseidon2::metal::RangeCheckQuotientSpec>,
+                              Vec<crate::hash::poseidon2::metal::U32QuotientSpec>,
+                          )>,
+                          hg: &mut Vec<LowDegreeRangeGate>,
+                          half_g: &mut Vec<(
+                              Vec<crate::hash::poseidon2::metal::RangeCheckQuotientSpec>,
+                              Vec<crate::hash::poseidon2::metal::U32QuotientSpec>,
+                          )>,
+                          half_gates: &mut Vec<LowDegreeRangeGate>| {
+            if degree > 4 {
+                return false;
+            }
+            let mut alone = spec.clone();
+            alone.group = spec.gate_index..spec.gate_index + 1;
+            alone.include_unused_selector = false;
+            let gate = LowDegreeRangeGate {
+                gate_index: spec.gate_index,
+                selector_column: spec.selector_column,
+                group: spec.group.clone(),
+                include_unused_selector: spec.include_unused_selector,
+            };
+            if degree <= 2 && quarter_ok {
+                qg.push((vec![alone], Vec::new()));
+                hg.push(gate);
             } else {
+                half_g.push((vec![alone], Vec::new()));
+                half_gates.push(gate);
+            }
+            true
+        };
+        for (spec, &degree) in specs.iter().zip(&spec_degrees) {
+            if !push_range(
+                degree,
+                spec,
+                &mut quarter_groups,
+                &mut quarter_gates,
+                &mut low_groups,
+                &mut low_gates,
+            ) {
                 high_specs.push(spec.clone());
             }
         }
@@ -2114,49 +2208,81 @@ fn start_gpu_range_check_gate_quotient<
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
-                low_groups.push((Vec::new(), vec![alone]));
-                low_gates.push(LowDegreeRangeGate {
+                let gate = LowDegreeRangeGate {
                     gate_index: spec.gate_index,
                     selector_column: spec.selector_column,
                     group: spec.group.clone(),
                     include_unused_selector: spec.include_unused_selector,
-                });
+                };
+                if degree <= 2 && quarter_ok {
+                    quarter_groups.push((Vec::new(), vec![alone]));
+                    quarter_gates.push(gate);
+                } else {
+                    low_groups.push((Vec::new(), vec![alone]));
+                    low_gates.push(gate);
+                }
             } else {
                 high_u32_specs.push(spec.clone());
             }
         }
-        if !low_groups.is_empty() {
-            if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+        let constants_for_compact = even_constants.unwrap_or(constants);
+        let mut quarter_job = None;
+        if !quarter_groups.is_empty() {
+            quarter_job = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
                 even_wires,
-                even_constants.unwrap_or(constants),
+                constants_for_compact,
+                quotient_rows / 4,
+                2,
+                &quarter_groups,
+                alphas,
+                alpha_offset,
+            );
+            if quarter_job.is_none() {
+                // Same values on the half-domain; just more GPU work.
+                low_groups.append(&mut quarter_groups);
+                low_gates.append(&mut quarter_gates);
+            }
+        }
+        let low_job = if !low_groups.is_empty() {
+            crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                even_wires,
+                constants_for_compact,
                 quotient_rows / 2,
                 1,
                 &low_groups,
                 alphas,
                 alpha_offset,
-            ) {
-                let high = if high_specs.is_empty() && high_u32_specs.is_empty() {
-                    None
-                } else {
-                    crate::hash::poseidon2::metal::start_range_check_gate_quotient(
-                        wires,
-                        constants,
-                        quotient_rows,
-                        step,
-                        &high_specs,
-                        &high_u32_specs,
-                        alphas,
-                        alpha_offset,
-                    )
-                };
-                if high.is_some() || (high_specs.is_empty() && high_u32_specs.is_empty()) {
-                    split_job = Some(RangeQuotientJobs::Split {
-                        low,
-                        low_gates,
-                        low_rows: quotient_rows / 2,
-                        high,
-                    });
-                }
+            )
+        } else {
+            None
+        };
+        let half_ok = low_groups.is_empty() || low_job.is_some();
+        let quarter_ok_job = quarter_groups.is_empty() || quarter_job.is_some();
+        if half_ok && quarter_ok_job && (low_job.is_some() || quarter_job.is_some()) {
+            let high = if high_specs.is_empty() && high_u32_specs.is_empty() {
+                None
+            } else {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient(
+                    wires,
+                    constants,
+                    quotient_rows,
+                    step,
+                    &high_specs,
+                    &high_u32_specs,
+                    alphas,
+                    alpha_offset,
+                )
+            };
+            if high.is_some() || (high_specs.is_empty() && high_u32_specs.is_empty()) {
+                split_job = Some(RangeQuotientJobs::Split {
+                    quarter: quarter_job,
+                    quarter_gates,
+                    quarter_rows: quotient_rows / 4,
+                    low: low_job,
+                    low_gates,
+                    low_rows: quotient_rows / 2,
+                    high,
+                });
             }
         }
     }
@@ -2547,18 +2673,44 @@ fn compute_quotient_polys<
     // behind work the proof does anyway; its result is consumed after.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let low_extension = || -> core::result::Result<Option<Vec<F>>, String> {
-        if let Some((_, RangeQuotientJobs::Split { low, low_gates, low_rows, .. })) = &gpu_range {
-            let low_values = low.finish()?;
+        if let Some((
+            _,
+            RangeQuotientJobs::Split {
+                quarter,
+                quarter_gates,
+                quarter_rows,
+                low,
+                low_gates,
+                low_rows,
+                ..
+            },
+        )) = &gpu_range
+        {
             let constants = prover_data
                 .constants_sigmas_commitment
                 .merkle_tree
                 .shared_columns()
                 .ok_or_else(|| "split range quotient requires Metal-backed constants".to_string())?;
+            let mut half_values = Vec::new();
+            let mut half_gates = Vec::new();
+            if let Some(qjob) = quarter {
+                let qv = qjob.finish()?;
+                half_values.extend(extend_quarter_to_half_range_quotient(
+                    &qv,
+                    quarter_gates.len(),
+                    *quarter_rows,
+                ));
+                half_gates.extend(quarter_gates.iter().cloned());
+            }
+            if let Some(ljob) = low {
+                half_values.extend(ljob.finish()?);
+                half_gates.extend(low_gates.iter().cloned());
+            }
             #[cfg(feature = "diagnostic_profile")]
             let _extend_span = crate::util::profile::span("quotient", "range_low_extend_combine");
             Ok(Some(extend_and_combine_low_range_quotient(
-                low_values,
-                low_gates,
+                &half_values,
+                &half_gates,
                 *low_rows,
                 points.len(),
                 constants,
@@ -2923,10 +3075,34 @@ fn compute_quotient_polys<
                 debug_assert_eq!(values.len(), quotient_values.len());
                 Some(values)
             }
-            RangeQuotientJobs::Split { low, high, .. } => {
+            RangeQuotientJobs::Split { low, quarter, high, .. } => {
                 match low_extension_result {
                     Ok(values) => gpu_range_low_values = values,
-                    Err(error) => range_fallback!(low, error),
+                    Err(error) => {
+                        if let Some(l) = low {
+                            range_fallback!(l, error);
+                        } else if let Some(q) = quarter {
+                            range_fallback!(q, error);
+                        } else {
+                            log::warn!(
+                                "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
+                            );
+                            return compute_quotient_polys(
+                                common_data,
+                                prover_data,
+                                public_inputs_hash,
+                                wires_commitment,
+                                zs_partial_products_and_lookup_commitment,
+                                betas,
+                                gammas,
+                                beta_k_is,
+                                deltas,
+                                alphas,
+                                col_major_perm,
+                                false,
+                            );
+                        }
+                    }
                 }
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 match high {
