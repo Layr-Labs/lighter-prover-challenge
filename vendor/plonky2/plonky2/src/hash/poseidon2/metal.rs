@@ -2458,52 +2458,68 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
+    // Group-wise fill + absorb. Fill two eight-column sponge groups before
+    // committing them through one encoder. The GPU remains the long pole for
+    // these wide trees, so sixteen columns still leave ample CPU/GPU overlap,
+    // while pairing adjacent passes halves command-buffer/encoder churn. A
+    // resource barrier between the two dispatches preserves the same parked
+    // state dependency that separate FIFO command buffers provided.
     let groups = leaf_width.div_ceil(8);
+    const GROUPS_PER_COMMAND: usize = 2;
+    let command_groups = groups.div_ceil(GROUPS_PER_COMMAND);
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
+    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(command_groups);
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
-        {
-            // SAFETY: each column slice covers a disjoint `leaf_count` range
-            // of the shared buffer; the GPU only reads columns of groups
-            // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
-                .map(|k| unsafe {
-                    slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
-                        leaf_count,
-                    )
-                })
-                .collect();
-            // Diagnostic only: the streamed CPU fill was the one large block of
-            // `compute wires commitment` not covered by any span, which left it
-            // ambiguous whether that time is CPU work or GPU queue wait.
-            #[cfg(feature = "diagnostic_profile")]
-            let _fill = crate::util::profile::span("streamed_fill", "fill_group");
-            fill_group(group, &mut slices);
+    for command_group in 0..command_groups {
+        let first_group = command_group * GROUPS_PER_COMMAND;
+        let end_group = (first_group + GROUPS_PER_COMMAND).min(groups);
+        for group in first_group..end_group {
+            let col_start = group * 8;
+            let chunk = (leaf_width - col_start).min(8);
+            {
+                // SAFETY: each column slice covers a disjoint `leaf_count`
+                // range of the shared buffer; the GPU only reads columns of
+                // command groups already committed after their fills finish.
+                let mut slices: Vec<&mut [F]> = (0..chunk)
+                    .map(|k| unsafe {
+                        slice::from_raw_parts_mut(
+                            base.add((col_start + k) * leaf_count).cast::<F>(),
+                            leaf_count,
+                        )
+                    })
+                    .collect();
+                // Diagnostic only: the streamed CPU fill was the one large
+                // block of `compute wires commitment` not covered by a span.
+                #[cfg(feature = "diagnostic_profile")]
+                let _fill = crate::util::profile::span("streamed_fill", "fill_group");
+                fill_group(group, &mut slices);
+            }
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            let state_resource: &metal::ResourceRef = state_buffer;
+            for group in first_group..end_group {
+                if group != first_group {
+                    encoder.memory_barrier_with_resources(&[state_resource]);
+                }
+                let col_start = group * 8;
+                let chunk = (leaf_width - col_start).min(8);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, chunk as u32);
+                set_u32(encoder, 8, (group == 0) as u32);
+                set_u32(encoder, 9, (group == groups - 1) as u32);
+                dispatch(encoder, pipeline, leaf_count);
+            }
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2512,7 +2528,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // second command buffer with one encoder per level. Identical
             // shaders, dispatch counts and buffer offsets; strictly fewer
             // command buffers and encoders.
-            if group == groups - 1 {
+            if end_group == groups {
                 let mut level_offset = 0usize;
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
@@ -2551,7 +2567,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            profile_command_buffer(
+                command_buffer,
+                "merkle_absorb",
+                (leaf_count * (leaf_width - first_group * 8).min(GROUPS_PER_COMMAND * 8)) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
