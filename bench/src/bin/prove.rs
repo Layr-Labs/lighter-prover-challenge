@@ -41,6 +41,33 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
+//
+// `oversize_threshold:0` extends that same retention decision to the huge
+// allocations the default configuration exempts from it: jemalloc routes
+// anything above the threshold (default 8 MiB) to a dedicated arena whose
+// pages are purged eagerly on free, which is exactly the madvise-then-
+// refault-zeroed cycle the paragraph above avoids for smaller shapes — and
+// the witness/coefficient/LDE buffers this prover recycles 50+ times per
+// worker are precisely the allocations above 8 MiB. Disabling the oversize
+// arena lets them follow the normal dirty-decay retention instead. A prior
+// public measurement of this exact knob on this workload saw page reclaims
+// fall ~19% and worker sys time ~13% for ~0.5 GiB of additional steady
+// resident memory; the ranked host has 48 GB and runs one worker at a time,
+// and the documented ~9.5 GiB failure mode is allocator/fault churn — which
+// this reduces — not a capacity wall. Configuration only: no computed value
+// changes.
+#[cfg(not(target_env = "msvc"))]
+#[repr(transparent)]
+struct MallocConf(*const core::ffi::c_char);
+#[cfg(not(target_env = "msvc"))]
+// SAFETY: the pointer targets a `'static` string literal; jemalloc only
+// reads through it.
+unsafe impl Sync for MallocConf {}
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: MallocConf = MallocConf(c"oversize_threshold:0".as_ptr());
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 // The serialized proof measures ~196 KB at the ranked circuit shapes, so the
 // prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
