@@ -1603,6 +1603,47 @@ pub fn prewarm() {
                 }
             }
             let _ = force_context();
+            // Recurring tx-proof wires LDE: 136 cols × 2^19 rows × 8 bytes
+            // = 544 MiB, under MAX_CACHED_COLUMN_STORE_BYTES, so the first
+            // take_or_new_column_buffer of that size hits the pool instead
+            // of zero-faulting on the proving critical path. Five sequential
+            // cold workers each pay this once. Page-walk at utility QoS so
+            // it prefers E-cores while circuit blobs finish loading.
+            // Scheduling-only: fill writes every live word before any read.
+            {
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x11, 0);
+                }
+            }
+            const TX_WIRES_STORE_BYTES: u64 = 136 * (1 << 19) * 8;
+            if let Some(context) = shared_context() {
+                let buffer = autoreleasepool(|| {
+                    context.device.new_buffer(
+                        TX_WIRES_STORE_BYTES,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                });
+                let base = buffer.contents().cast::<u8>();
+                if !base.is_null() {
+                    const PAGE: isize = 16 * 1024;
+                    let mut offset: isize = 0;
+                    while (offset as u64) < TX_WIRES_STORE_BYTES {
+                        // SAFETY: offset stays within the allocated length.
+                        unsafe { base.offset(offset).write_volatile(0) };
+                        offset += PAGE;
+                    }
+                    if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
+                        pool.recycle(buffer);
+                    }
+                }
+            }
         })
         .ok();
 }
@@ -1721,6 +1762,26 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
         return true;
+    }
+    // FRI fold trees: extension leaves (width = arity * D = 32 for the
+    // arity-16 rounds, 16 for arity-8) from the folded LDE codewords,
+    // starting at 2^16 leaves and shrinking by arity each round. Their
+    // permutation counts (width-32: 2^13 at 2^11 leaves .. 2^18 at 2^16
+    // leaves) sit below MIN_GPU_PERMUTATIONS, so gpu_worthwhile otherwise
+    // routes them to the CPU. The fold trees commit on the FRI serial
+    // critical path right after the big commitment trees, where the GPU
+    // stream is often unoccupied; when idle the GPU hashes these shapes
+    // ~2x faster (measured 7.8 ms vs 14.9 ms at 262k permutations). The
+    // same occupancy gate as the serial-critical shapes applies: routing a
+    // fold tree behind an in-flight pipelined 2^19 chunk tree would stretch
+    // it (measured 200-320 ms FIFO waits), so keep the CPU path while the
+    // stream is busy. Either routing hashes the identical tree, so this is
+    // value-exact.
+    let fold_shape = (17..=64).contains(&leaf_width)
+        && (1 << 14) <= leaf_count
+        && leaf_count <= (1 << 17);
+    if fold_shape && leaf_permutations + parent_permutations < min_permutations {
+        return exclusive || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0;
     }
     leaf_permutations + parent_permutations >= min_permutations
 }
@@ -2461,23 +2522,32 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
     // order, and each pass is committed before the next group''s fill starts.
+    //
+    // Fill the columns in 16-column batches (two absorb groups) so the fill''s
+    // rayon parallelism doubles: the fill closure parallelizes over the
+    // destination columns, and the M-series hosts have 12-14 cores while the
+    // previous 8-column batch left roughly half the pool idle during the fill.
+    // Each 16-column fill then feeds two 8-column absorb passes. Value-exact:
+    // identical columns, identical absorb arithmetic, only the fill batching
+    // (and thus core utilization) changes.
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
+    const FILL_WIDTH: usize = 16;
+    let mut fill_start = 0usize;
+    while fill_start < leaf_width {
+        let fill_chunk = (leaf_width - fill_start).min(FILL_WIDTH);
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
             // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
+            let mut slices: Vec<&mut [F]> = (0..fill_chunk)
                 .map(|k| unsafe {
                     slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        base.add((fill_start + k) * leaf_count).cast::<F>(),
                         leaf_count,
                     )
                 })
@@ -2487,9 +2557,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // ambiguous whether that time is CPU work or GPU queue wait.
             #[cfg(feature = "diagnostic_profile")]
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
-            fill_group(group, &mut slices);
+            fill_group(fill_start, &mut slices);
         }
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
+        for sub in 0..fill_chunk.div_ceil(8) {
+            let col_start = fill_start + sub * 8;
+            let chunk = (leaf_width - col_start).min(8);
+            let group = col_start / 8;
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
@@ -2554,8 +2628,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
             command_buffer.commit();
             command_buffer.to_owned()
-        });
+            });
         absorb_commands.push(command_buffer);
+        }
+        fill_start += fill_chunk;
     }
 
     let all_ok = absorb_commands.iter().all(|command_buffer| {
