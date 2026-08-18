@@ -20,7 +20,7 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars};
+use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 
 use crate::builder::Builder;
 use crate::eddsa::gadgets::base_field::{CircuitBuilderGFp5, QuinticExtensionTarget};
@@ -100,6 +100,46 @@ impl EvaluateSequenceGate {
         let start_of_state: usize = self.wire_state(i).start;
         start_of_state..start_of_state + 5
     }
+
+    /// Shared base-field batched evaluation: for every point `p` of the batch,
+    /// computes each constraint value in the exact order of `eval_unfiltered`
+    /// and hands it to `emit(constraint_index, point, value)`.
+    ///
+    /// Wires are laid out column-major: wire `w` for point `p` at `w * n + p`.
+    #[inline]
+    fn eval_base_batch_with<F: RichField + Extendable<D>, const D: usize>(
+        &self,
+        wires: &[F],
+        n: usize,
+        mut emit: impl FnMut(usize, usize, F),
+    ) {
+        let x_start = self.wire_x().start;
+        for p in 0..n {
+            let x = QuintupleBase::<F, D>::new(core::array::from_fn(|k| {
+                wires[(x_start + k) * n + p]
+            }));
+            let mut j = 0;
+            for i in 1..self.num_states {
+                let sum_old_start = self.wire_sum(i - 1).start;
+                let sum_start = self.wire_sum(i).start;
+                let sum_old = QuintupleBase::<F, D>::new(core::array::from_fn(|k| {
+                    wires[(sum_old_start + k) * n + p]
+                }));
+                let current_element = wires[self.wire_element(i) * n + p];
+                let selector = wires[self.wire_selector(i) * n + p];
+                // Same expression as `eval_unfiltered`, in the base field.
+                let expected_sum = (sum_old * x)
+                    .add_scalar(current_element)
+                    .scalar_mul(selector)
+                    + sum_old.scalar_mul(F::ONE - selector);
+                let expected = expected_sum.to_coeffs();
+                for k in 0..5 {
+                    emit(j + k, p, expected[k] - wires[(sum_start + k) * n + p]);
+                }
+                j += 5;
+            }
+        }
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateSequenceGate {
@@ -138,6 +178,31 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateSequen
         }
         constraints
     }
+
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let n = vars_base.len();
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        self.eval_base_batch_with::<F, D>(vars_base.local_wires, n, |j, p, value| {
+            res[j * n + p] = value;
+        });
+        res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
+        assert!(combined_gate_constraints.len() >= num_constraints * n);
+        self.eval_base_batch_with::<F, D>(vars_base.local_wires, n, |j, p, value| {
+            combined_gate_constraints[j * n + p] += filters[p] * value;
+        });
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -468,6 +533,23 @@ mod tests {
         let gate: EvaluateSequenceGate =
             EvaluateSequenceGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    // Differential test: the hand-written batched base-field paths
+    // (`eval_unfiltered_base_batch` and `eval_unfiltered_base_batch_accumulate`)
+    // must produce bit-identical constraint values to per-point
+    // `eval_unfiltered` across a multi-point batch.
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+
+        for config in [
+            CircuitConfig::standard_recursion_config(),
+            CircuitConfig::standard_ecc_config(),
+        ] {
+            let gate = EvaluateSequenceGate::new_from_config(&config);
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
     }
 
     #[test]
