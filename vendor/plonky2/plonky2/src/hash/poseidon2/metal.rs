@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "bde3a8e5ed559ccda6d55a39dbdb644475b00ace73b4fc2b161acff9f0921344";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -309,8 +309,9 @@ fn build_pipeline(
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
     "poseidon2_hash_leaves",
+    "poseidon2_hash_parents_fused",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
     "poseidon2_absorb_pass",
@@ -374,6 +375,7 @@ struct MetalShared {
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
+    parent_fused_pipeline: ComputePipelineState,
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
@@ -2520,6 +2522,75 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                 if child_count > cap_count {
                     encoder.set_compute_pipeline_state(&context.parent_pipeline);
                 }
+                // Fuse the bottom `FUSED_LEVELS` parent-compression rounds into
+                // one threadgroup-shared dispatch per 256-child group so the
+                // intermediate digests never round-trip device memory (the GPU
+                // Merkle block is ~34% of CPU time). Threadgroup size is
+                // `1 << (FUSED_LEVELS - 1)` = 128 threads, guaranteed by the
+                // `dispatch` helper's 128 cap on uniform work.
+                const FUSED_LEVELS: u32 = 8;
+                while child_count >= (1 << FUSED_LEVELS)
+                    && (child_count >> FUSED_LEVELS) >= cap_count
+                {
+                    encoder.memory_barrier_with_resources(&[output_resource]);
+                    encoder.set_compute_pipeline_state(&context.parent_fused_pipeline);
+                    let child_offset = level_offset;
+                    encoder.set_buffer(
+                        0,
+                        Some(output_buffer),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    // The kernel stores every fused intermediate level in
+                    // level-order after the children, so both buffers point at
+                    // the same base.
+                    encoder.set_buffer(
+                        1,
+                        Some(output_buffer),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    encoder.set_buffer(2, Some(&context.parameters), 0);
+                    set_u32(encoder, 3, FUSED_LEVELS);
+                    set_u32(encoder, 4, child_count as u32);
+                    // Two child digests per thread; dispatch with uniform
+                    // 128-thread groups — `dispatch_threads` cannot guarantee a
+                    // full threadgroup, and a `threadgroup_barrier` kernel
+                    // deadlocks on a partial group (observed on the M4).
+                    let fused_threads = child_count >> 1;
+                    encoder.dispatch_thread_groups(
+                        MTLSize {
+                            width: (fused_threads / 128) as NSUInteger,
+                            height: 1,
+                            depth: 1,
+                        },
+                        MTLSize {
+                            width: 128,
+                            height: 1,
+                            depth: 1,
+                        },
+                    );
+                    // The fused kernel wrote all `FUSED_LEVELS` intermediate
+                    // parent levels in level-order; record their offsets so the
+                    // CPU-side representation keeps every level (sparse Merkle
+                    // paths index them directly).
+                    let mut rel = level_offset + child_count * 4;
+                    let mut level_count = child_count >> 1;
+                    for _ in 0..FUSED_LEVELS {
+                        level_offsets.push(rel);
+                        rel += level_count * 4;
+                        level_count >>= 1;
+                    }
+                    // The next round's children are the block's *last* stored
+                    // level (`C >> (FUSED_LEVELS-1)` digests at the end of the
+                    // block), not the block's first stored level.
+                    level_offset =
+                        child_offset + (2 * child_count - (child_count >> (FUSED_LEVELS - 1))) * 4;
+                    child_count >>= FUSED_LEVELS;
+                }
+                if child_count > cap_count {
+                    // The fused loop, when entered, left the parent-fused
+                    // pipeline current; restore the plain parent kernel.
+                    encoder.set_compute_pipeline_state(&context.parent_pipeline);
+                }
                 while child_count > cap_count {
                     // Every parent level reads the output written by the
                     // preceding dispatch; preserve both the leaf-to-parent and
@@ -2854,6 +2925,7 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
+                parent_fused_pipeline,
             ) = std::thread::scope(|scope| {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
                 let leaf_colmajor =
@@ -2862,6 +2934,8 @@ impl MetalShared {
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
                 let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+                let parent_fused =
+                    scope.spawn(required("poseidon2_hash_parents_fused", "parent fused"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
                 (
@@ -2879,6 +2953,9 @@ impl MetalShared {
                     ifft_finalize
                         .join()
                         .expect("ifft finalize pipeline thread panicked"),
+                    parent_fused
+                        .join()
+                        .expect("parent fused pipeline thread panicked"),
                 )
             });
             // Everything the context blocks on is now built; the four optional
@@ -2901,6 +2978,7 @@ impl MetalShared {
             let ntt_prepare_pipeline = ntt_prepare_pipeline?;
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+            let parent_fused_pipeline = parent_fused_pipeline?;
 
             spawn_optional_pipelines(&device, &library, archive.as_ref());
 
@@ -2924,6 +3002,7 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
+                parent_fused_pipeline,
                 parameters,
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
