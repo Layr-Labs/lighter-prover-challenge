@@ -141,6 +141,14 @@ fn run_generator_worklist<
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
 
+    // Quad-batching lane state for Poseidon2 row generators (see the gather
+    // sites below). The buffers are drained after every flush, so like
+    // `buffer` they keep their high-water capacity across rounds.
+    let mut quad_buffers: [GeneratedValues<F>; 4] = core::array::from_fn(|_| GeneratedValues::empty());
+    let mut quad_rows = [0usize; 4];
+    let mut quad_generator_indices = [0usize; 4];
+    let mut quad_len = 0usize;
+
     // The two round queues are swapped rather than reallocated. Every round used
     // to start from a fresh `Vec::new()` and end by *moving* it over the old
     // queue, which freed the old buffer and forced the new one to grow from zero
@@ -188,6 +196,36 @@ fn run_generator_worklist<
                     // first few reallocations instead of from zero.
                     let mut annotated_values = Vec::with_capacity(chunk.len());
                     let mut round_buffer = GeneratedValues::empty();
+                    // Ready Poseidon2 row generators are deferred to
+                    // quad-batched interleaved passes after the chunk walk.
+                    // Every generator in the round reads the same immutable
+                    // witness snapshot and readiness comes from the snapshot
+                    // slice `round_unresolved_watches`, so running them later
+                    // (and after the chunk's other generators) produces the
+                    // identical values; only their position in this chunk's
+                    // `entries` moves to the tail, and the sequential merge is
+                    // order-insensitive for values (every schedule reaches the
+                    // same fixpoint, as documented on this function).
+                    let mut deferred_poseidon2: Vec<(usize, usize)> = Vec::new();
+                    fn annotate<'w, F: Field>(
+                        round_witness: &PartitionWitness<F>,
+                        generator_indices_by_watches: &'w GeneratorWatchIndex,
+                        t: Target,
+                        v: F,
+                        annotated_values: &mut Vec<(Target, F, usize, Option<&'w [u32]>)>,
+                    ) {
+                        let rep_index = round_witness.representative_map
+                            [round_witness.target_index(t)]
+                            as usize;
+                        let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
+                            generator_indices_by_watches.get(&rep_index)
+                        } else {
+                            // The representative is populated in the snapshot, so the merge
+                            // cannot newly populate it and never needs watchers.
+                            None
+                        };
+                        annotated_values.push((t, v, rep_index, watchers));
+                    }
                     for &generator_idx in chunk {
                         if round_generator_is_expired[generator_idx] {
                             continue;
@@ -196,6 +234,12 @@ fn run_generator_worklist<
                         if skip_unready && !ready {
                             continue;
                         }
+                        if ready {
+                            if let Some(row) = generators[generator_idx].0.poseidon2_quad_row() {
+                                deferred_poseidon2.push((generator_idx, row));
+                                continue;
+                            }
+                        }
                         let finished = generators[generator_idx].0.run_with_ready_hint(
                             round_witness,
                             &mut round_buffer,
@@ -203,25 +247,48 @@ fn run_generator_worklist<
                         );
                         entries.push((generator_idx, finished, round_buffer.target_values.len()));
                         for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
-                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
-                                generator_indices_by_watches.get(&rep_index)
-                            } else {
-                                // The representative is populated in the snapshot, so the merge
-                                // cannot newly populate it and never needs watchers.
-                                None
-                            };
-                            annotated_values.push((t, v, rep_index, watchers));
+                            annotate(round_witness, generator_indices_by_watches, t, v, &mut annotated_values);
+                        }
+                    }
+                    if !deferred_poseidon2.is_empty() {
+                        let mut lane_buffers: [GeneratedValues<F>; 4] =
+                            core::array::from_fn(|_| GeneratedValues::empty());
+                        let mut lane_rows = [0usize; 4];
+                        for group in deferred_poseidon2.chunks(4) {
+                            for (lane, &(_, row)) in group.iter().enumerate() {
+                                lane_rows[lane] = row;
+                            }
+                            // Infallible for Poseidon2 rows (all writes go to a
+                            // `GeneratedValues` buffer); mirror the adapter's
+                            // `run_once(..).is_ok()` on the off chance.
+                            let finished = generators[group[0].0]
+                                .0
+                                .run_poseidon2_rows_quad(
+                                    &lane_rows[..group.len()],
+                                    round_witness,
+                                    &mut lane_buffers[..group.len()],
+                                )
+                                .is_ok();
+                            for (lane, &(generator_idx, _)) in group.iter().enumerate() {
+                                entries.push((
+                                    generator_idx,
+                                    finished,
+                                    lane_buffers[lane].target_values.len(),
+                                ));
+                                for (t, v) in lane_buffers[lane].target_values.drain(..) {
+                                    annotate(round_witness, generator_indices_by_watches, t, v, &mut annotated_values);
+                                }
+                            }
                         }
                     }
                     (entries, annotated_values)
                 })
                 .collect();
 
-            // Merge phase: sequential and in ascending generator-index order, exactly like the
-            // sequential loop's per-generator merge.
+            // Merge phase: sequential; within each chunk the non-batched generators come
+            // first in ascending index order, then the chunk's quad-batched Poseidon2
+            // generators in ascending index order (value-identical under any merge
+            // order, per the fixpoint argument above).
             for (entries, annotated_values) in round_outputs {
                 let mut annotated_values = annotated_values.into_iter();
                 for (generator_idx, finished, value_count) in entries {
@@ -272,6 +339,51 @@ fn run_generator_worklist<
             continue;
         }
 
+        // Flushes the gathered Poseidon2 quad batch: one interleaved
+        // permutation pass, then the standard per-lane merge in gathered
+        // (encounter) order. Deferring a ready Poseidon2 generator's run and
+        // merge to the flush point is value-exact: once a generator is ready,
+        // every representative it reads is populated, and a populated slot's
+        // value can never change again (`set_target_returning_rep` only
+        // verifies equality on re-set), so its inputs at flush time are its
+        // inputs at encounter time. Deferring the merge only defers the
+        // watcher decrements; a generator whose readiness depended on a
+        // deferred output is simply skipped this round and re-queued by this
+        // very merge, and — as documented on this function — every schedule
+        // reaches the same fixpoint.
+        macro_rules! flush_poseidon2_quad {
+            () => {
+                if quad_len > 0 {
+                    generators[quad_generator_indices[0]].0.run_poseidon2_rows_quad(
+                        &quad_rows[..quad_len],
+                        witness,
+                        &mut quad_buffers[..quad_len],
+                    )?;
+                    for lane in 0..quad_len {
+                        for (t, v) in quad_buffers[lane].target_values.drain(..) {
+                            if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                                if let Some(watchers) = generator_indices_by_watches.get(&watch) {
+                                    for &watching_generator_idx in watchers {
+                                        let watching_generator_idx = watching_generator_idx as usize;
+                                        if !generator_is_expired[watching_generator_idx] {
+                                            debug_assert_ne!(
+                                                unresolved_watches[watching_generator_idx],
+                                                0
+                                            );
+                                            unresolved_watches[watching_generator_idx] -= 1;
+                                            next_pending_generator_indices
+                                                .push(watching_generator_idx);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    quad_len = 0;
+                }
+            };
+        }
+
         for &generator_idx in &pending_generator_indices {
             if generator_is_expired[generator_idx] {
                 continue;
@@ -279,6 +391,27 @@ fn run_generator_worklist<
             let ready = unresolved_watches[generator_idx] == 0;
             if skip_unready && !ready {
                 continue;
+            }
+
+            // Quad-batch gather: a ready Poseidon2 row generator is retired
+            // from the worklist immediately (exactly as if it had run — its
+            // `run_with_ready_hint` is `ready && run_once(..).is_ok()`, and
+            // its `run_once` is infallible), but its actual permutation is
+            // deferred so four independent rows can share one interleaved
+            // pass. Marking it expired here also keeps a duplicate queue
+            // entry later in this round from gathering it twice.
+            if ready {
+                if let Some(row) = generators[generator_idx].0.poseidon2_quad_row() {
+                    quad_rows[quad_len] = row;
+                    quad_generator_indices[quad_len] = generator_idx;
+                    quad_len += 1;
+                    generator_is_expired[generator_idx] = true;
+                    *remaining_generators -= 1;
+                    if quad_len == 4 {
+                        flush_poseidon2_quad!();
+                    }
+                    continue;
+                }
             }
 
             let finished =
@@ -312,6 +445,10 @@ fn run_generator_worklist<
                 }
             }
         }
+
+        // A partial batch left at the end of the round runs before the round
+        // boundary, so the next round observes every merge of this one.
+        flush_poseidon2_quad!();
 
         core::mem::swap(
             &mut pending_generator_indices,
@@ -1031,6 +1168,33 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         false
     }
 
+    /// If this generator is a quad-batchable Poseidon2 row generator, the gate
+    /// row it fills; `None` otherwise (the default).
+    ///
+    /// Returning `Some(row)` promises that (a) the generator's entire output is
+    /// a pure function of the (immutable-once-populated) values of its watched
+    /// targets, and (b) [`Self::run_poseidon2_rows_quad`] called on *any*
+    /// generator of this kind with a slice of such rows emits, per lane,
+    /// exactly the wires `run` would emit for that row, in the same order.
+    #[doc(hidden)]
+    fn poseidon2_quad_row(&self) -> Option<usize> {
+        None
+    }
+
+    /// Runs up to four quad-batchable Poseidon2 row generators (identified by
+    /// their rows) in one interleaved pass; lane `i`'s wires go to
+    /// `out_buffers[i]`. Only called on generators whose
+    /// [`Self::poseidon2_quad_row`] is `Some`.
+    #[doc(hidden)]
+    fn run_poseidon2_rows_quad(
+        &self,
+        _rows: &[usize],
+        _witness: &PartitionWitness<F>,
+        _out_buffers: &mut [GeneratedValues<F>],
+    ) -> Result<()> {
+        unreachable!("run_poseidon2_rows_quad called on a generator that is not quad-batchable")
+    }
+
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
     fn deserialize(src: &mut Buffer, common_data: &CommonCircuitData<F, D>) -> IoResult<Self>
@@ -1129,6 +1293,24 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
 
+    /// See [`WitnessGenerator::poseidon2_quad_row`]; forwarded by the adapter.
+    #[doc(hidden)]
+    fn poseidon2_quad_row(&self) -> Option<usize> {
+        None
+    }
+
+    /// See [`WitnessGenerator::run_poseidon2_rows_quad`]; forwarded by the
+    /// adapter.
+    #[doc(hidden)]
+    fn run_poseidon2_rows_quad(
+        &self,
+        _rows: &[usize],
+        _witness: &PartitionWitness<F>,
+        _out_buffers: &mut [GeneratedValues<F>],
+    ) -> Result<()> {
+        unreachable!("run_poseidon2_rows_quad called on a generator that is not quad-batchable")
+    }
+
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
         Self: Sized,
@@ -1188,6 +1370,19 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
     /// nothing is read and nothing is written. See [`WitnessGenerator::defers_until_ready`].
     fn defers_until_ready(&self) -> bool {
         true
+    }
+
+    fn poseidon2_quad_row(&self) -> Option<usize> {
+        self.inner.poseidon2_quad_row()
+    }
+
+    fn run_poseidon2_rows_quad(
+        &self,
+        rows: &[usize],
+        witness: &PartitionWitness<F>,
+        out_buffers: &mut [GeneratedValues<F>],
+    ) -> Result<()> {
+        self.inner.run_poseidon2_rows_quad(rows, witness, out_buffers)
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
