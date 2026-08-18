@@ -20,7 +20,7 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars};
+use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 
 use crate::builder::Builder;
 use crate::eddsa::gadgets::base_field::{CircuitBuilderGFp5, QuinticExtensionTarget};
@@ -138,6 +138,78 @@ impl EvaluateBitstreamGate {
     pub(crate) const fn wire_degree(&self) -> usize {
         1
     }
+
+    /// Shared base-field batched evaluation: for every point `p` of the batch,
+    /// computes each constraint value in the exact order of `eval_unfiltered`
+    /// and hands it to `emit(constraint_index, point, value)`.
+    ///
+    /// Wires are laid out column-major: wire `w` for point `p` at `w * n + p`.
+    #[inline]
+    fn eval_base_batch_with<F: RichField + Extendable<D>, const D: usize>(
+        &self,
+        wires: &[F],
+        n: usize,
+        mut emit: impl FnMut(usize, usize, F),
+    ) {
+        let field_chunk_max = F::from_canonical_usize(Self::CHUNK_MAX);
+        let x_start = self.wire_x().start;
+        for p in 0..n {
+            let x = QuintupleBase::<F, D>::new(core::array::from_fn(|k| {
+                wires[(x_start + k) * n + p]
+            }));
+            let mut degree_acc = wires[self.wire_degree_prev() * n + p];
+            let mut j = 0;
+            for i in 1..self.num_states {
+                let sum_old_start = self.wire_sum(i - 1).start;
+                let sum_start = self.wire_sum(i).start;
+                let sum_old = QuintupleBase::<F, D>::new(core::array::from_fn(|k| {
+                    wires[(sum_old_start + k) * n + p]
+                }));
+                let number_accumulator_old = wires[self.wire_number_accumulator(i - 1) * n + p];
+                let chunks_left_old = wires[self.wire_chunks_left(i - 1) * n + p];
+                let number_ending_old = wires[self.wire_number_ending(i - 1) * n + p];
+                let number_not_ending_old = wires[self.wire_not_number_ending(i - 1) * n + p];
+
+                let number_accumulator = wires[self.wire_number_accumulator(i) * n + p];
+                let chunks_left = wires[self.wire_chunks_left(i) * n + p];
+                let number_ending = wires[self.wire_number_ending(i) * n + p];
+                let number_not_ending = wires[self.wire_not_number_ending(i) * n + p];
+
+                let current_chunk = wires[self.wire_chunk(i) * n + p];
+
+                // Accumulate degree
+                degree_acc += number_ending;
+
+                // Constraints for number ending (zero check of chunks_left)
+                let chunks_left_inv = wires[self.wire_chunks_left_inv(i) * n + p];
+                emit(j, p, (chunks_left * chunks_left_inv) - number_not_ending);
+                emit(j + 1, p, (number_not_ending * chunks_left) - chunks_left);
+                emit(j + 2, p, (F::ONE - number_not_ending) - number_ending);
+
+                // Constraints for chunks_left
+                let expected_chunks_left = (number_ending_old * current_chunk)
+                    + number_not_ending_old * (chunks_left_old - F::ONE);
+                emit(j + 3, p, expected_chunks_left - chunks_left);
+
+                // Constraints for number_accumulator
+                let expected_number_accumulator = number_not_ending_old
+                    * (number_accumulator_old * field_chunk_max + current_chunk);
+                emit(j + 4, p, expected_number_accumulator - number_accumulator);
+
+                // Constraints for sum
+                let expected_sum = ((sum_old * x).add_scalar(number_accumulator))
+                    .scalar_mul(number_ending)
+                    + sum_old.scalar_mul(number_not_ending);
+                let expected = expected_sum.to_coeffs();
+                for k in 0..5 {
+                    emit(j + 5 + k, p, expected[k] - wires[(sum_start + k) * n + p]);
+                }
+                j += 10;
+            }
+            let new_degree = wires[self.wire_degree() * n + p];
+            emit(j, p, new_degree - degree_acc);
+        }
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateBitstreamGate {
@@ -211,6 +283,30 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateBitstr
         constraints.push(new_degree - degree_acc);
 
         constraints
+    }
+
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        let n = vars_base.len();
+        let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
+        self.eval_base_batch_with::<F, D>(vars_base.local_wires, n, |j, p, value| {
+            res[j * n + p] = value;
+        });
+        res
+    }
+
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
+        assert!(combined_gate_constraints.len() >= num_constraints * n);
+        self.eval_base_batch_with::<F, D>(vars_base.local_wires, n, |j, p, value| {
+            combined_gate_constraints[j * n + p] += filters[p] * value;
+        });
     }
 
     fn eval_unfiltered_circuit(
@@ -868,6 +964,23 @@ mod tests {
         let gate: EvaluateBitstreamGate =
             EvaluateBitstreamGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    // Differential test: the hand-written batched base-field paths
+    // (`eval_unfiltered_base_batch` and `eval_unfiltered_base_batch_accumulate`)
+    // must produce bit-identical constraint values to per-point
+    // `eval_unfiltered` across a multi-point batch.
+    #[test]
+    fn base_batch_matches_eval_unfiltered_across_batch() {
+        use crate::gate_batch_testing::assert_base_batch_matches_eval_unfiltered;
+
+        for config in [
+            CircuitConfig::standard_recursion_config(),
+            CircuitConfig::standard_ecc_config(),
+        ] {
+            let gate = EvaluateBitstreamGate::new_from_config(&config);
+            assert_base_batch_matches_eval_unfiltered(&gate);
+        }
     }
 
     #[test]

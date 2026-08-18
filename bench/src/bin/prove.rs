@@ -47,6 +47,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // a single write(2) with ~2.6x headroom over the measured size, while cutting
 // the per-worker buffer allocation 4x. Value-exact: buffer capacity changes
 // only syscall batching, never the serialized bytes.
+// Redraw marker: second draw of this tree; constant unchanged.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
 
 fn main() {
