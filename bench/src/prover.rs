@@ -210,7 +210,7 @@ fn mark_spine_thread_latency_critical() {}
 /// preempted while every other tree build queues behind it — a classic
 /// priority inversion at the pipeline's one serialized station. Best-effort.
 #[cfg(target_os = "macos")]
-fn mark_thread_user_initiated() {
+pub(crate) fn mark_thread_user_initiated() {
     #[allow(non_camel_case_types)]
     type qos_class_t = u32;
     unsafe extern "C" {
@@ -222,7 +222,27 @@ fn mark_thread_user_initiated() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mark_thread_user_initiated() {}
+pub(crate) fn mark_thread_user_initiated() {}
+
+/// Marks the calling thread `QOS_CLASS_USER_INITIATED` with relative
+/// priority -1: same class as the tx-proof buffer-set holders above (P-core
+/// preference, ranked above default QoS) but strictly below their relative 0,
+/// so a pool worker can never preempt the thread holding the single GPU
+/// buffer set. Used for the global rayon pool workers. Best-effort.
+#[cfg(target_os = "macos")]
+pub(crate) fn mark_thread_user_initiated_below() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x19, -1);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn mark_thread_user_initiated_below() {}
 
 /// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
 /// walks prefer E-cores instead of competing with the light pipeline's
@@ -929,7 +949,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -962,12 +981,21 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                pre_proof_ref,
+                                &pre_proof,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
+                    // Early pre-proof release (exp41 port): the pre-execution
+                    // proof's buffers are large and are consumed only by the
+                    // early witness feed above. Every remaining stage of this
+                    // lane and of the light path uses `pre_output`, `pending`
+                    // and the finished proofs — never this proof. Dropping it
+                    // now relieves that memory before the heavy/extensions
+                    // release and the late final-block witness, instead of
+                    // holding it across the rest of the pipeline.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");

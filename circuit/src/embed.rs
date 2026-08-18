@@ -28,16 +28,21 @@
 //! * every bulky section is independently zstd-compressed, keeping parallel
 //!   load memory bounded without a second whole-blob decompression pass.
 //!
-//! Everything recomputed is validated at load: the recomputed commitment cap
-//! must equal the embedded verifier data's cap, which transitively pins the
-//! circuit digest. On any mismatch the loader errors and callers fall back to
-//! building circuits from scratch.
+//! Everything recomputed is validated: the recomputed commitment cap must
+//! equal the embedded verifier data's cap, which transitively pins the
+//! circuit digest. Parse-time failures (absent or truncated sections, version
+//! mismatches) error out of the loader and callers fall back to building
+//! circuits from scratch. The commitment recompute itself is *deferred* into
+//! a [`plonky2::fri::oracle::LazyPolynomialBatch`] that materializes on the
+//! rayon pool underneath later startup work, so its cap check runs at
+//! materialization and panics on mismatch — reachable only from a binary
+//! whose compiled-in blob disagrees with its own verifier data.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
-use plonky2::fri::oracle::PolynomialBatch;
+use plonky2::fri::oracle::{LazyPolynomialBatch, PolynomialBatch};
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
@@ -509,22 +514,51 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 
     // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+    //
+    // DEFERRED, not skipped: the commitment's inputs (constant values + sigma
+    // values) exist right here, but its first consumer — the quotient
+    // evaluation, then the FRI openings, of a proof of THIS circuit — runs
+    // hundreds of milliseconds after the load join that this function sits
+    // under. Packing the recompute into a `LazyPolynomialBatch` and starting
+    // it on the rayon pool lets the loader return without it, pulling the
+    // startup joins in `bin/prove.rs` forward; the materialization overlaps
+    // the pre-execution proof tail and the first witness generations instead
+    // of blocking them. Value-exact: the closure runs the identical
+    // `from_values` call on the identical inputs, only later.
+    //
+    // The commitment-cap validation moves with the computation, and it is NOT
+    // weakened: the recomputed cap must still equal the embedded verifier
+    // data's cap, which transitively pins the circuit digest. What changes is
+    // the failure mode — a mismatch now panics at materialization (aborting
+    // the worker) instead of erroring out of this loader into the
+    // build-from-scratch fallback. That fallback remains reachable for every
+    // failure a healthy binary can hit (absent/stub blobs, truncated or
+    // version-mismatched sections all still error above, before this point);
+    // the cap check can only fire if the compiled-in blob is internally
+    // inconsistent with its own verifier data, i.e. a corrupt binary.
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
-    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
-        bail!(
+    let expected_cap = verifier_only.constants_sigmas_cap.clone();
+    let constants_sigmas_commitment = LazyPolynomialBatch::deferred(move || {
+        // Cache hit (the eager path above already populated it for this
+        // size); value-identical to the table captured by `prover_only`.
+        let root_table = cached_fft_root_table::<F>(max_fft_points);
+        let commitment = PolynomialBatch::<F, C, D>::from_values(
+            constants_sigmas_vecs,
+            rate_bits,
+            false,
+            cap_height,
+            &mut TimingTree::default(),
+            Some(&root_table),
+        );
+        assert!(
+            commitment.merkle_tree.cap == expected_cap,
             "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
              (stale or corrupt embedded circuit blob)"
         );
-    }
+        commitment
+    });
+    constants_sigmas_commitment.spawn_prefetch();
 
     let circuit_digest = verifier_only.circuit_digest;
 
