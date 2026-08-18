@@ -27,20 +27,24 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
-// mapped long enough for the next identically-shaped allocation to reuse them.
+// jemalloc 5.2+ routes allocations ≥ 8 MiB into a dedicated oversize arena
+// that instantly purges on free (jemalloc#2208; man opt.oversize_threshold).
+// This worker reallocates the same multi-hundred-megabyte LDE / witness /
+// column-store shapes 50+ times. Instant purge turns each free into a
+// zero-fault on the next identically-shaped alloc and opens GPU-idle gaps
+// between streamed absorb groups. Disabling the threshold lets those extents
+// honor the default 10 s dirty decay and be reused. Arena routing changes
+// no computed value.
 //
-// A previous revision exported `_rjem_malloc_conf = "dirty_decay_ms:0,
-// muzzy_decay_ms:0"` on the stated premise that five scored workers run
-// concurrently and contend for residency. The harness runs them strictly
-// sequentially (`run_private_sequence` awaits each worker's exit before
-// spawning the next), so exactly one worker owns the machine at a time and
-// residency pressure from a sibling worker does not exist. What decay:0 does
-// cost is kernel work on the proving path: the transaction/chain pipeline
-// allocates and frees the same multi-hundred-megabyte witness/coefficient
-// shapes 50+ times per worker, and with decay disabled every one of those
-// cycles madvises the pages away and then re-faults them zeroed on the next
-// step. Allocator page retention changes no computed value.
+// Do NOT also set dirty_decay_ms:0. A previous revision did that under the
+// false five-concurrent-workers premise. The harness is sequential
+// (`run_private_sequence`); decay:0 only adds madvise/refault work.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: Option<&'static core::ffi::c_char> = {
+    const BYTES: &[u8] = b"oversize_threshold:0\0";
+    Some(unsafe { &*(BYTES.as_ptr() as *const core::ffi::c_char) })
+};
 // Keep the promoted writer path while exercising a second submission from that baseline.
 // The serialized proof measures ~196 KB at the ranked circuit shapes, so the
 // prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
