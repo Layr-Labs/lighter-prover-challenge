@@ -720,7 +720,7 @@ struct ColumnStorePool {
 }
 
 const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
-const MAX_COLUMN_STORE_POOL_BYTES: u64 = 4096 << 20;
+const MAX_COLUMN_STORE_POOL_BYTES: u64 = 2560 << 20;
 
 static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
     free: Vec::new(),
@@ -2016,36 +2016,6 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
 /// width-generic integer, byte, quintic, and audited random-access gate, applies
 /// each selector filter, and reduces the shared constraint rows with the same
 /// two alpha challenges as the CPU quotient.
-/// Validated, flattened kernel inputs for one RangeCheck/U32 dispatch: the
-/// ten-word metadata records, the two challenge alpha-power rows and their
-/// stride. Shared by the single-dispatch job and the per-gate multi-dispatch
-/// job below, so both encode byte-identical arguments for identical specs.
-struct RangeQuotientDispatchArgs {
-    metadata: Vec<u32>,
-    alpha_powers: Vec<u64>,
-    alpha_stride: usize,
-}
-
-fn range_quotient_shape_ok<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    quotient_rows: usize,
-    step: usize,
-    alphas: &[F],
-) -> bool {
-    F::ORDER == 0xffff_ffff_0000_0001
-        && size_of::<F>() == size_of::<u64>()
-        && alphas.len() == 2
-        && wires.rows != 0
-        && wires.rows == constants.rows
-        && quotient_rows != 0
-        && step != 0
-        && quotient_rows.checked_mul(step) == Some(wires.rows)
-        && wires.rows <= u32::MAX as usize
-        && quotient_rows <= u32::MAX as usize
-        && step <= u32::MAX as usize
-}
-
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -2056,109 +2026,26 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
-    if !range_quotient_shape_ok(wires, constants, quotient_rows, step, alphas) {
-        return None;
-    }
-    let args = build_range_quotient_dispatch_args(
-        wires, constants, specs, u32_specs, alphas, alpha_offset,
-    )?;
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &args.metadata,
-        specs.len(),
-        u32_specs.len(),
-        &args.alpha_powers,
-        args.alpha_stride,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal RangeCheck gate quotient unavailable; using CPU path: {error}");
-            None
-        }
-    }
-}
+    const SPEC_WORDS: usize = 10;
+    const MAX_INLINE_BYTES: usize = 4096;
 
-/// One command buffer, one dispatch per entry of `groups`, each writing its
-/// own `quotient_rows * 2` point-major slice of a single output buffer (entry
-/// `k` occupies `[k * quotient_rows * 2, (k + 1) * quotient_rows * 2)`). Every
-/// dispatch is the unmodified `range_check_gate_quotient` kernel over the same
-/// `(quotient_rows, step)` sub-domain, so a group's slice is exactly what the
-/// single-dispatch job would have produced for those specs alone.
-pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    quotient_rows: usize,
-    step: usize,
-    groups: &[(Vec<RangeCheckQuotientSpec>, Vec<U32QuotientSpec>)],
-    alphas: &[F],
-    alpha_offset: usize,
-) -> Option<RangeCheckGateQuotientJob<F>> {
-    // The wires store may be a compact sub-domain copy while `constants` is
-    // the full-domain store: the kernel indexes both with `lde_rows =
-    // wires.rows`, so every constants read `col * wires.rows + row` stays in
-    // bounds as long as `constants.rows >= wires.rows`; the low-degree gates
-    // dispatched here read no constants (their selector load is unused).
-    if groups.is_empty()
-        || F::ORDER != 0xffff_ffff_0000_0001
+    let spec_count = specs.len().checked_add(u32_specs.len())?;
+
+    if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || alphas.len() != 2
+        || spec_count == 0
+        || spec_count
+            .checked_mul(SPEC_WORDS * size_of::<u32>())
+            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
         || wires.rows == 0
-        || constants.rows < wires.rows
+        || wires.rows != constants.rows
         || quotient_rows == 0
         || step == 0
         || quotient_rows.checked_mul(step) != Some(wires.rows)
         || wires.rows > u32::MAX as usize
         || quotient_rows > u32::MAX as usize
         || step > u32::MAX as usize
-    {
-        return None;
-    }
-    let mut dispatches = Vec::with_capacity(groups.len());
-    for (specs, u32_specs) in groups {
-        let args = build_range_quotient_dispatch_args(
-            wires, constants, specs, u32_specs, alphas, alpha_offset,
-        )?;
-        dispatches.push((args, specs.len(), u32_specs.len()));
-    }
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient_multi(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &dispatches,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!(
-                "Metal RangeCheck gate quotient (multi) unavailable; using CPU path: {error}"
-            );
-            None
-        }
-    }
-}
-
-fn build_range_quotient_dispatch_args<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    specs: &[RangeCheckQuotientSpec],
-    u32_specs: &[U32QuotientSpec],
-    alphas: &[F],
-    alpha_offset: usize,
-) -> Option<RangeQuotientDispatchArgs> {
-    const SPEC_WORDS: usize = 10;
-    const MAX_INLINE_BYTES: usize = 4096;
-
-    let spec_count = specs.len().checked_add(u32_specs.len())?;
-
-    if spec_count == 0
-        || spec_count
-            .checked_mul(SPEC_WORDS * size_of::<u32>())
-            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
     {
         return None;
     }
@@ -2429,35 +2316,21 @@ fn build_range_quotient_dispatch_args<F: RichField>(
         }
     }
 
-    Some(RangeQuotientDispatchArgs {
-        metadata,
-        alpha_powers,
-        alpha_stride,
-    })
-}
-
-/// Allocates a pooled shared column store with no Merkle-routing admission
-/// check: used for the compact even-row companion of a wires commitment that
-/// the half-domain quotient kernels read. Same buffer pool as
-/// [`allocate_columns`], so recurring shapes are recycled across proofs.
-pub(crate) fn allocate_plain_columns<F: RichField>(
-    cols: usize,
-    rows: usize,
-) -> Option<MetalColumns<F>> {
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || cols == 0
-        || rows == 0
-        || rows > u32::MAX as usize
-        || cols > u32::MAX as usize
-    {
-        return None;
-    }
     let context = shared_context()?;
-    match context.allocate_columns(rows, cols) {
-        Ok(columns) => Some(columns),
+    match context.start_range_check_gate_quotient(
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        &metadata,
+        specs.len(),
+        u32_specs.len(),
+        &alpha_powers,
+        alpha_stride,
+    ) {
+        Ok(job) => Some(job),
         Err(error) => {
-            log::warn!("Metal companion column allocation failed: {error}");
+            log::warn!("Metal RangeCheck gate quotient unavailable; using CPU path: {error}");
             None
         }
     }
@@ -3144,7 +3017,7 @@ impl MetalShared {
             set_u32(encoder, 10, group.start as u32);
             set_u32(encoder, 11, group.end as u32);
             set_u32(encoder, 12, include_unused_selector as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3216,7 +3089,7 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3237,90 +3110,6 @@ impl MetalShared {
             }
             observer
         });
-        Ok(RangeCheckGateQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            #[cfg(test)]
-            failure_observer,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
-    }
-
-    /// Multi-dispatch twin of `start_range_check_gate_quotient`: `dispatches[k]`
-    /// runs the same kernel with its own metadata/alpha rows and writes rows
-    /// `[k * quotient_rows, (k + 1) * quotient_rows)` (point-major, two
-    /// challenge words per row) of one shared output buffer. All dispatches
-    /// are encoded in one command buffer, so `finish` waits once.
-    fn start_range_check_gate_quotient_multi<F: RichField>(
-        &self,
-        wires: &MetalColumns<F>,
-        constants: &MetalColumns<F>,
-        quotient_rows: usize,
-        step: usize,
-        dispatches: &[(RangeQuotientDispatchArgs, usize, usize)],
-    ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        for (args, range_count, u32_count) in dispatches {
-            if args.metadata.len() != (range_count + u32_count) * 10
-                || args.alpha_powers.len() != args.alpha_stride * 2
-            {
-                return Err("invalid RangeCheck quotient metadata".to_string());
-            }
-        }
-        let slice_len = quotient_rows
-            .checked_mul(2)
-            .ok_or("RangeCheck gate quotient output length overflow")?;
-        let len = slice_len
-            .checked_mul(dispatches.len())
-            .ok_or("RangeCheck gate quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("RangeCheck gate quotient output size overflow")?;
-        let slice_bytes = slice_len * size_of::<u64>();
-        let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            for (k, (args, range_count, u32_count)) in dispatches.iter().enumerate() {
-                encoder.set_buffer(2, Some(&output), (k * slice_bytes) as NSUInteger);
-                encoder.set_bytes(
-                    3,
-                    size_of_val(args.alpha_powers.as_slice()) as NSUInteger,
-                    args.alpha_powers.as_ptr().cast::<c_void>(),
-                );
-                encoder.set_bytes(
-                    4,
-                    size_of_val(args.metadata.as_slice()) as NSUInteger,
-                    args.metadata.as_ptr().cast::<c_void>(),
-                );
-                set_u32(encoder, 8, args.alpha_stride as u32);
-                set_u32(encoder, 9, *range_count as u32);
-                set_u32(encoder, 10, *u32_count as u32);
-                dispatch(encoder, pipeline, quotient_rows);
-            }
-            encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "range_u32_quotient_split",
-                (quotient_rows * dispatches.len()) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-        #[cfg(test)]
-        let failure_observer = None;
         Ok(RangeCheckGateQuotientJob {
             command_buffer,
             output: Some(output),
@@ -3397,7 +3186,7 @@ impl MetalShared {
             set_u32(encoder, 13, num_partial_products as u32);
             set_u32(encoder, 14, chunk_size as u32);
             set_u32(encoder, 15, alpha_stride as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -4463,6 +4252,33 @@ fn dispatch(
         .max_total_threads_per_threadgroup()
         .min(128)
         .max(execution_width);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn dispatch_full(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    // Occupancy A/B: dispatch the three multiply-issue-bound quotient kernels
+    // with the device's full threadgroup width instead of the 128-cap used by
+    // the shared `dispatch`. On the M4 Pro these kernels are multiply-bound;
+    // wider threadgroups change scheduling granularity but never any computed
+    // value (the shader and the per-thread work are identical), so this is a
+    // value-exact scheduling/LD dispatch probe only.
+    let execution_width = pipeline.thread_execution_width();
+    let group_width = pipeline.max_total_threads_per_threadgroup().max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
