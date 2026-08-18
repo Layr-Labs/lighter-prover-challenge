@@ -831,6 +831,38 @@ static PREWARMED_STREAMED_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
 /// quotient.
 const PREWARMED_STREAMED_DIGEST_COUNT: usize = 3;
 
+/// One-off final-block GPU quotient output buffers.
+///
+/// The three GPU quotient jobs of the final degree-2^18 proof each need a
+/// ~32 MiB output, which is far above [`MAX_CACHED_QUOTIENT_OUTPUT_BYTES`], so
+/// `QuotientOutputPool` neither serves nor recycles them: all three allocate
+/// and first-touch in the exclusive serial tail. The orchestrator's prewarm
+/// thread fills this stash while the light pipeline still runs; a size miss
+/// falls through to the allocator.
+static PREWARMED_FINAL_QUOTIENTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+
+/// Pre-faults one final-block GPU quotient output and reserves it for requests
+/// above [`MAX_CACHED_QUOTIENT_OUTPUT_BYTES`].
+pub fn prewarm_final_quotient_output(bytes: u64) {
+    let Some(context) = shared_context() else {
+        return;
+    };
+    let Some(buffer) = allocate_page_walked(&context.device, bytes) else {
+        return;
+    };
+    if let Ok(mut stash) = PREWARMED_FINAL_QUOTIENTS.lock() {
+        stash.push(buffer);
+    }
+}
+
+/// Takes a pre-faulted final GPU quotient output of at least `bytes`, if one
+/// is stashed.
+fn take_prewarmed_final_quotient(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_FINAL_QUOTIENTS.lock().ok()?;
+    let index = stash.iter().position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
 /// Takes a pre-faulted digest replacement of at least `bytes`, if one is stashed.
 fn take_prewarmed_streamed_digest(bytes: u64) -> Option<Buffer> {
     let mut stash = PREWARMED_STREAMED_DIGESTS.lock().ok()?;
@@ -2960,6 +2992,11 @@ impl MetalShared {
     }
 
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
+        if bytes > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
+            if let Some(buffer) = take_prewarmed_final_quotient(bytes) {
+                return buffer;
+            }
+        }
         if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
             if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
                 if let Some(buffer) = pool.take_best_fit(bytes) {
@@ -4247,11 +4284,21 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
+    // Launch at the pipeline state's own occupancy ceiling instead of an
+    // arbitrary 128-thread clamp. The PSO's `max_total_threads_per_threadgroup`
+    // already accounts for register pressure and threadgroup memory; the
+    // kernels here use no threadgroup memory and are `gid`-bounded, so a wider
+    // threadgroup only changes scheduling, never the hashed bytes. Keep the
+    // group aligned to the SIMD width and no wider than the rounded grid so a
+    // tiny parent level (2, 4, 8 threads) does not launch a 1024-wide group.
+    let execution_width = pipeline.thread_execution_width().max(1);
+    let max_tg = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
         .max(execution_width);
+    let occupancy = (max_tg / execution_width) * execution_width;
+    let n = (thread_count as NSUInteger).max(1);
+    let grid = n.div_ceil(execution_width) * execution_width;
+    let group_width = occupancy.min(grid).max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
