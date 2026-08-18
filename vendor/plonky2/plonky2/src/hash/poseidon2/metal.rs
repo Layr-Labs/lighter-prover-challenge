@@ -915,13 +915,20 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
 /// allocator; the pool is a best-effort page-warm cache, never a correctness
 /// dependency.
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
+    // Blocking locks, not `try_lock`: every hold on these mutexes is an O(1)
+    // Vec/Option operation (the page walks and allocations that feed them
+    // happen outside the lock), so the worst contention cost is microseconds
+    // — while a missed take falls through to a fresh multi-hundred-megabyte
+    // shared allocation whose first-touch zero faults cost tens of
+    // milliseconds and whose twin sits idle in the pool. Poisoning still
+    // falls through to the allocator.
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
+        if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
             if let Some(buffer) = pool.take_best_fit(bytes) {
                 return buffer;
             }
         }
-    } else if let Ok(mut slot) = PREWARMED_LARGE_STORE.try_lock() {
+    } else if let Ok(mut slot) = PREWARMED_LARGE_STORE.lock() {
         if slot.as_ref().is_some_and(|b| b.length() >= bytes) {
             return slot.take().expect("checked above");
         }
@@ -931,15 +938,18 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
 
 /// Owns one column-store buffer for the lifetime of all `MetalColumns`
 /// handles over it; the last handle's drop returns the buffer to the pool
-/// (same pattern as `MetalDigestInner`). `try_lock`: on contention the
-/// buffer simply drops.
+/// (same pattern as `MetalDigestInner`). Blocking lock: a contended miss
+/// here silently dropped a ~570 MiB warm buffer, forcing the next
+/// commitment through a fresh allocation and its zero-fill faults; the
+/// pool's holds are O(1), so waiting costs microseconds. Poisoning still
+/// drops the buffer.
 struct ColumnStoreLease {
     buffer: Buffer,
 }
 
 impl Drop for ColumnStoreLease {
     fn drop(&mut self) {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
+        if let Ok(mut pool) = COLUMN_STORE_POOL.lock() {
             pool.recycle(self.buffer.clone());
         }
     }
@@ -1184,7 +1194,10 @@ struct MetalDigestInner {
 
 impl Drop for MetalDigestInner {
     fn drop(&mut self) {
-        if let Ok(mut pool) = self.pool.try_lock() {
+        // Blocking for the same reason as `ColumnStoreLease`: the pool's
+        // holds are O(1), and a contended miss drops a warm ~33 MiB digest
+        // buffer the next tree would otherwise reuse.
+        if let Ok(mut pool) = self.pool.lock() {
             pool.recycle(self.buffer.clone());
         }
     }
@@ -2488,6 +2501,25 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             #[cfg(feature = "diagnostic_profile")]
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
             fill_group(group, &mut slices);
+        }
+        // Bound the committed-but-unexecuted backlog to two passes. The CPU
+        // fill (~7 ms/group) outruns the GPU absorb (~12 ms/pass), so the
+        // uncapped loop left an ever-deeper queue of committed passes that
+        // every other command buffer — most critically the strictly serial
+        // chain spine's 2^17 fold trees, measured waiting 200-320 ms under
+        // pipeline load against 10-50 ms alone — had to sit behind on the
+        // single FIFO queue. Waiting for pass g-2 before committing pass g
+        // keeps the GPU double-buffered (pass g-1 is always committed before
+        // pass g-2 retires, so the queue never runs dry mid-build) while
+        // capping any interloper's wait at roughly two passes. This build's
+        // own GPU completion time is unchanged; only the final wait below
+        // gets shorter. Unconditional on purpose: a backlog-conditioned
+        // variant would be a state-triggered scheduling behavior, the class
+        // with a documented ranked portability failure.
+        if group >= 2 {
+            #[cfg(feature = "diagnostic_profile")]
+            let _pace = crate::util::profile::span("wait", "streamed_commit_pace");
+            absorb_commands[group - 2].wait_until_completed();
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
