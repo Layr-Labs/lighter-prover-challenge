@@ -1753,7 +1753,10 @@ kernel void poseidon2_hash_leaves_colmajor(
     for (uint offset = 0; offset < leaf_width; offset += 8) {
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+            // Poseidon2 starts with the external linear layer, which reduces
+            // every lane before use; widths <= 4 returned above and retain
+            // their required canonical identity-hash output.
+            state[i] = leaves[(ulong)(offset + i) * leaf_count + gid];
         }
         poseidon2(state, parameters);
     }
@@ -1814,8 +1817,12 @@ kernel void poseidon2_absorb_pass(
             st[i] = state[(ulong)i * leaf_count + gid];
         }
     }
+    // The permutation starts with `external_linear_layer`, which reduces all
+    // twelve lanes modulo Goldilocks before using them. Loading raw rate-lane
+    // representatives is therefore residue-identical and avoids redundant
+    // reductions on the first and final streamed passes.
     for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        st[i] = leaves[(ulong)(col_start + i) * leaf_count + gid];
     }
     poseidon2(st, parameters);
     if (final_pass != 0u) {
@@ -1830,5 +1837,74 @@ kernel void poseidon2_absorb_pass(
         for (uint i = 0; i < 12; ++i) {
             state[(ulong)i * leaf_count + gid] = st[i];
         }
+    }
+}
+
+// Steady-state streamed pass: every interior group has exactly eight columns,
+// reads the parked sponge state, and writes it back for the next group. Making
+// those uniform controls compile-time facts removes the dynamically bounded
+// absorb loop and the unused first/final branches from the hot pipeline.
+kernel void poseidon2_absorb_pass_mid8(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_count [[buffer(3)]],
+    constant uint& col_start [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12];
+    for (uint i = 0; i < 12; ++i) {
+        st[i] = state[(ulong)i * leaf_count + gid];
+    }
+    // `external_linear_layer` immediately reduces every lane modulo the
+    // Goldilocks prime. Feeding the raw representatives here is therefore
+    // equivalent to canonicalizing each lane first, while avoiding eight
+    // redundant reductions on every steady-state streamed pass.
+    st[0] = leaves[(ulong)(col_start + 0u) * leaf_count + gid];
+    st[1] = leaves[(ulong)(col_start + 1u) * leaf_count + gid];
+    st[2] = leaves[(ulong)(col_start + 2u) * leaf_count + gid];
+    st[3] = leaves[(ulong)(col_start + 3u) * leaf_count + gid];
+    st[4] = leaves[(ulong)(col_start + 4u) * leaf_count + gid];
+    st[5] = leaves[(ulong)(col_start + 5u) * leaf_count + gid];
+    st[6] = leaves[(ulong)(col_start + 6u) * leaf_count + gid];
+    st[7] = leaves[(ulong)(col_start + 7u) * leaf_count + gid];
+    poseidon2(st, parameters);
+    for (uint i = 0; i < 12; ++i) {
+        state[(ulong)i * leaf_count + gid] = st[i];
+    }
+}
+
+// Two-group interior pass. It keeps the sponge state in registers across
+// two consecutive eight-column absorbs, halving parked-state traffic while
+// preserving the CPU-fill/GPU-hash streaming granularity at 16 columns.
+kernel void poseidon2_absorb_pass_16(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_count [[buffer(3)]],
+    constant uint& col_start [[buffer(4)]],
+    constant uint& first_pass [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 0; i < 12u; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    for (uint i = 0; i < 8u; ++i) {
+        st[i] = leaves[(ulong)(col_start + i) * leaf_count + gid];
+    }
+    poseidon2(st, parameters);
+    for (uint i = 0; i < 8u; ++i) {
+        st[i] = leaves[(ulong)(col_start + 8u + i) * leaf_count + gid];
+    }
+    poseidon2(st, parameters);
+    for (uint i = 0; i < 12u; ++i) {
+        state[(ulong)i * leaf_count + gid] = st[i];
     }
 }

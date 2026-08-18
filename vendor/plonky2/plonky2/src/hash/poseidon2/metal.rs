@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "35f700ace2150b85dac19917e3f8e94cbe41c97f2c17b9fc8b72893c5671ccde";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -309,11 +309,13 @@ fn build_pipeline(
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 12] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
     "poseidon2_absorb_pass",
+    "poseidon2_absorb_pass_mid8",
+    "poseidon2_absorb_pass_16",
     "ntt_prepare",
     "ntt_stage",
     "ifft_finalize",
@@ -813,10 +815,11 @@ pub fn prewarm_large_column_store(bytes: u64) {
 /// install, and only when the stashed pair is actually smaller, so a build that
 /// is mid-flight simply finishes first.
 ///
-/// Writing zeros is semantics-preserving: a fresh `StorageModeShared` buffer is
-/// already zero-filled, and no build can observe this one until it is
-/// published, so the pair a later build takes holds exactly what a fresh
-/// allocation would have held.
+/// The inter-pass state is GPU-only: the first absorb dispatch initializes all
+/// twelve lanes before any later dispatch reads them. Keep that buffer in
+/// `StorageModePrivate`, avoiding a CPU mapping and allowing Metal to choose
+/// its GPU-optimal placement. The digest output remains shared and page-walked
+/// because it is returned to the CPU after the parent ladder completes.
 /// Pre-faulted digest-output buffers for the final block's streamed builds.
 ///
 /// Each streamed build swaps a fresh output buffer in so the completed one can
@@ -878,9 +881,11 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
     };
     let (state_bytes, output_bytes) = (state_bytes as u64, output_bytes as u64);
 
-    let Some(state) = allocate_page_walked(&context.device, state_bytes) else {
-        return;
-    };
+    let state = autoreleasepool(|| {
+        context
+            .device
+            .new_buffer(state_bytes, MTLResourceOptions::StorageModePrivate)
+    });
     let Some(output) = allocate_page_walked(&context.device, output_bytes) else {
         return;
     };
@@ -1419,6 +1424,8 @@ static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB_PASS_MID8_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB_PASS_16_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1437,6 +1444,16 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     // has landed — which is every call in steady state — this is the same
     // pointer `get` would return.
     ABSORB_PASS_PIPELINE.try_get()
+}
+
+fn absorb_pass_mid8_pipeline() -> Option<&'static ComputePipelineState> {
+    // A missing or not-yet-lowered specialization falls back to the generic
+    // pass, preserving both startup progress and proof bytes.
+    ABSORB_PASS_MID8_PIPELINE.try_get()
+}
+
+fn absorb_pass_16_pipeline() -> Option<&'static ComputePipelineState> {
+    ABSORB_PASS_16_PIPELINE.try_get()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1461,6 +1478,11 @@ fn spawn_optional_pipelines(
         ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        (
+            "poseidon2_absorb_pass_mid8",
+            &ABSORB_PASS_MID8_PIPELINE,
+        ),
+        ("poseidon2_absorb_pass_16", &ABSORB_PASS_16_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -2368,8 +2390,9 @@ pub(crate) fn allocate_columns<F: RichField>(
 
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
-/// Retained buffers for the streamed sponge build: the inter-pass state
-/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
+/// Retained buffers for the streamed sponge build: the GPU-private inter-pass
+/// state (12 u64 lanes per leaf, column-major) and the shared level-order digest
+/// output.
 /// One streamed build runs at a time (exclusive proving phases only), so a
 /// single grow-on-demand pair suffices; holding the lock for the whole build
 /// serializes any unexpected second caller onto the classic path.
@@ -2429,6 +2452,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let context = ready_context(leaf_width, leaf_count)?;
     let pipeline = absorb_pass_pipeline()?;
+    let mid8_pipeline = absorb_pass_mid8_pipeline();
     log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
 
     let cap_count = 1usize << cap_height;
@@ -2447,7 +2471,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             (
                 context.device.new_buffer(
                     state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
+                    MTLResourceOptions::StorageModePrivate,
                 ),
                 context.device.new_buffer(
                     output_bytes as u64,
@@ -2462,15 +2486,51 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // absorption of group g: commands on one queue execute in submission
     // order, and each pass is committed before the next group''s fill starts.
     let groups = leaf_width.div_ceil(8);
+    // Keep both edge groups on the generic kernels: submitting the first eight
+    // columns immediately starts CPU/GPU overlap, while the last group emits
+    // the digests. Pair only the interior full groups between those edges.
+    let batch2_pipeline = (groups >= 3 && groups % 2 == 1)
+        .then(absorb_pass_16_pipeline)
+        .flatten();
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
     for group in 0..groups {
+        if batch2_pipeline.is_some() && group > 0 && group % 2 == 0 && group + 1 < groups {
+            continue;
+        }
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
-        {
+        let batch_two = batch2_pipeline.is_some()
+            && group % 2 == 1
+            && group + 2 < groups
+            && chunk == 8;
+        let middle_pipeline = (!batch_two && group != 0 && group + 1 != groups && chunk == 8)
+            .then_some(mid8_pipeline)
+            .flatten();
+        if batch_two {
+            // Build both disjoint groups as one wider Rayon phase. The normal
+            // closure exposes eight independent column FFTs; pairing two
+            // groups gives the worker pool sixteen independent FFTs without
+            // changing either transform or its destination.
+            let mut slices: Vec<&mut [F]> = (0..16)
+                .map(|k| unsafe {
+                    slice::from_raw_parts_mut(
+                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        leaf_count,
+                    )
+                })
+                .collect();
+            let (first, second) = slices.split_at_mut(8);
+            #[cfg(feature = "diagnostic_profile")]
+            let _fill = crate::util::profile::span("streamed_fill", "fill_group_pair");
+            plonky2_maybe_rayon::join(
+                || fill_group(group, first),
+                || fill_group(group + 1, second),
+            );
+        } else {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
             // whose pass was already committed, after their fill completed.
@@ -2492,18 +2552,38 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            if batch_two {
+                let batch2_pipeline = batch2_pipeline.unwrap();
+                encoder.set_compute_pipeline_state(batch2_pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(encoder, 3, leaf_count as u32);
+                set_u32(encoder, 4, col_start as u32);
+                set_u32(encoder, 5, 0);
+                dispatch_with_cap(encoder, batch2_pipeline, leaf_count, 64);
+            } else if let Some(middle_pipeline) = middle_pipeline {
+                encoder.set_compute_pipeline_state(middle_pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(encoder, 3, leaf_count as u32);
+                set_u32(encoder, 4, col_start as u32);
+                dispatch_with_cap(encoder, middle_pipeline, leaf_count, 64);
+            } else {
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, chunk as u32);
+                set_u32(encoder, 8, (group == 0) as u32);
+                set_u32(encoder, 9, (group == groups - 1) as u32);
+                dispatch_with_cap(encoder, pipeline, leaf_count, 64);
+            }
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2544,14 +2624,23 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     );
                     encoder.set_buffer(2, Some(&context.parameters), 0);
                     set_u32(encoder, 3, parent_count_u32);
-                    dispatch(encoder, &context.parent_pipeline, parent_count);
+                    dispatch_with_cap(
+                        encoder,
+                        &context.parent_pipeline,
+                        parent_count,
+                        64,
+                    );
 
                     child_count = parent_count;
                 }
             }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            profile_command_buffer(
+                command_buffer,
+                "merkle_absorb",
+                (leaf_count * if batch_two { 16 } else { chunk }) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -3682,7 +3771,12 @@ impl MetalShared {
                     );
                     parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                     set_u32(parent_encoder, 3, parent_count_u32);
-                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                    dispatch_with_cap(
+                        parent_encoder,
+                        &self.parent_pipeline,
+                        parent_count,
+                        64,
+                    );
                     parent_encoder.end_encoding();
 
                     child_count = parent_count;
@@ -3946,7 +4040,12 @@ impl MetalShared {
                 );
                 parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                 set_u32(parent_encoder, 3, parent_count_u32);
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                dispatch_with_cap(
+                    parent_encoder,
+                    &self.parent_pipeline,
+                    parent_count,
+                    64,
+                );
                 parent_encoder.end_encoding();
 
                 child_count = parent_count;
@@ -4175,7 +4274,12 @@ impl MetalShared {
                     size_of::<u32>() as NSUInteger,
                     (&parent_count_u32 as *const u32).cast::<c_void>(),
                 );
-                dispatch(encoder, &self.parent_pipeline, parent_count);
+                dispatch_with_cap(
+                    encoder,
+                    &self.parent_pipeline,
+                    parent_count,
+                    64,
+                );
 
                 child_count = parent_count;
             }
@@ -4247,10 +4351,19 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_with_cap(encoder, pipeline, thread_count, 128);
+}
+
+fn dispatch_with_cap(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    cap: NSUInteger,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -4265,6 +4378,7 @@ fn dispatch(
         },
     );
 }
+
 
 /// Copies the GPU's level-order node array (leaf digests first, cap level
 /// last; 4 u64 limbs per digest) into CPU-owned [`LevelOrderDigests`] storage
@@ -6993,9 +7107,10 @@ kernel void goldilocks_mul_bench_native(
 
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
-        // 17 columns is three absorb groups with a *partial* final group, so
-        // the group that now carries the parent ladder is the short one.
-        let cols = 17;
+        // 41 columns is five absorb groups with a partial final group. This
+        // exercises one paired 16-column interior pass while keeping both
+        // generic edge passes and the parent ladder on the short final group.
+        let cols = 41;
         let cap_height = 4;
         let columns = context
             .allocate_columns::<F>(rows, cols)
@@ -7003,7 +7118,11 @@ kernel void goldilocks_mul_bench_native(
         set_exclusive_gpu_phase(true);
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
-        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
+        assert!(ABSORB_PASS_PIPELINE.get().is_some(), "absorb pipeline");
+        assert!(
+            ABSORB_PASS_16_PIPELINE.get().is_some(),
+            "paired absorb pipeline"
+        );
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
