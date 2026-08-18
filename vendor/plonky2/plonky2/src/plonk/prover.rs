@@ -1404,7 +1404,10 @@ fn start_gpu_range_check_gate_quotient<
             // existing CPU direct-accumulation evaluator instead: skipping it
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. })
+                || (common_data.degree_bits() >= 16
+                    && matches!(u32_gate, U32QuotientGate::RandomAccess { .. }))
+            {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -1614,15 +1617,30 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
-            // The transaction circuits' 67-bit exponentiation loop is the
-            // most divergent native branch in the shared Range/U32 command.
-            // Leave this one family on the existing CPU quotient evaluator:
-            // it stays out of `gate_indices`, so it is not CPU-excluded and
-            // its selector/alpha contribution remains byte-for-byte the
-            // ordinary generic path. This trades a small parallel CPU span
-            // for a shorter process-shared Metal queue tail.
-            None
+        let native = if let Some(exponentiation) =
+            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
+        {
+            // The 67-bit exponentiation loop was moved to the CPU quotient
+            // evaluator on the theory that five concurrent ranked workers
+            // contend for one Metal command queue. The ranked harness runs
+            // its workers sequentially (a plain for-loop over worker
+            // lifetimes), so the shared-queue tail that withdrawal bought
+            // does not exist; what it costs is this gate's 68 constraint
+            // rows on the serial CPU spine of both transaction shapes and
+            // the 68-row CPU scratch ceiling they pin. The Metal arm for
+            // this exact wire layout ships compiled in the prebuilt
+            // metallib (kernel kind 7) and its emissions were ranked-green
+            // when the spec was last admitted, so restoring the admission
+            // replays a proven code path, not a new one. The GPU differential
+            // gate runs the restored arm against the CPU evaluator
+            // per-constraint and passed on this tree.
+            let num_power_bits = exponentiation.num_power_bits;
+            Some((
+                U32QuotientKind::Exponentiation,
+                num_power_bits,
+                num_power_bits.checked_mul(2)?.checked_add(2)?,
+                num_power_bits.checked_add(1)?,
+            ))
         } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
             // The gate reads its single constant (the "one" value) as local
             // constant 0, i.e. the column immediately after the selector
@@ -1652,7 +1670,11 @@ fn start_gpu_range_check_gate_quotient<
         } else if let Some(reducing) =
             gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
         {
-            if D != 2 {
+            // The extension-reduction Horner fold (33 coefficients, 66
+            // constraint rows) fits under the wide shapes' pinned CPU
+            // scratch (136 wires / 68 rows) but not under the chain
+            // shape's (90 / 26), so it stays on the CPU only there.
+            if D != 2 || common_data.degree_bits() >= 16 {
                 None
             } else {
                 Some((
