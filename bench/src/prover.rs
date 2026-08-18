@@ -111,6 +111,10 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // 500-active-tx ranked fixture, so a window-depth effect is structurally
 // understated locally. Per the file's own guidance the ranked draw, not the
 // local number, settles it.
+// Ranked sweep result: window 5 drew 29.1421309958896 tx/s (submission
+// 2f036f38, rejected) against the frontier's window-6 draw of 31.1267 — the
+// shallow-depth hypothesis is not supported by the ranked draw, so restore
+// the frontier depth and re-sample the frontier tree's own distribution.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
