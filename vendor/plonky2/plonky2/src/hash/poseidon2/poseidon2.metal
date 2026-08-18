@@ -1832,3 +1832,70 @@ kernel void poseidon2_absorb_pass(
         }
     }
 }
+
+// Bottom-level parent compression fused in threadgroup shared memory: one
+// threadgroup compresses `1 << levels` child digests into one parent per
+// combine round while storing EVERY fused intermediate level in level-order,
+// so the tree stays complete for sparse Merkle path extraction. The
+// dispatcher must size the threadgroup at exactly `1 << (levels - 1)`
+// threads (128 for the 8 levels used by the tree build). Both buffers point
+// at the same base: `children` holds the fused block's child digests and
+// `parents` receives the `levels` output levels at level-order offsets
+// (level j starts at 4 * (2*C - (C >> j)), C = child_count), so the Rust
+// ladder records exactly those offsets and continues after the block.
+kernel void poseidon2_hash_parents_fused(
+    const device ulong* children [[buffer(0)]],
+    device ulong* parents [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& levels [[buffer(3)]],
+    constant uint& child_count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]],
+    uint lsize [[threads_per_threadgroup]]) {
+    // Shared frontier: two ping-pong halves of 128 digests (4 u64 limbs each).
+    constexpr ulong HALF_U64 = 128u * 4u;
+    threadgroup ulong shared[2 * 128 * 4];
+
+    const ulong C = (ulong)child_count;
+    const uint group = gid / lsize;
+    const uint local = gid % lsize;
+
+    // Level 1: every thread compresses one child pair (8 limbs) and parks the
+    // 4-limb digest in the first shared half, then stores it level-order.
+    const ulong pair = (ulong)gid * 8u;
+    ulong st[12] = { 0 };
+    for (uint i = 0; i < 8; ++i) {
+        st[i] = children[pair + (ulong)i];
+    }
+    poseidon2(st, parameters);
+    const ulong level1_row = C * 4u + (ulong)group * 128u * 4u + (ulong)local * 4u;
+    for (uint i = 0; i < 4; ++i) {
+        shared[(ulong)local * 4u + (ulong)i] = gl_canonicalize(st[i]);
+        parents[level1_row + (ulong)i] = gl_canonicalize(st[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Halve the frontier once per level, ping-ponging between the two shared
+    // halves; combine round `level` stores its parent level j = level+1 at
+    // 4 * (2*C - (C >> level)) + (group * next + local) * 4.
+    uint count = lsize;
+    for (uint level = 1u; level < levels; ++level) {
+        const uint next = count / 2u;
+        const ulong src = ((level - 1u) & 1u) == 0u ? 0u : HALF_U64;
+        const ulong dst = ((level - 1u) & 1u) == 0u ? HALF_U64 : 0u;
+        if (local < next) {
+            ulong cur[12] = { 0 };
+            for (uint i = 0; i < 8; ++i) {
+                cur[i] = shared[src + (ulong)local * 8u + (ulong)i];
+            }
+            poseidon2(cur, parameters);
+            const ulong level_start = 4u * (2u * C - (C >> (ulong)level));
+            const ulong row = (ulong)group * (ulong)next + (ulong)local;
+            for (uint i = 0; i < 4; ++i) {
+                shared[dst + (ulong)local * 4u + (ulong)i] = gl_canonicalize(cur[i]);
+                parents[level_start + row * 4u + (ulong)i] = gl_canonicalize(cur[i]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        count = next;
+    }
+}
