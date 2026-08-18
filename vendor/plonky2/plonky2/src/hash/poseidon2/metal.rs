@@ -102,15 +102,23 @@ fn profile_command_buffer(
 
 const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 
-/// `poseidon2.metal` precompiled to AIR, so a worker that cannot use the Metal
-/// shader cache does not pay the MSL front end. Regenerate whenever
-/// `poseidon2.metal` changes (see `MetalShared::new`); the
-/// `metallib_matches_shader_source` test enforces it.
+/// Exact promoted-frontier AIR library. Keep this blob byte-identical to
+/// `4d7d856`: the ranked M4 Pro binary archive is keyed to these function
+/// objects, and even recompiling unchanged kernels into a new metallib makes
+/// every archived pipeline miss.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
-/// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
+/// Current-source AIR library used only for the new optional interior-absorb
+/// pipeline. Separating it preserves all ten frontier archive hits; this one
+/// pipeline lowers in the background and the generic absorb remains available
+/// until it is ready.
+const MID8_SHADER_METALLIB: &[u8] = include_bytes!("poseidon2-mid8.metallib");
+const MID8_KERNEL: &str = "poseidon2_absorb_pass_mid8";
+
+/// SHA-256 of the `poseidon2.metal` bytes [`MID8_SHADER_METALLIB`] was built
+/// from. The primary metallib above deliberately remains the frontier blob.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "4c3daedb691d11e9e7c24a9dd5cbd8e92ca50d925cb2506ccdfcd122c301d54b";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -305,10 +313,9 @@ fn build_pipeline(
         .map_err(|error| format!("{name} pipeline creation failed: {error}"))
 }
 
-/// Every kernel the shader defines. The prebuilt library is trusted only if all
-/// of them resolve, so a stale or truncated artifact falls back to compiling the
-/// source. This deliberately includes the lazily-built gate-quotient kernels:
-/// they are absent from the eager path but must still be present in the AIR.
+/// Every kernel served by the promoted M4 Pro archive. The frontier metallib
+/// is trusted only if all of them resolve; the new mid8 specialization lives in
+/// its separate library so changing it cannot invalidate these ten entries.
 const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
@@ -358,11 +365,11 @@ const MAX_BUFFER_SETS: usize = 1;
 const MAX_DETACHED_READBACKS: usize = 2;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
-/// Reuse only the recurring transaction/chain quotient outputs. The final
-/// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
-/// peak unified-memory pressure.
+/// Reuse all three concurrently live recurring transaction/chain quotient
+/// outputs. The final block's one-off 32 MiB outputs remain uncached so the
+/// pool cannot amplify peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 3;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
@@ -584,11 +591,13 @@ fn recycle_completed_quotient_output(
     let Some(buffer) = output.take() else {
         return;
     };
-    // Allocation/recycling is an opportunistic micro-optimization. On lock
-    // contention or poisoning, drop normally instead of delaying a proof.
-    if let Ok(mut pool) = pool.try_lock() {
-        pool.recycle(buffer);
-    }
+    // The bounded pool holds at most three buffers and performs only a tiny
+    // scan/push here. Waiting through that critical section is cheaper than
+    // discarding reusable shared Metal ownership on a transient contention.
+    let mut pool = pool
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pool.recycle(buffer);
 }
 
 impl<F> Drop for PoseidonGateQuotientJob<F> {
@@ -720,12 +729,45 @@ struct ColumnStorePool {
 }
 
 const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
-const MAX_COLUMN_STORE_POOL_BYTES: u64 = 4096 << 20;
+const MAX_COLUMN_STORE_POOL_BYTES: u64 = 2560 << 20;
 
 static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {
     free: Vec::new(),
     total_bytes: 0,
 });
+
+/// Default to preserving a reusable buffer across the pool's tiny critical
+/// sections. Setting this to `try` restores the old opportunistic locking for
+/// same-binary A/B measurements.
+const COLUMN_STORE_POOL_LOCK_ENV: &str = "LIGHTER_METAL_COLUMN_STORE_POOL_LOCK";
+static BLOCK_ON_COLUMN_STORE_POOL: LazyLock<bool> = LazyLock::new(|| {
+    !std::env::var(COLUMN_STORE_POOL_LOCK_ENV)
+        .is_ok_and(|value| value.eq_ignore_ascii_case("try"))
+});
+
+/// Acquire a pool mutex according to `block_on_contention`. Blocking locks
+/// recover from poisoning: a panic cannot invalidate the pool's byte-count
+/// invariant because every mutation is performed only after all fallible
+/// operations in `take_best_fit` and `recycle`.
+fn column_store_pool_guard_with_policy<T>(
+    pool: &Mutex<T>,
+    block_on_contention: bool,
+) -> Option<std::sync::MutexGuard<'_, T>> {
+    if block_on_contention {
+        Some(
+            pool.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    } else {
+        pool.try_lock().ok()
+    }
+}
+
+fn column_store_pool_guard() -> Option<std::sync::MutexGuard<'static, ColumnStorePool>> {
+    // The `try` A/B mode deliberately retains the old miss-on-contention
+    // behavior. Production/default mode always returns a guard.
+    column_store_pool_guard_with_policy(&COLUMN_STORE_POOL, *BLOCK_ON_COLUMN_STORE_POOL)
+}
 
 impl ColumnStorePool {
     /// Smallest free buffer that fits `bytes`. The recurring shapes match
@@ -798,47 +840,15 @@ pub fn prewarm_large_column_store(bytes: u64) {
     }
 }
 
-/// Pre-sizes and pre-faults the streamed sponge's buffer pair at `leaf_count`.
-///
-/// Every streamed build before the final block is 2^19-leaf, so the pair is
-/// grown for the first time by the final block itself — 2^21 LDE rows, i.e. a
-/// 192 MiB state buffer and a ~128 MiB output buffer — and that growth lands
-/// inside the exclusive serial tail, where nothing else is running to hide the
-/// first-touch faults. This does the same job as
-/// [`prewarm_large_column_store`] for a different allocation.
-///
-/// Allocation and the page walk both happen *outside* the mutex: the lock
-/// serializes whole streamed builds, so walking hundreds of MiB under it would
-/// stall the light pipeline for the walk's duration. The lock is taken only to
-/// install, and only when the stashed pair is actually smaller, so a build that
-/// is mid-flight simply finishes first.
-///
-/// Writing zeros is semantics-preserving: a fresh `StorageModeShared` buffer is
-/// already zero-filled, and no build can observe this one until it is
-/// published, so the pair a later build takes holds exactly what a fresh
-/// allocation would have held.
-/// Pre-faulted digest-output buffers for the final block's streamed builds.
-///
-/// Each streamed build swaps a fresh output buffer in so the completed one can
-/// leave with the tree. At final-block dimensions that buffer is ~128 MiB,
-/// which is far above [`MAX_CACHED_DIGEST_OUTPUT_BYTES`], so `DigestOutputPool`
-/// will neither serve nor recycle it: all three of the block's commitments
-/// allocate and first-touch one, in the exclusive serial tail. This stash is
-/// consulted after the pool and before the allocator.
 static PREWARMED_STREAMED_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
-
-/// Number of final-block streamed commitments: wires, Zs/partial-products, and
-/// quotient.
 const PREWARMED_STREAMED_DIGEST_COUNT: usize = 3;
 
-/// Takes a pre-faulted digest replacement of at least `bytes`, if one is stashed.
 fn take_prewarmed_streamed_digest(bytes: u64) -> Option<Buffer> {
     let mut stash = PREWARMED_STREAMED_DIGESTS.lock().ok()?;
     let index = stash.iter().position(|buffer| buffer.length() >= bytes)?;
     Some(stash.swap_remove(index))
 }
 
-/// Allocates `bytes` and touches one byte per page so the faults are paid here.
 fn allocate_page_walked(device: &Device, bytes: u64) -> Option<Buffer> {
     let buffer =
         autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared));
@@ -860,19 +870,17 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
     let Some(context) = shared_context() else {
         return;
     };
-    // Size for the largest cap this leaf count can produce (`cap_count == 1`),
-    // so any real cap height leaves `needs_new` false rather than reallocating.
     let Some(state_bytes) = leaf_count
         .checked_mul(12)
-        .and_then(|v| v.checked_mul(size_of::<u64>()))
+        .and_then(|value| value.checked_mul(size_of::<u64>()))
     else {
         return;
     };
     let Some(output_bytes) = leaf_count
         .checked_mul(2)
-        .and_then(|v| v.checked_sub(1))
-        .and_then(|v| v.checked_mul(4))
-        .and_then(|v| v.checked_mul(size_of::<u64>()))
+        .and_then(|value| value.checked_sub(1))
+        .and_then(|value| value.checked_mul(4))
+        .and_then(|value| value.checked_mul(size_of::<u64>()))
     else {
         return;
     };
@@ -894,11 +902,6 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
         }
     }
 
-    // The block's three streamed commitments each swap in a fresh output
-    // buffer of this size, and the digest pool's cap rejects them, so without
-    // this they are three more first-touch allocations in the tail. Published
-    // one at a time so a block that arrives mid-walk takes whatever is ready
-    // rather than nothing.
     for _ in 0..PREWARMED_STREAMED_DIGEST_COUNT {
         let Some(buffer) = allocate_page_walked(&context.device, output_bytes) else {
             return;
@@ -911,17 +914,24 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
 }
 
 /// Returns a pooled buffer of exactly `bytes` when one is free, else a fresh
-/// device allocation. Misses (including lock contention) fall through to the
-/// allocator; the pool is a best-effort page-warm cache, never a correctness
-/// dependency.
+/// device allocation. The default lock policy waits through the pool's small
+/// bookkeeping critical section rather than turning contention into a massive
+/// fresh allocation; `LIGHTER_METAL_COLUMN_STORE_POOL_LOCK=try`
+/// restores the old opportunistic behavior for A/B measurements.
 fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
     if bytes <= MAX_CACHED_COLUMN_STORE_BYTES {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
+        if let Some(mut pool) = column_store_pool_guard() {
             if let Some(buffer) = pool.take_best_fit(bytes) {
                 return buffer;
             }
         }
-    } else if let Ok(mut slot) = PREWARMED_LARGE_STORE.try_lock() {
+    } else {
+        // The prewarmed final-block store is a single slot with a tiny critical
+        // section; contention must not turn its 2+ GiB ownership into a fresh
+        // allocation.
+        let mut slot = PREWARMED_LARGE_STORE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if slot.as_ref().is_some_and(|b| b.length() >= bytes) {
             return slot.take().expect("checked above");
         }
@@ -931,15 +941,15 @@ fn take_or_new_column_buffer(device: &Device, bytes: u64) -> Buffer {
 
 /// Owns one column-store buffer for the lifetime of all `MetalColumns`
 /// handles over it; the last handle's drop returns the buffer to the pool
-/// (same pattern as `MetalDigestInner`). `try_lock`: on contention the
-/// buffer simply drops.
+/// (same pattern as `MetalDigestInner`). Waiting here is safe: pool operations
+/// neither acquire another lock nor run code that can drop a `ColumnStoreLease`.
 struct ColumnStoreLease {
     buffer: Buffer,
 }
 
 impl Drop for ColumnStoreLease {
     fn drop(&mut self) {
-        if let Ok(mut pool) = COLUMN_STORE_POOL.try_lock() {
+        if let Some(mut pool) = column_store_pool_guard() {
             pool.recycle(self.buffer.clone());
         }
     }
@@ -1113,7 +1123,7 @@ impl QuotientOutputPool {
         Some(self.free.swap_remove(index))
     }
 
-    /// Retains at most the two largest recurring-size buffers. A larger buffer
+    /// Retains at most the three largest recurring-size buffers. A larger buffer
     /// can service every smaller quotient shape, while final-proof outputs are
     /// rejected by the size cap before they reach the cache.
     fn recycle(&mut self, buffer: Buffer) {
@@ -1184,9 +1194,13 @@ struct MetalDigestInner {
 
 impl Drop for MetalDigestInner {
     fn drop(&mut self) {
-        if let Ok(mut pool) = self.pool.try_lock() {
-            pool.recycle(self.buffer.clone());
-        }
+        // Four-entry bounded scan; retain ownership instead of converting a
+        // transient recycler race into another large shared-buffer allocation.
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pool.recycle(self.buffer.clone());
     }
 }
 
@@ -1392,24 +1406,6 @@ impl LazyPipeline {
         self.built.get()?.as_ref()
     }
 
-    /// Reports the kernel absent rather than waiting for its build.
-    ///
-    /// The reasoning in [`Self::get`] is specific to the gate-quotient
-    /// pipelines, where "absent" silently relocates gates onto the CPU
-    /// quotient. It does not hold for the streamed absorb pass, whose absence
-    /// has a complete and cheap fallback: the caller takes
-    /// `fill_lde_column_store` + `MerkleTree::new_column_store`, which is
-    /// exactly the pre-streaming behaviour and is asserted bit-identical by
-    /// this file's differentials.
-    ///
-    /// That difference matters at startup. The four optional lowerings only
-    /// start once the context is ready, and the first thing to reach the
-    /// streamed path afterwards is the embedded-blob load: both 2^19-leaf tx
-    /// blobs recompute `constants_sigmas_commitment`, and at 82 columns they
-    /// clear the `leaf_width > 64` stream admission unconditionally. Blocking
-    /// there put the slowest optional kernel's lowering directly on the
-    /// startup critical path that `bin/prove.rs` joins before proving can
-    /// begin, to save a hash the CPU can do meanwhile.
     fn try_get(&self) -> Option<&ComputePipelineState> {
         self.built.get()?.as_ref()
     }
@@ -1419,6 +1415,7 @@ static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB_PASS_MID8_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1433,24 +1430,29 @@ fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
 }
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
-    // Non-blocking on purpose; see `LazyPipeline::try_get`. Once the lowering
-    // has landed — which is every call in steady state — this is the same
-    // pointer `get` would return.
     ABSORB_PASS_PIPELINE.try_get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+fn absorb_pass_mid8_pipeline() -> Option<&'static ComputePipelineState> {
+    // Specialization is optional: arriving before its background lowering
+    // completes retains the bit-identical generic interior dispatch.
+    ABSORB_PASS_MID8_PIPELINE.try_get()
+}
+
+/// Starts the optional pipeline builds on detached threads.
 ///
 /// One thread each rather than one for both: they are the two slowest kernels
 /// in the shader, so serializing them would keep the GPU quotient path on the
 /// CPU for the sum of their lowerings instead of the larger of the two.
 ///
-/// Scheduling only. The pipelines are the same objects the blocking build
-/// produced, lowered from the same library, so nothing they later compute can
-/// differ; only the instant at which they become available does.
+/// Scheduling only. The frontier pipelines are the same objects the blocking
+/// build produced. The mid8 pipeline comes from the current-source AIR library,
+/// but is algebraically the generic interior branch with its uniform controls
+/// substituted; only the instant at which it becomes available differs.
 fn spawn_optional_pipelines(
     device: &Device,
     library: &metal::Library,
+    mid8_library: Option<&metal::Library>,
     archive: Option<&BinaryArchive>,
 ) {
     for (name, slot) in [
@@ -1466,7 +1468,6 @@ fn spawn_optional_pipelines(
         let library = library.clone();
         let archive = archive.cloned();
         let spawned = std::thread::Builder::new()
-            .name(format!("poseidon2-metal-{name}"))
             .spawn(move || {
                 let pipeline = autoreleasepool(|| {
                     build_pipeline(&device, &library, archive.as_ref(), name).ok()
@@ -1489,6 +1490,37 @@ fn spawn_optional_pipelines(
                 let _ = slot.built.set(None);
                 note_pipeline_settled();
             }
+        }
+    }
+
+    // The new pipeline comes from a separate AIR library and intentionally has
+    // no binary-archive entry. Lower it after the frontier pipelines have been
+    // launched; until it lands, `try_get` routes interior passes through the
+    // already-ready generic pipeline.
+    let Some(library) = mid8_library.cloned() else {
+        let _ = ABSORB_PASS_MID8_PIPELINE.built.set(None);
+        return;
+    };
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name(format!("poseidon2-metal-{MID8_KERNEL}"))
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                build_pipeline(&device, &library, None, MID8_KERNEL).ok()
+            });
+            if pipeline.is_none() {
+                log::debug!("mid8 absorb pipeline unavailable; using the generic pass");
+            }
+            let _ = ABSORB_PASS_MID8_PIPELINE.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = ABSORB_PASS_MID8_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = ABSORB_PASS_MID8_PIPELINE.built.set(None);
         }
     }
 }
@@ -1579,7 +1611,6 @@ fn context_ready() -> bool {
 /// is observable in a proof — the context holds compiled kernels, not values.
 pub fn prewarm() {
     std::thread::Builder::new()
-        .name("poseidon2-metal-prewarm".to_owned())
         .spawn(|| {
             // The shader compile and AIR->ISA lowering run in
             // MTLCompilerService, an XPC service that inherits the requesting
@@ -1637,29 +1668,14 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// chunk trees keep plain FIFO so the transaction pipeline is not slowed on
 /// the spine's behalf while the spine has slack. A plain unconditional
 /// priority measured both directions: the chain's predecessor waits fell but
-/// the deferred chunk trees stretched the light path — this backlog gate is
-/// the balance point.
+/// the deferred chunk trees stretched the light path. Two runnable serial
+/// steps are already a full predecessor plus successor behind: waiting for a
+/// third lets the early heavy-chain steps sit behind multiple wide chunk
+/// commitments, precisely when both paths create the most queue pressure.
+///                Triggering at two preserves plain FIFO while either path has only one step
+/// of slack, but rescues the serial spine one step earlier once it is truly
+/// behind.
 static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
-/// Lowered 3 -> 1 (any runnable chain step makes the spine urgent). The note
-/// above compared a *plain unconditional* priority against this gate and picked
-/// 3 as the balance point, but that balance was struck under the same
-/// five-concurrent-workers premise as the light-window retune, where five
-/// processes shared one physical GPU. The harness runs fixtures strictly
-/// sequentially, so the only contention on the queue is this process's own
-/// chunk trees — and that internal contention is precisely what the measured
-/// 200-320 ms fold commits (against 10-50 ms alone) are made of, so it is
-/// present on the ranked host too. With a single process on the queue, giving
-/// the strictly serial spine priority costs a deferred chunk tree much less
-/// than it saves on the chain's critical path.
-///
-/// Local same-binary interleaved ABBA, 8 pairs, direct worker, public fixture,
-/// busy host: gate 3 mean 9.313 s / min 8.959; gate 1 mean 9.154 s / min 9.044
-/// — paired mean -1.70%, gate 1 winning 6/8 pairs, gate 3 keeping the single
-/// fastest run. The paired mean is the estimator this design supports; the min
-/// of eight runs is a high-variance order statistic and is reported only for
-/// completeness. Local timing cannot settle a scheduling knob on a contended
-/// host, so this rests on the causal argument above and is submitted to be
-/// tested by the ranked draw.
 const SPINE_URGENT_BACKLOG: isize = 1;
 
 /// See [`SPINE_BACKLOG`].
@@ -2016,36 +2032,6 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
 /// width-generic integer, byte, quintic, and audited random-access gate, applies
 /// each selector filter, and reduces the shared constraint rows with the same
 /// two alpha challenges as the CPU quotient.
-/// Validated, flattened kernel inputs for one RangeCheck/U32 dispatch: the
-/// ten-word metadata records, the two challenge alpha-power rows and their
-/// stride. Shared by the single-dispatch job and the per-gate multi-dispatch
-/// job below, so both encode byte-identical arguments for identical specs.
-struct RangeQuotientDispatchArgs {
-    metadata: Vec<u32>,
-    alpha_powers: Vec<u64>,
-    alpha_stride: usize,
-}
-
-fn range_quotient_shape_ok<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    quotient_rows: usize,
-    step: usize,
-    alphas: &[F],
-) -> bool {
-    F::ORDER == 0xffff_ffff_0000_0001
-        && size_of::<F>() == size_of::<u64>()
-        && alphas.len() == 2
-        && wires.rows != 0
-        && wires.rows == constants.rows
-        && quotient_rows != 0
-        && step != 0
-        && quotient_rows.checked_mul(step) == Some(wires.rows)
-        && wires.rows <= u32::MAX as usize
-        && quotient_rows <= u32::MAX as usize
-        && step <= u32::MAX as usize
-}
-
 pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -2056,109 +2042,26 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
-    if !range_quotient_shape_ok(wires, constants, quotient_rows, step, alphas) {
-        return None;
-    }
-    let args = build_range_quotient_dispatch_args(
-        wires, constants, specs, u32_specs, alphas, alpha_offset,
-    )?;
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &args.metadata,
-        specs.len(),
-        u32_specs.len(),
-        &args.alpha_powers,
-        args.alpha_stride,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!("Metal RangeCheck gate quotient unavailable; using CPU path: {error}");
-            None
-        }
-    }
-}
+    const SPEC_WORDS: usize = 10;
+    const MAX_INLINE_BYTES: usize = 4096;
 
-/// One command buffer, one dispatch per entry of `groups`, each writing its
-/// own `quotient_rows * 2` point-major slice of a single output buffer (entry
-/// `k` occupies `[k * quotient_rows * 2, (k + 1) * quotient_rows * 2)`). Every
-/// dispatch is the unmodified `range_check_gate_quotient` kernel over the same
-/// `(quotient_rows, step)` sub-domain, so a group's slice is exactly what the
-/// single-dispatch job would have produced for those specs alone.
-pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    quotient_rows: usize,
-    step: usize,
-    groups: &[(Vec<RangeCheckQuotientSpec>, Vec<U32QuotientSpec>)],
-    alphas: &[F],
-    alpha_offset: usize,
-) -> Option<RangeCheckGateQuotientJob<F>> {
-    // The wires store may be a compact sub-domain copy while `constants` is
-    // the full-domain store: the kernel indexes both with `lde_rows =
-    // wires.rows`, so every constants read `col * wires.rows + row` stays in
-    // bounds as long as `constants.rows >= wires.rows`; the low-degree gates
-    // dispatched here read no constants (their selector load is unused).
-    if groups.is_empty()
-        || F::ORDER != 0xffff_ffff_0000_0001
+    let spec_count = specs.len().checked_add(u32_specs.len())?;
+
+    if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || alphas.len() != 2
+        || spec_count == 0
+        || spec_count
+            .checked_mul(SPEC_WORDS * size_of::<u32>())
+            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
         || wires.rows == 0
-        || constants.rows < wires.rows
+        || wires.rows != constants.rows
         || quotient_rows == 0
         || step == 0
         || quotient_rows.checked_mul(step) != Some(wires.rows)
         || wires.rows > u32::MAX as usize
         || quotient_rows > u32::MAX as usize
         || step > u32::MAX as usize
-    {
-        return None;
-    }
-    let mut dispatches = Vec::with_capacity(groups.len());
-    for (specs, u32_specs) in groups {
-        let args = build_range_quotient_dispatch_args(
-            wires, constants, specs, u32_specs, alphas, alpha_offset,
-        )?;
-        dispatches.push((args, specs.len(), u32_specs.len()));
-    }
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient_multi(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &dispatches,
-    ) {
-        Ok(job) => Some(job),
-        Err(error) => {
-            log::warn!(
-                "Metal RangeCheck gate quotient (multi) unavailable; using CPU path: {error}"
-            );
-            None
-        }
-    }
-}
-
-fn build_range_quotient_dispatch_args<F: RichField>(
-    wires: &MetalColumns<F>,
-    constants: &MetalColumns<F>,
-    specs: &[RangeCheckQuotientSpec],
-    u32_specs: &[U32QuotientSpec],
-    alphas: &[F],
-    alpha_offset: usize,
-) -> Option<RangeQuotientDispatchArgs> {
-    const SPEC_WORDS: usize = 10;
-    const MAX_INLINE_BYTES: usize = 4096;
-
-    let spec_count = specs.len().checked_add(u32_specs.len())?;
-
-    if spec_count == 0
-        || spec_count
-            .checked_mul(SPEC_WORDS * size_of::<u32>())
-            .map_or(true, |bytes| bytes > MAX_INLINE_BYTES)
     {
         return None;
     }
@@ -2429,35 +2332,21 @@ fn build_range_quotient_dispatch_args<F: RichField>(
         }
     }
 
-    Some(RangeQuotientDispatchArgs {
-        metadata,
-        alpha_powers,
-        alpha_stride,
-    })
-}
-
-/// Allocates a pooled shared column store with no Merkle-routing admission
-/// check: used for the compact even-row companion of a wires commitment that
-/// the half-domain quotient kernels read. Same buffer pool as
-/// [`allocate_columns`], so recurring shapes are recycled across proofs.
-pub(crate) fn allocate_plain_columns<F: RichField>(
-    cols: usize,
-    rows: usize,
-) -> Option<MetalColumns<F>> {
-    if F::ORDER != 0xffff_ffff_0000_0001
-        || size_of::<F>() != size_of::<u64>()
-        || cols == 0
-        || rows == 0
-        || rows > u32::MAX as usize
-        || cols > u32::MAX as usize
-    {
-        return None;
-    }
     let context = shared_context()?;
-    match context.allocate_columns(rows, cols) {
-        Ok(columns) => Some(columns),
+    match context.start_range_check_gate_quotient(
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        &metadata,
+        specs.len(),
+        u32_specs.len(),
+        &alpha_powers,
+        alpha_stride,
+    ) {
+        Ok(job) => Some(job),
         Err(error) => {
-            log::warn!("Metal companion column allocation failed: {error}");
+            log::warn!("Metal RangeCheck gate quotient unavailable; using CPU path: {error}");
             None
         }
     }
@@ -2556,6 +2445,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let context = ready_context(leaf_width, leaf_count)?;
     let pipeline = absorb_pass_pipeline()?;
+    let mid8_pipeline = absorb_pass_mid8_pipeline();
     log::debug!("streamed sponge build: {leaf_width} cols x {leaf_count} leaves");
 
     let cap_count = 1usize << cap_height;
@@ -2597,6 +2487,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
+        let middle_pipeline = (group != 0 && group + 1 != groups && chunk == 8)
+            .then_some(mid8_pipeline)
+            .flatten();
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
@@ -2609,28 +2502,33 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     )
                 })
                 .collect();
-            // Diagnostic only: the streamed CPU fill was the one large block of
-            // `compute wires commitment` not covered by any span, which left it
-            // ambiguous whether that time is CPU work or GPU queue wait.
-            #[cfg(feature = "diagnostic_profile")]
-            let _fill = crate::util::profile::span("streamed_fill", "fill_group");
             fill_group(group, &mut slices);
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            if let Some(middle_pipeline) = middle_pipeline {
+                encoder.set_compute_pipeline_state(middle_pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(&context.parameters), 0);
+                set_u32(encoder, 3, leaf_count as u32);
+                set_u32(encoder, 4, col_start as u32);
+                dispatch(encoder, middle_pipeline, leaf_count);
+            } else {
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, chunk as u32);
+                set_u32(encoder, 8, (group == 0) as u32);
+                set_u32(encoder, 9, (group == groups - 1) as u32);
+                dispatch(encoder, pipeline, leaf_count);
+            }
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2700,8 +2598,6 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take_best_fit(output_bytes as u64)
-        // Then the pre-faulted stash, which exists precisely for the sizes the
-        // pool's cap refuses (see `PREWARMED_STREAMED_DIGESTS`).
         .or_else(|| take_prewarmed_streamed_digest(output_bytes as u64))
         .unwrap_or_else(|| {
             autoreleasepool(|| {
@@ -2878,14 +2774,11 @@ impl MetalShared {
             // committed — which is what makes it viable where a build-time
             // `MTLBinaryArchive` is not.
             //
-            // Any failure falls back to compiling the source, so a runtime that
-            // rejects this AIR version behaves exactly as before. The function
-            // probe is what makes the fallback safe against a STALE artifact:
-            // regenerate with
-            //   xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air
-            //   xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib
-            // and `metallib_matches_shader_source` fails the test run if you
-            // forget.
+            // Any failure falls back to compiling the full source, so a runtime
+            // that rejects this AIR version behaves exactly as before. The
+            // primary artifact is deliberately pinned byte-for-byte to the
+            // promoted frontier; source freshness is enforced on the separate
+            // mid8 artifact by `metallib_matches_shader_source`.
             let library = device
                 .new_library_with_data(SHADER_METALLIB)
                 .ok()
@@ -2928,6 +2821,18 @@ impl MetalShared {
             // archive still loads and then misses silently; on a miss the archive
             // is dropped and every path below is exactly what it was.
             let _ = PIPELINE_PHASE_START.set(std::time::Instant::now());
+            let mid8_library = device
+                .new_library_with_data(MID8_SHADER_METALLIB)
+                .ok()
+                .filter(|library| library.get_function(MID8_KERNEL, None).is_ok())
+                // If the primary artifact was unavailable and the full source
+                // fallback compiled, it already contains the specialization.
+                .or_else(|| {
+                    library
+                        .get_function(MID8_KERNEL, None)
+                        .ok()
+                        .map(|_| library.clone())
+                });
             let archive = load_pipeline_archive(&device).filter(|archive| {
                 let serves = archive_serves(&device, &library, archive);
                 ARCHIVE_STATE.store(
@@ -3029,7 +2934,12 @@ impl MetalShared {
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
-            spawn_optional_pipelines(&device, &library, archive.as_ref());
+            spawn_optional_pipelines(
+                &device,
+                &library,
+                mid8_library.as_ref(),
+                archive.as_ref(),
+            );
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3088,10 +2998,12 @@ impl MetalShared {
 
     fn acquire_quotient_output(&self, bytes: u64) -> Buffer {
         if bytes <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
-            if let Ok(mut pool) = self.quotient_output_pool.try_lock() {
-                if let Some(buffer) = pool.take_best_fit(bytes) {
-                    return buffer;
-                }
+            let mut pool = self
+                .quotient_output_pool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(buffer) = pool.take_best_fit(bytes) {
+                return buffer;
             }
         }
         autoreleasepool(|| {
@@ -3237,90 +3149,6 @@ impl MetalShared {
             }
             observer
         });
-        Ok(RangeCheckGateQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            #[cfg(test)]
-            failure_observer,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
-    }
-
-    /// Multi-dispatch twin of `start_range_check_gate_quotient`: `dispatches[k]`
-    /// runs the same kernel with its own metadata/alpha rows and writes rows
-    /// `[k * quotient_rows, (k + 1) * quotient_rows)` (point-major, two
-    /// challenge words per row) of one shared output buffer. All dispatches
-    /// are encoded in one command buffer, so `finish` waits once.
-    fn start_range_check_gate_quotient_multi<F: RichField>(
-        &self,
-        wires: &MetalColumns<F>,
-        constants: &MetalColumns<F>,
-        quotient_rows: usize,
-        step: usize,
-        dispatches: &[(RangeQuotientDispatchArgs, usize, usize)],
-    ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        for (args, range_count, u32_count) in dispatches {
-            if args.metadata.len() != (range_count + u32_count) * 10
-                || args.alpha_powers.len() != args.alpha_stride * 2
-            {
-                return Err("invalid RangeCheck quotient metadata".to_string());
-            }
-        }
-        let slice_len = quotient_rows
-            .checked_mul(2)
-            .ok_or("RangeCheck gate quotient output length overflow")?;
-        let len = slice_len
-            .checked_mul(dispatches.len())
-            .ok_or("RangeCheck gate quotient output length overflow")?;
-        let bytes = len
-            .checked_mul(size_of::<u64>())
-            .ok_or("RangeCheck gate quotient output size overflow")?;
-        let slice_bytes = slice_len * size_of::<u64>();
-        let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            for (k, (args, range_count, u32_count)) in dispatches.iter().enumerate() {
-                encoder.set_buffer(2, Some(&output), (k * slice_bytes) as NSUInteger);
-                encoder.set_bytes(
-                    3,
-                    size_of_val(args.alpha_powers.as_slice()) as NSUInteger,
-                    args.alpha_powers.as_ptr().cast::<c_void>(),
-                );
-                encoder.set_bytes(
-                    4,
-                    size_of_val(args.metadata.as_slice()) as NSUInteger,
-                    args.metadata.as_ptr().cast::<c_void>(),
-                );
-                set_u32(encoder, 8, args.alpha_stride as u32);
-                set_u32(encoder, 9, *range_count as u32);
-                set_u32(encoder, 10, *u32_count as u32);
-                dispatch(encoder, pipeline, quotient_rows);
-            }
-            encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "range_u32_quotient_split",
-                (quotient_rows * dispatches.len()) as u64,
-            );
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-        #[cfg(test)]
-        let failure_observer = None;
         Ok(RangeCheckGateQuotientJob {
             command_buffer,
             output: Some(output),
@@ -4568,11 +4396,75 @@ mod tests {
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
+    #[test]
+    fn column_store_pool_lock_policy_waits_or_misses_as_requested() {
+        let pool = Arc::new(Mutex::new(()));
+        let held = pool.lock().unwrap();
+
+        // This is the old A/B policy: contention is an immediate cache miss.
+        assert!(column_store_pool_guard_with_policy(&pool, false).is_none());
+
+        // The default policy must wait, then acquire the same mutex after its
+        // current tiny critical section completes.
+        let worker_pool = Arc::clone(&pool);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _guard = column_store_pool_guard_with_policy(&worker_pool, true).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(held);
+        acquired_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn column_store_pool_blocking_lock_recovers_poison() {
+        let pool = Arc::new(Mutex::new(()));
+        let poisoner_pool = Arc::clone(&pool);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = poisoner_pool.lock().unwrap();
+                panic!("poison test mutex");
+            })
+            .join()
+            .is_err()
+        );
+        assert!(column_store_pool_guard_with_policy(&pool, true).is_some());
+    }
+
+    #[test]
+    fn column_store_pool_reuses_buffer_ownership() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let buffer = autoreleasepool(|| {
+            device.new_buffer(4096, MTLResourceOptions::StorageModeShared)
+        });
+        let contents = buffer.contents();
+        let length = buffer.length();
+        let mut pool = ColumnStorePool {
+            free: Vec::new(),
+            total_bytes: 0,
+        };
+        pool.recycle(buffer);
+        assert_eq!(pool.total_bytes, length);
+        assert_eq!(pool.free.len(), 1);
+
+        let reused = pool.take_best_fit(length).unwrap();
+        assert_eq!(reused.contents(), contents);
+        assert_eq!(pool.total_bytes, 0);
+        assert!(pool.free.is_empty());
+    }
+
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
     /// this pins the source bytes: edit `poseidon2.metal` without regenerating
-    /// `poseidon2.metallib` and this fails loudly instead of silently proving
-    /// with stale kernels.
+    /// `poseidon2-mid8.metallib` and this fails loudly instead of silently
+    /// proving with stale kernels.
     #[test]
     fn metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
@@ -4585,9 +4477,9 @@ mod tests {
         let digest = digest.split_whitespace().next().expect("empty shasum output");
         assert_eq!(
             digest, SHADER_SOURCE_SHA256,
-            "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
+            "poseidon2.metal changed but poseidon2-mid8.metallib was not regenerated. Run:\n  \
              xcrun -sdk macosx metal -c poseidon2.metal -o poseidon2.air\n  \
-             xcrun -sdk macosx metallib poseidon2.air -o poseidon2.metallib\n\
+             xcrun -sdk macosx metallib poseidon2.air -o poseidon2-mid8.metallib\n\
              then update SHADER_SOURCE_SHA256 to {digest}."
         );
     }
@@ -4606,9 +4498,16 @@ mod tests {
         for name in METALLIB_REQUIRED_KERNELS {
             assert!(
                 library.get_function(name, None).is_ok(),
-                "prebuilt metallib is missing kernel {name}"
+                "frontier metallib is missing kernel {name}"
             );
         }
+        let mid8_library = device
+            .new_library_with_data(MID8_SHADER_METALLIB)
+            .expect("mid8 metallib must load");
+        assert!(
+            mid8_library.get_function(MID8_KERNEL, None).is_ok(),
+            "mid8 metallib is missing its specialized kernel"
+        );
     }
 
     /// Opens the committed archive from a scratch copy, exactly as
@@ -4740,10 +4639,12 @@ mod tests {
         assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
         let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
         lengths.sort_unstable();
-        assert_eq!(lengths, vec![4 * mib, 8 * mib]);
+        assert_eq!(lengths, vec![2 * mib, 4 * mib, 8 * mib]);
 
         let four = pool.take_best_fit(3 * mib).expect("4 MiB best fit");
         assert_eq!(four.length(), 4 * mib);
+        let two = pool.take_best_fit(1).expect("2 MiB best fit");
+        assert_eq!(two.length(), 2 * mib);
         let eight = pool.take_best_fit(1).expect("remaining 8 MiB buffer");
         assert_eq!(eight.length(), 8 * mib);
         assert!(pool.take_best_fit(1).is_none());
@@ -7214,7 +7115,14 @@ kernel void goldilocks_mul_bench_native(
         set_exclusive_gpu_phase(true);
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
-        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
+        // Force both optional pipelines ready so this differential is not
+        // scheduler-racy when run alone; production intentionally uses
+        // nonblocking `try_get` and falls back to the generic pass.
+        assert!(ABSORB_PASS_PIPELINE.get().is_some(), "absorb pipeline");
+        assert!(
+            ABSORB_PASS_MID8_PIPELINE.get().is_some(),
+            "mid8 absorb pipeline"
+        );
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
@@ -7461,36 +7369,6 @@ kernel void goldilocks_mul_bench_native(
                     "Merkle path mismatch vs CPU at leaf {leaf}, level {level}"
                 );
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod occupancy_probe {
-    use super::*;
-
-    /// Diagnostic: reports per-kernel occupancy limits. `max_total_threads_per_threadgroup`
-    /// is the observable proxy for register pressure on Apple GPUs — a kernel that spills
-    /// or holds a large live set reports a lower ceiling than the 1024 an unconstrained
-    /// kernel gets. Ignored by default: device-specific, reports rather than asserts.
-    #[test]
-    #[ignore = "device-specific occupancy report"]
-    fn report_pipeline_occupancy() {
-        let device = Device::system_default().expect("metal device");
-        let library = device
-            .new_library_with_data(SHADER_METALLIB)
-            .expect("metallib loads");
-        for name in METALLIB_REQUIRED_KERNELS {
-            let function = library.get_function(name, None).expect(name);
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .expect("pipeline");
-            println!(
-                "{name}: max_threads={} exec_width={} tg_mem={}",
-                pipeline.max_total_threads_per_threadgroup(),
-                pipeline.thread_execution_width(),
-                pipeline.static_threadgroup_memory_length(),
-            );
         }
     }
 }
