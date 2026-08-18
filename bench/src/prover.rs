@@ -1,7 +1,7 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use circuit::block::Block;
@@ -260,16 +260,89 @@ impl ChainState<'_> {
     }
 }
 
+/// Seed the proof-independent half of a recursive chain step, recording the
+/// fixed target/representative topology once per heavy/light path and replaying
+/// it for later steps.
+///
+/// The late cyclic-proof feed intentionally stays on `feed_seeded`: unlike a
+/// fresh partition, it must account for generators that expired during the
+/// early phase, so the start-layout's aggregate watcher decrements cannot be
+/// reused there.
 #[allow(clippy::too_many_arguments)]
-fn chain_step_proof(
+fn start_early_chain_witness<'a>(
+    chain_target: &BlockTxChainTarget,
+    chain_data: &'a CircuitData<F, C, D>,
+    chain_step: u64,
+    dummy_proof: &Proof,
+    tx_proof: &Proof,
+    early_chain_layout: &std::sync::OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+    early_chain_layout_disabled: &AtomicBool,
+) -> anyhow::Result<PendingPartitionWitness<'a, F, C, D>> {
+    let seed = |seeder: &mut plonky2::iop::generator::PartitionSeeder<'a, '_, F>| {
+        BlockTxChainCircuit::witness_inputs_early_into(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            seeder,
+        )
+    };
+
+    // A typed applicability failure retires replay for this path. The writer is
+    // pure (it only copies the supplied proof/scalar values), so retrying it on
+    // a fresh witness is safe; every other writer/worklist error propagates and
+    // is never rerun. Atomic state avoids putting a lock around generator work:
+    // racing first steps may both record, but both recordings are ordinary,
+    // fully checked starts and only one immutable layout is published.
+    if !early_chain_layout_disabled.load(Ordering::Acquire) {
+        if let Some(layout) = early_chain_layout.get() {
+            match PendingPartitionWitness::start_seeded_with_layout(
+                &chain_data.prover_only,
+                &chain_data.common,
+                layout,
+                seed,
+            ) {
+                Err(error) if is_seed_layout_mismatch(&error) => {
+                    early_chain_layout_disabled.store(true, Ordering::Release);
+                    PendingPartitionWitness::start_seeded(
+                        &chain_data.prover_only,
+                        &chain_data.common,
+                        seed,
+                    )
+                }
+                result => result,
+            }
+        } else {
+            PendingPartitionWitness::start_seeded_recording(
+                &chain_data.prover_only,
+                &chain_data.common,
+                seed,
+            )
+            .map(|(pending, layout)| {
+                // Losing an initialization race is harmless: this pending
+                // witness was produced by the checked recording path itself.
+                let _ = early_chain_layout.set(layout);
+                pending
+            })
+        }
+    } else {
+        PendingPartitionWitness::start_seeded(&chain_data.prover_only, &chain_data.common, seed)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chain_step_proof<'a>(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
-    chain_data: &CircuitData<F, C, D>,
+    chain_data: &'a CircuitData<F, C, D>,
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    early_chain_layout: &std::sync::OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+    early_chain_layout_disabled: &AtomicBool,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -285,19 +358,14 @@ fn chain_step_proof(
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
         // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
+        let mut pending = start_early_chain_witness(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            early_chain_layout,
+            early_chain_layout_disabled,
         )?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
@@ -551,9 +619,17 @@ fn prove_path(
     );
     jump = next_jump;
 
-
+    // Each `prove_path` owns one topology instance, so heavy and light never
+    // share layouts even though their chain threads run concurrently. These
+    // owners sit outside the thread scope so every scoped borrow outlives its
+    // worker by construction.
+    let early_chain_layout_storage = std::sync::OnceLock::new();
+    let early_chain_layout_disabled_storage = AtomicBool::new(false);
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
+        // Copyable shared references can be captured by every scoped step.
+        let early_chain_layout = &early_chain_layout_storage;
+        let early_chain_layout_disabled = &early_chain_layout_disabled_storage;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -582,6 +658,8 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            early_chain_layout,
+                            early_chain_layout_disabled,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -676,6 +754,8 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        early_chain_layout,
+                        early_chain_layout_disabled,
                     )
                 })
                 .expect("chain step pipeline thread must start");
@@ -735,6 +815,8 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        early_chain_layout,
+                        early_chain_layout_disabled,
                     )
                 })
                 .expect("chain drain thread must start");
@@ -1363,6 +1445,242 @@ mod tests {
         }
     }
 
+    /// Production-topology oracle for the recursive-chain early writer. This
+    /// deliberately proves one transaction chunk per path so the recursive
+    /// verifier generators see a real proof, then differentially compares a
+    /// recorded start, a second replayed start, the generic start path, and the
+    /// exact production helper. Run explicitly because producing both real tx
+    /// proofs is substantially heavier than a unit test.
+    #[test]
+    #[ignore = "proves heavy and light transaction chunks for a chain-layout differential"]
+    fn production_chain_early_seed_layout_heavy_light_differential() {
+        // Embedded circuit loading and witness rounds use the global pool; give
+        // its workers the same circuit-safe stack as production.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build_global();
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(production_chain_early_seed_layout_heavy_light_differential_impl)
+            .expect("chain seed-layout component thread must start")
+            .join()
+            .expect("chain seed-layout component thread must finish");
+    }
+
+    fn production_chain_early_seed_layout_heavy_light_differential_impl() {
+        let block = Block::<F>::from_json_with_empty_txs(
+            include_bytes!("../bench_test.json"),
+            HEAVY_TX_PER_PROOF,
+            LIGHT_TX_PER_PROOF,
+            PUBLIC_HEAVY_TX_COUNT,
+            PUBLIC_LIGHT_TX_COUNT,
+        )
+        .expect("public fixture must parse");
+        let mut state_metadata = block.state_metadata.clone();
+        if block.calculate_funding {
+            state_metadata.last_funding_round_timestamp = block.created_at;
+        }
+        if block.calculate_oracle_prices {
+            state_metadata.last_oracle_price_timestamp = block.created_at;
+        }
+        if block.calculate_premium {
+            state_metadata.last_premium_timestamp = block.created_at;
+        }
+        let state_metadata_hash = state_metadata.hash();
+        let circuits = Circuits::load();
+
+        for path in [TxPath::Heavy, TxPath::Light] {
+            let tx_data_guard = match path {
+                TxPath::Heavy => circuits.heavy_tx_data.read().unwrap(),
+                TxPath::Light => circuits.light_tx_data.read().unwrap(),
+            };
+            let chain_data_guard = match path {
+                TxPath::Heavy => circuits.heavy_chain_data.read().unwrap(),
+                TxPath::Light => circuits.light_chain_data.read().unwrap(),
+            };
+            let (tx_target, chain_target, dummy_proof) = match path {
+                TxPath::Heavy => (
+                    &circuits.heavy_tx_target,
+                    &circuits.heavy_chain_target,
+                    &circuits.dummy_heavy_proof,
+                ),
+                TxPath::Light => (
+                    &circuits.light_tx_target,
+                    &circuits.light_chain_target,
+                    &circuits.dummy_light_proof,
+                ),
+            };
+            let txs = block
+                .tx_chunks
+                .iter()
+                .find(|txs| chunk_is_light(txs) == (path == TxPath::Light))
+                .expect("fixture must contain each transaction path")
+                .clone();
+            let old_state_root = txs[0].old_state_root;
+            let old_validium_root = txs[0].old_validium_root;
+            let old_account_delta_tree_root = txs[0].old_account_delta_tree_root;
+            let initial_jump = JumpState::initial(old_state_root, old_account_delta_tree_root);
+            let mut tx_layout = None;
+            let (tx_witness, _) = generate_tx_witness(
+                path,
+                0,
+                txs,
+                &tx_data_guard,
+                tx_target,
+                block.created_at,
+                state_metadata_hash,
+                initial_jump,
+                &mut tx_layout,
+            );
+            let tx_proof = prove_tx_witness(path, 0, &tx_data_guard, tx_witness);
+            let base_proof = cyclic_base_witness(
+                dummy_proof,
+                block.block_number,
+                block.created_at,
+                old_state_root,
+                old_validium_root,
+                old_account_delta_tree_root,
+            );
+
+            macro_rules! finish {
+                ($pending:expr $(,)?) => {{
+                    let mut pending = $pending;
+                    pending
+                        .feed_seeded(|feeder| {
+                            BlockTxChainCircuit::witness_inputs_cyclic_into(
+                                chain_target,
+                                &base_proof,
+                                feeder,
+                            )
+                        })
+                        .expect("cyclic input feed must succeed");
+                    pending.finish().expect("chain witness must finish")
+                }};
+            }
+            let seed = |step, seeder: &mut plonky2::iop::generator::PartitionSeeder<'_, '_, F>| {
+                BlockTxChainCircuit::witness_inputs_early_into(
+                    chain_target,
+                    &chain_data_guard,
+                    step,
+                    dummy_proof,
+                    &tx_proof,
+                    seeder,
+                )
+            };
+
+            let (recorded_pending, layout) = PendingPartitionWitness::start_seeded_recording(
+                &chain_data_guard.prover_only,
+                &chain_data_guard.common,
+                |seeder| seed(0, seeder),
+            )
+            .expect("first chain step must record");
+            let recorded = finish!(recorded_pending);
+            let first_plain = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("first generic chain start must succeed"),
+            );
+            let first_plain_repeat = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("repeated generic chain start must succeed"),
+            );
+            assert_seeded_witness_matches_plain(
+                &recorded,
+                &first_plain,
+                &first_plain_repeat,
+                &chain_data_guard,
+            );
+
+            let replayed = finish!(
+                PendingPartitionWitness::start_seeded_with_layout(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    &layout,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("second chain start must replay"),
+            );
+            let second_plain = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("second generic chain start must succeed"),
+            );
+            let second_plain_repeat = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("repeated second generic chain start must succeed"),
+            );
+            assert_seeded_witness_matches_plain(
+                &replayed,
+                &second_plain,
+                &second_plain_repeat,
+                &chain_data_guard,
+            );
+
+            // Exercise the published-once production route for both its record
+            // and replay branches. The cyclic phase remains the ordinary feed.
+            let production_layout = std::sync::OnceLock::new();
+            let production_disabled = AtomicBool::new(false);
+            let production_first = finish!(
+                start_early_chain_witness(
+                    chain_target,
+                    &chain_data_guard,
+                    0,
+                    dummy_proof,
+                    &tx_proof,
+                    &production_layout,
+                    &production_disabled,
+                )
+                .expect("production first chain start must succeed"),
+            );
+            assert!(production_layout.get().is_some());
+            assert_seeded_witness_matches_plain(
+                &production_first,
+                &first_plain,
+                &first_plain_repeat,
+                &chain_data_guard,
+            );
+            let production_second = finish!(
+                start_early_chain_witness(
+                    chain_target,
+                    &chain_data_guard,
+                    0,
+                    dummy_proof,
+                    &tx_proof,
+                    &production_layout,
+                    &production_disabled,
+                )
+                .expect("production second chain start must succeed"),
+            );
+            assert!(!production_disabled.load(Ordering::Acquire));
+            assert_seeded_witness_matches_plain(
+                &production_second,
+                &second_plain,
+                &second_plain_repeat,
+                &chain_data_guard,
+            );
+
+            println!(
+                "CHAIN_EARLY_SEED_LAYOUT_CENSUS path={path:?} target_writes={} changed_generators={}",
+                layout.target_write_count(),
+                layout.changed_generator_count(),
+            );
+        }
+    }
+
     #[cfg(feature = "diagnostic_profile")]
     #[test]
     fn profile_path_context_names_are_stable() {
@@ -1581,6 +1899,8 @@ mod tests {
             old_delta_root,
         );
 
+        let early_chain_layout = std::sync::OnceLock::new();
+        let early_chain_layout_disabled = AtomicBool::new(false);
         let mut previous: Option<Proof> = None;
         for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
@@ -1661,6 +1981,8 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                &early_chain_layout,
+                &early_chain_layout_disabled,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);

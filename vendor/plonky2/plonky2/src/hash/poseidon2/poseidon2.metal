@@ -1832,3 +1832,35 @@ kernel void poseidon2_absorb_pass(
         }
     }
 }
+
+// Every steady-state interior streamed pass absorbs exactly eight columns,
+// starts from parked state, and parks the result again. Making those uniform
+// controls structural removes two unused branches, the dynamic absorb bound,
+// and the unused digest-output binding from the dominant leaf queue.
+kernel void poseidon2_absorb_pass_mid8(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_count [[buffer(3)]],
+    constant uint& col_start [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12];
+    for (uint i = 0; i < 12; ++i) {
+        st[i] = state[(ulong)i * leaf_count + gid];
+    }
+    st[0] = gl_canonicalize(leaves[(ulong)(col_start + 0u) * leaf_count + gid]);
+    st[1] = gl_canonicalize(leaves[(ulong)(col_start + 1u) * leaf_count + gid]);
+    st[2] = gl_canonicalize(leaves[(ulong)(col_start + 2u) * leaf_count + gid]);
+    st[3] = gl_canonicalize(leaves[(ulong)(col_start + 3u) * leaf_count + gid]);
+    st[4] = gl_canonicalize(leaves[(ulong)(col_start + 4u) * leaf_count + gid]);
+    st[5] = gl_canonicalize(leaves[(ulong)(col_start + 5u) * leaf_count + gid]);
+    st[6] = gl_canonicalize(leaves[(ulong)(col_start + 6u) * leaf_count + gid]);
+    st[7] = gl_canonicalize(leaves[(ulong)(col_start + 7u) * leaf_count + gid]);
+    poseidon2(st, parameters);
+    for (uint i = 0; i < 12; ++i) {
+        state[(ulong)i * leaf_count + gid] = st[i];
+    }
+}

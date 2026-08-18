@@ -31,8 +31,8 @@ use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
-    eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
-    VanishingScratch,
+    deferred_alpha_reduction_enabled, eval_vanishing_poly_base_batch, gate_constraint_alpha_powers,
+    get_lut_poly, interleave_pair_plan, PermutationBatch, VanishingScratch,
 };
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
@@ -2074,6 +2074,13 @@ fn compute_quotient_polys<
         .max()
         .unwrap_or(0);
     debug_assert!(cpu_num_gate_constraints <= common_data.num_gate_constraints);
+    // The same challenge powers feed every 32-point quotient batch. Build the
+    // challenge-major table once per proof, outside the parallel batch loop.
+    let gate_alpha_power_stride = cpu_num_gate_constraints;
+    let gate_alpha_powers = gate_constraint_alpha_powers(alphas, gate_alpha_power_stride);
+    // Runtime A/B selection is likewise fixed once per proof and passed into
+    // the hot loop. `=0` selects current Horner in this exact executable.
+    let enable_deferred_alpha_reduction = deferred_alpha_reduction_enabled();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     if gpu_poseidon_quotient_diagnostics_enabled() && !excluded_gate_indices.is_empty() {
         eprintln!(
@@ -2231,11 +2238,10 @@ fn compute_quotient_polys<
                 } else {
                     (BatchLayout::PointMajor, 0..zs_row_width, 0..zs_row_width)
                 };
-                wires_commitment.fill_lde_batch(
+                wires_commitment.fill_lde_batch_quotient_wires(
                     &scratch.indices,
                     step,
                     0..cpu_num_wires,
-                    BatchLayout::PolyMajor,
                     &mut scratch.local_wires,
                 );
                 zs_partial_products_and_lookup_commitment.fill_lde_batch(
@@ -2346,6 +2352,9 @@ fn compute_quotient_polys<
                     beta_k_is,
                     deltas,
                     alphas,
+                    &gate_alpha_powers,
+                    gate_alpha_power_stride,
+                    enable_deferred_alpha_reduction,
                     &cpu_gate_indices,
                     cpu_num_gate_constraints,
                     interleave_pair.as_ref(),

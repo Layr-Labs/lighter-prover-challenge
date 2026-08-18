@@ -509,6 +509,235 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     }
 }
 
+pub(crate) fn gate_constraint_alpha_powers<F: Field>(alphas: &[F], num_rows: usize) -> Vec<F> {
+    let mut powers = Vec::with_capacity(alphas.len() * num_rows);
+    for &alpha in alphas {
+        let mut power = F::ONE;
+        for _ in 0..num_rows {
+            powers.push(power);
+            power *= alpha;
+        }
+    }
+    powers
+}
+
+/// Runtime A/B switch for the ranked reducer. Both settings select code in the
+/// same executable; set `PLONKY2_DEFERRED_ALPHA_REDUCTION=0` to retain Horner.
+/// The default is enabled on the AArch64/std build where the specialization is
+/// available. The decision is made once per process and passed into every
+/// quotient batch, so the hot reducer does not inspect the environment.
+pub(crate) fn deferred_alpha_reduction_enabled() -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("PLONKY2_DEFERRED_ALPHA_REDUCTION")
+                .map(|value| value != "0")
+                .unwrap_or(true)
+        })
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+const MAX_DEFERRED_ALPHA_ROWS: usize = 136;
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Copy, Clone, Default)]
+struct DeferredProductSum {
+    /// Low 128 bits of the exact unsigned product sum.
+    low: u128,
+    /// Carry count above bit 127. For at most 136 products this is at most 135.
+    top: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DeferredProductSum {
+    #[inline(always)]
+    fn add_wide(&mut self, product: u128) {
+        let (low, carry) = self.low.overflowing_add(product);
+        self.low = low;
+        self.top += carry as u64;
+    }
+
+    #[inline(always)]
+    fn add_product(&mut self, lhs: u64, rhs: u64) {
+        self.add_wide((lhs as u128) * (rhs as u128));
+    }
+
+    #[inline(always)]
+    fn materialize(self, products: usize) -> crate::field::goldilocks_field::GoldilocksField {
+        use crate::field::goldilocks_field::GoldilocksField;
+
+        debug_assert!(products > 0);
+        debug_assert!(products <= MAX_DEFERRED_ALPHA_ROWS);
+        // Every raw product is below 2^128, hence the exact sum is below
+        // products * 2^128 and its carry count is at most products - 1.
+        debug_assert!(self.top < products as u64);
+        debug_assert!(self.top <= (MAX_DEFERRED_ALPHA_ROWS - 1) as u64);
+
+        // For p = 2^64 - 2^32 + 1, 2^128 == -2^32 (mod p). Reduce the
+        // low 128 bits once and subtract the bounded high correction. Since
+        // top <= 135, `top << 32` is canonical and cannot overflow u64.
+        GoldilocksField::from_noncanonical_u128(self.low)
+            - GoldilocksField::from_canonical_u64(self.top << 32)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn deferred_dot_two_points_two_alphas(
+    terms: &mut [crate::field::goldilocks_field::GoldilocksField],
+    batch_size: usize,
+    point_0: usize,
+    point_1: usize,
+    powers_0: &[crate::field::goldilocks_field::GoldilocksField],
+    powers_1: &[crate::field::goldilocks_field::GoldilocksField],
+    clear_as_consumed: bool,
+) -> [[crate::field::goldilocks_field::GoldilocksField; 2]; 2] {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    debug_assert!(point_0 < point_1);
+    debug_assert!(point_1 < batch_size);
+    debug_assert_eq!(powers_0.len(), powers_1.len());
+    let mut acc_00 = DeferredProductSum::default();
+    let mut acc_01 = DeferredProductSum::default();
+    let mut acc_10 = DeferredProductSum::default();
+    let mut acc_11 = DeferredProductSum::default();
+    let terms_ptr = terms.as_mut_ptr();
+    let mut offset = 0;
+    for (&power_0, &power_1) in powers_0.iter().zip(powers_1) {
+        // SAFETY: `offset` selects a valid row and the two distinct point
+        // indices are below `batch_size`. Each slot is visited by exactly one
+        // point pair during the outer traversal.
+        let (term_0, term_1) = unsafe {
+            let slot_0 = terms_ptr.add(offset + point_0);
+            let slot_1 = terms_ptr.add(offset + point_1);
+            let values = ((*slot_0).0, (*slot_1).0);
+            if clear_as_consumed {
+                *slot_0 = GoldilocksField::ZERO;
+                *slot_1 = GoldilocksField::ZERO;
+            }
+            values
+        };
+        let power_0 = power_0.0;
+        let power_1 = power_1.0;
+        // Spell out all four widening products before either carry chain so
+        // the M4 scheduler can issue independent mul/umulh pairs together.
+        let product_00 = (term_0 as u128) * (power_0 as u128);
+        let product_01 = (term_0 as u128) * (power_1 as u128);
+        let product_10 = (term_1 as u128) * (power_0 as u128);
+        let product_11 = (term_1 as u128) * (power_1 as u128);
+        acc_00.add_wide(product_00);
+        acc_01.add_wide(product_01);
+        acc_10.add_wide(product_10);
+        acc_11.add_wide(product_11);
+        offset += batch_size;
+    }
+    let products = powers_0.len();
+    [
+        [acc_00.materialize(products), acc_01.materialize(products)],
+        [acc_10.materialize(products), acc_11.materialize(products)],
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn deferred_dot_one_point_two_alphas(
+    terms: &mut [crate::field::goldilocks_field::GoldilocksField],
+    batch_size: usize,
+    point: usize,
+    powers_0: &[crate::field::goldilocks_field::GoldilocksField],
+    powers_1: &[crate::field::goldilocks_field::GoldilocksField],
+    clear_as_consumed: bool,
+) -> [crate::field::goldilocks_field::GoldilocksField; 2] {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    debug_assert!(point < batch_size);
+    debug_assert_eq!(powers_0.len(), powers_1.len());
+    let mut acc_0 = DeferredProductSum::default();
+    let mut acc_1 = DeferredProductSum::default();
+    let terms_ptr = terms.as_mut_ptr();
+    let mut offset = 0;
+    for (&power_0, &power_1) in powers_0.iter().zip(powers_1) {
+        // SAFETY: `offset` selects a valid row and `point < batch_size`.
+        let term = unsafe {
+            let slot = terms_ptr.add(offset + point);
+            let value = (*slot).0;
+            if clear_as_consumed {
+                *slot = GoldilocksField::ZERO;
+            }
+            value
+        };
+        acc_0.add_product(term, power_0.0);
+        acc_1.add_product(term, power_1.0);
+        offset += batch_size;
+    }
+    let products = powers_0.len();
+    [acc_0.materialize(products), acc_1.materialize(products)]
+}
+
+/// Exact Goldilocks dot product for the production two-alpha/zero-seed shape.
+/// Alpha powers are challenge-major and are built once by the proof caller.
+#[cfg(target_arch = "aarch64")]
+fn reduce_gate_constraints_deferred_goldilocks_two_alpha(
+    constraint_terms_batch: &mut [crate::field::goldilocks_field::GoldilocksField],
+    batch_size: usize,
+    alpha_powers: &[crate::field::goldilocks_field::GoldilocksField],
+    alpha_power_stride: usize,
+    res_out: &mut [crate::field::goldilocks_field::GoldilocksField],
+    clear_as_consumed: bool,
+) {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    let num_rows = constraint_terms_batch.len() / batch_size;
+    debug_assert!(num_rows <= MAX_DEFERRED_ALPHA_ROWS);
+    debug_assert!(alpha_power_stride >= num_rows);
+    debug_assert!(alpha_powers.len() >= alpha_power_stride + num_rows);
+    debug_assert_eq!(res_out.len(), batch_size * 2);
+    if num_rows == 0 {
+        res_out.fill(GoldilocksField::ZERO);
+        return;
+    }
+
+    let powers_0 = &alpha_powers[..num_rows];
+    let powers_1 = &alpha_powers[alpha_power_stride..alpha_power_stride + num_rows];
+    // A two-point kernel keeps four independent 192-bit accumulators live
+    // without the spills caused by holding a complete eight-point tile.
+    let mut point = 0;
+    while point + 1 < batch_size {
+        let pair = deferred_dot_two_points_two_alphas(
+            constraint_terms_batch,
+            batch_size,
+            point,
+            point + 1,
+            powers_0,
+            powers_1,
+            clear_as_consumed,
+        );
+        res_out[2 * point] = pair[0][0];
+        res_out[2 * point + 1] = pair[0][1];
+        res_out[2 * point + 2] = pair[1][0];
+        res_out[2 * point + 3] = pair[1][1];
+        point += 2;
+    }
+    if point < batch_size {
+        let tail = deferred_dot_one_point_two_alphas(
+            constraint_terms_batch,
+            batch_size,
+            point,
+            powers_0,
+            powers_1,
+            clear_as_consumed,
+        );
+        res_out[2 * point] = tail[0];
+        res_out[2 * point + 1] = tail[1];
+    }
+}
+
 /// Reduces the per-row constraint terms into `res_out`.
 ///
 /// `clear_as_consumed` zeroes each term as it is read. Every element is read
@@ -521,14 +750,83 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &mut [F],
     batch_size: usize,
     alphas: &[F],
+    alpha_powers: &[F],
+    alpha_power_stride: usize,
     res_out: &mut [F],
     res_out_is_zero_seed: bool,
     clear_as_consumed: bool,
+    enable_deferred: bool,
 ) {
     debug_assert!(batch_size > 0);
     debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
     debug_assert_eq!(res_out.len(), batch_size * alphas.len());
+    let num_rows = constraint_terms_batch.len() / batch_size;
+    debug_assert!(alpha_power_stride >= num_rows);
+    debug_assert!(
+        alphas.is_empty()
+            || alpha_powers.len() >= (alphas.len() - 1) * alpha_power_stride + num_rows
+    );
 
+    // The TypeId equality proves all three casts have exactly the Goldilocks
+    // element type and layout. All unsupported fields/shapes keep the current
+    // Horner implementation and its raw-limb behavior.
+    #[cfg(target_arch = "aarch64")]
+    if enable_deferred
+        && res_out_is_zero_seed
+        && alphas.len() == 2
+        && num_rows <= MAX_DEFERRED_ALPHA_ROWS
+        && core::any::TypeId::of::<F>()
+            == core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+    {
+        unsafe {
+            let terms = core::slice::from_raw_parts_mut(
+                constraint_terms_batch
+                    .as_mut_ptr()
+                    .cast::<crate::field::goldilocks_field::GoldilocksField>(),
+                constraint_terms_batch.len(),
+            );
+            let powers = core::slice::from_raw_parts(
+                alpha_powers
+                    .as_ptr()
+                    .cast::<crate::field::goldilocks_field::GoldilocksField>(),
+                alpha_powers.len(),
+            );
+            let output = core::slice::from_raw_parts_mut(
+                res_out
+                    .as_mut_ptr()
+                    .cast::<crate::field::goldilocks_field::GoldilocksField>(),
+                res_out.len(),
+            );
+            reduce_gate_constraints_deferred_goldilocks_two_alpha(
+                terms,
+                batch_size,
+                powers,
+                alpha_power_stride,
+                output,
+                clear_as_consumed,
+            );
+        }
+        return;
+    }
+
+    reduce_gate_constraints_base_batch_horner(
+        constraint_terms_batch,
+        batch_size,
+        alphas,
+        res_out,
+        res_out_is_zero_seed,
+        clear_as_consumed,
+    );
+}
+
+fn reduce_gate_constraints_base_batch_horner<F: Field>(
+    constraint_terms_batch: &mut [F],
+    batch_size: usize,
+    alphas: &[F],
+    res_out: &mut [F],
+    res_out_is_zero_seed: bool,
+    clear_as_consumed: bool,
+) {
     // When `res_out` is known to be an all-zero (or uninitialized) seed, the
     // first reversed row can be *assigned* rather than accumulated: with
     // `*value == F::ZERO`, `term.multiply_accumulate(ZERO, alpha)` is
@@ -633,6 +931,9 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
+    gate_alpha_powers: &[F],
+    gate_alpha_power_stride: usize,
+    enable_deferred_alpha_reduction: bool,
     cpu_gate_indices: &[usize],
     cpu_num_gate_constraints: usize,
     interleave_pair: Option<&InterleavePairPlan>,
@@ -682,7 +983,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true, true);
+    reduce_gate_constraints_base_batch(
+        constraint_terms_batch,
+        n,
+        alphas,
+        gate_alpha_powers,
+        gate_alpha_power_stride,
+        res_out,
+        true,
+        true,
+        enable_deferred_alpha_reduction,
+    );
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -1868,7 +2179,18 @@ mod tests {
             F::from_canonical_u64(6),
             F::from_canonical_u64(6),
         ];
-        reduce_gate_constraints_base_batch(&mut terms, 2, &alphas, &mut actual, false, false);
+        let alpha_powers = gate_constraint_alpha_powers(&alphas, 2);
+        reduce_gate_constraints_base_batch(
+            &mut terms,
+            2,
+            &alphas,
+            &alpha_powers,
+            2,
+            &mut actual,
+            false,
+            false,
+            false,
+        );
         assert_eq!(actual[0], F::from_canonical_u64(91));
         assert_eq!(actual[2], F::from_canonical_u64(116));
 
@@ -1892,7 +2214,18 @@ mod tests {
             }
 
             let mut actual = initial;
-            reduce_gate_constraints_base_batch(&mut terms, batch_size, &alphas, &mut actual, false, false);
+            let alpha_powers = gate_constraint_alpha_powers(&alphas, num_constraints);
+            reduce_gate_constraints_base_batch(
+                &mut terms,
+                batch_size,
+                &alphas,
+                &alpha_powers,
+                num_constraints,
+                &mut actual,
+                false,
+                false,
+                false,
+            );
             assert_eq!(actual, expected, "batch size {batch_size}");
         }
     }
@@ -2227,11 +2560,16 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut expected_reduction = initial_reduction.clone();
             let mut actual_reduction = initial_reduction;
+            let num_rows = expected_rows.len() / batch_size;
+            let alpha_powers = gate_constraint_alpha_powers(&alphas, num_rows);
             reduce_gate_constraints_base_batch(
                 &mut expected_rows,
                 batch_size,
                 &alphas,
+                &alpha_powers,
+                num_rows,
                 &mut expected_reduction,
+                false,
                 false,
                 false,
             );
@@ -2239,7 +2577,10 @@ mod tests {
                 &mut actual_rows,
                 batch_size,
                 &alphas,
+                &alpha_powers,
+                num_rows,
                 &mut actual_reduction,
+                false,
                 false,
                 false,
             );
@@ -2298,13 +2639,17 @@ mod tests {
                     }
                     let mut narrowed = full[..m * batch_size].to_vec();
 
+                    let alpha_powers = gate_constraint_alpha_powers(&alphas, k);
                     let mut expected = vec![F::ZERO; batch_size * alphas.len()];
                     reduce_gate_constraints_base_batch(
                         &mut full,
                         batch_size,
                         &alphas,
+                        &alpha_powers,
+                        k,
                         &mut expected,
                         true,
+                        false,
                         false,
                     );
                     let mut actual = vec![F::ZERO; batch_size * alphas.len()];
@@ -2312,8 +2657,11 @@ mod tests {
                         &mut narrowed,
                         batch_size,
                         &alphas,
+                        &alpha_powers,
+                        k,
                         &mut actual,
                         true,
+                        false,
                         false,
                     );
 
@@ -2325,6 +2673,290 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn deferred_product_materialization_handles_maximum_bounded_carry() {
+        type F = GoldilocksField;
+
+        let mut deferred = DeferredProductSum::default();
+        let factor = u64::MAX;
+        let mut expected = F::ZERO;
+        for _ in 0..MAX_DEFERRED_ALPHA_ROWS {
+            deferred.add_product(factor, factor);
+            expected += GoldilocksField(factor) * GoldilocksField(factor);
+        }
+        assert_eq!(deferred.top, 135, "maximum 136-product carry bound");
+        assert_eq!(
+            deferred
+                .materialize(MAX_DEFERRED_ALPHA_ROWS)
+                .to_canonical_u64(),
+            expected.to_canonical_u64(),
+        );
+    }
+
+    /// Exact candidate-vs-current differential in one executable. It covers
+    /// full-range raw limbs, arithmetic boundaries, actual 68/136 row shapes,
+    /// odd batch tails, a wider precomputed-power stride, both scratch-clear
+    /// modes, and the nonzero-seed fallback.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn deferred_two_alpha_matches_horner_canonically_and_preserves_clear_contract() {
+        type F = GoldilocksField;
+        const EDGES: &[u64] = &[
+            0,
+            1,
+            2,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0000,
+            0xffff_ffff_0000_0001,
+            0xffff_ffff_0000_0002,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            GoldilocksField(state)
+        };
+        let raw_words = |values: &[F]| values.iter().map(|value| value.0).collect::<Vec<_>>();
+        let canonical = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>()
+        };
+
+        for rows in [0usize, 1, 2, 10, 68, 135, 136] {
+            for batch_size in [1usize, 2, 7, 8, 9, 31, 32, 33] {
+                for random_inputs in [false, true] {
+                    let terms = (0..rows * batch_size)
+                        .map(|i| {
+                            if random_inputs {
+                                random()
+                            } else {
+                                GoldilocksField(EDGES[(i * 7 + rows + batch_size) % EDGES.len()])
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let alphas = if random_inputs {
+                        [random(), random()]
+                    } else {
+                        [
+                            GoldilocksField(EDGES[(rows + batch_size) % EDGES.len()]),
+                            GoldilocksField(EDGES[(3 * rows + batch_size + 1) % EDGES.len()]),
+                        ]
+                    };
+                    // Production uses stride == rows. A padded stride proves
+                    // challenge-major slicing does not accidentally use the
+                    // candidate's shorter live row count as a column offset.
+                    let power_stride = rows + 3;
+                    let alpha_powers = gate_constraint_alpha_powers(&alphas, power_stride);
+                    let dirty_output = (0..2 * batch_size)
+                        .map(|i| {
+                            if random_inputs {
+                                random()
+                            } else {
+                                GoldilocksField(EDGES[(5 * i + rows + batch_size) % EDGES.len()])
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
+                    for clear_as_consumed in [false, true] {
+                        let mut horner_terms = terms.clone();
+                        let mut horner_output = dirty_output.clone();
+                        reduce_gate_constraints_base_batch(
+                            &mut horner_terms,
+                            batch_size,
+                            &alphas,
+                            &alpha_powers,
+                            power_stride,
+                            &mut horner_output,
+                            true,
+                            clear_as_consumed,
+                            false,
+                        );
+
+                        let mut deferred_terms = terms.clone();
+                        let mut deferred_output = dirty_output.clone();
+                        reduce_gate_constraints_base_batch(
+                            &mut deferred_terms,
+                            batch_size,
+                            &alphas,
+                            &alpha_powers,
+                            power_stride,
+                            &mut deferred_output,
+                            true,
+                            clear_as_consumed,
+                            true,
+                        );
+
+                        assert_eq!(
+                            canonical(&deferred_output),
+                            canonical(&horner_output),
+                            "zero-seed mismatch rows={rows}, batch={batch_size}, random={random_inputs}, clear={clear_as_consumed}",
+                        );
+                        if clear_as_consumed {
+                            assert!(
+                                horner_terms.iter().all(|value| value.0 == 0)
+                                    && deferred_terms.iter().all(|value| value.0 == 0),
+                                "scratch not cleared rows={rows}, batch={batch_size}",
+                            );
+                        } else {
+                            assert_eq!(raw_words(&horner_terms), raw_words(&terms));
+                            assert_eq!(raw_words(&deferred_terms), raw_words(&terms));
+                        }
+                    }
+
+                    // The deferred bound assumes a zero seed. The enabled arm
+                    // must fall back to current Horner and remain raw-identical
+                    // when a caller supplies a running accumulator.
+                    let mut horner_terms = terms.clone();
+                    let mut horner_output = dirty_output.clone();
+                    reduce_gate_constraints_base_batch(
+                        &mut horner_terms,
+                        batch_size,
+                        &alphas,
+                        &alpha_powers,
+                        power_stride,
+                        &mut horner_output,
+                        false,
+                        false,
+                        false,
+                    );
+                    let mut toggled_terms = terms.clone();
+                    let mut toggled_output = dirty_output.clone();
+                    reduce_gate_constraints_base_batch(
+                        &mut toggled_terms,
+                        batch_size,
+                        &alphas,
+                        &alpha_powers,
+                        power_stride,
+                        &mut toggled_output,
+                        false,
+                        false,
+                        true,
+                    );
+                    assert_eq!(raw_words(&toggled_output), raw_words(&horner_output));
+                    assert_eq!(raw_words(&toggled_terms), raw_words(&horner_terms));
+                }
+            }
+        }
+    }
+
+    /// Focused gate before any full-proof timing. Both arms are compiled into
+    /// and invoked by this one test binary. The measured call includes current
+    /// `clear_as_consumed` stores and an identical scratch refill in each arm.
+    #[test]
+    #[ignore = "focused serialized M4 reducer benchmark; run only after timing permission"]
+    #[cfg(target_arch = "aarch64")]
+    fn deferred_two_alpha_reducer_microbench_requires_32_percent() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        type F = GoldilocksField;
+        const BATCH_SIZE: usize = 32;
+        const SAMPLES: usize = 9;
+
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+
+        for rows in [68usize, 136] {
+            let iterations = if rows == 68 { 8_000 } else { 4_000 };
+            let source = (0..rows * BATCH_SIZE)
+                .map(|i| {
+                    GoldilocksField(
+                        0x9e37_79b9_7f4a_7c15u64
+                            .wrapping_mul((i as u64).wrapping_add(1))
+                            .rotate_left((i % 61) as u32),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let alphas = [
+                GoldilocksField(0xd1b5_4a32_d192_ed03),
+                GoldilocksField(0xa24b_aed4_963e_e407),
+            ];
+            let alpha_powers = gate_constraint_alpha_powers(&alphas, rows);
+
+            let run_horner = || {
+                let mut terms = source.clone();
+                let mut output = vec![F::ZERO; BATCH_SIZE * 2];
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    terms.copy_from_slice(black_box(&source));
+                    reduce_gate_constraints_base_batch_horner(
+                        black_box(&mut terms),
+                        BATCH_SIZE,
+                        black_box(&alphas),
+                        black_box(&mut output),
+                        true,
+                        true,
+                    );
+                }
+                let seconds = start.elapsed().as_secs_f64() / iterations as f64;
+                black_box((terms, output));
+                seconds
+            };
+            let run_deferred = || {
+                let mut terms = source.clone();
+                let mut output = vec![F::ZERO; BATCH_SIZE * 2];
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    terms.copy_from_slice(black_box(&source));
+                    reduce_gate_constraints_base_batch(
+                        black_box(&mut terms),
+                        BATCH_SIZE,
+                        black_box(&alphas),
+                        black_box(&alpha_powers),
+                        rows,
+                        black_box(&mut output),
+                        true,
+                        true,
+                        true,
+                    );
+                }
+                let seconds = start.elapsed().as_secs_f64() / iterations as f64;
+                black_box((terms, output));
+                seconds
+            };
+
+            black_box(run_horner());
+            black_box(run_deferred());
+            let mut horner_samples = Vec::with_capacity(SAMPLES);
+            let mut deferred_samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..SAMPLES {
+                if sample % 2 == 0 {
+                    horner_samples.push(run_horner());
+                    deferred_samples.push(run_deferred());
+                } else {
+                    deferred_samples.push(run_deferred());
+                    horner_samples.push(run_horner());
+                }
+            }
+            let horner_median = median(&horner_samples);
+            let deferred_median = median(&deferred_samples);
+            let saving = (horner_median - deferred_median) / horner_median;
+            println!(
+                "rows={rows} ns/call median: Horner {:.1}; deferred {:.1}; saving {:.2}%",
+                horner_median * 1e9,
+                deferred_median * 1e9,
+                saving * 100.0,
+            );
+            assert!(
+                saving >= 0.32,
+                "deferred reducer gate rejected at rows={rows}: {:.2}% < 32%",
+                saving * 100.0,
+            );
         }
     }
 }

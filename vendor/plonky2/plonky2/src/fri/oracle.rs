@@ -40,6 +40,141 @@ pub const SALT_SIZE: usize = 4;
 /// trees (`new_columns`) remain on.
 const GPU_NTT_COMMITMENTS: bool = false;
 
+/// Setting this environment variable disables only the fixed 32-row AArch64
+/// contiguous-copy kernel. It is intentionally a runtime switch so focused
+/// A/Bs compare the same binary; every other gather path is identical.
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+const DISABLE_LDE_GATHER_32_ENV: &str = "PLONKY2_DISABLE_LDE_GATHER_32";
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn lde_gather_32_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var_os(DISABLE_LDE_GATHER_32_ENV).is_none())
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+/// Copies exactly 32 eight-byte values (256 bytes). Four register-pair loads
+/// and stores are issued at a time so only the caller-saved SIMD registers
+/// q0-q7 are clobbered. The kernel is exactly eight `ldp q` and eight `stp q`
+/// instructions with no ABI save/restore spills.
+///
+/// # Safety
+/// `src` and `dst` must each be valid for 256 bytes, initialized on the source
+/// side, writable on the destination side, and non-overlapping.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn copy_32x8_aarch64(dst: *mut u8, src: *const u8) {
+    // SAFETY: upheld by the caller. AArch64 SIMD loads/stores permit unaligned
+    // addresses, which matters for a nonzero starting LDE row. `prfm` is a
+    // non-faulting hint and may name the first byte after the final batch.
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{src}, #256]",
+            "prfm pldl1keep, [{src}, #384]",
+            "ldp q0, q1, [{src}, #0]",
+            "ldp q2, q3, [{src}, #32]",
+            "ldp q4, q5, [{src}, #64]",
+            "ldp q6, q7, [{src}, #96]",
+            "stp q0, q1, [{dst}, #0]",
+            "stp q2, q3, [{dst}, #32]",
+            "stp q4, q5, [{dst}, #64]",
+            "stp q6, q7, [{dst}, #96]",
+            "ldp q0, q1, [{src}, #128]",
+            "ldp q2, q3, [{src}, #160]",
+            "ldp q4, q5, [{src}, #192]",
+            "ldp q6, q7, [{src}, #224]",
+            "stp q0, q1, [{dst}, #128]",
+            "stp q2, q3, [{dst}, #160]",
+            "stp q4, q5, [{dst}, #192]",
+            "stp q6, q7, [{dst}, #224]",
+            src = in(reg) src,
+            dst = in(reg) dst,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+/// Shared Metal columns occupy one flat column-major allocation, so the fixed
+/// copy can keep the column-stride loop in the same assembly block. Each loop
+/// iteration remains exactly the audited eight `ldp q` plus eight `stp q`.
+///
+/// # Safety
+/// `src` must name `columns` readable 256-byte regions separated by
+/// `src_stride`; `dst` must name `columns * 256` writable bytes. The regions
+/// must not overlap and `columns` must be nonzero.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn copy_shared_columns_32x8_aarch64(
+    dst: *mut u8,
+    src: *const u8,
+    src_stride: usize,
+    columns: usize,
+) {
+    debug_assert_ne!(columns, 0);
+    // SAFETY: upheld by the caller; q0-q7 and the inout GPRs are caller-saved.
+    // The next-column/next-batch `prfm` operands are non-faulting hints and may
+    // name the first cache line after the last requested region.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "add {next_src}, {src}, {src_stride}",
+            "prfm pldl1keep, [{next_src}, #0]",
+            "prfm pldl1keep, [{next_src}, #128]",
+            "prfm pldl1keep, [{src}, #256]",
+            "prfm pldl1keep, [{src}, #384]",
+            "ldp q0, q1, [{src}, #0]",
+            "ldp q2, q3, [{src}, #32]",
+            "ldp q4, q5, [{src}, #64]",
+            "ldp q6, q7, [{src}, #96]",
+            "stp q0, q1, [{dst}, #0]",
+            "stp q2, q3, [{dst}, #32]",
+            "stp q4, q5, [{dst}, #64]",
+            "stp q6, q7, [{dst}, #96]",
+            "ldp q0, q1, [{src}, #128]",
+            "ldp q2, q3, [{src}, #160]",
+            "ldp q4, q5, [{src}, #192]",
+            "ldp q6, q7, [{src}, #224]",
+            "stp q0, q1, [{dst}, #128]",
+            "stp q2, q3, [{dst}, #160]",
+            "stp q4, q5, [{dst}, #192]",
+            "stp q6, q7, [{dst}, #224]",
+            "mov {src}, {next_src}",
+            "add {dst}, {dst}, #256",
+            "subs {columns}, {columns}, #1",
+            "b.ne 2b",
+            src = inout(reg) src => _,
+            dst = inout(reg) dst => _,
+            columns = inout(reg) columns => _,
+            src_stride = in(reg) src_stride,
+            next_src = out(reg) _,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("v6") _,
+            out("v7") _,
+            options(nostack),
+        );
+    }
+}
+
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BatchLayout {
@@ -476,6 +611,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         }
     }
 
+    /// Quotient-wire gather with an explicit production invariant. The caller
+    /// constructs `indices` as one ascending batch. For a full 32-point batch
+    /// at stride one, use that guarantee directly instead of rescanning all 32
+    /// indices; short final batches and every other stride retain the generic
+    /// gather byte-for-byte.
+    pub(crate) fn fill_lde_batch_quotient_wires(
+        &self,
+        indices: &[usize],
+        step: usize,
+        col_range: core::ops::Range<usize>,
+        out: &mut Vec<F>,
+    ) {
+        #[cfg(target_arch = "aarch64")]
+        if lde_gather_32_enabled() && step == 1 && indices.len() == 32 {
+            self.fill_lde_batch_contiguous(indices[0], 32, col_range, out);
+            return;
+        }
+        self.fill_lde_batch(indices, step, col_range, BatchLayout::PolyMajor, out);
+    }
+
     /// Copies consecutive LDE points into a PolyMajor output buffer.
     ///
     /// Column-backed commitments use one contiguous slice copy per column,
@@ -488,6 +643,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         col_range: core::ops::Range<usize>,
         out: &mut Vec<F>,
     ) {
+        #[cfg(target_arch = "aarch64")]
+        let use_kernel = lde_gather_32_enabled();
+        #[cfg(not(target_arch = "aarch64"))]
+        let use_kernel = false;
+        self.fill_lde_batch_contiguous_impl(index_start, n, col_range, out, use_kernel);
+    }
+
+    fn fill_lde_batch_contiguous_impl(
+        &self,
+        index_start: usize,
+        n: usize,
+        col_range: core::ops::Range<usize>,
+        out: &mut Vec<F>,
+        use_kernel: bool,
+    ) {
         let start = col_range.start;
         let w = col_range.len();
         out.resize(n * w, F::ZERO);
@@ -497,6 +667,52 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let index_end = index_start
                     .checked_add(n)
                     .expect("contiguous LDE batch range overflow");
+
+                #[cfg(target_arch = "aarch64")]
+                if use_kernel && n == 32 && core::mem::size_of::<F>() == 8 {
+                    #[cfg(all(feature = "std", target_os = "macos"))]
+                    if let ColumnStore::Shared(shared) = columns {
+                        if w != 0 {
+                            assert!(
+                                col_range.end <= shared.cols(),
+                                "contiguous LDE column range out of bounds",
+                            );
+                            let source =
+                                &shared.col(col_range.start)[index_start..index_end];
+                            // SAFETY: Shared columns are one flat column-major
+                            // allocation with exactly `rows` elements between
+                            // column starts; the assertion proves all `w` exist.
+                            // `out` has `w * 32` initialized,
+                            // writable elements and cannot alias `self`.
+                            unsafe {
+                                copy_shared_columns_32x8_aarch64(
+                                    out.as_mut_ptr().cast::<u8>(),
+                                    source.as_ptr().cast::<u8>(),
+                                    shared.rows() * core::mem::size_of::<F>(),
+                                    w,
+                                );
+                            }
+                        }
+                        return;
+                    }
+
+                    for (ci, c) in col_range.clone().enumerate() {
+                        let source = &columns.col(c)[index_start..index_end];
+                        let destination = &mut out[ci * 32..(ci + 1) * 32];
+                        // SAFETY: both slices contain exactly 32 initialized
+                        // eight-byte values and come from disjoint allocations
+                        // (`self` versus the caller's mutable scratch buffer).
+                        unsafe {
+                            copy_32x8_aarch64(
+                                destination.as_mut_ptr().cast::<u8>(),
+                                source.as_ptr().cast::<u8>(),
+                            );
+                        }
+                    }
+                    return;
+                }
+
+                let _ = use_kernel;
                 for (ci, c) in col_range.enumerate() {
                     out[ci * n..(ci + 1) * n]
                         .copy_from_slice(&columns.col(c)[index_start..index_end]);
@@ -985,6 +1201,8 @@ fn accumulate_linear_quotient<F: Field>(
 mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    #[cfg(target_arch = "aarch64")]
+    use crate::field::types::Field64;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
 
@@ -1089,6 +1307,370 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn raw_bytes<T>(values: &[T]) -> &[u8] {
+        // SAFETY: the byte view covers exactly the initialized slice and does
+        // not outlive it. Tests only compare the bytes; they never mutate them.
+        unsafe {
+            core::slice::from_raw_parts(
+                values.as_ptr().cast::<u8>(),
+                core::mem::size_of_val(values),
+            )
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn raw_owned_batch(
+        width: usize,
+        rows: usize,
+    ) -> PolynomialBatch<GoldilocksField, Poseidon2GoldilocksConfig, 2> {
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let special = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        let columns = (0..width)
+            .map(|column| {
+                (0..rows)
+                    .map(|row| {
+                        let i = column * rows + row;
+                        GoldilocksField(if i % 9 < special.len() {
+                            special[i % 9]
+                        } else {
+                            (i as u64)
+                                .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                                .rotate_left((column & 63) as u32)
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut merkle_tree = MerkleTree::default();
+        merkle_tree.leaves = MerkleLeaves::Columns {
+            columns: ColumnStore::Owned(columns),
+            log_rows: log2_strict(rows),
+        };
+        merkle_tree.num_leaves = rows;
+        PolynomialBatch::<F, C, 2> {
+            polynomials: Vec::new(),
+            merkle_tree,
+            degree_log: log2_strict(rows),
+            rate_bits: 0,
+            blinding: false,
+        }
+    }
+
+    /// The forced-on and forced-off arms run in the same test binary. They must
+    /// preserve every raw byte, including noncanonical Goldilocks words, from
+    /// an unaligned nonzero start and a nonzero column subrange in Owned storage.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn contiguous_lde_gather_32_owned_raw_start_subrange() {
+        type F = GoldilocksField;
+
+        let batch = raw_owned_batch(9, 128);
+        let start = 37;
+        let range = 2..8;
+        let mut expected = Vec::new();
+        let MerkleLeaves::Columns { columns, .. } = &batch.merkle_tree.leaves else {
+            unreachable!()
+        };
+        for column in range.clone() {
+            expected.extend_from_slice(&columns.col(column)[start..start + 32]);
+        }
+
+        let poison = GoldilocksField(0xdead_beef_cafe_babe);
+        let mut legacy = vec![poison; expected.len()];
+        let mut kernel = legacy.clone();
+        batch.fill_lde_batch_contiguous_impl(start, 32, range.clone(), &mut legacy, false);
+        batch.fill_lde_batch_contiguous_impl(start, 32, range, &mut kernel, true);
+
+        assert_eq!(raw_bytes(&legacy), raw_bytes(&expected));
+        assert_eq!(raw_bytes(&kernel), raw_bytes(&expected));
+        assert_eq!(raw_bytes(&kernel), raw_bytes(&legacy));
+        assert!(kernel.iter().any(|value| value.0 >= F::ORDER));
+    }
+
+    /// The quotient-only entry may skip the index scan only for its guaranteed
+    /// stride-one/full-batch shape. Its short-batch and non-unit-stride arms,
+    /// plus row-backed storage, stay on the old gather and remain raw-identical.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn quotient_wire_gather_direct_and_fallbacks_raw() {
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let batch = raw_owned_batch(7, 128);
+        let range = 1..6;
+        for (indices, step) in [
+            ((19..51).collect::<Vec<_>>(), 1usize),
+            ((3..34).collect::<Vec<_>>(), 1),
+            ((0..32).collect::<Vec<_>>(), 2),
+        ] {
+            let mut expected = Vec::new();
+            let mut actual = Vec::new();
+            batch.fill_lde_batch(
+                &indices,
+                step,
+                range.clone(),
+                BatchLayout::PolyMajor,
+                &mut expected,
+            );
+            batch.fill_lde_batch_quotient_wires(
+                &indices,
+                step,
+                range.clone(),
+                &mut actual,
+            );
+            assert_eq!(raw_bytes(&actual), raw_bytes(&expected));
+        }
+
+        let width = range.len();
+        let rows = 128;
+        let row_words = (0..rows * width)
+            .map(|i| GoldilocksField((i as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)))
+            .collect::<Vec<_>>();
+        let mut merkle_tree = MerkleTree::default();
+        merkle_tree.leaves = MerkleLeaves::Rows {
+            data: row_words,
+            width,
+        };
+        merkle_tree.num_leaves = rows;
+        let row_batch = PolynomialBatch::<F, C, 2> {
+            polynomials: Vec::new(),
+            merkle_tree,
+            degree_log: log2_strict(rows),
+            rate_bits: 0,
+            blinding: false,
+        };
+        let mut legacy = Vec::new();
+        let mut forced = Vec::new();
+        row_batch.fill_lde_batch_contiguous_impl(11, 32, 0..width, &mut legacy, false);
+        row_batch.fill_lde_batch_contiguous_impl(11, 32, 0..width, &mut forced, true);
+        assert_eq!(raw_bytes(&forced), raw_bytes(&legacy));
+    }
+
+    /// Shared Metal columns expose the same ordinary slice contract as Owned
+    /// columns. Exercise the identical unaligned start/subrange byte copy from
+    /// an actual StorageModeShared backing allocation.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn contiguous_lde_gather_32_shared_raw_start_subrange() {
+        use crate::hash::poseidon2::metal;
+
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+        const WIDTH: usize = 136;
+        const ROWS: usize = 1 << 12;
+
+        // This shape clears the exclusive-phase allocation admission threshold.
+        metal::set_exclusive_gpu_phase(true);
+        let mut shared = None;
+        for _ in 0..3 {
+            shared = metal::allocate_columns::<F>(WIDTH, ROWS, 0);
+            if shared.is_some() {
+                break;
+            }
+        }
+        metal::set_exclusive_gpu_phase(false);
+        let Some(mut shared) = shared else {
+            return; // No Metal device: Shared storage is unreachable on this host.
+        };
+        {
+            let mut columns = shared.columns_mut().expect("fresh shared handle is unique");
+            for (column, destination) in columns.iter_mut().enumerate() {
+                for (row, value) in destination.iter_mut().enumerate() {
+                    let i = column * ROWS + row;
+                    *value = GoldilocksField(match i % 7 {
+                        0 => F::ORDER,
+                        1 => F::ORDER + 1,
+                        2 => u64::MAX,
+                        _ => (i as u64).wrapping_mul(0xa076_1d64_78bd_642f),
+                    });
+                }
+            }
+        }
+
+        let mut merkle_tree = MerkleTree::default();
+        merkle_tree.leaves = MerkleLeaves::Columns {
+            columns: ColumnStore::Shared(shared),
+            log_rows: log2_strict(ROWS),
+        };
+        merkle_tree.num_leaves = ROWS;
+        let batch = PolynomialBatch::<F, C, 2> {
+            polynomials: Vec::new(),
+            merkle_tree,
+            degree_log: log2_strict(ROWS),
+            rate_bits: 0,
+            blinding: false,
+        };
+        let start = 29;
+        let range = 73..81;
+        let mut legacy = Vec::new();
+        let mut kernel = Vec::new();
+        batch.fill_lde_batch_contiguous_impl(start, 32, range.clone(), &mut legacy, false);
+        batch.fill_lde_batch_contiguous_impl(start, 32, range, &mut kernel, true);
+        assert_eq!(raw_bytes(&kernel), raw_bytes(&legacy));
+        assert!(kernel.iter().any(|value| value.0 >= F::ORDER));
+    }
+
+    /// The fixed Shared path must reject a safe-API range past the final
+    /// column before entering the unchecked assembly loop.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[should_panic(expected = "contiguous LDE column range out of bounds")]
+    fn contiguous_lde_gather_32_shared_rejects_invalid_range() {
+        use crate::hash::poseidon2::metal;
+
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+        const WIDTH: usize = 136;
+        const ROWS: usize = 1 << 12;
+
+        metal::set_exclusive_gpu_phase(true);
+        let mut shared = None;
+        for _ in 0..3 {
+            shared = metal::allocate_columns::<F>(WIDTH, ROWS, 0);
+            if shared.is_some() {
+                break;
+            }
+        }
+        metal::set_exclusive_gpu_phase(false);
+        let mut shared = shared.expect("Shared storage requires a Metal device");
+        for column in shared
+            .columns_mut()
+            .expect("fresh shared handle is unique")
+            .iter_mut()
+        {
+            column.fill(GoldilocksField(0));
+        }
+
+        let mut merkle_tree = MerkleTree::default();
+        merkle_tree.leaves = MerkleLeaves::Columns {
+            columns: ColumnStore::Shared(shared),
+            log_rows: log2_strict(ROWS),
+        };
+        merkle_tree.num_leaves = ROWS;
+        let batch = PolynomialBatch::<F, C, 2> {
+            polynomials: Vec::new(),
+            merkle_tree,
+            degree_log: log2_strict(ROWS),
+            rate_bits: 0,
+            blinding: false,
+        };
+        let mut output = Vec::new();
+        batch.fill_lde_batch_contiguous_impl(0, 32, 0..WIDTH + 1, &mut output, true);
+    }
+
+    /// Focused production-shape gate for the fixed contiguous-copy kernel.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    #[ignore]
+    fn bench_contiguous_lde_gather_32_136_by_2pow19() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        use crate::hash::poseidon2::metal;
+
+        const WIDTH: usize = 136;
+        const ROWS: usize = 1 << 19;
+        const ALTERNATIONS: usize = 30;
+
+        let mut shared = None;
+        for _ in 0..3 {
+            shared = metal::allocate_columns::<GoldilocksField>(WIDTH, ROWS, 0);
+            if shared.is_some() {
+                break;
+            }
+        }
+        let mut shared = shared.expect("focused gate requires production Shared columns");
+        for (column, destination) in shared
+            .columns_mut()
+            .expect("fresh shared handle is unique")
+            .iter_mut()
+            .enumerate()
+        {
+            destination.fill(GoldilocksField(
+                (column as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            ));
+        }
+        let mut merkle_tree = MerkleTree::default();
+        merkle_tree.leaves = MerkleLeaves::Columns {
+            columns: ColumnStore::Shared(shared),
+            log_rows: log2_strict(ROWS),
+        };
+        merkle_tree.num_leaves = ROWS;
+        let batch = PolynomialBatch::<GoldilocksField, Poseidon2GoldilocksConfig, 2> {
+            polynomials: Vec::new(),
+            merkle_tree,
+            degree_log: log2_strict(ROWS),
+            rate_bits: 0,
+            blinding: false,
+        };
+        let all_indices = (0..ROWS).collect::<Vec<_>>();
+        let mut output = Vec::with_capacity(WIDTH * 32);
+        let mut run = |use_kernel: bool| {
+            let started = Instant::now();
+            for start in (0..ROWS).step_by(32) {
+                let indices = &all_indices[start..start + 32];
+                if !use_kernel {
+                    // Exact scan performed by the old generic wire call.
+                    assert!(indices
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, &index)| indices[0].checked_add(offset) == Some(index)));
+                }
+                batch.fill_lde_batch_contiguous_impl(
+                    indices[0],
+                    32,
+                    0..WIDTH,
+                    &mut output,
+                    black_box(use_kernel),
+                );
+            }
+            black_box(output[(output[0].0 as usize) % output.len()].0);
+            started.elapsed().as_secs_f64()
+        };
+
+        // Equal warmup, then alternating order to cancel drift and thermal bias.
+        black_box(run(false));
+        black_box(run(true));
+        let mut legacy = Vec::with_capacity(ALTERNATIONS);
+        let mut kernel = Vec::with_capacity(ALTERNATIONS);
+        for i in 0..ALTERNATIONS {
+            if i & 1 == 0 {
+                legacy.push(run(false));
+                kernel.push(run(true));
+            } else {
+                kernel.push(run(true));
+                legacy.push(run(false));
+            }
+        }
+        legacy.sort_by(f64::total_cmp);
+        kernel.sort_by(f64::total_cmp);
+        let median = |samples: &[f64]| {
+            (samples[samples.len() / 2 - 1] + samples[samples.len() / 2]) * 0.5
+        };
+        let old = median(&legacy);
+        let new = median(&kernel);
+        let speedup = old / new - 1.0;
+        eprintln!(
+            "gather32 136x2^19 legacy={old:.6}s kernel={new:.6}s speedup={:.2}% legacy={legacy:?} kernel={kernel:?}",
+            100.0 * speedup,
+        );
+        assert!(
+            speedup >= 0.25,
+            "fixed gather kernel missed the 25% gate: {:.2}%",
+            100.0 * speedup,
+        );
     }
 
     /// Natural-order retained columns must preserve the row-backed oracle's
