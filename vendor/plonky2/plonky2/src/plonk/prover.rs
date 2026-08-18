@@ -1327,6 +1327,13 @@ pub(crate) enum RangeQuotientJobs<F: RichField> {
         low_gates: Vec<LowDegreeRangeGate>,
         low_rows: usize,
         high: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
+        /// Gates with no Metal family (PublicInput, Arithmetic, MulExtension)
+        /// of degree <= 4: evaluated on the CPU on the even rows only, from
+        /// the companions, with each gate's own `eval_unfiltered_base_batch`,
+        /// then extended and filtered exactly like the GPU low gates. This
+        /// empties the generic full-domain CPU batch loop of every gate that
+        /// forced its 80-column gathers.
+        cpu_low_gates: Vec<LowDegreeRangeGate>,
     },
 }
 
@@ -1342,6 +1349,31 @@ fn range_quotient_split_enabled() -> bool {
 /// lookups, two challenges) and only for the pipelined 2^19-row LDE shapes
 /// where the quotient kernel dominates (`LIGHTER_QSPLIT_MIN_LDE_BITS`
 /// overrides the floor).
+/// Whether a circuit's constants/sigmas commitment should retain its even-row
+/// companion at build/load time (once per circuit): the same shapes as the
+/// wires companion. With it, the constant-reading degree-2 gate kinds
+/// (`Equality`, `BaseAddition`) join the half-domain job.
+pub fn constants_even_companion_wanted(degree_bits: usize, rate_bits: usize) -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        static MIN_BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let min_bits = *MIN_BITS.get_or_init(|| {
+            std::env::var("LIGHTER_QSPLIT_MIN_LDE_BITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(19)
+        });
+        // Only the pipelined 2^19 shapes: the final block's 2^21 store would
+        // cost a 0.7 GiB companion for a single proof.
+        range_quotient_split_enabled() && degree_bits + rate_bits >= min_bits && degree_bits + rate_bits <= 19
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    {
+        let _ = (degree_bits, rate_bits);
+        false
+    }
+}
+
 fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
 ) -> bool {
@@ -1358,6 +1390,9 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
             && common_data.num_lookup_polys == 0
             && common_data.config.num_challenges == 2
             && common_data.degree_bits() + common_data.config.fri_config.rate_bits >= min_bits
+            // Not the final block's 2^21 shape: measured slower there (its
+            // 1 GiB companion and 2^20-point extension sit on the serial tail).
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits <= 19
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
@@ -1366,19 +1401,133 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+/// Dedicated pool for the half-domain extension: a few threads at
+/// `QOS_CLASS_UTILITY` (0x11), which macOS schedules onto the E-cores first,
+/// so the extension's FFTs never displace the serial chain spine's P-core
+/// work on the global pool. `LIGHTER_QSPLIT_EXT_THREADS` sets the size
+/// (default 0 = run on the global pool: locally 4 vs 0 was neutral, but the
+/// ranked draw with the utility pool (31.03) came in below the global-pool
+/// build (31.46), so the extension stays on the P-core pool by default).
+#[cfg(all(feature = "std", feature = "parallel", target_arch = "aarch64", target_os = "macos"))]
+fn range_extension_pool() -> Option<&'static plonky2_maybe_rayon::rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<plonky2_maybe_rayon::rayon::ThreadPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("LIGHTER_QSPLIT_EXT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        if threads == 0 {
+            return None;
+        }
+        #[allow(non_camel_case_types)]
+        type qos_class_t = u32;
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+        }
+        plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("qsplit-ext-{i}"))
+            .stack_size(64 * 1024 * 1024)
+            .start_handler(|_| unsafe {
+                let _ = pthread_set_qos_class_self_np(0x11, 0);
+            })
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Evaluates `S_g = sum_j alpha_c^(offset + j) C_{g,j}` on the even rows for
+/// gates that have no Metal family, using each gate's own
+/// `eval_unfiltered_base_batch` on wires/constants read from the companions
+/// (so the arithmetic is the gate's own CPU code, on the same values the
+/// full-domain loop would read at those rows). Output layout matches the GPU
+/// low job: `[gate][row * 2 + challenge]`, `half_rows` rows per gate.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn eval_cpu_low_gates_even_rows<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    gates: &[LowDegreeRangeGate],
+    even_wires: &crate::hash::poseidon2::metal::MetalColumns<F>,
+    even_constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
+    public_inputs_hash: &crate::hash::hash_types::HashOut<F>,
+    alphas: &[F],
+    half_rows: usize,
+) -> Vec<F> {
+    const BATCH: usize = 64;
+    let num_challenges = alphas.len();
+    debug_assert_eq!(num_challenges, 2);
+    let alpha_offset = num_challenges * (common_data.num_partial_products + 2);
+    let prefix = common_data.selectors_info.num_selectors() + common_data.num_lookup_selectors;
+    let constant_cols = common_data.constants_range().len();
+    let mut out: Vec<F> = Vec::with_capacity(gates.len() * half_rows * 2);
+    // SAFETY: every slot is written exactly once by the disjoint parallel pass.
+    unsafe { out.set_len(gates.len() * half_rows * 2) };
+    let chunks = half_rows.div_ceil(BATCH);
+    out.par_chunks_mut(half_rows * 2)
+        .zip(gates.par_iter())
+        .for_each(|(gate_out, gate)| {
+            let g = &common_data.gates[gate.gate_index].0;
+            let num_wires = g.num_wires();
+            let num_constraints = g.num_constraints();
+            let mut alpha_powers = vec![F::ZERO; num_challenges * num_constraints];
+            for c in 0..num_challenges {
+                let mut power = alphas[c].exp_u64(alpha_offset as u64);
+                for j in 0..num_constraints {
+                    alpha_powers[c * num_constraints + j] = power;
+                    power *= alphas[c];
+                }
+            }
+            gate_out
+                .par_chunks_mut(BATCH * 2)
+                .enumerate()
+                .for_each(|(chunk_i, chunk)| {
+                    let k0 = chunk_i * BATCH;
+                    let n = chunk.len() / 2;
+                    debug_assert!(chunk_i < chunks);
+                    let mut wires = vec![F::ZERO; num_wires * n];
+                    for w in 0..num_wires {
+                        let col = even_wires.col(w);
+                        wires[w * n..(w + 1) * n].copy_from_slice(&col[k0..k0 + n]);
+                    }
+                    let mut consts = vec![F::ZERO; constant_cols * n];
+                    for cc in 0..constant_cols {
+                        let col = even_constants.col(cc);
+                        consts[cc * n..(cc + 1) * n].copy_from_slice(&col[k0..k0 + n]);
+                    }
+                    let mut vars = EvaluationVarsBaseBatch::new(n, &consts, &wires, public_inputs_hash);
+                    vars.remove_prefix(prefix);
+                    let res = g.eval_unfiltered_base_batch(vars);
+                    debug_assert_eq!(res.len(), num_constraints * n);
+                    for i in 0..n {
+                        let mut acc = [F::ZERO; 2];
+                        for j in 0..num_constraints {
+                            let v = res[j * n + i];
+                            acc[0] += alpha_powers[j] * v;
+                            acc[1] += alpha_powers[num_constraints + j] * v;
+                        }
+                        chunk[i * 2] = acc[0];
+                        chunk[i * 2 + 1] = acc[1];
+                    }
+                });
+        });
+    out
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn extend_and_combine_low_range_quotient<F: RichField>(
-    low: &[F],
-    gates: &[LowDegreeRangeGate],
+/// Odd-row values (per gate, per challenge: `odd[g * 2 + c][k]` = row `2k+1`)
+/// of the half-domain sums given on the even rows (`low[g][k * 2 + c]`).
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn extend_low_gates_odd_rows<F: RichField>(
+    low: &[&[F]],
     half_rows: usize,
     full_rows: usize,
-    constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
-) -> Vec<F> {
+) -> Vec<Vec<F>> {
     debug_assert_eq!(full_rows, half_rows * 2);
-    debug_assert_eq!(low.len(), gates.len() * half_rows * 2);
+    debug_assert!(low.iter().all(|s| s.len() == half_rows * 2));
     let lde_bits = log2_strict(full_rows);
     // `points[i] = omega^i` on the full domain, so the even rows are the coset
     // `shift * <omega^2>` and the odd rows are `(shift * omega) * <omega^2>`.
@@ -1389,19 +1538,36 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // into the IFFT's normalization pass (`coset_ifft_with_powers`).
     let omega = F::primitive_root_of_unity(lde_bits);
     let omega_powers = precomputed::shift_powers::<F>(omega, half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
+    (0..low.len() * 2)
         .into_par_iter()
         .map(|t| {
             let g = t / 2;
             let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+            let src = low[g];
+            let values: Vec<F> = (0..half_rows).map(|k| src[k * 2 + c]).collect();
             PolynomialValues::new(values)
                 .coset_ifft_with_powers(&omega_powers)
                 .fft()
                 .values
         })
-        .collect();
+        .collect()
+}
+
+/// Applies each gate's selector filter on all rows (even rows from `low`,
+/// odd rows from `odd`) and sums, producing the point-major
+/// `[row * 2 + challenge]` layout of a full-domain range job.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn combine_low_gates<F: RichField>(
+    low: &[&[F]],
+    odd: &[Vec<F>],
+    gates: &[&LowDegreeRangeGate],
+    half_rows: usize,
+    full_rows: usize,
+    constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
+) -> Vec<F> {
+    debug_assert_eq!(full_rows, half_rows * 2);
+    debug_assert_eq!(low.len(), gates.len());
+    debug_assert_eq!(odd.len(), gates.len() * 2);
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     let unused = F::from_canonical_u64(u32::MAX as u64);
@@ -1481,12 +1647,12 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                 let f = &filters[g * ROWS_PER_CHUNK..g * ROWS_PER_CHUNK + rows];
                 let odd0 = &odd[g * 2];
                 let odd1 = &odd[g * 2 + 1];
-                let low_base = g * half_rows * 2;
+                let src = low[g];
                 for r in 0..rows {
                     let i = row0 + r;
                     let (sv0, sv1) = if i & 1 == 0 {
-                        let base = low_base + (i >> 1) * 2;
-                        (low[base], low[base + 1])
+                        let base = (i >> 1) * 2;
+                        (src[base], src[base + 1])
                     } else {
                         (odd0[i >> 1], odd1[i >> 1])
                     };
@@ -1580,7 +1746,7 @@ pub fn range_quotient_microbench<
     };
     time(&format!("production range job (split={}) full rows", range_quotient_split_enabled()), &|| run_whole(quotient_rows, step));
     // Split pieces individually + CPU extension.
-    if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high })) =
+    if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high, .. })) =
         start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)
     {
         let _ = (wires, even);
@@ -1618,7 +1784,10 @@ pub fn range_quotient_microbench<
         });
         time("  CPU extend+combine", &|| {
             let t = std::time::Instant::now();
-            let out = extend_and_combine_low_range_quotient(low_values, &low_gates, low_rows, lde_size, constants);
+            let slices: Vec<&[F]> = (0..low_gates.len()).map(|g| &low_values[g * low_rows * 2..(g + 1) * low_rows * 2]).collect();
+            let refs: Vec<&LowDegreeRangeGate> = low_gates.iter().collect();
+            let odd = extend_low_gates_odd_rows(&slices, low_rows, lde_size);
+            let out = combine_low_gates(&slices, &odd, &refs, low_rows, lde_size, constants);
             core::hint::black_box(&out);
             Some(t.elapsed().as_secs_f64() * 1e3)
         });
@@ -1732,7 +1901,9 @@ fn start_gpu_range_check_gate_quotient<
             // existing CPU direct-accumulation evaluator instead: skipping it
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. })
+                && !(range_quotient_split_enabled() && wires_commitment.even_columns.get().is_some())
+            {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -2065,28 +2236,48 @@ fn start_gpu_range_check_gate_quotient<
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
+    let even_constants = prover_data.constants_sigmas_commitment.even_columns.get();
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
-        // Kinds that read gate constants stay on the full-domain (real
-        // constants store) dispatch; everything else of degree <= 4 goes to
-        // the compact even-row companion, which is bound as `wires` with
+        // Kinds that read gate constants join the half-domain job only when
+        // the constants store also has an even-row companion (so their reads
+        // hit rows of the same sub-domain); otherwise they stay on the
+        // full-domain filtered dispatch. Everything else of degree <= 4 goes
+        // to the compact wires companion, bound as `wires` with
         // `lde_rows = quotient_rows / 2`.
+        let have_even_constants = even_constants.is_some_and(|c| c.rows() == even_wires.rows());
         let reads_constants = |kind: &U32QuotientKind| {
-            matches!(
-                kind,
-                U32QuotientKind::Equality { .. }
-                    | U32QuotientKind::BaseAddition { .. }
-                    | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
-            )
+            !have_even_constants
+                && matches!(
+                    kind,
+                    U32QuotientKind::Equality { .. }
+                        | U32QuotientKind::BaseAddition { .. }
+                        | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
+                )
         };
+        let low_constants = if have_even_constants { even_constants.unwrap() } else { constants };
+        // Gates below this many constraints save little kernel time on the
+        // half domain but each costs a CPU IFFT/FFT pair; keep them on the
+        // full-domain job. `LIGHTER_QSPLIT_MIN_CONSTRAINTS` (default 60:
+        // measured 26.91 / 26.62 / 26.59 s for 0 / 30 / 60 and 27.30 s for
+        // 120 over 3 interleaved rounds; 60 keeps the wide U32/range families
+        // and drops BaseSum4, QuinticMul, BaseAddition, Selection, RA-3).
+        static MIN_CONSTRAINTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let min_constraints = *MIN_CONSTRAINTS.get_or_init(|| {
+            std::env::var("LIGHTER_QSPLIT_MIN_CONSTRAINTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60)
+        });
         let mut low_groups = Vec::new();
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
         let mut high_u32_specs = Vec::new();
         for (spec, &degree) in specs.iter().zip(&spec_degrees) {
-            if degree <= 4 {
+            let n_constraints = common_data.gates[spec.gate_index].0.num_constraints();
+            if degree <= 4 && n_constraints >= min_constraints {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2102,7 +2293,8 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && !reads_constants(&spec.kind) {
+            let n_constraints = common_data.gates[spec.gate_index].0.num_constraints();
+            if degree <= 4 && !reads_constants(&spec.kind) && n_constraints >= min_constraints {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2120,7 +2312,7 @@ fn start_gpu_range_check_gate_quotient<
         if !low_groups.is_empty() {
             if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
                 even_wires,
-                constants,
+                low_constants,
                 quotient_rows / 2,
                 1,
                 &low_groups,
@@ -2142,11 +2334,40 @@ fn start_gpu_range_check_gate_quotient<
                     )
                 };
                 if high.is_some() || (high_specs.is_empty() && high_u32_specs.is_empty()) {
+                    // Remaining CPU gates of degree <= 4 with constraints: take
+                    // them off the generic full-domain loop (requires the
+                    // constants companion so their constant reads hit the same
+                    // sub-domain).
+                    let mut cpu_low_gates = Vec::new();
+                    if have_even_constants {
+                        for (i, gate) in common_data.gates.iter().enumerate() {
+                            let on_gpu = gate_indices.contains(&i)
+                                || random_access_gate_indices.contains(&i);
+                            if on_gpu
+                                || gate.0.degree() > 4
+                                || gate.0.num_constraints() == 0
+                                || gate.0.as_any().is::<Poseidon2Gate<F, D>>()
+                            {
+                                continue;
+                            }
+                            let selector_column = common_data.selectors_info.selector_indices[i];
+                            cpu_low_gates.push(LowDegreeRangeGate {
+                                gate_index: i,
+                                selector_column,
+                                group: common_data.selectors_info.groups[selector_column].clone(),
+                                include_unused_selector,
+                            });
+                        }
+                    }
+                    for g in &cpu_low_gates {
+                        gate_indices.push(g.gate_index);
+                    }
                     split_job = Some(RangeQuotientJobs::Split {
                         low,
                         low_gates,
                         low_rows: quotient_rows / 2,
                         high,
+                        cpu_low_gates,
                     });
                 }
             }
@@ -2534,36 +2755,76 @@ fn compute_quotient_polys<
     // writes every element before any is read (see above). Same idiom as the
     // promoted zero-tail fast path in `fri/oracle.rs`.
     unsafe { quotient_values.set_len(quotient_len) };
-    // The half-domain range job's CPU extension runs concurrently with the
-    // CPU gate batch loop below (both on the pool), so its latency hides
-    // behind work the proof does anyway; its result is consumed after.
+    // Half-domain range job, CPU side. Two concurrent lanes:
+    //  - global pool: the (now small) generic gate batch loop, then the CPU
+    //    low gates evaluated on the even rows and extended to the odd rows;
+    //  - the extension pool (E-cores): wait for the GPU low job, extend its
+    //    gates to the odd rows.
+    // The filter/combine over all gates runs after the join. Values are
+    // identical to the single-lane form; only which threads compute them.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let low_extension = || -> core::result::Result<Option<Vec<F>>, String> {
-        if let Some((_, RangeQuotientJobs::Split { low, low_gates, low_rows, .. })) = &gpu_range {
-            let low_values = low.finish()?;
-            let constants = prover_data
-                .constants_sigmas_commitment
-                .merkle_tree
-                .shared_columns()
-                .ok_or_else(|| "split range quotient requires Metal-backed constants".to_string())?;
-            #[cfg(feature = "diagnostic_profile")]
-            let _extend_span = crate::util::profile::span("quotient", "range_low_extend_combine");
-            Ok(Some(extend_and_combine_low_range_quotient(
-                low_values,
-                low_gates,
-                *low_rows,
-                points.len(),
-                constants,
-            )))
-        } else {
-            Ok(None)
+    let split_parts = match &gpu_range {
+        Some((_, RangeQuotientJobs::Split { low, low_gates, low_rows, cpu_low_gates, .. })) => {
+            Some((low, low_gates, *low_rows, cpu_low_gates))
         }
+        _ => None,
     };
-    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-    let low_extension = || -> core::result::Result<Option<Vec<F>>, String> { Ok(None) };
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let cpu_low_lane = || -> core::result::Result<Option<(Vec<F>, Vec<Vec<F>>)>, String> {
+        let Some((_, _, low_rows, cpu_low_gates)) = split_parts else { return Ok(None) };
+        if cpu_low_gates.is_empty() {
+            return Ok(None);
+        }
+        let even_wires = wires_commitment
+            .even_columns
+            .get()
+            .ok_or_else(|| "cpu low gates require the wires companion".to_string())?;
+        let even_constants = prover_data
+            .constants_sigmas_commitment
+            .even_columns
+            .get()
+            .ok_or_else(|| "cpu low gates require the constants companion".to_string())?;
+        #[cfg(feature = "diagnostic_profile")]
+        let _cpu_span = crate::util::profile::span("quotient", "cpu_low_gates_eval_extend");
+        let values = eval_cpu_low_gates_even_rows(
+            common_data,
+            cpu_low_gates,
+            even_wires,
+            even_constants,
+            public_inputs_hash,
+            alphas,
+            low_rows,
+        );
+        let slices: Vec<&[F]> = (0..cpu_low_gates.len())
+            .map(|g| &values[g * low_rows * 2..(g + 1) * low_rows * 2])
+            .collect();
+        let odd = extend_low_gates_odd_rows(&slices, low_rows, points.len());
+        Ok(Some((values, odd)))
+    };
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_low_lane = || -> core::result::Result<Option<Vec<Vec<F>>>, String> {
+        let Some((low, low_gates, low_rows, _)) = split_parts else { return Ok(None) };
+        #[cfg(feature = "diagnostic_profile")]
+        let _extend_span = crate::util::profile::span("quotient", "range_low_extend");
+        let run = || -> core::result::Result<Vec<Vec<F>>, String> {
+            let low_values = low.finish()?;
+            let slices: Vec<&[F]> = (0..low_gates.len())
+                .map(|g| &low_values[g * low_rows * 2..(g + 1) * low_rows * 2])
+                .collect();
+            Ok(extend_low_gates_odd_rows(&slices, low_rows, points.len()))
+        };
+        #[cfg(feature = "parallel")]
+        let odd = match range_extension_pool() {
+            Some(pool) => pool.install(run)?,
+            None => run()?,
+        };
+        #[cfg(not(feature = "parallel"))]
+        let odd = run()?;
+        Ok(Some(odd))
+    };
     let quotient_values_ref = &mut quotient_values;
     let z_h_on_coset_ref = &z_h_on_coset;
-    let run_batches = move || quotient_values_ref
+    let run_batches_only = move || quotient_values_ref
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
         .enumerate()
@@ -2825,7 +3086,49 @@ fn compute_quotient_polys<
                 // from disagreeing when a launched job yields no values.
             },
         );
-    let ((), low_extension_result) = plonky2_maybe_rayon::join(run_batches, low_extension);
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let (cpu_lane_result, gpu_lane_result) = plonky2_maybe_rayon::join(
+        || {
+            run_batches_only();
+            cpu_low_lane()
+        },
+        gpu_low_lane,
+    );
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    run_batches_only();
+    // Combine all low gates (GPU + CPU) over the full domain.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let low_extension_result: core::result::Result<Option<Vec<F>>, String> = (|| {
+        let Some((low, low_gates, low_rows, cpu_low_gates)) = split_parts else { return Ok(None) };
+        let gpu_odd = gpu_lane_result?.ok_or_else(|| "gpu low lane missing".to_string())?;
+        let cpu_part = cpu_lane_result?;
+        let constants = prover_data
+            .constants_sigmas_commitment
+            .merkle_tree
+            .shared_columns()
+            .ok_or_else(|| "split range quotient requires Metal-backed constants".to_string())?;
+        let low_values = low.finish()?;
+        let mut all_gates: Vec<&LowDegreeRangeGate> = low_gates.iter().collect();
+        let mut slices: Vec<&[F]> = (0..low_gates.len())
+            .map(|g| &low_values[g * low_rows * 2..(g + 1) * low_rows * 2])
+            .collect();
+        let mut odd = gpu_odd;
+        if let Some((cpu_values, cpu_odd)) = &cpu_part {
+            all_gates.extend(cpu_low_gates.iter());
+            for g in 0..cpu_low_gates.len() {
+                slices.push(&cpu_values[g * low_rows * 2..(g + 1) * low_rows * 2]);
+            }
+            odd.extend(cpu_odd.iter().cloned());
+        }
+        Ok(Some(combine_low_gates(
+            &slices,
+            &odd,
+            &all_gates,
+            low_rows,
+            points.len(),
+            constants,
+        )))
+    })();
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {

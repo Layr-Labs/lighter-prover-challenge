@@ -511,13 +511,14 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values_with_even_companion(
         constants_sigmas_vecs,
         rate_bits,
         false,
         cap_height,
         &mut TimingTree::default(),
         Some(&root_table),
+        plonky2::plonk::prover::constants_even_companion_wanted(degree_bits, rate_bits),
     );
     if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
         bail!(

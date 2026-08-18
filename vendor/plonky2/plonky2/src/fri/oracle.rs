@@ -134,6 +134,28 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
+        Self::from_values_with_even_companion(
+            values,
+            rate_bits,
+            blinding,
+            cap_height,
+            timing,
+            fft_root_table,
+            false,
+        )
+    }
+
+    /// [`Self::from_values`] with the optional even-row companion (see
+    /// [`EvenColumns`] and [`Self::from_coeffs_with_even_companion`]).
+    pub fn from_values_with_even_companion(
+        values: Vec<PolynomialValues<F>>,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        want_even_companion: bool,
+    ) -> Self {
         if GPU_NTT_COMMITMENTS && !blinding {
             let value_columns: Vec<&[F]> =
                 values.iter().map(|v| v.values.as_slice()).collect();
@@ -168,13 +190,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
         );
 
-        Self::from_coeffs(
+        Self::from_coeffs_with_even_companion(
             coeffs,
             rate_bits,
             blinding,
             cap_height,
             timing,
             fft_root_table,
+            want_even_companion,
         )
     }
 

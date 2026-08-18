@@ -361,8 +361,12 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
 /// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
 /// peak unified-memory pressure.
-const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+// Raised from 8 MiB x 2 for the half-domain range job, whose per-proof output
+// (17 gates x 2^18 rows x 2 challenges x 8 B = 68 MiB) would otherwise be a
+// fresh, page-faulted allocation on every transaction proof; the pipeline
+// keeps up to six proofs in flight.
+const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 80 * 1024 * 1024;
+const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 8;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;

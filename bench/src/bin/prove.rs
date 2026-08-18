@@ -96,6 +96,21 @@ fn main() {
     );
 
     // Fixture parse overlaps the pre-execution circuit load; both are fast.
+    // Start the remaining circuit loads (the light-tx circuit gates the first
+    // transaction proof) before the pre-execution circuit load and fixture
+    // parse rather than after them: they are independent, and the previous
+    // ordering put the ~0.1 s pre load serially ahead of the ~0.45 s remaining
+    // loads on the path to the first light proof.
+    let remaining_handle = std::thread::Builder::new()
+        .name("remaining-circuit-loads".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(|| {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
+            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
+                .then(Circuits::load_remaining_embedded)
+        })
+        .expect("remaining circuit load thread must start");
     let (block, pre_circuits) = rayon::join(
         || {
             #[cfg(feature = "diagnostic_profile")]
@@ -134,12 +149,7 @@ fn main() {
     // tail of the blob loads instead of waiting for them to finish first.
     // Value-exact: no quantity is computed differently, only in parallel.
     let (pre_handle, remaining) = std::thread::scope(|scope| {
-        let remaining_handle = scope.spawn(|| {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
-            (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-                .then(Circuits::load_remaining_embedded)
-        });
+        let _ = scope;
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
