@@ -798,7 +798,7 @@ pub fn prewarm_large_column_store(bytes: u64) {
     }
 }
 
-/// Pre-sizes and pre-faults the streamed sponge's buffer pair at `leaf_count`.
+/// Pre-sizes and pre-faults streamed sponge buffer pairs at `leaf_count`.
 ///
 /// Every streamed build before the final block is 2^19-leaf, so the pair is
 /// grown for the first time by the final block itself — 2^21 LDE rows, i.e. a
@@ -808,10 +808,9 @@ pub fn prewarm_large_column_store(bytes: u64) {
 /// [`prewarm_large_column_store`] for a different allocation.
 ///
 /// Allocation and the page walk both happen *outside* the mutex: the lock
-/// serializes whole streamed builds, so walking hundreds of MiB under it would
-/// stall the light pipeline for the walk's duration. The lock is taken only to
-/// install, and only when the stashed pair is actually smaller, so a build that
-/// is mid-flight simply finishes first.
+/// only publishes into the free list. A build that is mid-flight (pair taken
+/// out of `free`) simply finishes first; we may still install a second pair
+/// up to [`MAX_STREAMED_PAIRS`].
 ///
 /// Writing zeros is semantics-preserving: a fresh `StorageModeShared` buffer is
 /// already zero-filled, and no build can observe this one until it is
@@ -885,12 +884,14 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
         return;
     };
 
-    if let Ok(mut slot) = STREAMED_BUFFERS.lock() {
-        let smaller = slot.as_ref().map_or(true, |(state, output)| {
-            state.length() < state_bytes || output.length() < output_bytes
-        });
-        if smaller {
-            *slot = Some((state, output));
+    if let Ok(mut pool) = STREAMED_BUFFERS.lock() {
+        if let Some(index) = pool.free.iter().position(|(held_state, held_output)| {
+            held_state.length() < state_bytes || held_output.length() < output_bytes
+        }) {
+            pool.free[index] = (state, output);
+        } else if pool.created < MAX_STREAMED_PAIRS {
+            pool.free.push((state, output));
+            pool.created += 1;
         }
     }
 
@@ -2368,19 +2369,74 @@ pub(crate) fn allocate_columns<F: RichField>(
 
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
-/// Retained buffers for the streamed sponge build: the inter-pass state
-/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
-static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+///
+/// Retained buffers for the streamed sponge: inter-pass state (12 u64 lanes
+/// per leaf, column-major) and the level-order digest output. This is **not**
+/// [`MAX_BUFFER_SETS`] — those remain the classic leaf/output sets, still 1.
+///
+/// Two pairs, not one: the previous design held a single mutex for the whole
+/// fill + GPU wait, so a hideable 2^19 stream parked the chain-step 2^17 fill
+/// until the queue drained. A free pair can leave for fill/absorb while the
+/// other pair's command buffers are still in flight. A third caller declines
+/// (`None`) and the classic path takes over; we never block on this pool.
+const MAX_STREAMED_PAIRS: usize = 2;
+
+struct StreamedBufferPool {
+    free: Vec<(Buffer, Buffer)>,
+    created: usize,
+}
+
+static STREAMED_BUFFERS: Mutex<StreamedBufferPool> = Mutex::new(StreamedBufferPool {
+    free: Vec::new(),
+    created: 0,
+});
+
+fn new_streamed_pair(device: &Device, state_bytes: u64, output_bytes: u64) -> (Buffer, Buffer) {
+    autoreleasepool(|| {
+        (
+            device.new_buffer(state_bytes, MTLResourceOptions::StorageModeShared),
+            device.new_buffer(output_bytes, MTLResourceOptions::StorageModeShared),
+        )
+    })
+}
+
+/// Pops a free pair, or creates one up to [`MAX_STREAMED_PAIRS`]. Returns
+/// `None` when both pairs are in flight so the caller can fall back.
+fn take_streamed_pair(
+    device: &Device,
+    state_bytes: u64,
+    output_bytes: u64,
+) -> Option<(Buffer, Buffer)> {
+    let mut pool = STREAMED_BUFFERS.lock().ok()?;
+    if let Some((state, output)) = pool.free.pop() {
+        drop(pool);
+        if state.length() >= state_bytes && output.length() >= output_bytes {
+            return Some((state, output));
+        }
+        return Some(new_streamed_pair(device, state_bytes, output_bytes));
+    }
+    if pool.created < MAX_STREAMED_PAIRS {
+        pool.created += 1;
+        drop(pool);
+        return Some(new_streamed_pair(device, state_bytes, output_bytes));
+    }
+    None
+}
+
+fn return_streamed_pair(state: Buffer, output: Buffer) {
+    if let Ok(mut pool) = STREAMED_BUFFERS.lock() {
+        pool.free.push((state, output));
+    }
+}
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
-/// the GPU absorbs each group while the CPU fills the next. Only used inside
-/// exclusive proving phases (nothing else contends for the GPU stream) and
-/// for large wide trees, where the overlap converts the previously serial
-/// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
+/// the GPU absorbs each group while the CPU fills the next. Used inside
+/// exclusive proving phases, for large wide pipelined trees, and for the
+/// serial-critical 2^17-leaf chain/pre-exec commitments (rank-1 spine join
+/// lever): those previously filled every column, then sat on the single Metal
+/// queue. Streaming converts that into max(fill, hash) + one pass and keeps
+/// them off the pooled buffer set.
 ///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
@@ -2403,13 +2459,22 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // serial CPU-fill-then-GPU-hash into max(fill, hash), and it runs out of
     // this function's own retained buffers rather than the pooled buffer set.
     //
-    // The pipeline's single widest commitment takes that path unconditionally.
-    // Keeping it off the buffer set is what lets the serial 2^17 trees
-    // admitted in `gpu_worthwhile` actually get the set when they ask; the
-    // narrower pipelined commitments still wait for an idle stream, because
-    // moving all of them costs the pipeline more latency than the serial path
-    // gains. See the note in `gpu_worthwhile`: these two rules are one change.
-    let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
+    // Rank 1: the serial-critical 2^17 trees (same predicate as
+    // `gpu_worthwhile`, minus the width>4 vs >=16 gate already applied
+    // below) stream too. They are the chain-step wires commitment: tip
+    // 307.4 ms, ~4/5 of that a wait on the serialized Metal queue. Filling
+    // all columns before one classic submit left that wait fully exposed;
+    // group-wise absorb starts the GPU after the first 8 columns.
+    //
+    // The pipeline's single widest commitment still takes this path
+    // unconditionally. Keeping wide 2^19 work off the buffer set is what
+    // lets a declined 2^17 fall back onto `gpu_worthwhile`'s classic GPU
+    // path and actually get the set. See the note in `gpu_worthwhile`.
+    let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
+    let stream_admitted = if serial_critical_shape {
+        true
+    } else if exclusive {
         leaf_count >= 1 << 20
     } else {
         leaf_count >= 1 << 19
@@ -2437,30 +2502,16 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
+    let (state_buffer, output_buffer) =
+        take_streamed_pair(&context.device, state_bytes as u64, output_bytes as u64)?;
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
-    let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
-        state.length() < state_bytes as u64 || output.length() < output_bytes as u64
-    });
-    if needs_new {
-        *buffers = Some(autoreleasepool(|| {
-            (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-            )
-        }));
-    }
-    let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
+    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU's
     // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
+    // order, and each pass is committed before the next group's fill starts.
+    // The pair is *not* held under STREAMED_BUFFERS during this loop, so a
+    // second 2^17/2^19 stream can take the other pair and fill while this
+    // tree's absorbs drain.
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
@@ -2494,8 +2545,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
+            encoder.set_buffer(1, Some(&state_buffer), 0);
+            encoder.set_buffer(2, Some(&output_buffer), 0);
             encoder.set_buffer(3, Some(&context.parameters), 0);
             set_u32(encoder, 4, leaf_count as u32);
             set_u32(encoder, 5, leaf_count.ilog2());
@@ -2516,7 +2567,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                 let mut level_offset = 0usize;
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
-                let output_resource: &metal::ResourceRef = output_buffer;
+                let output_resource: &metal::ResourceRef = &output_buffer;
                 if child_count > cap_count {
                     encoder.set_compute_pipeline_state(&context.parent_pipeline);
                 }
@@ -2534,12 +2585,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     let parent_count_u32 = parent_count as u32;
                     encoder.set_buffer(
                         0,
-                        Some(output_buffer),
+                        Some(&output_buffer),
                         (child_offset * size_of::<u64>()) as NSUInteger,
                     );
                     encoder.set_buffer(
                         1,
-                        Some(output_buffer),
+                        Some(&output_buffer),
                         (level_offset * size_of::<u64>()) as NSUInteger,
                     );
                     encoder.set_buffer(2, Some(&context.parameters), 0);
@@ -2558,16 +2609,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
-        command_buffer.wait_until_completed();
-        command_buffer.status() == MTLCommandBufferStatus::Completed
-    });
-    drop(job);
-    if !all_ok {
-        log::warn!("streamed Metal sponge build failed; falling back to the classic path");
-        return None;
-    }
-
+    // Earlier staging: the digest replacement used to be allocated *after*
+    // wait_until_completed. The GPU already has the output buffer; fetching a
+    // spare now overlaps the queue drain instead of adding a first-touch after
+    // it.
     let replacement = context
         .digest_output_pool
         .lock()
@@ -2583,10 +2628,32 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
             })
         });
-    let completed = core::mem::replace(output_buffer, replacement);
-    drop(buffers);
+
+    // Same Metal queue, FIFO: waiting on the last command buffer waits for
+    // every earlier absorb. Checking every status still catches a mid-stream
+    // error so we fall back instead of reading a partial digest.
+    if let Some(last) = absorb_commands.last() {
+        last.wait_until_completed();
+    }
+    let all_ok = !absorb_commands.is_empty()
+        && absorb_commands
+            .iter()
+            .all(|command_buffer| command_buffer.status() == MTLCommandBufferStatus::Completed);
+    drop(job);
+    if !all_ok {
+        log::warn!("streamed Metal sponge build failed; falling back to the classic path");
+        context
+            .digest_output_pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recycle(replacement);
+        return_streamed_pair(state_buffer, output_buffer);
+        return None;
+    }
+
+    return_streamed_pair(state_buffer, replacement);
     let nodes = MetalDigests::with_buffer(
-        completed,
+        output_buffer,
         Arc::clone(&context.digest_output_pool),
         total_node_count,
     );
@@ -7014,6 +7081,35 @@ kernel void goldilocks_mul_bench_native(
             },
         )
         .expect("streamed tree");
+        assert!(streamed.0.nodes.is_shared());
+
+        let classic = context
+            .build(LeafSource::Shared(&columns), cols, rows, cap_height)
+            .expect("classic tree");
+        assert_eq!(streamed, classic);
+    }
+
+    #[test]
+    fn streamed_merkle_serial_critical_2_17_matches_classic() {
+        type F = GoldilocksField;
+        let context = shared_context().expect("Metal context");
+        let rows = 1usize << 17;
+        let cols = 17;
+        let cap_height = 4;
+        let columns = context
+            .allocate_columns::<F>(rows, cols)
+            .expect("shared columns");
+        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
+        let streamed = build_merkle_tree_shared_streamed(
+            &columns,
+            cap_height,
+            &|group, destinations| {
+                for (index, destination) in destinations.iter_mut().enumerate() {
+                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                }
+            },
+        )
+        .expect("streamed 2^17 tree");
         assert!(streamed.0.nodes.is_shared());
 
         let classic = context
