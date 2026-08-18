@@ -40,6 +40,164 @@ pub const SALT_SIZE: usize = 4;
 /// trees (`new_columns`) remain on.
 const GPU_NTT_COMMITMENTS: bool = false;
 
+/// A [`PolynomialBatch`] whose materialization (IFFT + LDE + Merkle tree) may
+/// be deferred off the thread that constructs it and overlapped with unrelated
+/// work, without changing any computed value.
+///
+/// Motivation: the embedded-circuit loader recomputes each circuit's
+/// constants/sigmas commitment at startup, and that recompute sits on the
+/// worker's critical path (the loads are joined before proving begins) while
+/// its first *consumer* — the quotient evaluation, then the FRI openings — runs
+/// hundreds of milliseconds later. Wrapping the commitment lets the loader
+/// return as soon as the commitment's *inputs* exist and materialize it on the
+/// global pool underneath the witness phase instead.
+///
+/// Semantics: a `ready` batch behaves exactly like a plain [`PolynomialBatch`].
+/// A `deferred` batch holds the closure that produces it; the first access
+/// (any deref) runs the closure to completion — under [`std::sync::OnceLock`],
+/// so exactly one thread computes it and concurrent accessors block until the
+/// value exists, then read it forever after through a lock-free acquire load.
+/// [`Self::spawn_prefetch`] starts that materialization in the background on
+/// the rayon global pool. There is no deadlock window: a consumer that arrives
+/// before the prefetch task was scheduled simply runs the closure itself
+/// inline (`get_or_init`), so progress never depends on pool capacity.
+///
+/// Value-exactness: the closure is the same computation the eager path ran,
+/// moved in time only. Nothing about the produced batch differs.
+pub struct LazyPolynomialBatch<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    state: std::sync::Arc<LazyBatchState<F, C, D>>,
+}
+
+type LazyBatchJob<F, C, const D: usize> =
+    Box<dyn FnOnce() -> PolynomialBatch<F, C, D> + Send>;
+
+struct LazyBatchState<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> {
+    cell: std::sync::OnceLock<PolynomialBatch<F, C, D>>,
+    /// The pending materialization, if any. Taken (exactly once) inside the
+    /// `cell` initialization closure, so the lock is touched only before the
+    /// value exists — never on the steady-state read path.
+    job: std::sync::Mutex<Option<LazyBatchJob<F, C, D>>>,
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    LazyBatchState<F, C, D>
+{
+    fn force(&self) -> &PolynomialBatch<F, C, D> {
+        self.cell.get_or_init(|| {
+            let job = self
+                .job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("lazy polynomial batch constructed without a value or a job");
+            job()
+        })
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    LazyPolynomialBatch<F, C, D>
+{
+    /// Wraps an already-materialized batch; every access is a plain read.
+    pub fn ready(batch: PolynomialBatch<F, C, D>) -> Self {
+        let state = LazyBatchState {
+            cell: std::sync::OnceLock::from(batch),
+            job: std::sync::Mutex::new(None),
+        };
+        Self {
+            state: std::sync::Arc::new(state),
+        }
+    }
+
+    /// Wraps a pending materialization. `job` runs at most once — on the first
+    /// deref or when a [`Self::spawn_prefetch`] task gets scheduled, whichever
+    /// happens first.
+    pub fn deferred(job: impl FnOnce() -> PolynomialBatch<F, C, D> + Send + 'static) -> Self {
+        let state = LazyBatchState {
+            cell: std::sync::OnceLock::new(),
+            job: std::sync::Mutex::new(Some(Box::new(job) as LazyBatchJob<F, C, D>)),
+        };
+        Self {
+            state: std::sync::Arc::new(state),
+        }
+    }
+
+    /// Starts materialization on the rayon global pool (without `parallel`,
+    /// materializes inline). Idempotent; a consumer that derefs first simply
+    /// does the work itself and the prefetch task finds the cell populated.
+    pub fn spawn_prefetch(&self)
+    where
+        F: 'static,
+        C: 'static,
+    {
+        #[cfg(feature = "parallel")]
+        {
+            let state = std::sync::Arc::clone(&self.state);
+            plonky2_maybe_rayon::rayon::spawn(move || {
+                state.force();
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        self.state.force();
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    core::ops::Deref for LazyPolynomialBatch<F, C, D>
+{
+    type Target = PolynomialBatch<F, C, D>;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.force()
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    From<PolynomialBatch<F, C, D>> for LazyPolynomialBatch<F, C, D>
+{
+    fn from(batch: PolynomialBatch<F, C, D>) -> Self {
+        Self::ready(batch)
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn default() -> Self {
+        Self::ready(PolynomialBatch::default())
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> core::fmt::Debug
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.state.cell.get() {
+            Some(batch) => f.debug_tuple("LazyPolynomialBatch").field(batch).finish(),
+            None => f.write_str("LazyPolynomialBatch(<pending>)"),
+        }
+    }
+}
+
+/// Comparison materializes both sides: equality is a property of the batch
+/// *values*, which deferral does not change.
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> PartialEq
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn eq(&self, other: &Self) -> bool {
+        *self.state.force() == *other.state.force()
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Eq
+    for LazyPolynomialBatch<F, C, D>
+{
+}
+
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BatchLayout {
@@ -47,51 +205,6 @@ pub(crate) enum BatchLayout {
     PointMajor,
     /// `out[column * num_points + point]`
     PolyMajor,
-}
-
-/// Optional compact copy of the even LDE rows of a column-major commitment
-/// (row `k` of the companion is row `2k` of the commitment), retained in a
-/// shared Metal buffer so the half-domain quotient kernels read contiguous
-/// columns instead of a stride-2 gather over the full store. Filled by the
-/// same CPU pass that writes the LDE, from the just-computed column while it
-/// is cache-resident. Absent on non-Metal targets and unless requested via
-/// [`PolynomialBatch::from_coeffs_with_even_companion`].
-pub struct EvenColumns<F> {
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
-    _phantom: core::marker::PhantomData<F>,
-}
-
-impl<F> Default for EvenColumns<F> {
-    fn default() -> Self {
-        Self {
-            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            columns: None,
-            _phantom: core::marker::PhantomData,
-        }
-    }
-}
-
-// The companion is a derived cache of the commitment's own LDE, so it does
-// not participate in equality; two batches with identical polynomials and
-// trees are equal whether or not either retained a companion.
-impl<F> PartialEq for EvenColumns<F> {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-impl<F> Eq for EvenColumns<F> {}
-impl<F> core::fmt::Debug for EvenColumns<F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("EvenColumns")
-    }
-}
-
-impl<F> EvenColumns<F> {
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn get(&self) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
-        self.columns.as_ref()
-    }
 }
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
@@ -103,8 +216,6 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
     pub degree_log: usize,
     pub rate_bits: usize,
     pub blinding: bool,
-    /// See [`EvenColumns`].
-    pub even_columns: EvenColumns<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
@@ -117,7 +228,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
-            even_columns: EvenColumns::default(),
         }
     }
 }
@@ -157,7 +267,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     degree_log: log2_strict(degree),
                     rate_bits,
                     blinding,
-                    even_columns: EvenColumns::default(),
                 };
             }
         }
@@ -187,33 +296,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        Self::from_coeffs_with_even_companion(
-            polynomials,
-            rate_bits,
-            blinding,
-            cap_height,
-            timing,
-            fft_root_table,
-            false,
-        )
-    }
-
-    /// [`Self::from_coeffs`], additionally retaining the compact even-row
-    /// companion (see [`EvenColumns`]) when `want_even_companion` is set and
-    /// the commitment lands in retained shared column storage. Values and
-    /// tree are identical either way; the companion is a pure read-only copy.
-    pub fn from_coeffs_with_even_companion(
-        polynomials: Vec<PolynomialCoeffs<F>>,
-        rate_bits: usize,
-        blinding: bool,
-        cap_height: usize,
-        timing: &mut TimingTree,
-        fft_root_table: Option<&FftRootTable<F>>,
-        want_even_companion: bool,
-    ) -> Self {
         let degree = polynomials[0].len();
-        #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-        let _ = want_even_companion;
 
         if GPU_NTT_COMMITMENTS && !blinding {
             let coeff_columns: Vec<&[F]> = polynomials
@@ -236,7 +319,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     degree_log: log2_strict(degree),
                     rate_bits,
                     blinding,
-                    even_columns: EvenColumns::default(),
                 };
             }
         }
@@ -256,44 +338,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
-                // Compact even-row companion (Metal only, on request): the
-                // fill below writes row `2k` of every column into row `k` of
-                // the companion right after that column's FFT, while the
-                // column is still cache-resident.
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
-                    crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
-                        polynomials.len(),
-                        lde_len / 2,
-                    )
-                } else {
-                    None
-                };
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs: Option<Vec<usize>> = even_companion.as_mut().and_then(|companion| {
-                    companion
-                        .columns_mut()
-                        .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
-                });
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs = &even_ptrs;
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let half_len = lde_len / 2;
-                let copy_even = |_column: usize, _destination: &[F]| {
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    if let Some(ptrs) = even_ptrs {
-                        // SAFETY: each column index is written by exactly one
-                        // closure invocation (columns are disjoint), the
-                        // companion outlives the fill, and `F` is plain data.
-                        let out = unsafe {
-                            core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
-                        };
-                        for (k, slot) in out.iter_mut().enumerate() {
-                            *slot = _destination[2 * k];
-                        }
-                    }
-                };
-                let copy_even = &copy_even;
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
@@ -323,7 +367,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
                                 },
                             );
                         },
@@ -341,11 +384,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: EvenColumns {
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            columns: even_companion,
-                            _phantom: core::marker::PhantomData,
-                        },
                     };
                 }
                 let initialized = timed!(
@@ -356,7 +394,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &polynomials,
                         rate_bits,
                         fft_root_table,
-                        copy_even,
                     )
                 );
                 if initialized {
@@ -371,11 +408,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: EvenColumns {
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            columns: even_companion,
-                            _phantom: core::marker::PhantomData,
-                        },
                     };
                 }
             }
@@ -399,7 +431,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             degree_log: log2_strict(degree),
             rate_bits,
             blinding,
-            even_columns: EvenColumns::default(),
         }
     }
 
@@ -469,7 +500,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         polynomials: &[PolynomialCoeffs<F>],
         rate_bits: usize,
         fft_root_table: Option<&FftRootTable<F>>,
-        copy_even: &(dyn Fn(usize, &[F]) + Sync),
     ) -> bool {
         let degree = polynomials[0].len();
         let lde_len = degree << rate_bits;
@@ -483,8 +513,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         destinations
             .into_par_iter()
             .zip(polynomials.par_iter())
-            .enumerate()
-            .for_each(|(column, (destination, polynomial))| {
+            .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
                 // Fused copy-and-scale: the unscaled coefficient image that
                 // `copy_from_slice` used to materialize here is never observed —
@@ -507,7 +536,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
                 fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
-                copy_even(column, destination);
             });
         true
     }
@@ -1199,7 +1227,6 @@ mod tests {
                         &polynomials,
                         rate_bits,
                         root_table,
-                        &|_, _| {},
                     ));
 
                     for (column, expected) in expected.iter().enumerate() {

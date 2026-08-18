@@ -1472,7 +1472,8 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             generator_indices_by_watches,
             generator_watch_counts,
             generators_defer_until_ready,
-            constants_sigmas_commitment,
+            // The builder just computed the commitment; store it materialized.
+            constants_sigmas_commitment: constants_sigmas_commitment.into(),
             sigmas,
             subgroup,
             public_inputs: self.public_inputs,
