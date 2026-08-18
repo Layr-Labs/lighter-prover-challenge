@@ -426,29 +426,36 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
             return H::two_to_one(left_digest, right_digest);
         }
 
-        // Whole synchronous 16-leaf subtree, level order: four leaf quads,
-        // two quads then one quad of level-1/2 compressions, one level-3 pair.
+        // Whole synchronous 16-leaf subtree, level order: two leaf eights,
+        // one eight of level-1 compressions, one quad of level-2, one level-3
+        // pair.
         if num_leaves == 16 {
-            let mut leaf_digests = [core::mem::MaybeUninit::<H::Hash>::uninit(); 16];
-            for q in 0..4 {
-                let base = q * 4 * leaf_width;
-                let quad_leaves = if q < 2 { left_leaves } else { right_leaves };
-                let base = base - if q < 2 { 0 } else { 8 * leaf_width };
-                let (leaf_a, rest) = quad_leaves[base..base + 4 * leaf_width].split_at(leaf_width);
-                let (leaf_b, rest2) = rest.split_at(leaf_width);
-                let (leaf_c, leaf_d) = rest2.split_at(leaf_width);
-                let (ha, hb, hc, hd) = H::hash_or_noop_quad(leaf_a, leaf_b, leaf_c, leaf_d);
-                leaf_digests[4 * q].write(ha);
-                leaf_digests[4 * q + 1].write(hb);
-                leaf_digests[4 * q + 2].write(hc);
-                leaf_digests[4 * q + 3].write(hd);
-            }
-            // SAFETY: all 16 entries were initialized above.
-            let h: [H::Hash; 16] = unsafe { core::mem::transmute_copy(&leaf_digests) };
+            // Sixteen independent leaf sponges and eight independent level-1
+            // compressions, batched eight-wide instead of four-wide: the batch
+            // primitives are per-input bit-identical to the scalar ones, so the
+            // grouping cannot move a digest, and eight interleaved permutations
+            // expose more of the round's independent work than four do.
+            let leaf_at = |k: usize| -> &[F] {
+                let src = if k < 8 { left_leaves } else { right_leaves };
+                let b = (k % 8) * leaf_width;
+                &src[b..b + leaf_width]
+            };
+            let lo = H::hash_or_noop_oct(core::array::from_fn(|k| leaf_at(k)));
+            let hi = H::hash_or_noop_oct(core::array::from_fn(|k| leaf_at(8 + k)));
+            let h: [H::Hash; 16] = core::array::from_fn(|k| if k < 8 { lo[k] } else { hi[k - 8] });
 
-            let n_a = H::two_to_one_quad([(h[0], h[1]), (h[2], h[3]), (h[4], h[5]), (h[6], h[7])]);
-            let n_b =
-                H::two_to_one_quad([(h[8], h[9]), (h[10], h[11]), (h[12], h[13]), (h[14], h[15])]);
+            let n = H::two_to_one_oct([
+                (h[0], h[1]),
+                (h[2], h[3]),
+                (h[4], h[5]),
+                (h[6], h[7]),
+                (h[8], h[9]),
+                (h[10], h[11]),
+                (h[12], h[13]),
+                (h[14], h[15]),
+            ]);
+            let n_a = [n[0], n[1], n[2], n[3]];
+            let n_b = [n[4], n[5], n[6], n[7]];
             let m = H::two_to_one_quad([
                 (n_a[0], n_a[1]),
                 (n_a[2], n_a[3]),
