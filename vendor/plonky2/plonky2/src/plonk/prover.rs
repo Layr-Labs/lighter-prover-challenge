@@ -1342,6 +1342,31 @@ fn range_quotient_split_enabled() -> bool {
 /// lookups, two challenges) and only for the pipelined 2^19-row LDE shapes
 /// where the quotient kernel dominates (`LIGHTER_QSPLIT_MIN_LDE_BITS`
 /// overrides the floor).
+/// Whether a circuit's constants/sigmas commitment should retain its even-row
+/// companion at build/load time (once per circuit): the same shapes as the
+/// wires companion. With it, the constant-reading degree-2 gate kinds
+/// (`Equality`, `BaseAddition`) join the half-domain job.
+pub fn constants_even_companion_wanted(degree_bits: usize, rate_bits: usize) -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        static MIN_BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let min_bits = *MIN_BITS.get_or_init(|| {
+            std::env::var("LIGHTER_QSPLIT_MIN_LDE_BITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(19)
+        });
+        // Only the pipelined 2^19 shapes: the final block's 2^21 store would
+        // cost a 0.7 GiB companion for a single proof.
+        range_quotient_split_enabled() && degree_bits + rate_bits >= min_bits && degree_bits + rate_bits <= 19
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    {
+        let _ = (degree_bits, rate_bits);
+        false
+    }
+}
+
 fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
 ) -> bool {
@@ -1358,12 +1383,50 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
             && common_data.num_lookup_polys == 0
             && common_data.config.num_challenges == 2
             && common_data.degree_bits() + common_data.config.fri_config.rate_bits >= min_bits
+            // Not the final block's 2^21 shape: measured slower there (its
+            // 1 GiB companion and 2^20-point extension sit on the serial tail).
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits <= 19
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
         let _ = common_data;
         false
     }
+}
+
+/// Dedicated pool for the half-domain extension: a few threads at
+/// `QOS_CLASS_UTILITY` (0x11), which macOS schedules onto the E-cores first,
+/// so the extension's FFTs never displace the serial chain spine's P-core
+/// work on the global pool. `LIGHTER_QSPLIT_EXT_THREADS` sets the size
+/// (default 4; 0 = run on the global pool).
+#[cfg(all(feature = "std", feature = "parallel", target_arch = "aarch64", target_os = "macos"))]
+fn range_extension_pool() -> Option<&'static plonky2_maybe_rayon::rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<plonky2_maybe_rayon::rayon::ThreadPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = std::env::var("LIGHTER_QSPLIT_EXT_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4);
+        if threads == 0 {
+            return None;
+        }
+        #[allow(non_camel_case_types)]
+        type qos_class_t = u32;
+        unsafe extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+        }
+        plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|i| format!("qsplit-ext-{i}"))
+            .stack_size(64 * 1024 * 1024)
+            .start_handler(|_| unsafe {
+                let _ = pthread_set_qos_class_self_np(0x11, 0);
+            })
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 /// Extends the per-gate half-domain sums to the odd rows and applies the
@@ -2065,28 +2128,48 @@ fn start_gpu_range_check_gate_quotient<
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
+    let even_constants = prover_data.constants_sigmas_commitment.even_columns.get();
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
-        // Kinds that read gate constants stay on the full-domain (real
-        // constants store) dispatch; everything else of degree <= 4 goes to
-        // the compact even-row companion, which is bound as `wires` with
+        // Kinds that read gate constants join the half-domain job only when
+        // the constants store also has an even-row companion (so their reads
+        // hit rows of the same sub-domain); otherwise they stay on the
+        // full-domain filtered dispatch. Everything else of degree <= 4 goes
+        // to the compact wires companion, bound as `wires` with
         // `lde_rows = quotient_rows / 2`.
+        let have_even_constants = even_constants.is_some_and(|c| c.rows() == even_wires.rows());
         let reads_constants = |kind: &U32QuotientKind| {
-            matches!(
-                kind,
-                U32QuotientKind::Equality { .. }
-                    | U32QuotientKind::BaseAddition { .. }
-                    | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
-            )
+            !have_even_constants
+                && matches!(
+                    kind,
+                    U32QuotientKind::Equality { .. }
+                        | U32QuotientKind::BaseAddition { .. }
+                        | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
+                )
         };
+        let low_constants = if have_even_constants { even_constants.unwrap() } else { constants };
+        // Gates below this many constraints save little kernel time on the
+        // half domain but each costs a CPU IFFT/FFT pair; keep them on the
+        // full-domain job. `LIGHTER_QSPLIT_MIN_CONSTRAINTS` (default 60:
+        // measured 26.91 / 26.62 / 26.59 s for 0 / 30 / 60 and 27.30 s for
+        // 120 over 3 interleaved rounds; 60 keeps the wide U32/range families
+        // and drops BaseSum4, QuinticMul, BaseAddition, Selection, RA-3).
+        static MIN_CONSTRAINTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let min_constraints = *MIN_CONSTRAINTS.get_or_init(|| {
+            std::env::var("LIGHTER_QSPLIT_MIN_CONSTRAINTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60)
+        });
         let mut low_groups = Vec::new();
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
         let mut high_u32_specs = Vec::new();
         for (spec, &degree) in specs.iter().zip(&spec_degrees) {
-            if degree <= 4 {
+            let n_constraints = common_data.gates[spec.gate_index].0.num_constraints();
+            if degree <= 4 && n_constraints >= min_constraints {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2102,7 +2185,8 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && !reads_constants(&spec.kind) {
+            let n_constraints = common_data.gates[spec.gate_index].0.num_constraints();
+            if degree <= 4 && !reads_constants(&spec.kind) && n_constraints >= min_constraints {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2120,7 +2204,7 @@ fn start_gpu_range_check_gate_quotient<
         if !low_groups.is_empty() {
             if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
                 even_wires,
-                constants,
+                low_constants,
                 quotient_rows / 2,
                 1,
                 &low_groups,
@@ -2548,13 +2632,23 @@ fn compute_quotient_polys<
                 .ok_or_else(|| "split range quotient requires Metal-backed constants".to_string())?;
             #[cfg(feature = "diagnostic_profile")]
             let _extend_span = crate::util::profile::span("quotient", "range_low_extend_combine");
-            Ok(Some(extend_and_combine_low_range_quotient(
-                low_values,
-                low_gates,
-                *low_rows,
-                points.len(),
-                constants,
-            )))
+            let run = || {
+                extend_and_combine_low_range_quotient(
+                    low_values,
+                    low_gates,
+                    *low_rows,
+                    points.len(),
+                    constants,
+                )
+            };
+            #[cfg(feature = "parallel")]
+            let values = match range_extension_pool() {
+                Some(pool) => pool.install(run),
+                None => run(),
+            };
+            #[cfg(not(feature = "parallel"))]
+            let values = run();
+            Ok(Some(values))
         } else {
             Ok(None)
         }

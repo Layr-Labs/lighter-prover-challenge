@@ -1287,13 +1287,14 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let constants_sigmas_commitment = if commit_to_sigma {
             let mut constants_sigmas_vecs = constant_vecs;
             constants_sigmas_vecs.extend(sigma_vecs);
-            PolynomialBatch::<F, C, D>::from_values(
+            PolynomialBatch::<F, C, D>::from_values_with_even_companion(
                 constants_sigmas_vecs,
                 rate_bits,
                 PlonkOracle::CONSTANTS_SIGMAS.blinding,
                 cap_height,
                 &mut timing,
                 Some(&fft_root_table),
+                crate::plonk::prover::constants_even_companion_wanted(degree_bits, rate_bits),
             )
         } else {
             PolynomialBatch::<F, C, D>::default()
