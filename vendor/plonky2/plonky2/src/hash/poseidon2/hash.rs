@@ -146,6 +146,58 @@ pub trait Poseidon2: PrimeField64 {
         }
     }
 
+    /// Eight-state variant of `poseidon2_x4`; same bit-identity guarantee.
+    #[inline]
+    fn poseidon2_x8(inputs: [[Self; WIDTH]; 8]) -> [[Self; WIDTH]; 8] {
+        let mut s = inputs;
+        for state in s.iter_mut() {
+            Self::external_linear_layer(state);
+        }
+        Self::full_rounds_x8(&mut s, 0);
+        Self::partial_rounds_x8(&mut s);
+        Self::full_rounds_x8(&mut s, ROUNDS_F_HALF);
+        s
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn full_rounds_x8(s: &mut [[Self; WIDTH]; 8], start: usize) {
+        for r in start..(start + ROUNDS_F_HALF) {
+            for i in 0..8 {
+                Self::add_rc(&mut s[i], r);
+            }
+            for i in 0..8 {
+                Self::sbox(&mut s[i]);
+            }
+            for i in 0..8 {
+                Self::external_linear_layer(&mut s[i]);
+            }
+        }
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn partial_rounds_x8(s: &mut [[Self; WIDTH]; 8]) {
+        for r in 0..ROUNDS_P {
+            let rc = Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            for i in 0..8 {
+                s[i][0] += rc;
+            }
+            for i in 0..8 {
+                s[i][0] = Self::sbox_p(&s[i][0]);
+            }
+            let (lo, hi) = s.split_at_mut(4);
+            let (a, rest) = lo.split_at_mut(1);
+            let (b, rest) = rest.split_at_mut(1);
+            let (c, d) = rest.split_at_mut(1);
+            Self::internal_linear_layer_x4(&mut a[0], &mut b[0], &mut c[0], &mut d[0]);
+            let (e, rest) = hi.split_at_mut(1);
+            let (f, rest) = rest.split_at_mut(1);
+            let (g, h) = rest.split_at_mut(1);
+            Self::internal_linear_layer_x4(&mut e[0], &mut f[0], &mut g[0], &mut h[0]);
+        }
+    }
+
     #[inline]
     #[unroll::unroll_for_loops]
     fn full_rounds(state: &mut [Self; WIDTH], start: usize) {
@@ -838,6 +890,26 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
     (out(&state_a), out(&state_b), out(&state_c), out(&state_d))
 }
 
+/// Eight-input variant of `hash_quad_no_pad`, permuted via `poseidon2_x8`.
+/// Each output is bit-identical to `hash_n_to_hash_no_pad` on that input.
+pub(crate) fn hash_oct_no_pad<F: RichField + Poseidon2>(inputs: [&[F]; 8]) -> [HashOut<F>; 8] {
+    let len = inputs[0].len();
+    debug_assert!(inputs.iter().all(|i| i.len() == len));
+    let mut states = [[F::ZERO; WIDTH]; 8];
+    let mut off = 0;
+    while off < len {
+        let n = RATE.min(len - off);
+        for (state, input) in states.iter_mut().zip(inputs.iter()) {
+            state[..n].copy_from_slice(&input[off..off + n]);
+        }
+        states = F::poseidon2_x8(states);
+        off += RATE;
+    }
+    core::array::from_fn(|i| HashOut {
+        elements: states[i][..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    })
+}
+
 /// Two independent `compress` calls with their permutations interleaved via
 /// `poseidon2_x2`. Each output is bit-identical to `compress` on that pair.
 pub(crate) fn compress_pair<F: RichField + Poseidon2>(
@@ -886,6 +958,23 @@ pub(crate) fn compress_quad<F: RichField + Poseidon2>(
         elements: state[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
     };
     [out(a), out(b), out(c), out(d)]
+}
+
+/// Eight independent `compress` calls with their permutations interleaved via
+/// `poseidon2_x8`. Each output is bit-identical to `compress` on that pair.
+pub(crate) fn compress_oct<F: RichField + Poseidon2>(
+    inputs: [(HashOut<F>, HashOut<F>); 8],
+) -> [HashOut<F>; 8] {
+    let load = |(x, y): (HashOut<F>, HashOut<F>)| {
+        let mut state = [F::ZERO; WIDTH];
+        state[..NUM_HASH_OUT_ELTS].copy_from_slice(&x.elements);
+        state[NUM_HASH_OUT_ELTS..2 * NUM_HASH_OUT_ELTS].copy_from_slice(&y.elements);
+        state
+    };
+    let states = F::poseidon2_x8(core::array::from_fn(|i| load(inputs[i])));
+    core::array::from_fn(|i| HashOut {
+        elements: states[i][..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    })
 }
 
 /// Poseidon2 hash function.
@@ -948,6 +1037,19 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     fn two_to_one_quad(inputs: [(Self::Hash, Self::Hash); 4]) -> [Self::Hash; 4] {
         compress_quad::<F>(inputs)
+    }
+
+    fn hash_or_noop_oct(inputs: [&[F]; 8]) -> [Self::Hash; 8] {
+        debug_assert!(inputs.iter().all(|i| i.len() == inputs[0].len()));
+        if inputs[0].len() * 8 <= <Self as Hasher<F>>::HASH_SIZE {
+            core::array::from_fn(|i| <Self as Hasher<F>>::hash_or_noop(inputs[i]))
+        } else {
+            hash_oct_no_pad::<F>(inputs)
+        }
+    }
+
+    fn two_to_one_oct(inputs: [(Self::Hash, Self::Hash); 8]) -> [Self::Hash; 8] {
+        compress_oct::<F>(inputs)
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -1285,6 +1387,78 @@ mod pair_hash_tests {
             let (ha, hb) = Poseidon2Hash::hash_or_noop_pair(&a, &b);
             assert_eq!(ha, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&a), "width {width} a");
             assert_eq!(hb, <Poseidon2Hash as Hasher<F>>::hash_or_noop(&b), "width {width} b");
+        }
+    }
+
+    /// The eight-wide leaf sponge must reproduce `hash_or_noop` on every one
+    /// of its eight inputs, at every width the Merkle builds present -- both
+    /// sides of the `hash_or_noop` no-op boundary, non-multiples of the rate,
+    /// and the two production leaf widths (16 and 20) and FRI width (32).
+    /// Compared on raw `to_noncanonical_u64` limbs, because `HashOut`'s
+    /// `PartialEq` canonicalises and would hide a changed representative.
+    #[test]
+    fn oct_hash_matches_individual_across_widths() {
+        use plonky2_field::types::PrimeField64;
+        for width in [1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 17, 20, 24, 32, 33, 87, 135, 136] {
+            let inputs: Vec<Vec<F>> = (0..8)
+                .map(|_| (0..width).map(|_| F::rand()).collect())
+                .collect();
+            let borrowed: [&[F]; 8] = core::array::from_fn(|i| inputs[i].as_slice());
+            let got = Poseidon2Hash::hash_or_noop_oct(borrowed);
+            for i in 0..8 {
+                let want = <Poseidon2Hash as Hasher<F>>::hash_or_noop(&inputs[i]);
+                assert_eq!(
+                    got[i].elements.map(|e| e.to_noncanonical_u64()),
+                    want.elements.map(|e| e.to_noncanonical_u64()),
+                    "width {width} input {i}"
+                );
+            }
+        }
+    }
+
+    /// The eight-wide compression must reproduce `two_to_one` on every one of
+    /// its eight pairs, on raw limbs.
+    #[test]
+    fn oct_compress_matches_individual() {
+        use plonky2_field::types::PrimeField64;
+        for _ in 0..64 {
+            let pairs: [(HashOut<F>, HashOut<F>); 8] = core::array::from_fn(|_| {
+                (
+                    HashOut::from_vec(F::rand_vec(NUM_HASH_OUT_ELTS)),
+                    HashOut::from_vec(F::rand_vec(NUM_HASH_OUT_ELTS)),
+                )
+            });
+            let got = Poseidon2Hash::two_to_one_oct(pairs);
+            for i in 0..8 {
+                let want =
+                    <Poseidon2Hash as Hasher<F>>::two_to_one(pairs[i].0, pairs[i].1);
+                assert_eq!(
+                    got[i].elements.map(|e| e.to_noncanonical_u64()),
+                    want.elements.map(|e| e.to_noncanonical_u64()),
+                    "pair {i}"
+                );
+            }
+        }
+    }
+
+    /// `poseidon2_x8` must reproduce `poseidon2` on each of its eight states.
+    #[test]
+    fn poseidon2_x8_matches_scalar() {
+        use plonky2_field::types::PrimeField64;
+        for _ in 0..64 {
+            let states: [[F; WIDTH]; 8] =
+                core::array::from_fn(|_| core::array::from_fn(|_| F::rand()));
+            let got = <F as Poseidon2>::poseidon2_x8(states);
+            for i in 0..8 {
+                let want = <F as Poseidon2>::poseidon2(states[i]);
+                for j in 0..WIDTH {
+                    assert_eq!(
+                        got[i][j].to_noncanonical_u64(),
+                        want[j].to_noncanonical_u64(),
+                        "state {i} lane {j}"
+                    );
+                }
+            }
         }
     }
 
