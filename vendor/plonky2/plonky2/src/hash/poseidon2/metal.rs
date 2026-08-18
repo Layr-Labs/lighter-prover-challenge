@@ -4247,11 +4247,23 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
+    let execution_width = pipeline.thread_execution_width().max(1);
+    let max_tg = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
         .max(execution_width);
+    // Metal requires threadgroup width to be a SIMD multiple.
+    // `max_total_threads_per_threadgroup` already encodes register pressure
+    // (Apple MTLComputePipelineState); the historical `.min(128)` clamp
+    // (4fee105b raised 64→128 as a composition leftover) leaves occupancy on
+    // the table whenever the PSO reports a higher ceiling. 32f823a8 added
+    // `occupancy_probe` for this number and never consumed it. Absorb/parent/
+    // quotient kernels bound-check `gid` and allocate no threadgroup memory,
+    // so a larger group is value-exact. For tiny parent levels, do not launch
+    // a group bigger than the SIMD-rounded grid.
+    let occupancy = (max_tg / execution_width) * execution_width;
+    let n = (thread_count as NSUInteger).max(1);
+    let grid = n.div_ceil(execution_width) * execution_width;
+    let group_width = occupancy.min(grid).max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
