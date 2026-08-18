@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "e01a1ceb60d512573fc7dcafdf773651a4346d5c396a5cc20d0167cfa52e2da9";
+    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -386,11 +386,7 @@ struct MetalShared {
     /// Buffers backing live level-order digest stores return here after the
     /// proof has extracted its sparse Merkle paths.
     digest_output_pool: Arc<Mutex<DigestOutputPool>>,
-    /// Regular tree builders wait here; serial-critical spine builders use a
-    /// separate condition variable so releasing one singleton set never has
-    /// to broadcast just to reach the priority class.
     available: Condvar,
-    spine_available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
     ntt_roots: Mutex<HashMap<u32, NttRoots>>,
@@ -704,296 +700,6 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
-}
-
-/// The Range/U32 shader keeps one shared selector-product base per selected
-/// group in thread-local storage. Production selector groups are small; the
-/// fixed bound keeps malformed or unusually fragmented circuits on the
-/// existing per-spec filter path instead of increasing register pressure for
-/// every quotient thread.
-const MAX_SHARED_SELECTOR_PLANS: usize = 8;
-const MAX_SHARED_SELECTOR_GROUP_GATES: usize = 64;
-const SELECTOR_PLAN_HEADER_WORDS: usize = 5;
-const MAX_SELECTOR_PLAN_WORDS: usize = 4096 / size_of::<u32>();
-
-/// GPU-side selector-product plan encoded as u32 words.
-///
-/// Layout:
-/// - one plan id plus one per quotient spec (`0` means use the generic path),
-/// - one record offset per plan,
-/// - variable records: selector column, group start/end, UNUSED flag, active
-///   gate count, then the active gate labels in ascending spec order.
-///
-/// The shader forms the product of all *inactive* group factors (and the
-/// optional UNUSED factor) once per quotient point. Each participating spec
-/// then appends the other active factors. No inversions are used, so selector
-/// values equal to gate labels remain exact zero-factor cases.
-#[derive(Clone, Debug, Default)]
-struct SelectorFilterPlan {
-    words: Vec<u32>,
-    plan_count: usize,
-    planned_specs: usize,
-}
-
-#[derive(Debug)]
-struct SelectorPlanCandidate {
-    selector_column: usize,
-    group: core::ops::Range<usize>,
-    include_unused_selector: bool,
-    members: Vec<(usize, usize)>, // (flat spec index, gate index)
-    duplicate_gate: bool,
-    saved_factor_products: usize,
-}
-
-impl SelectorFilterPlan {
-    fn disabled() -> Self {
-        // Metal's setBytes API requires a non-empty source even though a zero
-        // plan count makes the shader ignore the contents.
-        Self {
-            words: vec![0],
-            plan_count: 0,
-            planned_specs: 0,
-        }
-    }
-}
-
-/// Builds the immutable shape plan consumed by the live Range/U32 Metal
-/// kernel. Failure to specialize is deliberately non-fatal: all records stay
-/// mapped to zero and retain the previous gate-local selector loop.
-fn build_selector_filter_plan(
-    specs: &[RangeCheckQuotientSpec],
-    u32_specs: &[U32QuotientSpec],
-) -> SelectorFilterPlan {
-    let spec_count = match specs.len().checked_add(u32_specs.len()) {
-        Some(count) if count > 0 => count,
-        _ => return SelectorFilterPlan::disabled(),
-    };
-    let mut candidates = Vec::<SelectorPlanCandidate>::new();
-    let mut add_spec = |flat_index: usize,
-                        selector_column: usize,
-                        gate_index: usize,
-                        group: &core::ops::Range<usize>,
-                        include_unused_selector: bool| {
-        let candidate = candidates.iter_mut().find(|candidate| {
-            candidate.selector_column == selector_column
-                && candidate.group == *group
-                && candidate.include_unused_selector == include_unused_selector
-        });
-        let candidate = match candidate {
-            Some(candidate) => candidate,
-            None => {
-                candidates.push(SelectorPlanCandidate {
-                    selector_column,
-                    group: group.clone(),
-                    include_unused_selector,
-                    members: Vec::new(),
-                    duplicate_gate: false,
-                    saved_factor_products: 0,
-                });
-                candidates.last_mut().expect("candidate was just inserted")
-            }
-        };
-        if candidate
-            .members
-            .iter()
-            .any(|&(_, existing_gate)| existing_gate == gate_index)
-        {
-            candidate.duplicate_gate = true;
-        }
-        candidate.members.push((flat_index, gate_index));
-    };
-    for (flat_index, spec) in specs.iter().enumerate() {
-        add_spec(
-            flat_index,
-            spec.selector_column,
-            spec.gate_index,
-            &spec.group,
-            spec.include_unused_selector,
-        );
-    }
-    for (u32_index, spec) in u32_specs.iter().enumerate() {
-        add_spec(
-            specs.len() + u32_index,
-            spec.selector_column,
-            spec.gate_index,
-            &spec.group,
-            spec.include_unused_selector,
-        );
-    }
-
-    let mut eligible = Vec::new();
-    for (index, candidate) in candidates.iter_mut().enumerate() {
-        let group_len = candidate.group.len();
-        let active = candidate.members.len();
-        if candidate.duplicate_gate
-            || active < 2
-            || group_len > MAX_SHARED_SELECTOR_GROUP_GATES
-            || active > group_len
-            || candidate.group.start > candidate.group.end
-            || candidate.selector_column > u32::MAX as usize
-            || candidate.group.end > u32::MAX as usize
-            || candidate
-                .members
-                .iter()
-                .any(|&(_, gate)| !candidate.group.contains(&gate) || gate > u32::MAX as usize)
-        {
-            continue;
-        }
-        let unused = usize::from(candidate.include_unused_selector);
-        let Some(local_factors) = active
-            .checked_mul(group_len.saturating_sub(1).saturating_add(unused))
-        else {
-            continue;
-        };
-        let Some(shared_factors) = group_len
-            .checked_sub(active)
-            .and_then(|inactive| inactive.checked_add(unused))
-            .and_then(|base| active.checked_mul(active - 1).and_then(|cross| base.checked_add(cross)))
-        else {
-            continue;
-        };
-        if shared_factors >= local_factors {
-            continue;
-        }
-        candidate.saved_factor_products = local_factors - shared_factors;
-        eligible.push(index);
-    }
-    eligible.sort_by(|&left, &right| {
-        candidates[right]
-            .saved_factor_products
-            .cmp(&candidates[left].saved_factor_products)
-            .then_with(|| left.cmp(&right))
-    });
-    eligible.truncate(MAX_SHARED_SELECTOR_PLANS);
-
-    while !eligible.is_empty() {
-        let record_words = eligible.iter().try_fold(0usize, |total, &index| {
-            total.checked_add(SELECTOR_PLAN_HEADER_WORDS + candidates[index].members.len())
-        });
-        let total_words = record_words.and_then(|records| {
-            spec_count
-                .checked_add(eligible.len())
-                .and_then(|header| header.checked_add(records))
-        });
-        if total_words.is_some_and(|words| words <= MAX_SELECTOR_PLAN_WORDS) {
-            break;
-        }
-        eligible.pop();
-    }
-    if eligible.is_empty() {
-        return SelectorFilterPlan::disabled();
-    }
-
-    let plan_count = eligible.len();
-    let mut words = vec![0u32; spec_count + plan_count];
-    let mut planned_specs = 0usize;
-    for (plan_index, &candidate_index) in eligible.iter().enumerate() {
-        let candidate = &candidates[candidate_index];
-        let Ok(record_offset) = u32::try_from(words.len()) else {
-            return SelectorFilterPlan::disabled();
-        };
-        words[spec_count + plan_index] = record_offset;
-        words.extend([
-            candidate.selector_column as u32,
-            candidate.group.start as u32,
-            candidate.group.end as u32,
-            candidate.include_unused_selector as u32,
-            candidate.members.len() as u32,
-        ]);
-        for &(flat_index, gate_index) in &candidate.members {
-            words[flat_index] = (plan_index + 1) as u32;
-            words.push(gate_index as u32);
-            planned_specs += 1;
-        }
-    }
-    SelectorFilterPlan {
-        words,
-        plan_count,
-        planned_specs,
-    }
-}
-
-/// Defense in depth for the bytes bound to the shader. The public launcher
-/// only produces plans through [`build_selector_filter_plan`], but validating
-/// the flattened representation here keeps future call-site changes from
-/// turning an offset bug into an out-of-bounds GPU read.
-fn selector_filter_plan_is_valid(
-    words: &[u32],
-    metadata: &[u32],
-    spec_count: usize,
-    plan_count: usize,
-) -> bool {
-    if plan_count == 0 {
-        return !words.is_empty();
-    }
-    if plan_count > MAX_SHARED_SELECTOR_PLANS
-        || words.len() > MAX_SELECTOR_PLAN_WORDS
-        || metadata.len() != spec_count.saturating_mul(10)
-        || words.len() < spec_count.saturating_add(plan_count)
-        || words[..spec_count]
-            .iter()
-            .any(|&plan| plan as usize > plan_count)
-    {
-        return false;
-    }
-
-    for plan_index in 0..plan_count {
-        let offset = words[spec_count + plan_index] as usize;
-        let Some(header_end) = offset.checked_add(SELECTOR_PLAN_HEADER_WORDS) else {
-            return false;
-        };
-        if offset < spec_count + plan_count || header_end > words.len() {
-            return false;
-        }
-        let selector_column = words[offset];
-        let group_start = words[offset + 1];
-        let group_end = words[offset + 2];
-        let include_unused = words[offset + 3];
-        let active = words[offset + 4] as usize;
-        let Some(record_end) = header_end.checked_add(active) else {
-            return false;
-        };
-        if include_unused > 1
-            || active < 2
-            || group_start >= group_end
-            || (group_end - group_start) as usize > MAX_SHARED_SELECTOR_GROUP_GATES
-            || record_end > words.len()
-        {
-            return false;
-        }
-        let gates = &words[header_end..record_end];
-        if gates
-            .iter()
-            .enumerate()
-            .any(|(index, &gate)| {
-                gate < group_start
-                    || gate >= group_end
-                    || gates[..index].contains(&gate)
-            })
-        {
-            return false;
-        }
-        let mut mapped = 0usize;
-        for (flat_index, &mapped_plan) in words[..spec_count].iter().enumerate() {
-            if mapped_plan as usize != plan_index + 1 {
-                continue;
-            }
-            mapped += 1;
-            let record = &metadata[flat_index * 10..flat_index * 10 + 10];
-            if record[0] != selector_column
-                || record[2] != group_start
-                || record[3] != group_end
-                || record[4] != include_unused
-                || !gates.contains(&record[1])
-            {
-                return false;
-            }
-        }
-        if mapped != active {
-            return false;
-        }
-    }
-    true
 }
 
 /// Bounded exact-size cache of shared column-store buffers.
@@ -2610,22 +2316,6 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         }
     }
 
-    let selector_filter_plan = build_selector_filter_plan(specs, u32_specs);
-    debug_assert!(selector_filter_plan_is_valid(
-        &selector_filter_plan.words,
-        &metadata,
-        spec_count,
-        selector_filter_plan.plan_count,
-    ));
-    if selector_filter_plan.plan_count != 0 {
-        log::debug!(
-            "Metal Range/U32 selector sharing active: plans={}, specs={}/{}",
-            selector_filter_plan.plan_count,
-            selector_filter_plan.planned_specs,
-            spec_count,
-        );
-    }
-
     let context = shared_context()?;
     match context.start_range_check_gate_quotient(
         wires,
@@ -2637,8 +2327,6 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         u32_specs.len(),
         &alpha_powers,
         alpha_stride,
-        &selector_filter_plan.words,
-        selector_filter_plan.plan_count,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
@@ -3248,7 +2936,6 @@ impl MetalShared {
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
-                spine_available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
@@ -3330,7 +3017,7 @@ impl MetalShared {
             set_u32(encoder, 10, group.start as u32);
             set_u32(encoder, 11, group.end as u32);
             set_u32(encoder, 12, include_unused_selector as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3363,22 +3050,11 @@ impl MetalShared {
         u32_count: usize,
         alpha_powers: &[u64],
         alpha_stride: usize,
-        selector_filter_plan: &[u32],
-        selector_filter_plan_count: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
-        let spec_count = range_count
-            .checked_add(u32_count)
-            .ok_or("RangeCheck gate quotient spec count overflow")?;
-        if metadata.len() != spec_count * 10
+        if metadata.len() != (range_count + u32_count) * 10
             || alpha_powers.len() != alpha_stride * 2
-            || !selector_filter_plan_is_valid(
-                selector_filter_plan,
-                metadata,
-                spec_count,
-                selector_filter_plan_count,
-            )
         {
             return Err("invalid RangeCheck quotient metadata".to_string());
         }
@@ -3407,19 +3083,13 @@ impl MetalShared {
                 size_of_val(metadata) as NSUInteger,
                 metadata.as_ptr().cast::<c_void>(),
             );
-            encoder.set_bytes(
-                11,
-                size_of_val(selector_filter_plan) as NSUInteger,
-                selector_filter_plan.as_ptr().cast::<c_void>(),
-            );
             set_u32(encoder, 5, wires.rows as u32);
             set_u32(encoder, 6, quotient_rows as u32);
             set_u32(encoder, 7, step as u32);
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            set_u32(encoder, 12, selector_filter_plan_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3516,7 +3186,7 @@ impl MetalShared {
             set_u32(encoder, 13, num_partial_products as u32);
             set_u32(encoder, 14, chunk_size as u32);
             set_u32(encoder, 15, alpha_stride as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3562,12 +3232,7 @@ impl MetalShared {
             if spine {
                 pool.spine_waiters += 1;
             }
-            let available = if spine {
-                &self.spine_available
-            } else {
-                &self.available
-            };
-            match available.wait(pool) {
+            match self.available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
                     if spine {
@@ -3593,17 +3258,23 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // A released singleton set can satisfy one waiter. Spine and regular
-        // builders sleep on distinct condition variables, so the priority
-        // class can be targeted directly without waking every regular waiter
-        // and making them re-contend for the mutex only to sleep again.
+        // With a spine waiter queued, whichever non-spine waiter the OS would
+        // hand a `notify_one` to would just re-block, so the wake must reach
+        // the spine thread. Otherwise, a released singleton set can satisfy
+        // only one waiter and broadcasting just creates mutex contention.
+        // slow-host band; this comment changes no executable behavior.
         if pool.waiters == 0 {
             return;
         }
-        if pool.spine_waiters != 0 {
-            self.spine_available.notify_one();
-        } else {
+        if pool.spine_waiters == 0 {
+            // All sleepers are interchangeable non-spine jobs. One released
+            // set can satisfy exactly one of them, so waking the rest only
+            // makes them contend for the mutex and go back to sleep. Keep the
+            // broadcast solely for the priority case below, where the OS may
+            // otherwise wake a non-spine waiter ahead of the chain spine.
             self.available.notify_one();
+        } else {
+            self.available.notify_all();
         }
     }
 
@@ -3984,7 +3655,6 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
-                set_u32(leaf_encoder, 6, 0);
                 dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
@@ -4249,7 +3919,6 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
-            set_u32(leaf_encoder, 6, 0);
             dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
@@ -4463,19 +4132,11 @@ impl MetalShared {
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
             if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
-            encoder.set_bytes(
-                5,
-                size_of::<u32>() as NSUInteger,
-                (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
-            );
-            if !matches!(&source, LeafSource::Rows(_)) {
-                let canonicalize_in_place = u32::from(matches!(&source, LeafSource::Shared(_)));
                 encoder.set_bytes(
-                    6,
+                    5,
                     size_of::<u32>() as NSUInteger,
-                    (&canonicalize_in_place as *const u32).cast::<c_void>(),
+                    (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
-            }
             }
             dispatch(encoder, leaf_pipeline, leaf_count);
 
@@ -4591,6 +4252,33 @@ fn dispatch(
         .max_total_threads_per_threadgroup()
         .min(128)
         .max(execution_width);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn dispatch_full(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    // Occupancy A/B: dispatch the three multiply-issue-bound quotient kernels
+    // with the device's full threadgroup width instead of the 128-cap used by
+    // the shared `dispatch`. On the M4 Pro these kernels are multiply-bound;
+    // wider threadgroups change scheduling granularity but never any computed
+    // value (the shader and the per-thread work are identical), so this is a
+    // value-exact scheduling/LD dispatch probe only.
+    let execution_width = pipeline.thread_execution_width();
+    let group_width = pipeline.max_total_threads_per_threadgroup().max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
@@ -5311,130 +4999,6 @@ mod tests {
     }
 
     #[test]
-    fn selector_filter_plan_is_cross_family_zero_safe_and_guarded() {
-        type F = GoldilocksField;
-
-        let range_specs = vec![RangeCheckQuotientSpec {
-            selector_column: 2,
-            gate_index: 2,
-            group: 2..6,
-            include_unused_selector: true,
-            num_ops: 4,
-            bit_size: 16,
-        }];
-        let u32_specs = vec![
-            U32QuotientSpec {
-                selector_column: 2,
-                gate_index: 3,
-                group: 2..6,
-                include_unused_selector: true,
-                num_ops: 2,
-                kind: U32QuotientKind::Arithmetic,
-            },
-            U32QuotientSpec {
-                selector_column: 2,
-                gate_index: 5,
-                group: 2..6,
-                include_unused_selector: true,
-                num_ops: 4,
-                kind: U32QuotientKind::Subtraction { result_limbs: 16 },
-            },
-            // A singleton in a different group must retain the generic path.
-            U32QuotientSpec {
-                selector_column: 3,
-                gate_index: 8,
-                group: 7..10,
-                include_unused_selector: true,
-                num_ops: 4,
-                kind: U32QuotientKind::Subtraction { result_limbs: 8 },
-            },
-        ];
-        let plan = build_selector_filter_plan(&range_specs, &u32_specs);
-        assert_eq!(plan.plan_count, 1);
-        assert_eq!(plan.planned_specs, 3);
-        assert_eq!(plan.words[..4], [1, 1, 1, 0]);
-
-        let mut metadata = Vec::new();
-        for (selector, gate, start, end, unused) in [
-            (2, 2, 2, 6, 1),
-            (2, 3, 2, 6, 1),
-            (2, 5, 2, 6, 1),
-            (3, 8, 7, 10, 1),
-        ] {
-            metadata.extend([selector, gate, start, end, unused, 0, 0, 0, 0, 0]);
-        }
-        assert!(selector_filter_plan_is_valid(
-            &plan.words,
-            &metadata,
-            4,
-            plan.plan_count,
-        ));
-
-        let record_offset = plan.words[4] as usize;
-        let group = plan.words[record_offset + 1] as usize
-            ..plan.words[record_offset + 2] as usize;
-        let active_count = plan.words[record_offset + 4] as usize;
-        let active = &plan.words[record_offset + SELECTOR_PLAN_HEADER_WORDS
-            ..record_offset + SELECTOR_PLAN_HEADER_WORDS + active_count];
-        assert_eq!(active, [2, 3, 5]);
-
-        // Gate labels, the inactive label, UNUSED, arbitrary canonical values,
-        // and a deliberately noncanonical u64 representative cover every zero
-        // placement and the raw-input contract used by retained LDE columns.
-        for selector in [
-            F::from_canonical_u64(0),
-            F::from_canonical_u64(2),
-            F::from_canonical_u64(3),
-            F::from_canonical_u64(4),
-            F::from_canonical_u64(5),
-            F::from_canonical_usize(UNUSED_SELECTOR),
-            F::from_canonical_u64(0x1234_5678_9abc_def0 % F::ORDER),
-            GoldilocksField(F::ORDER + 7),
-        ] {
-            let mut shared_base = F::ONE;
-            for gate in group.clone().filter(|gate| !active.contains(&(*gate as u32))) {
-                shared_base *= F::from_canonical_usize(gate) - selector;
-            }
-            shared_base *= F::from_canonical_usize(UNUSED_SELECTOR) - selector;
-            for &gate in active {
-                let mut planned = shared_base;
-                for &other in active.iter().filter(|&&other| other != gate) {
-                    planned *= F::from_canonical_usize(other as usize) - selector;
-                }
-                let generic = group
-                    .clone()
-                    .filter(|&other| other != gate as usize)
-                    .chain(core::iter::once(UNUSED_SELECTOR))
-                    .fold(F::ONE, |filter, other| {
-                        filter * (F::from_canonical_usize(other) - selector)
-                    });
-                assert_eq!(
-                    planned.to_canonical_u64(),
-                    generic.to_canonical_u64(),
-                    "gate={gate}, selector_raw={:#018x}",
-                    selector.to_noncanonical_u64(),
-                );
-            }
-        }
-
-        let mut corrupt = plan.words.clone();
-        corrupt[record_offset + SELECTOR_PLAN_HEADER_WORDS] = 6;
-        assert!(!selector_filter_plan_is_valid(
-            &corrupt,
-            &metadata,
-            4,
-            plan.plan_count,
-        ));
-
-        // Duplicate records for one gate are unsupported by the shared plan;
-        // they stay on the original local-filter path instead of changing the
-        // leave-one-out multiplicity.
-        let duplicate_specs = vec![u32_specs[0].clone(), u32_specs[0].clone()];
-        let duplicate_plan = build_selector_filter_plan(&[], &duplicate_specs);
-        assert_eq!(duplicate_plan.plan_count, 0);
-    }
-
-    #[test]
     fn metal_range_check_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
         const WIRE_COLUMNS: usize = 136;
@@ -5449,23 +5013,23 @@ mod tests {
             RangeCheckQuotientSpec {
                 selector_column: 0,
                 gate_index: 2,
-                group: 1..10,
+                group: 1..4,
                 include_unused_selector: true,
                 num_ops: 15,
                 bit_size: 16,
             },
             RangeCheckQuotientSpec {
-                selector_column: 0,
+                selector_column: 1,
                 gate_index: 5,
-                group: 1..10,
+                group: 4..7,
                 include_unused_selector: true,
                 num_ops: 8,
                 bit_size: 32,
             },
             RangeCheckQuotientSpec {
-                selector_column: 0,
+                selector_column: 2,
                 gate_index: 8,
-                group: 1..10,
+                group: 7..10,
                 include_unused_selector: true,
                 num_ops: 5,
                 bit_size: 48,
@@ -5479,10 +5043,6 @@ mod tests {
                 bit_size: 15,
             },
         ];
-        let production_plan = build_selector_filter_plan(&specs, &[]);
-        assert_eq!(production_plan.plan_count, 1);
-        assert_eq!(production_plan.planned_specs, 3);
-        assert_eq!(production_plan.words[..3], [1, 1, 1]);
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -5498,20 +5058,19 @@ mod tests {
                     *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
                 }
             }
-            let mut constants_columns = constants.columns_mut().expect("unique selector columns");
-            let mut initialized = vec![false; constants_columns.len()];
-            for spec in &specs {
-                if initialized[spec.selector_column] {
-                    continue;
-                }
-                initialized[spec.selector_column] = true;
-                let column = &mut constants_columns[spec.selector_column];
+            let constants_columns = constants.columns_mut().expect("unique selector columns");
+            for (spec, column) in specs.iter().zip(constants_columns) {
+                let other_gate = spec
+                    .group
+                    .clone()
+                    .find(|&gate| gate != spec.gate_index)
+                    .unwrap();
                 for row in 0..full_rows {
                     column[row] = match (row / step) & 3 {
                         0 => F::from_canonical_usize(spec.gate_index),
-                        1 => F::from_canonical_usize(spec.group.start + 1),
+                        1 => F::from_canonical_usize(other_gate),
                         2 => F::from_canonical_usize(UNUSED_SELECTOR),
-                        _ => GoldilocksField(rng.next_u64()),
+                        _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
                     };
                 }
             }
@@ -5579,11 +5138,6 @@ mod tests {
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
-                    actual.to_noncanonical_u64(),
-                    expected.to_canonical_u64(),
-                    "RangeCheck raw canonical output mismatch at word {i}, step {step}"
-                );
-                assert_eq!(
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "RangeCheck gate quotient mismatch at word {i}, step {step}"
@@ -5605,15 +5159,15 @@ mod tests {
             U32QuotientSpec {
                 selector_column: 0,
                 gate_index: 2,
-                group: 1..10,
+                group: 1..4,
                 include_unused_selector: true,
                 num_ops: 3,
                 kind: U32QuotientKind::Arithmetic,
             },
             U32QuotientSpec {
-                selector_column: 0,
+                selector_column: 1,
                 gate_index: 5,
-                group: 1..10,
+                group: 4..7,
                 include_unused_selector: true,
                 num_ops: 6,
                 kind: U32QuotientKind::Subtraction { result_limbs: 16 },
@@ -5622,9 +5176,9 @@ mod tests {
             // with a different limb count, so they exercise the same branch
             // at both ends of the supported width range.
             U32QuotientSpec {
-                selector_column: 0,
+                selector_column: 2,
                 gate_index: 8,
-                group: 1..10,
+                group: 7..10,
                 include_unused_selector: true,
                 num_ops: 9,
                 kind: U32QuotientKind::Subtraction { result_limbs: 8 },
@@ -5708,10 +5262,6 @@ mod tests {
                 constant_base: addition_constant_base,
             },
         });
-        let production_plan = build_selector_filter_plan(&[], &specs);
-        assert!(production_plan.plan_count >= 1);
-        assert!(production_plan.planned_specs >= 3);
-        assert_eq!(production_plan.words[..3], [1, 1, 1]);
 
         for step in [1, 4] {
             let full_rows = QUOTIENT_ROWS * step;
@@ -5727,27 +5277,29 @@ mod tests {
                     *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
                 }
             }
-            let mut constants_columns = constants.columns_mut().expect("unique selector columns");
-            let mut initialized = vec![false; constants_columns.len()];
-            for spec in &specs {
-                if initialized[spec.selector_column] {
-                    continue;
-                }
-                initialized[spec.selector_column] = true;
-                let column = &mut constants_columns[spec.selector_column];
+            for (spec, column) in specs
+                .iter()
+                .zip(constants.columns_mut().expect("unique selector columns"))
+            {
+                let other_gate = spec
+                    .group
+                    .clone()
+                    .find(|&gate| gate != spec.gate_index)
+                    .unwrap();
                 for row in 0..full_rows {
                     column[row] = match (row / step) & 3 {
                         0 => F::from_canonical_usize(spec.gate_index),
-                        1 => F::from_canonical_usize(spec.group.start + 1),
+                        1 => F::from_canonical_usize(other_gate),
                         2 => F::from_canonical_usize(UNUSED_SELECTOR),
-                        _ => GoldilocksField(rng.next_u64()),
+                        _ => F::from_canonical_u64(rng.next_u64() % F::ORDER),
                     };
                 }
             }
+            let mut constant_columns = constants.columns_mut().expect("unique constant columns");
             for row in 0..full_rows {
-                constants_columns[addition_constant_base][row] =
+                constant_columns[addition_constant_base][row] =
                     F::from_canonical_u64(3 + (row % 19) as u64);
-                constants_columns[addition_constant_base + 1][row] =
+                constant_columns[addition_constant_base + 1][row] =
                     F::from_canonical_u64(5 + (row % 23) as u64);
             }
 
@@ -5948,11 +5500,6 @@ mod tests {
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
-                    actual.to_noncanonical_u64(),
-                    expected.to_canonical_u64(),
-                    "U32 raw canonical output mismatch at word {i}, step {step}"
-                );
-                assert_eq!(
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "U32 gate quotient mismatch at word {i}, step {step}"
@@ -5963,11 +5510,11 @@ mod tests {
 
     // Differential coverage for the byte-decomposition and EdDSA quintic
     // gates evaluated in the same union job as production RangeCheck,
-    // width-generic subtraction and add-many specs. The shared stores are
-    // initially filled with random canonical values plus the twelve raw
-    // boundary representatives, then passed through the same in-place
-    // canonicalizing commitment read that establishes the production
-    // MetalColumns invariant before any quotient kernel consumes them.
+    // width-generic subtraction and add-many specs. Wire columns mix random
+    // canonical values with a rotating window of the twelve raw boundary
+    // representatives (including noncanonical encodings at and above the
+    // field order) from the packed-field differential suite, so every kernel
+    // operation sees the carry-boundary cases.
     #[test]
     fn metal_byte_and_quintic_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
@@ -6171,20 +5718,6 @@ mod tests {
                     }
                 }
             }
-
-            context
-                .build(LeafSource::Shared(&wires), WIRE_COLUMNS, full_rows, 0)
-                .expect("wire commitment must establish canonical columns");
-            context
-                .build(
-                    LeafSource::Shared(&constants),
-                    shapes.len() + 3,
-                    full_rows,
-                    0,
-                )
-                .expect("constant commitment must establish canonical columns");
-            assert!(wires.raw().iter().all(|&value| value < F::ORDER));
-            assert!(constants.raw().iter().all(|&value| value < F::ORDER));
 
             let mut expected = vec![F::ZERO; QUOTIENT_ROWS * 2];
             let two = F::from_canonical_u64(2);
@@ -7469,11 +7002,6 @@ kernel void goldilocks_mul_bench_native(
                     .build(LeafSource::Shared(&shared), cols, rows, cap_height)
                     .unwrap();
 
-                assert!(
-                    shared.raw().iter().all(|&value| value < GoldilocksField::ORDER),
-                    "shared-column hashing must establish the canonical MetalColumns invariant"
-                );
-
                 assert_tree_raw_eq(&direct, &staged, cols, cap_height);
                 assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
             }
@@ -7502,24 +7030,18 @@ kernel void goldilocks_mul_bench_native(
         set_exclusive_gpu_phase(true);
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
-        assert!(ABSORB_PASS_PIPELINE.get().is_some(), "absorb pipeline");
+        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    let value = (group * 8 + index + 1) as u64;
-                    let raw = if index & 1 == 0 { value } else { F::ORDER + value };
-                    destination.fill(F::from_noncanonical_u64(raw));
+                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
                 }
             },
         )
         .expect("streamed tree");
         assert!(streamed.0.nodes.is_shared());
-        for column in 0..cols {
-            assert!(columns.col(column)[0].0 < F::ORDER);
-            assert!(columns.col(column)[rows - 1].0 < F::ORDER);
-        }
 
         let classic = context
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
