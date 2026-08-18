@@ -2558,10 +2558,15 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
-        command_buffer.wait_until_completed();
-        command_buffer.status() == MTLCommandBufferStatus::Completed
-    });
+    // Every absorb command was committed to the same FIFO queue. Completion
+    // of the final command therefore implies that every predecessor reached a
+    // terminal state. Wait once instead of parking and waking this CPU thread
+    // at every eight-column pass, then retain the per-command status scan so a
+    // failure in any predecessor still triggers the classic-path fallback.
+    absorb_commands.last()?.wait_until_completed();
+    let all_ok = absorb_commands
+        .iter()
+        .all(|command_buffer| command_buffer.status() == MTLCommandBufferStatus::Completed);
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
