@@ -22,6 +22,134 @@ use crate::plonk::circuit_data::{CommonCircuitData, GeneratorWatchIndex, ProverO
 use crate::plonk::config::GenericConfig;
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
+/// Recorded `(target index, representative)` pairs for one generator, plus the
+/// replay state.
+///
+/// A generator's emitted *targets* are fixed by the circuit (only the values
+/// are input-dependent) for the vast majority of generator kinds, but the
+/// claim is never trusted: replay compares the emitted target's index — pure
+/// arithmetic on the `Target` enum, no memory traffic — against the recorded
+/// index before the cached representative is used, and the first divergence
+/// retires the entry permanently, with the rest of that run (and every later
+/// run) taking the ordinary gather path. A stale entry produced by prover-data
+/// address reuse degrades exactly the same way; it can never produce a wrong
+/// write, because a representative is only ever consumed when the target index
+/// it was recorded for reappears.
+#[cfg(feature = "std")]
+enum GeneratorRepEntry {
+    /// First observed run: gather the representative once per value (the read
+    /// being eliminated) and record the pair.
+    Recording(Vec<(u32, u32)>),
+    /// Later runs: replay positionally after the per-write index check.
+    Replaying(Vec<(u32, u32)>),
+    /// Emission drifted (or the entry predates this circuit instance): use
+    /// the generic path forever.
+    Uncacheable,
+}
+
+/// Per-thread cache of recorded generator emission layouts, keyed by the
+/// address of the immutable `ProverOnlyCircuitData` they were recorded from.
+///
+/// Witness generation for one circuit runs on one lane thread for the whole
+/// block (transaction chunks, chain steps), so a thread-local map keyed by the
+/// owner's address sees exactly the circuits that thread proves. Entries are
+/// value-verified per write (see [`GeneratorRepEntry`]); the address key is
+/// only a routing hint, not a soundness assumption.
+#[cfg(feature = "std")]
+mod generator_rep_cache {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use super::GeneratorRepEntry;
+
+    thread_local! {
+        static ENTRIES: RefCell<HashMap<usize, Vec<GeneratorRepEntry>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// Runs `f` with the entry for `(owner, generator_idx)`, sizing the
+    /// per-circuit vector on first use. New slots start as empty recordings
+    /// and are only promoted to `Replaying` by a completed run; retired
+    /// entries are never revived.
+    pub(super) fn with_entry<R>(
+        owner: usize,
+        generator_idx: usize,
+        num_generators: usize,
+        f: impl FnOnce(&mut GeneratorRepEntry) -> R,
+    ) -> R {
+        ENTRIES.with(|entries| {
+            let mut entries = entries.borrow_mut();
+            let vector = entries.entry(owner).or_insert_with(|| {
+                Vec::with_capacity(num_generators)
+            });
+            if vector.len() < num_generators {
+                vector.resize_with(num_generators, || GeneratorRepEntry::Recording(Vec::new()));
+            }
+            f(&mut vector[generator_idx])
+        })
+    }
+}
+
+/// Merges one generated value through the replay cache when possible.
+///
+/// Returns the newly-populated representative exactly like
+/// `PartitionWitness::set_target_returning_rep`. Every path writes either
+/// through `set_rep_index_returning_new` with a representative recorded for
+/// this very target index, or through the ordinary gather; both are
+/// documented bit-for-bit equivalent.
+#[cfg(feature = "std")]
+fn set_generated_value_replaying<F: Field>(
+    witness: &mut PartitionWitness<F>,
+    owner: usize,
+    generator_idx: usize,
+    num_generators: usize,
+    run_cursor: &mut usize,
+    target: Target,
+    value: F,
+) -> Result<Option<usize>> {
+    let target_index = witness.target_index(target) as u32;
+    generator_rep_cache::with_entry(owner, generator_idx, num_generators, |entry| {
+        match entry {
+            GeneratorRepEntry::Recording(pairs) => {
+                let representative = witness.representative_map[target_index as usize];
+                pairs.push((target_index, representative));
+                *run_cursor += 1;
+                witness.set_rep_index_returning_new(representative as usize, target, value)
+            }
+            GeneratorRepEntry::Replaying(pairs) => {
+                if let Some(&(recorded_index, representative)) = pairs.get(*run_cursor) {
+                    if recorded_index == target_index {
+                        *run_cursor += 1;
+                        return witness
+                            .set_rep_index_returning_new(representative as usize, target, value);
+                    }
+                }
+                // Divergence: retire permanently. The current value still
+                // merges through the ordinary gather, and no later run can
+                // ever re-record (only `Replaying`/`Recording` transitions
+                // exist, and both require a completed prior recording).
+                *entry = GeneratorRepEntry::Uncacheable;
+                witness.set_target_returning_rep(target, value)
+            }
+            GeneratorRepEntry::Uncacheable => {
+                witness.set_target_returning_rep(target, value)
+            }
+        }
+    })
+}
+
+/// Promotes a still-recording entry to replaying after a run completed without
+/// divergence. Split from the write helper so the borrow ends between them.
+#[cfg(feature = "std")]
+fn promote_generator_rep_entry(owner: usize, generator_idx: usize, num_generators: usize) {
+    generator_rep_cache::with_entry(owner, generator_idx, num_generators, |entry| {
+        if let GeneratorRepEntry::Recording(pairs) = entry {
+            let pairs = core::mem::take(pairs);
+            *entry = GeneratorRepEntry::Replaying(pairs);
+        }
+    });
+}
+
 /// Given a `PartitionWitness` that has only inputs set, populates the rest of the witness using the
 /// given set of generators.
 pub fn generate_partial_witness<
@@ -297,8 +425,40 @@ fn run_generator_worklist<
             // touch disjoint state, so fusing the two passes deletes the per-run intermediate
             // rep Vec while preserving both the `set_target_returning_rep` call order and the
             // pending-queue push order exactly.
+            //
+            // The merge routes through the per-generator emission replay cache
+            // (see `set_generated_value_replaying`): after the first run of a
+            // generator on this thread, each value's representative is already
+            // recorded for exactly the target index being written, validated
+            // per write with pure arithmetic, so the scattered
+            // `representative_map[target_index]` gather — one read per
+            // generated value, on the order of 10^6 per proof on the serial
+            // transaction lanes — disappears. Bit-for-bit writes are
+            // guaranteed by `set_rep_index_returning_new`'s contract when the
+            // recorded index matches, and any drift falls back to the gather
+            // before a wrong slot can be touched.
+            //
+            // Emission order is preserved exactly: values are taken from the
+            // buffer front-first (`drain`), and the replay cursor advances one
+            // per emitted value, so a later run replays the same sequence.
+            #[cfg(feature = "std")]
+            let owner = core::ptr::from_ref(generators).addr();
+            #[cfg(feature = "std")]
+            let mut run_cursor = 0usize;
             for (t, v) in buffer.target_values.drain(..) {
-                if let Some(watch) = witness.set_target_returning_rep(t, v)? {
+                #[cfg(feature = "std")]
+                let watch = set_generated_value_replaying(
+                    witness,
+                    owner,
+                    generator_idx,
+                    generators.len(),
+                    &mut run_cursor,
+                    t,
+                    v,
+                )?;
+                #[cfg(not(feature = "std"))]
+                let watch = witness.set_target_returning_rep(t, v)?;
+                if let Some(watch) = watch {
                     if let Some(watchers) = generator_indices_by_watches.get(&watch) {
                         for &watching_generator_idx in watchers {
                             let watching_generator_idx = watching_generator_idx as usize;
@@ -309,6 +469,16 @@ fn run_generator_worklist<
                             }
                         }
                     }
+                }
+            }
+            #[cfg(feature = "std")]
+            {
+                // A run that emitted at least one value and never diverged is
+                // a complete emission recording; promote it for replay. An
+                // empty run or a diverged one leaves the entry as-is (empty
+                // recordings stay recording; divergence already retired it).
+                if run_cursor > 0 {
+                    promote_generator_rep_entry(owner, generator_idx, generators.len());
                 }
             }
         }

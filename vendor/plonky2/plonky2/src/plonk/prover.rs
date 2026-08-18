@@ -1404,7 +1404,10 @@ fn start_gpu_range_check_gate_quotient<
             // existing CPU direct-accumulation evaluator instead: skipping it
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. })
+                || (common_data.degree_bits() >= 16
+                    && matches!(u32_gate, U32QuotientGate::RandomAccess { .. }))
+            {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -1652,7 +1655,11 @@ fn start_gpu_range_check_gate_quotient<
         } else if let Some(reducing) =
             gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
         {
-            if D != 2 {
+            // The extension-reduction Horner fold (33 coefficients, 66
+            // constraint rows) fits under the wide shapes' pinned CPU
+            // scratch (136 wires / 68 rows) but not under the chain
+            // shape's (90 / 26), so it stays on the CPU only there.
+            if D != 2 || common_data.degree_bits() >= 16 {
                 None
             } else {
                 Some((
