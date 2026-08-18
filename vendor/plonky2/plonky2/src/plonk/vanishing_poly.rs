@@ -8,9 +8,11 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
 use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
-use crate::gates::gate::InterleavePairGate;
+use crate::gates::exponentiation::ExponentiationGate;
+use crate::gates::gate::{fill_base_batch_filter, Gate, InterleavePairGate};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::selectors::{LookupSelectors, UNUSED_SELECTOR};
@@ -182,8 +184,25 @@ pub(crate) struct VanishingScratch<F> {
     pub vanishing_all_lookup_terms: Vec<F>,
     pub lookup_selectors: Vec<F>,
     pub constraint_terms_batch: Vec<F>,
+    /// Point-major two-alpha contribution of the exact direct gate. The
+    /// selected evaluator overwrites every slot before the residual reduction
+    /// is added, so this buffer needs no per-batch clear.
+    pub direct_gate_alpha_output: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+    /// Gate-major selector filters produced once per selector group with
+    /// shared prefix/suffix products. Only gates selected by
+    /// `shared_gate_filter_plan` have initialized rows.
+    pub shared_gate_filters: Vec<F>,
+    /// One batch-width suffix product used while constructing a selector
+    /// group's shared filters.
+    pub selector_filter_suffix: Vec<F>,
+    /// Reused sum of the two filters consumed by the dense interleave pair.
+    pub interleave_summed_filter: Vec<F>,
+    /// Proof-local decision: a set bit means that gate's selector filter is
+    /// cheaper to obtain from its group's shared prefix/suffix pass than from
+    /// the gate-local product. Initialized once per Rayon worker.
+    pub shared_gate_filter_plan: Vec<bool>,
 }
 
 /// Permutation-argument inputs for [`eval_vanishing_poly_base_batch`], in one
@@ -286,6 +305,139 @@ pub(crate) fn interleave_pair_plan<F: RichField + Extendable<D>, const D: usize>
         })
 }
 
+const DIRECT_EXPONENTIATION_BITS: usize = 67;
+const DIRECT_EXPONENTIATION_CONSTRAINTS: usize = 68;
+const DIRECT_EXPONENTIATION_RESIDUAL_ROWS: usize = 26;
+const DIRECT_EXPONENTIATION_WIRES: usize = 136;
+const DIRECT_EXPONENTIATION_BATCH: usize = 32;
+
+/// Exact proof-local shape authorized to remove one exponentiation gate from
+/// the shared constraint rows. It contains no circuit or transcript data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectGateAlphaPlan {
+    pub(crate) gate_index: usize,
+    pub(crate) residual_num_gate_constraints: usize,
+}
+
+impl DirectGateAlphaPlan {
+    #[inline(always)]
+    fn applies_to_batch(self, batch_size: usize, res_out_is_zero_seed: bool) -> bool {
+        batch_size == DIRECT_EXPONENTIATION_BATCH && res_out_is_zero_seed
+    }
+}
+
+/// Same-executable control for the exponentiation/alpha composition. Setting
+/// `PLONKY2_EXP_ALPHA_FUSION=0` retains the full shared-row evaluator while
+/// leaving deferred alpha reduction itself unchanged.
+pub(crate) fn exponentiation_alpha_fusion_enabled() -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("PLONKY2_EXP_ALPHA_FUSION")
+                .map(|value| value != "0")
+                .unwrap_or(true)
+        })
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+/// Preflight every invariant before the per-batch scratch is narrowed. A
+/// caller receiving `None` must use the original full CPU list and row count;
+/// there is intentionally no try-direct-then-fallback path.
+pub(crate) fn direct_exponentiation_alpha_plan<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    cpu_gate_indices: &[usize],
+    interleave_pair: Option<&InterleavePairPlan>,
+    enable_deferred: bool,
+    enable_fusion: bool,
+    alpha_count: usize,
+    res_out_is_zero_seed: bool,
+) -> Option<DirectGateAlphaPlan> {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (
+            common_data,
+            cpu_gate_indices,
+            interleave_pair,
+            enable_deferred,
+            enable_fusion,
+            alpha_count,
+            res_out_is_zero_seed,
+        );
+        return None;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !enable_deferred
+            || !enable_fusion
+            || !res_out_is_zero_seed
+            || D != 2
+            || alpha_count != 2
+            || common_data.config.num_challenges != 2
+            || common_data.num_lookup_polys != 0
+            || common_data.num_lookup_selectors != 0
+            || interleave_pair.is_some()
+            || common_data.config.num_wires != DIRECT_EXPONENTIATION_WIRES
+            || core::any::TypeId::of::<F>()
+                != core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+            || <<F as Packable>::Packing as crate::field::packed::PackedField>::WIDTH != 4
+        {
+            return None;
+        }
+
+        let full_num_gate_constraints = cpu_gate_indices
+            .iter()
+            .map(|&index| common_data.gates[index].0.num_constraints())
+            .max()
+            .unwrap_or(0);
+        let cpu_num_wires = cpu_gate_indices
+            .iter()
+            .map(|&index| common_data.gates[index].0.num_wires())
+            .max()
+            .unwrap_or(0);
+        if full_num_gate_constraints != DIRECT_EXPONENTIATION_CONSTRAINTS
+            || cpu_num_wires != DIRECT_EXPONENTIATION_WIRES
+        {
+            return None;
+        }
+
+        let mut eligible = cpu_gate_indices.iter().copied().filter(|&index| {
+            common_data.gates[index]
+                .0
+                .as_any()
+                .downcast_ref::<ExponentiationGate<F, D>>()
+                .is_some_and(|gate| {
+                    gate.num_power_bits == DIRECT_EXPONENTIATION_BITS
+                        && gate.num_constraints() == DIRECT_EXPONENTIATION_CONSTRAINTS
+                        && gate.num_wires() == DIRECT_EXPONENTIATION_WIRES
+                })
+        });
+        let gate_index = eligible.next()?;
+        if eligible.next().is_some() {
+            return None;
+        }
+
+        let residual_num_gate_constraints = cpu_gate_indices
+            .iter()
+            .copied()
+            .filter(|&index| index != gate_index)
+            .map(|index| common_data.gates[index].0.num_constraints())
+            .max()
+            .unwrap_or(0);
+        (residual_num_gate_constraints == DIRECT_EXPONENTIATION_RESIDUAL_ROWS).then_some(
+            DirectGateAlphaPlan {
+                gate_index,
+                residual_num_gate_constraints,
+            },
+        )
+    }
+}
+
 /// Computes one selector filter column in the same factor order as
 /// `Gate::eval_filtered_base_batch` without consuming the constants prefix.
 fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
@@ -316,6 +468,163 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
         for (filter, &selector) in output.iter_mut().zip(selector_col) {
             *filter *= constant - selector;
         }
+    }
+}
+
+/// Whether a selector group saves field operations when its active gates share
+/// one prefix/suffix pass.
+///
+/// A gate-local filter with `f` factors performs `f` subtractions and
+/// `f - 1` multiplications. For a group of `g` gates, the shared construction
+/// performs two `g - 1` factor passes, one multiplication per requested output,
+/// and (when there is more than one selector column) one common unused-selector
+/// subtraction. The estimate exactly matches the loops in
+/// [`fill_shared_selector_group_filters`]; strict inequality keeps small or
+/// heavily-offloaded groups on the existing path.
+#[inline]
+fn shared_selector_group_is_cheaper(
+    group_len: usize,
+    active_gates: usize,
+    include_unused_selector: bool,
+) -> bool {
+    if group_len == 0 || active_gates < 2 {
+        return false;
+    }
+    let unused = usize::from(include_unused_selector);
+    let factors_per_gate = group_len - 1 + unused;
+    if factors_per_gate == 0 {
+        return false;
+    }
+    let local_ops = active_gates * (2 * factors_per_gate - 1);
+    let shared_ops = 4 * (group_len - 1) + unused + active_gates;
+    shared_ops < local_ops
+}
+
+/// Selects the CPU-owned gates whose selector filters should share their
+/// group's factor products. The plan depends only on the circuit shape and the
+/// proof's already-computed CPU gate list, so each worker derives it once and
+/// reuses it for every quotient batch it receives.
+fn prepare_shared_gate_filter_plan<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    cpu_gate_indices: &[usize],
+    plan: &mut Vec<bool>,
+) {
+    plan.clear();
+    plan.resize(common_data.gates.len(), false);
+    let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
+    for group in &common_data.selectors_info.groups {
+        let active_gates = cpu_gate_indices
+            .iter()
+            .filter(|&&gate| group.contains(&gate))
+            .count();
+        if shared_selector_group_is_cheaper(
+            group.len(),
+            active_gates,
+            include_unused_selector,
+        ) {
+            for &gate in cpu_gate_indices {
+                if group.contains(&gate) {
+                    plan[gate] = true;
+                }
+            }
+        }
+    }
+}
+
+/// Computes selected gate filters for one selector group with shared
+/// prefix/suffix products.
+///
+/// For gate `i` this writes
+/// `prod(j - s, j in group, j != i) * (UNUSED_SELECTOR - s)?`, exactly the
+/// polynomial used by `Gate::eval_filtered_base_batch`. Prefixes contain the
+/// factors below `i`; the descending suffix contains those above it and the
+/// optional unused-selector factor. This changes association only, so the
+/// result is the same field element while each group factor is formed a
+/// constant number of times instead of once per active gate.
+fn fill_shared_selector_group_filters<F: Field>(
+    selector_col: &[F],
+    group: core::ops::Range<usize>,
+    include_unused_selector: bool,
+    active_gate_plan: &[bool],
+    gate_filters: &mut [F],
+    suffix: &mut [F],
+) {
+    let batch_size = selector_col.len();
+    debug_assert!(!group.is_empty());
+    debug_assert_eq!(suffix.len(), batch_size);
+    debug_assert_eq!(gate_filters.len(), active_gate_plan.len() * batch_size);
+
+    let first = group.start;
+    gate_filters[first * batch_size..(first + 1) * batch_size].fill(F::ONE);
+    for gate in first + 1..group.end {
+        let factor_constant = F::from_canonical_usize(gate - 1);
+        let split = gate * batch_size;
+        let (prefixes, rest) = gate_filters.split_at_mut(split);
+        let previous = &prefixes[(gate - 1) * batch_size..gate * batch_size];
+        let current = &mut rest[..batch_size];
+        for point in 0..batch_size {
+            current[point] = previous[point] * (factor_constant - selector_col[point]);
+        }
+    }
+
+    if include_unused_selector {
+        let unused = F::from_canonical_usize(UNUSED_SELECTOR);
+        for (value, &selector) in suffix.iter_mut().zip(selector_col) {
+            *value = unused - selector;
+        }
+    } else {
+        suffix.fill(F::ONE);
+    }
+
+    for gate in group.clone().rev() {
+        if active_gate_plan[gate] {
+            let output = &mut gate_filters[gate * batch_size..(gate + 1) * batch_size];
+            for (filter, &tail) in output.iter_mut().zip(suffix.iter()) {
+                *filter *= tail;
+            }
+        }
+        if gate != first {
+            let factor_constant = F::from_canonical_usize(gate);
+            for (tail, &selector) in suffix.iter_mut().zip(selector_col) {
+                *tail *= factor_constant - selector;
+            }
+        }
+    }
+}
+
+/// Fills every selector group selected by `plan`. The output is gate-major:
+/// gate `i` owns `i * batch_size..(i + 1) * batch_size`.
+fn fill_shared_gate_filters<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    plan: &[bool],
+    gate_filters: &mut Vec<F>,
+    suffix: &mut Vec<F>,
+) {
+    let batch_size = vars_batch.len();
+    debug_assert_eq!(plan.len(), common_data.gates.len());
+    if gate_filters.len() != common_data.gates.len() * batch_size {
+        gate_filters.resize(common_data.gates.len() * batch_size, F::ZERO);
+    }
+    if suffix.len() != batch_size {
+        suffix.resize(batch_size, F::ZERO);
+    }
+
+    let include_unused_selector = common_data.selectors_info.num_selectors() > 1;
+    for (selector_index, group) in common_data.selectors_info.groups.iter().enumerate() {
+        if !plan[group.clone()].iter().any(|&active| active) {
+            continue;
+        }
+        let selector_col =
+            &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+        fill_shared_selector_group_filters(
+            selector_col,
+            group.clone(),
+            include_unused_selector,
+            plan,
+            gate_filters,
+            suffix,
+        );
     }
 }
 
@@ -509,6 +818,311 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     }
 }
 
+pub(crate) fn gate_constraint_alpha_powers<F: Field>(alphas: &[F], num_rows: usize) -> Vec<F> {
+    let mut powers = Vec::with_capacity(alphas.len() * num_rows);
+    for &alpha in alphas {
+        let mut power = F::ONE;
+        for _ in 0..num_rows {
+            powers.push(power);
+            power *= alpha;
+        }
+    }
+    powers
+}
+
+/// Runtime A/B switch for the ranked reducer. Both settings select code in the
+/// same executable; set `PLONKY2_DEFERRED_ALPHA_REDUCTION=0` to retain Horner.
+/// The default is enabled on the AArch64/std build where the specialization is
+/// available. The decision is made once per process and passed into every
+/// quotient batch, so the hot reducer does not inspect the environment.
+pub(crate) fn deferred_alpha_reduction_enabled() -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("PLONKY2_DEFERRED_ALPHA_REDUCTION")
+                .map(|value| value != "0")
+                .unwrap_or(true)
+        })
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64")))]
+    {
+        false
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+const MAX_DEFERRED_ALPHA_ROWS: usize = 136;
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Copy, Clone, Default)]
+struct DeferredProductSum {
+    /// Low 128 bits of the exact unsigned product sum.
+    low: u128,
+    /// Carry count above bit 127. For at most 136 products this is at most 135.
+    top: u64,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl DeferredProductSum {
+    #[inline(always)]
+    fn add_wide(&mut self, product: u128) {
+        let (low, carry) = self.low.overflowing_add(product);
+        self.low = low;
+        self.top += carry as u64;
+    }
+
+    #[inline(always)]
+    fn add_product(&mut self, lhs: u64, rhs: u64) {
+        self.add_wide((lhs as u128) * (rhs as u128));
+    }
+
+    #[inline(always)]
+    fn materialize(self, products: usize) -> crate::field::goldilocks_field::GoldilocksField {
+        use crate::field::goldilocks_field::GoldilocksField;
+
+        debug_assert!(products > 0);
+        debug_assert!(products <= MAX_DEFERRED_ALPHA_ROWS);
+        // Every raw product is below 2^128, hence the exact sum is below
+        // products * 2^128 and its carry count is at most products - 1.
+        debug_assert!(self.top < products as u64);
+        debug_assert!(self.top <= (MAX_DEFERRED_ALPHA_ROWS - 1) as u64);
+
+        // For p = 2^64 - 2^32 + 1, 2^128 == -2^32 (mod p). Reduce the
+        // low 128 bits once and subtract the bounded high correction. Since
+        // top <= 135, `top << 32` is canonical and cannot overflow u64.
+        GoldilocksField::from_noncanonical_u128(self.low)
+            - GoldilocksField::from_canonical_u64(self.top << 32)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn deferred_dot_two_points_two_alphas(
+    terms: &mut [crate::field::goldilocks_field::GoldilocksField],
+    batch_size: usize,
+    point_0: usize,
+    point_1: usize,
+    powers_0: &[crate::field::goldilocks_field::GoldilocksField],
+    powers_1: &[crate::field::goldilocks_field::GoldilocksField],
+    clear_as_consumed: bool,
+) -> [[crate::field::goldilocks_field::GoldilocksField; 2]; 2] {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    debug_assert!(point_0 < point_1);
+    debug_assert!(point_1 < batch_size);
+    debug_assert_eq!(powers_0.len(), powers_1.len());
+    let mut acc_00 = DeferredProductSum::default();
+    let mut acc_01 = DeferredProductSum::default();
+    let mut acc_10 = DeferredProductSum::default();
+    let mut acc_11 = DeferredProductSum::default();
+    let terms_ptr = terms.as_mut_ptr();
+    let mut offset = 0;
+    for (&power_0, &power_1) in powers_0.iter().zip(powers_1) {
+        // SAFETY: `offset` selects a valid row and the two distinct point
+        // indices are below `batch_size`. Each slot is visited by exactly one
+        // point pair during the outer traversal.
+        let (term_0, term_1) = unsafe {
+            let slot_0 = terms_ptr.add(offset + point_0);
+            let slot_1 = terms_ptr.add(offset + point_1);
+            let values = ((*slot_0).0, (*slot_1).0);
+            if clear_as_consumed {
+                *slot_0 = GoldilocksField::ZERO;
+                *slot_1 = GoldilocksField::ZERO;
+            }
+            values
+        };
+        let power_0 = power_0.0;
+        let power_1 = power_1.0;
+        // Spell out all four widening products before either carry chain so
+        // the M4 scheduler can issue independent mul/umulh pairs together.
+        let product_00 = (term_0 as u128) * (power_0 as u128);
+        let product_01 = (term_0 as u128) * (power_1 as u128);
+        let product_10 = (term_1 as u128) * (power_0 as u128);
+        let product_11 = (term_1 as u128) * (power_1 as u128);
+        acc_00.add_wide(product_00);
+        acc_01.add_wide(product_01);
+        acc_10.add_wide(product_10);
+        acc_11.add_wide(product_11);
+        offset += batch_size;
+    }
+    let products = powers_0.len();
+    [
+        [acc_00.materialize(products), acc_01.materialize(products)],
+        [acc_10.materialize(products), acc_11.materialize(products)],
+    ]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn deferred_dot_one_point_two_alphas(
+    terms: &mut [crate::field::goldilocks_field::GoldilocksField],
+    batch_size: usize,
+    point: usize,
+    powers_0: &[crate::field::goldilocks_field::GoldilocksField],
+    powers_1: &[crate::field::goldilocks_field::GoldilocksField],
+    clear_as_consumed: bool,
+) -> [crate::field::goldilocks_field::GoldilocksField; 2] {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    debug_assert!(point < batch_size);
+    debug_assert_eq!(powers_0.len(), powers_1.len());
+    let mut acc_0 = DeferredProductSum::default();
+    let mut acc_1 = DeferredProductSum::default();
+    let terms_ptr = terms.as_mut_ptr();
+    let mut offset = 0;
+    for (&power_0, &power_1) in powers_0.iter().zip(powers_1) {
+        // SAFETY: `offset` selects a valid row and `point < batch_size`.
+        let term = unsafe {
+            let slot = terms_ptr.add(offset + point);
+            let value = (*slot).0;
+            if clear_as_consumed {
+                *slot = GoldilocksField::ZERO;
+            }
+            value
+        };
+        acc_0.add_product(term, power_0.0);
+        acc_1.add_product(term, power_1.0);
+        offset += batch_size;
+    }
+    let products = powers_0.len();
+    [acc_0.materialize(products), acc_1.materialize(products)]
+}
+
+/// Exact Goldilocks dot product for the production two-alpha/zero-seed shape.
+/// Alpha powers are challenge-major and are built once by the proof caller.
+#[cfg(target_arch = "aarch64")]
+fn reduce_gate_constraints_deferred_goldilocks_two_alpha(
+    constraint_terms_batch: &mut [crate::field::goldilocks_field::GoldilocksField],
+    batch_size: usize,
+    alpha_powers: &[crate::field::goldilocks_field::GoldilocksField],
+    alpha_power_stride: usize,
+    res_out: &mut [crate::field::goldilocks_field::GoldilocksField],
+    clear_as_consumed: bool,
+) {
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    let num_rows = constraint_terms_batch.len() / batch_size;
+    debug_assert!(num_rows <= MAX_DEFERRED_ALPHA_ROWS);
+    debug_assert!(alpha_power_stride >= num_rows);
+    debug_assert!(alpha_powers.len() >= alpha_power_stride + num_rows);
+    debug_assert_eq!(res_out.len(), batch_size * 2);
+    if num_rows == 0 {
+        res_out.fill(GoldilocksField::ZERO);
+        return;
+    }
+
+    let powers_0 = &alpha_powers[..num_rows];
+    let powers_1 = &alpha_powers[alpha_power_stride..alpha_power_stride + num_rows];
+    // A two-point kernel keeps four independent 192-bit accumulators live
+    // without the spills caused by holding a complete eight-point tile.
+    let mut point = 0;
+    while point + 1 < batch_size {
+        let pair = deferred_dot_two_points_two_alphas(
+            constraint_terms_batch,
+            batch_size,
+            point,
+            point + 1,
+            powers_0,
+            powers_1,
+            clear_as_consumed,
+        );
+        res_out[2 * point] = pair[0][0];
+        res_out[2 * point + 1] = pair[0][1];
+        res_out[2 * point + 2] = pair[1][0];
+        res_out[2 * point + 3] = pair[1][1];
+        point += 2;
+    }
+    if point < batch_size {
+        let tail = deferred_dot_one_point_two_alphas(
+            constraint_terms_batch,
+            batch_size,
+            point,
+            powers_0,
+            powers_1,
+            clear_as_consumed,
+        );
+        res_out[2 * point] = tail[0];
+        res_out[2 * point + 1] = tail[1];
+    }
+}
+
+/// Packet-local entry used by the exact exponentiation evaluator. It reuses
+/// the same bounded `DeferredProductSum` arithmetic as the shared-row reducer;
+/// only the packet's four point lanes are materialized at a time.
+#[inline(always)]
+pub(crate) fn reduce_gate_packet_deferred_two_alpha<F: Field>(
+    constraint_terms_packet: &mut [F],
+    packet_size: usize,
+    alpha_powers: &[F],
+    alpha_power_stride: usize,
+    output: &mut [F],
+) {
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (
+            constraint_terms_packet,
+            packet_size,
+            alpha_powers,
+            alpha_power_stride,
+            output,
+        );
+        unreachable!("direct exponentiation alpha reduction is AArch64-only");
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert_eq!(
+            core::any::TypeId::of::<F>(),
+            core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>(),
+        );
+        assert_eq!(packet_size, 4);
+        assert_eq!(constraint_terms_packet.len() % packet_size, 0);
+        assert_eq!(output.len(), packet_size * 2);
+        let num_rows = constraint_terms_packet.len() / packet_size;
+        assert_eq!(num_rows, DIRECT_EXPONENTIATION_CONSTRAINTS);
+        assert!(alpha_power_stride >= num_rows);
+        assert!(alpha_powers.len() >= alpha_power_stride + num_rows);
+        unsafe {
+            let terms = core::slice::from_raw_parts_mut(
+                constraint_terms_packet.as_mut_ptr().cast(),
+                constraint_terms_packet.len(),
+            );
+            let powers =
+                core::slice::from_raw_parts(alpha_powers.as_ptr().cast(), alpha_powers.len());
+            let output = core::slice::from_raw_parts_mut(output.as_mut_ptr().cast(), output.len());
+            let powers_0 = &powers[..num_rows];
+            let powers_1 = &powers[alpha_power_stride..alpha_power_stride + num_rows];
+            let first = deferred_dot_two_points_two_alphas(
+                terms,
+                packet_size,
+                0,
+                1,
+                powers_0,
+                powers_1,
+                false,
+            );
+            let second = deferred_dot_two_points_two_alphas(
+                terms,
+                packet_size,
+                2,
+                3,
+                powers_0,
+                powers_1,
+                false,
+            );
+            output[0] = first[0][0];
+            output[1] = first[0][1];
+            output[2] = first[1][0];
+            output[3] = first[1][1];
+            output[4] = second[0][0];
+            output[5] = second[0][1];
+            output[6] = second[1][0];
+            output[7] = second[1][1];
+        }
+    }
+}
+
 /// Reduces the per-row constraint terms into `res_out`.
 ///
 /// `clear_as_consumed` zeroes each term as it is read. Every element is read
@@ -521,14 +1135,83 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &mut [F],
     batch_size: usize,
     alphas: &[F],
+    alpha_powers: &[F],
+    alpha_power_stride: usize,
     res_out: &mut [F],
     res_out_is_zero_seed: bool,
     clear_as_consumed: bool,
+    enable_deferred: bool,
 ) {
     debug_assert!(batch_size > 0);
     debug_assert_eq!(constraint_terms_batch.len() % batch_size, 0);
     debug_assert_eq!(res_out.len(), batch_size * alphas.len());
+    let num_rows = constraint_terms_batch.len() / batch_size;
+    debug_assert!(alpha_power_stride >= num_rows);
+    debug_assert!(
+        alphas.is_empty()
+            || alpha_powers.len() >= (alphas.len() - 1) * alpha_power_stride + num_rows
+    );
 
+    // The TypeId equality proves all three casts have exactly the Goldilocks
+    // element type and layout. All unsupported fields/shapes keep the current
+    // Horner implementation and its raw-limb behavior.
+    #[cfg(target_arch = "aarch64")]
+    if enable_deferred
+        && res_out_is_zero_seed
+        && alphas.len() == 2
+        && num_rows <= MAX_DEFERRED_ALPHA_ROWS
+        && core::any::TypeId::of::<F>()
+            == core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+    {
+        unsafe {
+            let terms = core::slice::from_raw_parts_mut(
+                constraint_terms_batch
+                    .as_mut_ptr()
+                    .cast::<crate::field::goldilocks_field::GoldilocksField>(),
+                constraint_terms_batch.len(),
+            );
+            let powers = core::slice::from_raw_parts(
+                alpha_powers
+                    .as_ptr()
+                    .cast::<crate::field::goldilocks_field::GoldilocksField>(),
+                alpha_powers.len(),
+            );
+            let output = core::slice::from_raw_parts_mut(
+                res_out
+                    .as_mut_ptr()
+                    .cast::<crate::field::goldilocks_field::GoldilocksField>(),
+                res_out.len(),
+            );
+            reduce_gate_constraints_deferred_goldilocks_two_alpha(
+                terms,
+                batch_size,
+                powers,
+                alpha_power_stride,
+                output,
+                clear_as_consumed,
+            );
+        }
+        return;
+    }
+
+    reduce_gate_constraints_base_batch_horner(
+        constraint_terms_batch,
+        batch_size,
+        alphas,
+        res_out,
+        res_out_is_zero_seed,
+        clear_as_consumed,
+    );
+}
+
+fn reduce_gate_constraints_base_batch_horner<F: Field>(
+    constraint_terms_batch: &mut [F],
+    batch_size: usize,
+    alphas: &[F],
+    res_out: &mut [F],
+    res_out_is_zero_seed: bool,
+    clear_as_consumed: bool,
+) {
     // When `res_out` is known to be an all-zero (or uninitialized) seed, the
     // first reversed row can be *assigned* rather than accumulated: with
     // `*value == F::ZERO`, `term.multiply_accumulate(ZERO, alpha)` is
@@ -633,8 +1316,12 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     beta_k_is: &[F],
     deltas: &[F],
     alphas: &[F],
+    gate_alpha_powers: &[F],
+    gate_alpha_power_stride: usize,
+    enable_deferred_alpha_reduction: bool,
     cpu_gate_indices: &[usize],
     cpu_num_gate_constraints: usize,
+    direct_gate_alpha_plan: Option<&DirectGateAlphaPlan>,
     interleave_pair: Option<&InterleavePairPlan>,
     permutation_products_offloaded: bool,
     permutation_gate_scales: &[F],
@@ -661,19 +1348,51 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
-    evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
-        common_data,
-        vars_batch,
-        &mut scratch.constraint_terms_batch,
-        cpu_gate_indices,
-        &mut scratch.gate_filters,
-        cpu_num_gate_constraints,
-        interleave_pair,
-    );
+    // A short/tail batch must select the full fallback before the shared row
+    // scratch is sized. The proof-level plan already established every other
+    // invariant, including the zero seed and exact field/alpha shape.
+    let active_direct_plan = direct_gate_alpha_plan
+        .copied()
+        .filter(|plan| plan.applies_to_batch(n, true));
+    if let Some(plan) = active_direct_plan {
+        evaluate_gate_constraints_base_batch_into_cpu_gates_with_direct::<F, D>(
+            common_data,
+            vars_batch,
+            &mut scratch.constraint_terms_batch,
+            cpu_gate_indices,
+            &mut scratch.gate_filters,
+            &mut scratch.shared_gate_filters,
+            &mut scratch.selector_filter_suffix,
+            &mut scratch.interleave_summed_filter,
+            &mut scratch.shared_gate_filter_plan,
+            plan.residual_num_gate_constraints,
+            interleave_pair,
+            Some(DirectGateAlphaEvaluation {
+                plan: &plan,
+                alpha_powers: gate_alpha_powers,
+                alpha_power_stride: gate_alpha_power_stride,
+                output: &mut scratch.direct_gate_alpha_output,
+            }),
+        );
+    } else {
+        evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
+            common_data,
+            vars_batch,
+            &mut scratch.constraint_terms_batch,
+            cpu_gate_indices,
+            &mut scratch.gate_filters,
+            &mut scratch.shared_gate_filters,
+            &mut scratch.selector_filter_suffix,
+            &mut scratch.interleave_summed_filter,
+            &mut scratch.shared_gate_filter_plan,
+            cpu_num_gate_constraints,
+            interleave_pair,
+        );
+    }
     let constraint_terms_batch = &mut scratch.constraint_terms_batch;
     // `<=`, not `==`: the buffer is sized by the widest gate still on the CPU,
     // which is at most `num_gate_constraints` and strictly less whenever a
-    // widest gate has been offloaded.
+    // widest gate has been offloaded or alpha-fused.
     debug_assert!(constraint_terms_batch.len() <= n * num_gate_constraints);
     debug_assert_eq!(constraint_terms_batch.len() % n, 0);
 
@@ -682,7 +1401,23 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true, true);
+    reduce_gate_constraints_base_batch(
+        constraint_terms_batch,
+        n,
+        alphas,
+        gate_alpha_powers,
+        gate_alpha_power_stride,
+        res_out,
+        true,
+        true,
+        enable_deferred_alpha_reduction,
+    );
+    if active_direct_plan.is_some() {
+        debug_assert_eq!(scratch.direct_gate_alpha_output.len(), res_out.len());
+        for (value, &direct) in res_out.iter_mut().zip(&scratch.direct_gate_alpha_output) {
+            *value += direct;
+        }
+    }
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -1530,15 +2265,30 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         .filter(|i| !excluded_gate_indices.contains(i))
         .collect::<Vec<_>>();
     let mut filters = Vec::with_capacity(vars_batch.len());
+    let mut shared_gate_filters = Vec::new();
+    let mut selector_filter_suffix = Vec::new();
+    let mut interleave_summed_filter = Vec::new();
+    let mut shared_gate_filter_plan = Vec::new();
     evaluate_gate_constraints_base_batch_into_cpu_gates(
         common_data,
         vars_batch,
         constraints_batch,
         &cpu_gate_indices,
         &mut filters,
+        &mut shared_gate_filters,
+        &mut selector_filter_suffix,
+        &mut interleave_summed_filter,
+        &mut shared_gate_filter_plan,
         num_constraint_rows,
         None,
     );
+}
+
+struct DirectGateAlphaEvaluation<'a, F> {
+    plan: &'a DirectGateAlphaPlan,
+    alpha_powers: &'a [F],
+    alpha_power_stride: usize,
+    output: &'a mut Vec<F>,
 }
 
 pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
@@ -1550,10 +2300,56 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     constraints_batch: &mut Vec<F>,
     cpu_gate_indices: &[usize],
     filters: &mut Vec<F>,
+    shared_gate_filters: &mut Vec<F>,
+    selector_filter_suffix: &mut Vec<F>,
+    interleave_summed_filter: &mut Vec<F>,
+    shared_gate_filter_plan: &mut Vec<bool>,
     num_constraint_rows: usize,
     interleave_pair: Option<&InterleavePairPlan>,
 ) {
+    evaluate_gate_constraints_base_batch_into_cpu_gates_with_direct(
+        common_data,
+        vars_batch,
+        constraints_batch,
+        cpu_gate_indices,
+        filters,
+        shared_gate_filters,
+        selector_filter_suffix,
+        interleave_summed_filter,
+        shared_gate_filter_plan,
+        num_constraint_rows,
+        interleave_pair,
+        None,
+    );
+}
+
+fn evaluate_gate_constraints_base_batch_into_cpu_gates_with_direct<
+    F: RichField + Extendable<D>,
+    const D: usize,
+>(
+    common_data: &CommonCircuitData<F, D>,
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    constraints_batch: &mut Vec<F>,
+    cpu_gate_indices: &[usize],
+    filters: &mut Vec<F>,
+    shared_gate_filters: &mut Vec<F>,
+    selector_filter_suffix: &mut Vec<F>,
+    interleave_summed_filter: &mut Vec<F>,
+    shared_gate_filter_plan: &mut Vec<bool>,
+    num_constraint_rows: usize,
+    interleave_pair: Option<&InterleavePairPlan>,
+    mut direct_alpha: Option<DirectGateAlphaEvaluation<'_, F>>,
+) {
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
+    if let Some(direct) = direct_alpha.as_mut() {
+        debug_assert_eq!(
+            num_constraint_rows,
+            direct.plan.residual_num_gate_constraints
+        );
+        if direct.output.len() != 2 * vars_batch.len() {
+            direct.output.resize(2 * vars_batch.len(), F::ZERO);
+        }
+    }
     // The gates below accumulate, so this buffer must start at zero — but it
     // does not need re-zeroing here. `reduce_gate_constraints_base_batch` is
     // the sole consumer, it runs immediately after this function on every
@@ -1573,9 +2369,52 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
         constraints_batch.iter().all(|v| *v == F::ZERO),
         "constraint scratch must be zero on entry; the consumer clears it as it reads"
     );
+    if filters.len() != vars_batch.len() {
+        filters.resize(vars_batch.len(), F::ZERO);
+    }
+    if shared_gate_filter_plan.len() != common_data.gates.len() {
+        prepare_shared_gate_filter_plan(
+            common_data,
+            cpu_gate_indices,
+            shared_gate_filter_plan,
+        );
+    }
+    fill_shared_gate_filters(
+        common_data,
+        vars_batch,
+        shared_gate_filter_plan,
+        shared_gate_filters,
+        selector_filter_suffix,
+    );
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
+                if shared_gate_filter_plan[plan.interleave_index]
+                    && shared_gate_filter_plan[plan.uninterleave_index]
+                {
+                    let batch_size = vars_batch.len();
+                    let interleave_filter = &shared_gate_filters
+                        [plan.interleave_index * batch_size..(plan.interleave_index + 1) * batch_size];
+                    let uninterleave_filter = &shared_gate_filters[plan.uninterleave_index
+                        * batch_size
+                        ..(plan.uninterleave_index + 1) * batch_size];
+                    if interleave_summed_filter.len() != batch_size {
+                        interleave_summed_filter.resize(batch_size, F::ZERO);
+                    }
+                    for point in 0..batch_size {
+                        interleave_summed_filter[point] =
+                            interleave_filter[point] + uninterleave_filter[point];
+                    }
+                    eval_interleave_pair_dense_fused(
+                        vars_batch.local_wires,
+                        batch_size,
+                        interleave_filter,
+                        uninterleave_filter,
+                        interleave_summed_filter,
+                        constraints_batch,
+                    );
+                    continue;
+                }
                 // Size the buffer without re-zeroing it. `clear()` then
                 // `resize()` memset all three sub-slices on every batch, but
                 // each is fully assigned before it is read: the two
@@ -1620,18 +2459,76 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
                 continue;
             }
         }
+        if direct_alpha
+            .as_ref()
+            .is_some_and(|direct| i == direct.plan.gate_index)
+        {
+            let direct = direct_alpha.as_mut().expect("direct plan disappeared");
+            let gate = &common_data.gates[i];
+            let exponentiation = gate
+                .0
+                .as_any()
+                .downcast_ref::<ExponentiationGate<F, D>>()
+                .expect("preflight selected a non-exponentiation gate");
+            // Preserve fa87's selector choice and algebra. When the CPU survivor
+            // group was admitted to the prefix/suffix plan, reuse that exact
+            // field-valued filter; otherwise retain compute_filter's ascending
+            // factor order through the shared gate helper.
+            let selector_filter = if shared_gate_filter_plan[i] {
+                let batch_size = vars_batch.len();
+                &shared_gate_filters[i * batch_size..(i + 1) * batch_size]
+            } else {
+                let selector_index = common_data.selectors_info.selector_indices[i];
+                fill_base_batch_filter(
+                    vars_batch,
+                    i,
+                    selector_index,
+                    common_data.selectors_info.groups[selector_index].clone(),
+                    common_data.selectors_info.num_selectors(),
+                    filters,
+                );
+                filters.as_slice()
+            };
+            let mut unfiltered_vars = vars_batch;
+            unfiltered_vars.remove_prefix(
+                common_data.selectors_info.num_selectors() + common_data.num_lookup_selectors,
+            );
+            exponentiation.eval_unfiltered_base_batch_alpha_fused(
+                unfiltered_vars,
+                selector_filter,
+                direct.alpha_powers,
+                direct.alpha_power_stride,
+                direct.output,
+            );
+            continue;
+        }
         let gate = &common_data.gates[i];
-        let selector_index = common_data.selectors_info.selector_indices[i];
-        gate.0.eval_filtered_base_batch(
-            vars_batch,
-            i,
-            selector_index,
-            common_data.selectors_info.groups[selector_index].clone(),
-            common_data.selectors_info.num_selectors(),
-            common_data.num_lookup_selectors,
-            filters,
-            constraints_batch,
-        );
+        if shared_gate_filter_plan[i] {
+            let batch_size = vars_batch.len();
+            let filter = &shared_gate_filters[i * batch_size..(i + 1) * batch_size];
+            let mut unfiltered_vars = vars_batch;
+            unfiltered_vars.remove_prefix(
+                common_data.selectors_info.num_selectors()
+                    + common_data.num_lookup_selectors,
+            );
+            gate.0.eval_unfiltered_base_batch_accumulate(
+                unfiltered_vars,
+                filter,
+                constraints_batch,
+            );
+        } else {
+            let selector_index = common_data.selectors_info.selector_indices[i];
+            gate.0.eval_filtered_base_batch(
+                vars_batch,
+                i,
+                selector_index,
+                common_data.selectors_info.groups[selector_index].clone(),
+                common_data.selectors_info.num_selectors(),
+                common_data.num_lookup_selectors,
+                filters,
+                constraints_batch,
+            );
+        }
     }
 }
 
@@ -1844,9 +2741,1049 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
+    use plonky2_field::types::{Field64, PrimeField64};
 
     use super::*;
+    #[cfg(target_arch = "aarch64")]
+    use crate::gates::arithmetic_base::ArithmeticGate;
+    #[cfg(target_arch = "aarch64")]
+    use crate::gates::gate::GateRef;
+    #[cfg(target_arch = "aarch64")]
+    use crate::gates::multiplication_extension::MulExtensionGate;
+    #[cfg(target_arch = "aarch64")]
+    use crate::gates::random_access::RandomAccessGate;
+    #[cfg(target_arch = "aarch64")]
+    use crate::hash::hash_types::HashOut;
+    #[cfg(target_arch = "aarch64")]
+    use crate::plonk::circuit_data::CircuitConfig;
+    #[cfg(target_arch = "aarch64")]
+    use crate::plonk::config::PoseidonGoldilocksConfig;
+
+    #[cfg(target_arch = "aarch64")]
+    const DIRECT_TEST_D: usize = 2;
+
+    #[cfg(target_arch = "aarch64")]
+    fn direct_test_common() -> CommonCircuitData<GoldilocksField, DIRECT_TEST_D> {
+        type F = GoldilocksField;
+        let config = CircuitConfig {
+            num_wires: 136,
+            num_routed_wires: 80,
+            ..CircuitConfig::standard_recursion_config()
+        };
+        let mut builder = CircuitBuilder::<F, DIRECT_TEST_D>::new(config.clone());
+        builder.add_gate(
+            ExponentiationGate::<F, DIRECT_TEST_D>::new(DIRECT_EXPONENTIATION_BITS),
+            vec![],
+        );
+        builder.add_gate(
+            MulExtensionGate::<DIRECT_TEST_D>::new_from_config(&config),
+            vec![F::from_canonical_u64(3)],
+        );
+        builder.add_gate(
+            ArithmeticGate::new_from_config(&config),
+            vec![F::from_canonical_u64(5), F::from_canonical_u64(7)],
+        );
+        let random_access = RandomAccessGate::<F, DIRECT_TEST_D>::new_from_config(&config, 4);
+        assert_eq!(random_access.num_constraints(), 26);
+        builder.add_gate(
+            random_access,
+            vec![F::from_canonical_u64(11), F::from_canonical_u64(13)],
+        );
+        builder.build::<PoseidonGoldilocksConfig>().common
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn direct_test_plan(
+        common: &CommonCircuitData<GoldilocksField, DIRECT_TEST_D>,
+    ) -> (Vec<usize>, DirectGateAlphaPlan) {
+        let cpu_gate_indices = (0..common.gates.len()).collect::<Vec<_>>();
+        let plan =
+            direct_exponentiation_alpha_plan(common, &cpu_gate_indices, None, true, true, 2, true)
+                .expect("exact synthetic production shape must be eligible");
+        assert_eq!(plan.residual_num_gate_constraints, 26);
+        (cpu_gate_indices, plan)
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn raw_fixture(len: usize, mut state: u64) -> Vec<GoldilocksField> {
+        (0..len)
+            .map(|i| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let edges = [
+                    0,
+                    1,
+                    GoldilocksField::ORDER,
+                    GoldilocksField::ORDER + 1,
+                    u64::MAX,
+        ];
+                GoldilocksField(if i % 7 == 0 {
+                    edges[i % edges.len()]
+                } else {
+                    state
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn run_direct_mixed_gate_differential(
+        common: &CommonCircuitData<GoldilocksField, DIRECT_TEST_D>,
+        cpu_gate_indices: &[usize],
+        plan: DirectGateAlphaPlan,
+        batch_size: usize,
+        alpha_power_stride: usize,
+    ) -> (
+        Vec<GoldilocksField>,
+        Vec<GoldilocksField>,
+        Vec<GoldilocksField>,
+        Vec<GoldilocksField>,
+    ) {
+        type F = GoldilocksField;
+        let constants = raw_fixture(common.num_constants * batch_size, 0x243f_6a88_85a3_08d3);
+        let wires = raw_fixture(common.config.num_wires * batch_size, 0x1319_8a2e_0370_7344);
+        let hash = HashOut::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(batch_size, &constants, &wires, &hash);
+        let alphas = [
+            GoldilocksField(0xd1b5_4a32_d192_ed03),
+            GoldilocksField(0xa24b_aed4_963e_e407),
+        ];
+        let alpha_powers = gate_constraint_alpha_powers(&alphas, alpha_power_stride);
+
+        let mut full_rows = Vec::new();
+        let mut full_filters = Vec::new();
+        evaluate_gate_constraints_base_batch_into_cpu_gates(
+            common,
+            vars,
+            &mut full_rows,
+            cpu_gate_indices,
+            &mut full_filters,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            DIRECT_EXPONENTIATION_CONSTRAINTS,
+            None,
+        );
+        assert!(full_rows.iter().any(|value| value.0 != 0));
+        let mut control = vec![F::ZERO; 2 * batch_size];
+        reduce_gate_constraints_base_batch(
+            &mut full_rows,
+            batch_size,
+            &alphas,
+            &alpha_powers,
+            alpha_power_stride,
+            &mut control,
+            true,
+            true,
+            true,
+        );
+        assert!(full_rows.iter().all(|value| value.0 == 0));
+
+        let mut residual_rows = Vec::new();
+        let mut direct_output = Vec::new();
+        let mut direct_filters = Vec::new();
+        evaluate_gate_constraints_base_batch_into_cpu_gates_with_direct(
+            common,
+            vars,
+            &mut residual_rows,
+            cpu_gate_indices,
+            &mut direct_filters,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            plan.residual_num_gate_constraints,
+            None,
+            Some(DirectGateAlphaEvaluation {
+                plan: &plan,
+                alpha_powers: &alpha_powers,
+                alpha_power_stride,
+                output: &mut direct_output,
+            }),
+        );
+        assert_eq!(residual_rows.len(), 26 * batch_size);
+        assert!(residual_rows.iter().any(|value| value.0 != 0));
+        let mut candidate = vec![F::ZERO; 2 * batch_size];
+        reduce_gate_constraints_base_batch(
+            &mut residual_rows,
+            batch_size,
+            &alphas,
+            &alpha_powers,
+            alpha_power_stride,
+            &mut candidate,
+            true,
+            true,
+            true,
+        );
+        for (value, &direct) in candidate.iter_mut().zip(&direct_output) {
+            *value += direct;
+        }
+        (control, candidate, residual_rows, direct_output)
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_production_shape_matches_full_rows_canonically() {
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        let (control, candidate, residual, direct) =
+            run_direct_mixed_gate_differential(&common, &cpu_gate_indices, plan, 32, 68);
+        assert!(residual.iter().all(|value| value.0 == 0));
+        assert_eq!(direct.len(), 64);
+        assert_eq!(
+            candidate
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+            control
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_short_batch_fallback_is_raw_identical() {
+        type F = GoldilocksField;
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        assert!(!plan.applies_to_batch(31, true));
+        assert!(!plan.applies_to_batch(33, true));
+
+        for n in [31usize, 33] {
+            let constants = raw_fixture(common.num_constants * n, 0xdead_beef_0123_4567);
+            let wires = raw_fixture(common.config.num_wires * n, 0x0123_4567_89ab_cdef);
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+            let mut expected_rows = Vec::new();
+            let mut expected_filters = Vec::new();
+            evaluate_gate_constraints_base_batch_into_cpu_gates(
+                &common,
+                vars,
+                &mut expected_rows,
+                &cpu_gate_indices,
+                &mut expected_filters,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+                68,
+                None,
+            );
+            let mut actual_rows = Vec::new();
+            let mut actual_filters = Vec::new();
+            // This is the production preflight branch for an unsupported
+            // batch: it invokes every ordinary dynamic override, including
+            // Exponentiation's packed batch evaluator.
+            if plan.applies_to_batch(n, true) {
+                panic!("short/tail batch unexpectedly selected direct path");
+            } else {
+                evaluate_gate_constraints_base_batch_into_cpu_gates(
+                    &common,
+                    vars,
+                    &mut actual_rows,
+                    &cpu_gate_indices,
+                    &mut actual_filters,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+                    68,
+                    None,
+                );
+            }
+            assert_eq!(
+                actual_rows.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected_rows
+                    .iter()
+                    .map(|value| value.0)
+                    .collect::<Vec<_>>(),
+            );
+
+            let alphas = [
+                GoldilocksField(0x1234_5678_9abc_def0),
+                GoldilocksField(0xfedc_ba98_7654_3210),
+            ];
+            let powers = gate_constraint_alpha_powers(&alphas, 68);
+            let mut expected = vec![F::ZERO; 2 * n];
+            let mut actual = vec![F::ZERO; 2 * n];
+            reduce_gate_constraints_base_batch(
+                &mut expected_rows,
+                n,
+                &alphas,
+                &powers,
+                68,
+                &mut expected,
+                true,
+                true,
+                true,
+            );
+            reduce_gate_constraints_base_batch(
+                &mut actual_rows,
+                n,
+                &alphas,
+                &powers,
+                68,
+                &mut actual,
+                true,
+                true,
+                true,
+            );
+            assert_eq!(
+                actual.iter().map(|value| value.0).collect::<Vec<_>>(),
+                expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_uses_row_order_and_full_padded_alpha_stride() {
+        type F = GoldilocksField;
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        let n = 32;
+        let stride = 73;
+        let constants = raw_fixture(common.num_constants * n, 0x6a09_e667_f3bc_c909);
+        let wires = raw_fixture(common.config.num_wires * n, 0xbb67_ae85_84ca_a73b);
+        let hash = HashOut::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+        let selected = &common.gates[plan.gate_index];
+        let gate = selected
+            .0
+            .as_any()
+            .downcast_ref::<ExponentiationGate<F, DIRECT_TEST_D>>()
+            .unwrap();
+        let selector_index = common.selectors_info.selector_indices[plan.gate_index];
+        let mut filters = Vec::new();
+        fill_base_batch_filter(
+            vars,
+            plan.gate_index,
+            selector_index,
+            common.selectors_info.groups[selector_index].clone(),
+            common.selectors_info.num_selectors(),
+            &mut filters,
+        );
+        let mut unfiltered = vars;
+        unfiltered.remove_prefix(common.selectors_info.num_selectors());
+        let alphas = [F::from_canonical_u64(3), F::from_canonical_u64(11)];
+        let powers = gate_constraint_alpha_powers(&alphas, stride);
+        let rows = gate.eval_unfiltered_base_batch(unfiltered);
+        let mut expected = vec![F::ZERO; 2 * n];
+        for point in 0..n {
+            for challenge in 0..2 {
+                let mut sum = F::ZERO;
+                let power_base = challenge * stride;
+                for row in 0..68 {
+                    sum += rows[row * n + point] * powers[power_base + row];
+                }
+                expected[2 * point + challenge] = sum * filters[point];
+            }
+        }
+        let mut actual = vec![F::ZERO; 2 * n];
+        gate.eval_unfiltered_base_batch_alpha_fused(
+            unfiltered,
+            &filters,
+            &powers,
+            stride,
+            &mut actual,
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+        );
+
+        // Challenge one must start at the original full stride, not at the
+        // residual 26 rows and not at an interval derived from gate index.
+        let mut wrong = vec![F::ZERO; 2 * n];
+        for point in 0..n {
+            for row in 0..68 {
+                wrong[2 * point + 1] += rows[row * n + point] * powers[26 + row];
+            }
+            wrong[2 * point + 1] *= filters[point];
+        }
+        assert!(actual
+            .iter()
+            .zip(&wrong)
+            .any(|(a, b)| { a.to_canonical_u64() != b.to_canonical_u64() }));
+        assert_eq!(cpu_gate_indices[plan.gate_index], plan.gate_index);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_mixed_gates_share_rows_and_leave_26_residual_rows() {
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        assert!(common
+            .gates
+            .iter()
+            .any(|gate| gate.0.as_any().is::<MulExtensionGate<DIRECT_TEST_D>>()));
+        assert!(common
+            .gates
+            .iter()
+            .any(|gate| gate.0.as_any().is::<ArithmeticGate>()));
+        assert!(common.gates.iter().any(|gate| gate
+            .0
+            .as_any()
+            .is::<RandomAccessGate<GoldilocksField, DIRECT_TEST_D>>()));
+        let (control, candidate, residual, _) =
+            run_direct_mixed_gate_differential(&common, &cpu_gate_indices, plan, 32, 68);
+        assert_eq!(residual.len(), 26 * 32);
+        for (index, (&actual, &expected)) in candidate.iter().zip(&control).enumerate() {
+            assert_eq!(
+                actual.to_canonical_u64(),
+                expected.to_canonical_u64(),
+                "mixed shared-row mismatch at {index}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_selector_filter_matches_singleton_multi_and_unused_order() {
+        type F = GoldilocksField;
+        let n = 32;
+        let constants = raw_fixture(4 * n, 0x3c6e_f372_fe94_f82b);
+        let wires = vec![F::ZERO; n];
+        let hash = HashOut::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+        let mut singleton = Vec::new();
+        fill_base_batch_filter(vars, 0, 0, 0..1, 1, &mut singleton);
+        assert!(singleton.iter().all(|value| value.0 == F::ONE.0));
+
+        let mut multi = Vec::new();
+        fill_base_batch_filter(vars, 1, 2, 0..3, 4, &mut multi);
+        let selector_col = &constants[2 * n..3 * n];
+        let expected = selector_col
+            .iter()
+            .map(|&selector| {
+                (F::from_canonical_usize(0) - selector)
+                    * (F::from_canonical_usize(2) - selector)
+                    * (F::from_canonical_usize(UNUSED_SELECTOR) - selector)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            multi.iter().map(|value| value.0).collect::<Vec<_>>(),
+            expected.iter().map(|value| value.0).collect::<Vec<_>>(),
+        );
+
+        let mut stripped = vars;
+        stripped.remove_prefix(3);
+        assert_eq!(
+            stripped.local_constants[0].0,
+            constants[3 * n].0,
+            "selector prefix removal changed column order",
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_residual_scratch_reuses_and_switches_full_lengths() {
+        type F = GoldilocksField;
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        let alphas = [F::from_canonical_u64(5), F::from_canonical_u64(17)];
+        let powers = gate_constraint_alpha_powers(&alphas, 68);
+        let hash = HashOut::ZERO;
+        let mut rows = Vec::new();
+        let mut filters = Vec::new();
+        let mut shared_gate_filters = Vec::new();
+        let mut selector_filter_suffix = Vec::new();
+        let mut interleave_summed_filter = Vec::new();
+        let mut shared_gate_filter_plan = Vec::new();
+        let mut direct = Vec::new();
+
+        for (step, n) in [32usize, 32, 31, 32].into_iter().enumerate() {
+            let constants = raw_fixture(
+                common.num_constants * n,
+                0x510e_527f_ade6_82d1 + step as u64,
+            );
+            let wires = raw_fixture(
+                common.config.num_wires * n,
+                0x9b05_688c_2b3e_6c1f + step as u64,
+            );
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+            let mut output = vec![F::ZERO; 2 * n];
+            if plan.applies_to_batch(n, true) {
+                evaluate_gate_constraints_base_batch_into_cpu_gates_with_direct(
+                    &common,
+                    vars,
+                    &mut rows,
+                    &cpu_gate_indices,
+                    &mut filters,
+                    &mut shared_gate_filters,
+                    &mut selector_filter_suffix,
+                    &mut interleave_summed_filter,
+                    &mut shared_gate_filter_plan,
+                    26,
+                    None,
+                    Some(DirectGateAlphaEvaluation {
+                        plan: &plan,
+                        alpha_powers: &powers,
+                        alpha_power_stride: 68,
+                        output: &mut direct,
+                    }),
+                );
+                assert_eq!(rows.len(), 26 * n);
+                reduce_gate_constraints_base_batch(
+                    &mut rows,
+                    n,
+                    &alphas,
+                    &powers,
+                    68,
+                    &mut output,
+                    true,
+                    true,
+                    true,
+                );
+                for (value, &term) in output.iter_mut().zip(&direct) {
+                    *value += term;
+                }
+            } else {
+                evaluate_gate_constraints_base_batch_into_cpu_gates(
+                    &common,
+                    vars,
+                    &mut rows,
+                    &cpu_gate_indices,
+                    &mut filters,
+                    &mut shared_gate_filters,
+                    &mut selector_filter_suffix,
+                    &mut interleave_summed_filter,
+                    &mut shared_gate_filter_plan,
+                    68,
+                    None,
+                );
+                assert_eq!(rows.len(), 68 * n);
+                reduce_gate_constraints_base_batch(
+                    &mut rows,
+                    n,
+                    &alphas,
+                    &powers,
+                    68,
+                    &mut output,
+                    true,
+                    true,
+                    true,
+                );
+            }
+            assert!(rows.iter().all(|value| value.0 == 0));
+
+            let mut reference_rows = Vec::new();
+            let mut reference_filters = Vec::new();
+            evaluate_gate_constraints_base_batch_into_cpu_gates(
+                &common,
+                vars,
+                &mut reference_rows,
+                &cpu_gate_indices,
+                &mut reference_filters,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+                68,
+                None,
+            );
+            let mut reference = vec![F::ZERO; 2 * n];
+            reduce_gate_constraints_base_batch(
+                &mut reference_rows,
+                n,
+                &alphas,
+                &powers,
+                68,
+                &mut reference,
+                true,
+                true,
+                true,
+            );
+            assert_eq!(
+                output
+                    .iter()
+                    .map(PrimeField64::to_canonical_u64)
+                    .collect::<Vec<_>>(),
+                reference
+                    .iter()
+                    .map(PrimeField64::to_canonical_u64)
+                    .collect::<Vec<_>>(),
+                "scratch transition failed at step {step}",
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_fallback_preflight_covers_every_unsupported_shape() {
+        type F = GoldilocksField;
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        assert!(plan.applies_to_batch(32, true));
+        assert!(!plan.applies_to_batch(31, true));
+        assert!(!plan.applies_to_batch(33, true));
+        assert!(!plan.applies_to_batch(32, false));
+
+        let preflight = |common: &CommonCircuitData<F, DIRECT_TEST_D>,
+                         cpu: &[usize],
+                         deferred: bool,
+                         fusion: bool,
+                         alphas: usize,
+                         zero_seed: bool,
+                         interleave: Option<&InterleavePairPlan>| {
+            direct_exponentiation_alpha_plan(
+                common, cpu, interleave, deferred, fusion, alphas, zero_seed,
+            )
+        };
+        assert!(preflight(&common, &cpu_gate_indices, false, true, 2, true, None).is_none());
+        assert!(preflight(&common, &cpu_gate_indices, true, false, 2, true, None).is_none());
+        assert!(preflight(&common, &cpu_gate_indices, true, true, 1, true, None).is_none());
+        assert!(preflight(&common, &cpu_gate_indices, true, true, 3, true, None).is_none());
+        assert!(preflight(&common, &cpu_gate_indices, true, true, 2, false, None).is_none());
+
+        let mut lookup = common.clone();
+        lookup.num_lookup_polys = 1;
+        assert!(preflight(&lookup, &cpu_gate_indices, true, true, 2, true, None).is_none());
+
+        let fake_interleave = InterleavePairPlan {
+            interleave_index: 0,
+            uninterleave_index: 1,
+        };
+        assert!(preflight(
+            &common,
+            &cpu_gate_indices,
+            true,
+            true,
+            2,
+            true,
+            Some(&fake_interleave),
+        )
+        .is_none());
+
+        for bits in [66usize, 68] {
+            let mut changed = common.clone();
+            changed.gates[plan.gate_index] =
+                GateRef::new(ExponentiationGate::<F, DIRECT_TEST_D>::new(bits));
+            assert!(preflight(&changed, &cpu_gate_indices, true, true, 2, true, None).is_none());
+        }
+
+        let mut duplicate = common.clone();
+        duplicate
+            .gates
+            .push(GateRef::new(ExponentiationGate::<F, DIRECT_TEST_D>::new(
+                67,
+            )));
+        let duplicate_cpu = (0..duplicate.gates.len()).collect::<Vec<_>>();
+        assert!(preflight(&duplicate, &duplicate_cpu, true, true, 2, true, None).is_none());
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_plan_uses_cpu_survivors_and_preserves_exclusions() {
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        let survivors = cpu_gate_indices
+            .iter()
+            .copied()
+            .filter(|&index| index != plan.gate_index)
+            .collect::<Vec<_>>();
+        let survivor_snapshot = survivors.clone();
+        assert!(
+            direct_exponentiation_alpha_plan(&common, &survivors, None, true, true, 2, true,)
+                .is_none()
+        );
+        assert_eq!(survivors, survivor_snapshot, "preflight mutated exclusions");
+
+        let n = 32;
+        let constants = raw_fixture(common.num_constants * n, 0x1f83_d9ab_fb41_bd6b);
+        let wires = raw_fixture(common.config.num_wires * n, 0x5be0_cd19_137e_2179);
+        let hash = HashOut::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+        let mut rows = Vec::new();
+        let mut filters = Vec::new();
+        let direct_sentinel = vec![GoldilocksField(u64::MAX); 64];
+        evaluate_gate_constraints_base_batch_into_cpu_gates(
+            &common,
+            vars,
+            &mut rows,
+            &survivors,
+            &mut filters,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            26,
+            None,
+        );
+        assert_eq!(rows.len(), 26 * n);
+        assert!(rows.iter().any(|value| value.0 != 0));
+        assert!(direct_sentinel.iter().all(|value| value.0 == u64::MAX));
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_sum_precedes_cpu_and_offloaded_permutation_continuations() {
+        type F = GoldilocksField;
+        let common = direct_test_common();
+        let (cpu_gate_indices, plan) = direct_test_plan(&common);
+        let (control, candidate, _, _) =
+            run_direct_mixed_gate_differential(&common, &cpu_gate_indices, plan, 32, 68);
+        let alphas = [F::from_canonical_u64(7), F::from_canonical_u64(19)];
+
+        let mut cpu_control = control.clone();
+        let mut cpu_candidate = candidate.clone();
+        let lookup_and_permutation_terms = raw_fixture(9 * 32, 0xcbbb_9d5d_c105_9ed8);
+        for point in 0..32 {
+            for row in (0..9).rev() {
+                let term = lookup_and_permutation_terms[row * 32 + point];
+                for challenge in 0..2 {
+                    let offset = 2 * point + challenge;
+                    cpu_control[offset] =
+                        term.multiply_accumulate(cpu_control[offset], alphas[challenge]);
+                    cpu_candidate[offset] =
+                        term.multiply_accumulate(cpu_candidate[offset], alphas[challenge]);
+                }
+            }
+        }
+        assert_eq!(
+            cpu_candidate
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+            cpu_control
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+            "CPU permutation/lookup continuation shifted only one gate sum",
+        );
+
+        let scales = [F::from_canonical_u64(23), F::from_canonical_u64(29)];
+        let z0 = raw_fixture(32, 0x629a_292a_367c_d507);
+        let z1 = raw_fixture(32, 0x9159_015a_3070_dd17);
+        let mut gpu_control = control;
+        let mut gpu_candidate = candidate;
+        for point in 0..32 {
+            for challenge in 0..2 {
+                let offset = 2 * point + challenge;
+                gpu_control[offset] = z0[point]
+                    + z1[point] * alphas[challenge]
+                    + gpu_control[offset] * scales[challenge];
+                gpu_candidate[offset] = z0[point]
+                    + z1[point] * alphas[challenge]
+                    + gpu_candidate[offset] * scales[challenge];
+            }
+        }
+        assert_eq!(
+            gpu_candidate
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+            gpu_control
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+            "offloaded permutation gate scaling did not apply to the combined sum",
+        );
+    }
+
+    #[test]
+    #[ignore = "focused exact d16 gate+reduce benchmark; quiet-host grant required"]
+    #[cfg(target_arch = "aarch64")]
+    fn direct_exponentiation_gate_reduce_microbench_requires_25_percent() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        type F = GoldilocksField;
+        const N: usize = 32;
+        const SAMPLES: usize = 31;
+        const ITERATIONS: usize = 2_048;
+
+        let gate = ExponentiationGate::<F, DIRECT_TEST_D>::new(67);
+        let wires = raw_fixture(136 * N, 0x428a_2f98_d728_ae22);
+        let hash = HashOut::ZERO;
+        let vars = EvaluationVarsBaseBatch::new(N, &[], &wires, &hash);
+        let filters = raw_fixture(N, 0x7137_4491_23ef_65cd);
+        let alphas = [
+            GoldilocksField(0xb5c0_fbcf_ec4d_3b2f),
+            GoldilocksField(0xe9b5_dba5_8189_dbbc),
+        ];
+        let powers = gate_constraint_alpha_powers(&alphas, 68);
+        let mut control_rows = vec![F::ZERO; 68 * N];
+        let mut control_output = vec![F::ZERO; 2 * N];
+        let mut direct_output = vec![F::ZERO; 2 * N];
+        let mut candidate_output = vec![F::ZERO; 2 * N];
+
+        let mut run_control = |iterations: usize| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                gate.eval_unfiltered_base_batch_accumulate(
+                    black_box(vars),
+                    black_box(&filters),
+                    black_box(&mut control_rows),
+                );
+                reduce_gate_constraints_base_batch(
+                    black_box(&mut control_rows),
+                    N,
+                    black_box(&alphas),
+                    black_box(&powers),
+                    68,
+                    black_box(&mut control_output),
+                    true,
+                    true,
+                    true,
+                );
+                black_box(&control_output);
+            }
+            start.elapsed().as_secs_f64()
+        };
+        let mut run_candidate = |iterations: usize| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                gate.eval_unfiltered_base_batch_alpha_fused(
+                    black_box(vars),
+                    black_box(&filters),
+                    black_box(&powers),
+                    68,
+                    black_box(&mut direct_output),
+                );
+                // The selected gate's packet-local dot is its reduction.
+                // Residual gates are a separate, unchanged component and are
+                // covered by the mixed-path correctness/reuse tests above.
+                candidate_output.copy_from_slice(&direct_output);
+                black_box(&candidate_output);
+            }
+            start.elapsed().as_secs_f64()
+        };
+
+        run_control(512);
+        run_candidate(512);
+        // The two closures own separate scratch but evaluate identical wires,
+        // filters and alphas for the exact d16 selected gate+reduce component.
+        let mut control_samples = Vec::with_capacity(SAMPLES);
+        let mut candidate_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample % 2 == 0 {
+                control_samples.push(run_control(ITERATIONS));
+                candidate_samples.push(run_candidate(ITERATIONS));
+            } else {
+                candidate_samples.push(run_candidate(ITERATIONS));
+                control_samples.push(run_control(ITERATIONS));
+            }
+        }
+        drop(run_control);
+        drop(run_candidate);
+        assert_eq!(
+            control_output
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+            candidate_output
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>(),
+        );
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+        let control_median = median(&control_samples);
+        let candidate_median = median(&candidate_samples);
+        let saving = 1.0 - candidate_median / control_median;
+        eprintln!(
+            "direct-exp exact d16 gate+reduce: control={:.3}ns candidate={:.3}ns saving={:.2}% samples={SAMPLES}",
+            control_median * 1e9 / ITERATIONS as f64,
+            candidate_median * 1e9 / ITERATIONS as f64,
+            saving * 100.0,
+        );
+        assert!(
+            saving >= 0.25,
+            "exact d16 gate+reduce median saving {:.2}% is below 25%",
+            saving * 100.0,
+        );
+
+        // Unsupported n=31 executes the ordinary packed gate and full 68-row
+        // reducer in both arms. The candidate arm includes its real one-branch
+        // batch preflight; it may not regress the fallback median by >5%.
+        const FALLBACK_N: usize = 31;
+        const FALLBACK_ITERS: usize = 1_024;
+        let fallback_wires = raw_fixture(136 * FALLBACK_N, 0xa54f_f53a_5f1d_36f1);
+        let fallback_filters = raw_fixture(FALLBACK_N, 0xade6_82d1_9b05_688c);
+        let fallback_vars = EvaluationVarsBaseBatch::new(FALLBACK_N, &[], &fallback_wires, &hash);
+        let fallback_plan = DirectGateAlphaPlan {
+            gate_index: 0,
+            residual_num_gate_constraints: 26,
+        };
+        let mut baseline_rows = vec![F::ZERO; 68 * FALLBACK_N];
+        let mut baseline_output = vec![F::ZERO; 2 * FALLBACK_N];
+        let mut toggled_rows = vec![F::ZERO; 68 * FALLBACK_N];
+        let mut toggled_output = vec![F::ZERO; 2 * FALLBACK_N];
+        let mut run_fallback_baseline = |iterations: usize| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                gate.eval_unfiltered_base_batch_accumulate(
+                    black_box(fallback_vars),
+                    black_box(&fallback_filters),
+                    black_box(&mut baseline_rows),
+                );
+                reduce_gate_constraints_base_batch(
+                    black_box(&mut baseline_rows),
+                    FALLBACK_N,
+                    black_box(&alphas),
+                    black_box(&powers),
+                    68,
+                    black_box(&mut baseline_output),
+                    true,
+                    true,
+                    true,
+                );
+            }
+            start.elapsed().as_secs_f64()
+        };
+        let mut run_fallback_toggled = |iterations: usize| {
+            let start = Instant::now();
+            for _ in 0..iterations {
+                if fallback_plan.applies_to_batch(black_box(FALLBACK_N), true) {
+                    unreachable!();
+                }
+                gate.eval_unfiltered_base_batch_accumulate(
+                    black_box(fallback_vars),
+                    black_box(&fallback_filters),
+                    black_box(&mut toggled_rows),
+                );
+                reduce_gate_constraints_base_batch(
+                    black_box(&mut toggled_rows),
+                    FALLBACK_N,
+                    black_box(&alphas),
+                    black_box(&powers),
+                    68,
+                    black_box(&mut toggled_output),
+                    true,
+                    true,
+                    true,
+                );
+            }
+            start.elapsed().as_secs_f64()
+        };
+        run_fallback_baseline(256);
+        run_fallback_toggled(256);
+        let mut fallback_baseline = Vec::with_capacity(SAMPLES);
+        let mut fallback_toggled = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            if sample % 2 == 0 {
+                fallback_baseline.push(run_fallback_baseline(FALLBACK_ITERS));
+                fallback_toggled.push(run_fallback_toggled(FALLBACK_ITERS));
+            } else {
+                fallback_toggled.push(run_fallback_toggled(FALLBACK_ITERS));
+                fallback_baseline.push(run_fallback_baseline(FALLBACK_ITERS));
+            }
+        }
+        drop(run_fallback_baseline);
+        drop(run_fallback_toggled);
+        let fallback_baseline_median = median(&fallback_baseline);
+        let fallback_toggled_median = median(&fallback_toggled);
+        let fallback_ratio = fallback_toggled_median / fallback_baseline_median;
+        eprintln!(
+            "direct-exp fallback n31: baseline={:.3}ns toggled={:.3}ns ratio={:.4}",
+            fallback_baseline_median * 1e9 / FALLBACK_ITERS as f64,
+            fallback_toggled_median * 1e9 / FALLBACK_ITERS as f64,
+            fallback_ratio,
+        );
+        assert!(fallback_ratio <= 1.05, "fallback regressed by >5%");
+        assert_eq!(
+            baseline_output
+                .iter()
+                .map(|value| value.0)
+                .collect::<Vec<_>>(),
+            toggled_output
+                .iter()
+                .map(|value| value.0)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn shared_selector_filters_match_gate_local_products() {
+        type F = GoldilocksField;
+
+        for batch_size in [1usize, 7, 32] {
+            let selector_col = (0..batch_size)
+                .map(|point| {
+                    // Include exact gate labels, the unused sentinel and
+                    // ordinary off-domain values so zero and nonzero factors
+                    // are both covered.
+                    F::from_canonical_usize(match point % 5 {
+                        0 => 2,
+                        1 => 5,
+                        2 => UNUSED_SELECTOR,
+                        _ => 17 * point + 11,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let group = 2..8;
+            let gate_count = 10;
+
+            for include_unused_selector in [false, true] {
+                for active_pattern in [0usize, 1] {
+                    let active = (0..gate_count)
+                        .map(|gate| group.contains(&gate) && (gate + active_pattern) % 2 == 0)
+                        .collect::<Vec<_>>();
+                    let mut actual = vec![F::ZERO; gate_count * batch_size];
+                    let mut suffix = vec![F::ZERO; batch_size];
+                    fill_shared_selector_group_filters(
+                        &selector_col,
+                        group.clone(),
+                        include_unused_selector,
+                        &active,
+                        &mut actual,
+                        &mut suffix,
+                    );
+
+                    for gate in group.clone().filter(|&gate| active[gate]) {
+                        for (point, &selector) in selector_col.iter().enumerate() {
+                            let mut factors = group
+                                .clone()
+                                .filter(|&other| other != gate)
+                                .chain(include_unused_selector.then_some(UNUSED_SELECTOR));
+                            let expected = match factors.next() {
+                                Some(first) => {
+                                    let mut value = F::from_canonical_usize(first) - selector;
+                                    for factor in factors {
+                                        value *= F::from_canonical_usize(factor) - selector;
+                                    }
+                                    value
+                                }
+                                None => F::ONE,
+                            };
+                            let actual = actual[gate * batch_size + point];
+                            assert_eq!(
+                                actual.to_canonical_u64(),
+                                expected.to_canonical_u64(),
+                                "gate {gate}, point {point}, unused={include_unused_selector}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_selector_filter_plan_keeps_small_groups_local() {
+        assert!(!shared_selector_group_is_cheaper(1, 1, false));
+        assert!(!shared_selector_group_is_cheaper(2, 2, true));
+        assert!(!shared_selector_group_is_cheaper(3, 3, false));
+        assert!(shared_selector_group_is_cheaper(3, 3, true));
+        assert!(shared_selector_group_is_cheaper(4, 4, false));
+        assert!(shared_selector_group_is_cheaper(8, 6, true));
+        assert!(!shared_selector_group_is_cheaper(8, 1, true));
+    }
 
     #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
@@ -1868,7 +3805,18 @@ mod tests {
             F::from_canonical_u64(6),
             F::from_canonical_u64(6),
         ];
-        reduce_gate_constraints_base_batch(&mut terms, 2, &alphas, &mut actual, false, false);
+        let alpha_powers = gate_constraint_alpha_powers(&alphas, 2);
+        reduce_gate_constraints_base_batch(
+            &mut terms,
+            2,
+            &alphas,
+            &alpha_powers,
+            2,
+            &mut actual,
+            false,
+            false,
+            false,
+        );
         assert_eq!(actual[0], F::from_canonical_u64(91));
         assert_eq!(actual[2], F::from_canonical_u64(116));
 
@@ -1892,7 +3840,18 @@ mod tests {
             }
 
             let mut actual = initial;
-            reduce_gate_constraints_base_batch(&mut terms, batch_size, &alphas, &mut actual, false, false);
+            let alpha_powers = gate_constraint_alpha_powers(&alphas, num_constraints);
+            reduce_gate_constraints_base_batch(
+                &mut terms,
+                batch_size,
+                &alphas,
+                &alpha_powers,
+                num_constraints,
+                &mut actual,
+                false,
+                false,
+                false,
+            );
             assert_eq!(actual, expected, "batch size {batch_size}");
         }
     }
@@ -2227,11 +4186,16 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut expected_reduction = initial_reduction.clone();
             let mut actual_reduction = initial_reduction;
+            let num_rows = expected_rows.len() / batch_size;
+            let alpha_powers = gate_constraint_alpha_powers(&alphas, num_rows);
             reduce_gate_constraints_base_batch(
                 &mut expected_rows,
                 batch_size,
                 &alphas,
+                &alpha_powers,
+                num_rows,
                 &mut expected_reduction,
+                false,
                 false,
                 false,
             );
@@ -2239,7 +4203,10 @@ mod tests {
                 &mut actual_rows,
                 batch_size,
                 &alphas,
+                &alpha_powers,
+                num_rows,
                 &mut actual_reduction,
+                false,
                 false,
                 false,
             );
@@ -2298,13 +4265,17 @@ mod tests {
                     }
                     let mut narrowed = full[..m * batch_size].to_vec();
 
+                    let alpha_powers = gate_constraint_alpha_powers(&alphas, k);
                     let mut expected = vec![F::ZERO; batch_size * alphas.len()];
                     reduce_gate_constraints_base_batch(
                         &mut full,
                         batch_size,
                         &alphas,
+                        &alpha_powers,
+                        k,
                         &mut expected,
                         true,
+                        false,
                         false,
                     );
                     let mut actual = vec![F::ZERO; batch_size * alphas.len()];
@@ -2312,8 +4283,11 @@ mod tests {
                         &mut narrowed,
                         batch_size,
                         &alphas,
+                        &alpha_powers,
+                        k,
                         &mut actual,
                         true,
+                        false,
                         false,
                     );
 
@@ -2325,6 +4299,290 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn deferred_product_materialization_handles_maximum_bounded_carry() {
+        type F = GoldilocksField;
+
+        let mut deferred = DeferredProductSum::default();
+        let factor = u64::MAX;
+        let mut expected = F::ZERO;
+        for _ in 0..MAX_DEFERRED_ALPHA_ROWS {
+            deferred.add_product(factor, factor);
+            expected += GoldilocksField(factor) * GoldilocksField(factor);
+        }
+        assert_eq!(deferred.top, 135, "maximum 136-product carry bound");
+        assert_eq!(
+            deferred
+                .materialize(MAX_DEFERRED_ALPHA_ROWS)
+                .to_canonical_u64(),
+            expected.to_canonical_u64(),
+        );
+    }
+
+    /// Exact candidate-vs-current differential in one executable. It covers
+    /// full-range raw limbs, arithmetic boundaries, actual 68/136 row shapes,
+    /// odd batch tails, a wider precomputed-power stride, both scratch-clear
+    /// modes, and the nonzero-seed fallback.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn deferred_two_alpha_matches_horner_canonically_and_preserves_clear_contract() {
+        type F = GoldilocksField;
+        const EDGES: &[u64] = &[
+            0,
+            1,
+            2,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_fffe_ffff_ffff,
+            0xffff_ffff_0000_0000,
+            0xffff_ffff_0000_0001,
+            0xffff_ffff_0000_0002,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+
+        let mut state = 0x243f_6a88_85a3_08d3u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            GoldilocksField(state)
+        };
+        let raw_words = |values: &[F]| values.iter().map(|value| value.0).collect::<Vec<_>>();
+        let canonical = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_canonical_u64)
+                .collect::<Vec<_>>()
+        };
+
+        for rows in [0usize, 1, 2, 10, 68, 135, 136] {
+            for batch_size in [1usize, 2, 7, 8, 9, 31, 32, 33] {
+                for random_inputs in [false, true] {
+                    let terms = (0..rows * batch_size)
+                        .map(|i| {
+                            if random_inputs {
+                                random()
+                            } else {
+                                GoldilocksField(EDGES[(i * 7 + rows + batch_size) % EDGES.len()])
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let alphas = if random_inputs {
+                        [random(), random()]
+                    } else {
+                        [
+                            GoldilocksField(EDGES[(rows + batch_size) % EDGES.len()]),
+                            GoldilocksField(EDGES[(3 * rows + batch_size + 1) % EDGES.len()]),
+                        ]
+                    };
+                    // Production uses stride == rows. A padded stride proves
+                    // challenge-major slicing does not accidentally use the
+                    // candidate's shorter live row count as a column offset.
+                    let power_stride = rows + 3;
+                    let alpha_powers = gate_constraint_alpha_powers(&alphas, power_stride);
+                    let dirty_output = (0..2 * batch_size)
+                        .map(|i| {
+                            if random_inputs {
+                                random()
+                            } else {
+                                GoldilocksField(EDGES[(5 * i + rows + batch_size) % EDGES.len()])
+                            }
+                        })
+                        .collect::<Vec<_>>();
+
+                    for clear_as_consumed in [false, true] {
+                        let mut horner_terms = terms.clone();
+                        let mut horner_output = dirty_output.clone();
+                        reduce_gate_constraints_base_batch(
+                            &mut horner_terms,
+                            batch_size,
+                            &alphas,
+                            &alpha_powers,
+                            power_stride,
+                            &mut horner_output,
+                            true,
+                            clear_as_consumed,
+                            false,
+                        );
+
+                        let mut deferred_terms = terms.clone();
+                        let mut deferred_output = dirty_output.clone();
+                        reduce_gate_constraints_base_batch(
+                            &mut deferred_terms,
+                            batch_size,
+                            &alphas,
+                            &alpha_powers,
+                            power_stride,
+                            &mut deferred_output,
+                            true,
+                            clear_as_consumed,
+                            true,
+                        );
+
+                        assert_eq!(
+                            canonical(&deferred_output),
+                            canonical(&horner_output),
+                            "zero-seed mismatch rows={rows}, batch={batch_size}, random={random_inputs}, clear={clear_as_consumed}",
+                        );
+                        if clear_as_consumed {
+                            assert!(
+                                horner_terms.iter().all(|value| value.0 == 0)
+                                    && deferred_terms.iter().all(|value| value.0 == 0),
+                                "scratch not cleared rows={rows}, batch={batch_size}",
+                            );
+                        } else {
+                            assert_eq!(raw_words(&horner_terms), raw_words(&terms));
+                            assert_eq!(raw_words(&deferred_terms), raw_words(&terms));
+                        }
+                    }
+
+                    // The deferred bound assumes a zero seed. The enabled arm
+                    // must fall back to current Horner and remain raw-identical
+                    // when a caller supplies a running accumulator.
+                    let mut horner_terms = terms.clone();
+                    let mut horner_output = dirty_output.clone();
+                    reduce_gate_constraints_base_batch(
+                        &mut horner_terms,
+                        batch_size,
+                        &alphas,
+                        &alpha_powers,
+                        power_stride,
+                        &mut horner_output,
+                        false,
+                        false,
+                        false,
+                    );
+                    let mut toggled_terms = terms.clone();
+                    let mut toggled_output = dirty_output.clone();
+                    reduce_gate_constraints_base_batch(
+                        &mut toggled_terms,
+                        batch_size,
+                        &alphas,
+                        &alpha_powers,
+                        power_stride,
+                        &mut toggled_output,
+                        false,
+                        false,
+                        true,
+                    );
+                    assert_eq!(raw_words(&toggled_output), raw_words(&horner_output));
+                    assert_eq!(raw_words(&toggled_terms), raw_words(&horner_terms));
+                }
+            }
+        }
+    }
+
+    /// Focused gate before any full-proof timing. Both arms are compiled into
+    /// and invoked by this one test binary. The measured call includes current
+    /// `clear_as_consumed` stores and an identical scratch refill in each arm.
+    #[test]
+    #[ignore = "focused serialized M4 reducer benchmark; run only after timing permission"]
+    #[cfg(target_arch = "aarch64")]
+    fn deferred_two_alpha_reducer_microbench_requires_32_percent() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        type F = GoldilocksField;
+        const BATCH_SIZE: usize = 32;
+        const SAMPLES: usize = 9;
+
+        let median = |samples: &[f64]| {
+            let mut sorted = samples.to_vec();
+            sorted.sort_by(f64::total_cmp);
+            sorted[sorted.len() / 2]
+        };
+
+        for rows in [68usize, 136] {
+            let iterations = if rows == 68 { 8_000 } else { 4_000 };
+            let source = (0..rows * BATCH_SIZE)
+                .map(|i| {
+                    GoldilocksField(
+                        0x9e37_79b9_7f4a_7c15u64
+                            .wrapping_mul((i as u64).wrapping_add(1))
+                            .rotate_left((i % 61) as u32),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let alphas = [
+                GoldilocksField(0xd1b5_4a32_d192_ed03),
+                GoldilocksField(0xa24b_aed4_963e_e407),
+            ];
+            let alpha_powers = gate_constraint_alpha_powers(&alphas, rows);
+
+            let run_horner = || {
+                let mut terms = source.clone();
+                let mut output = vec![F::ZERO; BATCH_SIZE * 2];
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    terms.copy_from_slice(black_box(&source));
+                    reduce_gate_constraints_base_batch_horner(
+                        black_box(&mut terms),
+                        BATCH_SIZE,
+                        black_box(&alphas),
+                        black_box(&mut output),
+                        true,
+                        true,
+                    );
+                }
+                let seconds = start.elapsed().as_secs_f64() / iterations as f64;
+                black_box((terms, output));
+                seconds
+            };
+            let run_deferred = || {
+                let mut terms = source.clone();
+                let mut output = vec![F::ZERO; BATCH_SIZE * 2];
+                let start = Instant::now();
+                for _ in 0..iterations {
+                    terms.copy_from_slice(black_box(&source));
+                    reduce_gate_constraints_base_batch(
+                        black_box(&mut terms),
+                        BATCH_SIZE,
+                        black_box(&alphas),
+                        black_box(&alpha_powers),
+                        rows,
+                        black_box(&mut output),
+                        true,
+                        true,
+                        true,
+                    );
+                }
+                let seconds = start.elapsed().as_secs_f64() / iterations as f64;
+                black_box((terms, output));
+                seconds
+            };
+
+            black_box(run_horner());
+            black_box(run_deferred());
+            let mut horner_samples = Vec::with_capacity(SAMPLES);
+            let mut deferred_samples = Vec::with_capacity(SAMPLES);
+            for sample in 0..SAMPLES {
+                if sample % 2 == 0 {
+                    horner_samples.push(run_horner());
+                    deferred_samples.push(run_deferred());
+                } else {
+                    deferred_samples.push(run_deferred());
+                    horner_samples.push(run_horner());
+                }
+            }
+            let horner_median = median(&horner_samples);
+            let deferred_median = median(&deferred_samples);
+            let saving = (horner_median - deferred_median) / horner_median;
+            println!(
+                "rows={rows} ns/call median: Horner {:.1}; deferred {:.1}; saving {:.2}%",
+                horner_median * 1e9,
+                deferred_median * 1e9,
+                saving * 100.0,
+            );
+            assert!(
+                saving >= 0.32,
+                "deferred reducer gate rejected at rows={rows}: {:.2}% < 32%",
+                saving * 100.0,
+            );
         }
     }
 }

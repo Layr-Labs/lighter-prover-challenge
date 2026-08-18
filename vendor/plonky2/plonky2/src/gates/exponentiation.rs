@@ -6,11 +6,13 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 
 use anyhow::Result;
 
 use crate::field::extension::Extendable;
 use crate::field::ops::Square;
+use crate::field::packable::Packable;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
@@ -55,6 +57,75 @@ impl<F: RichField + Extendable<D>, const D: usize> ExponentiationGate<F, D> {
         let max_for_routed_wires = num_routed_wires - 2;
         let max_for_wires = (num_wires - 2) / 2;
         max_for_routed_wires.min(max_for_wires)
+    }
+
+    /// Exact D=2/bits=67/n=32 packed evaluator composed with the production
+    /// two-alpha deferred dot. Selector filtering is factored until after each
+    /// packet's 68 rows have been reduced, so only two results per point are
+    /// multiplied by the filter.
+    #[inline(always)]
+    pub(crate) fn eval_unfiltered_base_batch_alpha_fused(
+        &self,
+        vars_batch: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        alpha_powers: &[F],
+        alpha_power_stride: usize,
+        direct_output: &mut [F],
+    ) {
+        type Packing<T> = <T as Packable>::Packing;
+
+        let n = vars_batch.len();
+        let width = Packing::<F>::WIDTH;
+        assert_eq!(D, 2);
+        assert_eq!(self.num_power_bits, 67);
+        assert_eq!(n, 32);
+        assert_eq!(width, 4);
+        assert_eq!(filters.len(), n);
+        assert_eq!(direct_output.len(), 2 * n);
+        assert!(alpha_power_stride >= 68);
+        assert!(alpha_powers.len() >= alpha_power_stride + 68);
+
+        // This matches the established packed evaluator's packet-local
+        // scratch layout: row j occupies `j * width..(j + 1) * width`.
+        // The used prefix is initialized once, then fully overwritten by all
+        // 68 emitted constraints before each subsequent read.
+        let scratch_len = 68 * width;
+        let mut scratch_storage = [MaybeUninit::<F>::uninit(); 1024];
+        let prefix = &mut scratch_storage[..scratch_len];
+        prefix.fill(MaybeUninit::new(F::ZERO));
+        // SAFETY: every element of `prefix` was initialized above and
+        // `MaybeUninit<F>` has the same layout/alignment as `F`.
+        let scratch = unsafe {
+            core::slice::from_raw_parts_mut(prefix.as_mut_ptr().cast::<F>(), scratch_len)
+        };
+
+        let (vars_packed_iter, vars_leftovers_iter) = vars_batch.pack::<Packing<F>>();
+        assert_eq!(vars_leftovers_iter.len(), 0);
+        for (group, vars_packed) in vars_packed_iter.enumerate() {
+            self.eval_unfiltered_base_packed(
+                vars_packed,
+                StridedConstraintConsumer::new(scratch, width, 0),
+            );
+            let point_offset = group * width;
+            let packet_output = &mut direct_output[2 * point_offset..2 * (point_offset + width)];
+            crate::plonk::vanishing_poly::reduce_gate_packet_deferred_two_alpha(
+                scratch,
+                width,
+                alpha_powers,
+                alpha_power_stride,
+                packet_output,
+            );
+            for pair in 0..2 {
+                let output_lanes = &mut packet_output[pair * width..(pair + 1) * width];
+                let mut duplicated_filter = Packing::<F>::ZEROS;
+                for lane in 0..width {
+                    duplicated_filter.as_slice_mut()[lane] =
+                        filters[point_offset + 2 * pair + lane / 2];
+                }
+                let packed_output = Packing::<F>::from_slice_mut(output_lanes);
+                *packed_output *= duplicated_filter;
+            }
+        }
     }
 
     pub(crate) const fn wire_base(&self) -> usize {

@@ -93,6 +93,40 @@ pub enum InterleavePairGate {
     UninterleaveToU32 { num_ops: usize },
 }
 
+/// Fill one gate's selector filter across a contiguous base-field batch.
+///
+/// The factor order is deliberately identical to [`compute_filter`]. Keeping
+/// this in one helper lets specialized evaluators factor the selector out of a
+/// linear alpha dot without silently changing singleton groups, the
+/// `UNUSED_SELECTOR` factor, or selector-prefix handling.
+pub(crate) fn fill_base_batch_filter<F: Field>(
+    vars_batch: EvaluationVarsBaseBatch<F>,
+    row: usize,
+    selector_index: usize,
+    group_range: Range<usize>,
+    num_selectors: usize,
+    filters: &mut Vec<F>,
+) {
+    let batch_size = vars_batch.len();
+    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+    let mut factors = group_range
+        .filter(|&i| i != row)
+        .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
+    filters.clear();
+    if let Some(i) = factors.next() {
+        let k = F::from_canonical_usize(i);
+        filters.extend(selector_col.iter().map(|&s| k - s));
+    } else {
+        filters.resize(batch_size, F::ONE);
+    }
+    for i in factors {
+        let k = F::from_canonical_usize(i);
+        for (filter, &s) in filters.iter_mut().zip(selector_col) {
+            *filter *= k - s;
+        }
+    }
+}
+
 /// A custom gate.
 ///
 /// Vanilla Plonk arithmetization only supports basic fan-in 2 / fan-out 1 arithmetic gates,
@@ -255,27 +289,14 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
-        // Contiguous-column filter computation: read the selector constant
-        // column once and accumulate the same product terms, in the same
-        // order, as the per-point `compute_filter` — identical field values
-        // without the per-point strided views.
-        let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-        let mut factors = group_range
-            .filter(|&i| i != row)
-            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
-        filters.clear();
-        if let Some(i) = factors.next() {
-            let k = F::from_canonical_usize(i);
-            filters.extend(selector_col.iter().map(|&s| k - s));
-        } else {
-            filters.resize(batch_size, F::ONE);
-        }
-        for i in factors {
-            let k = F::from_canonical_usize(i);
-            for (filter, &s) in filters.iter_mut().zip(selector_col) {
-                *filter *= k - s;
-            }
-        }
+        fill_base_batch_filter(
+            vars_batch,
+            row,
+            selector_index,
+            group_range,
+            num_selectors,
+            filters,
+        );
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
         self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
     }

@@ -41,7 +41,7 @@ use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
     CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest, WirePartition};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -66,7 +66,7 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 1;
+const EMBED_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -286,6 +286,27 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
+    // Routed-wire permutation successors. They are a pure function of the
+    // frozen representative map, but rebuilding them at runtime walks that
+    // multi-million-entry map and mutates every copy-class root once per
+    // worker. Derive them here in the untimed build job and delta-code against
+    // the identity permutation; singleton wires encode as zero and dominate
+    // these circuits, so the extra blob section stays compact.
+    let mut forest = Forest::from_parents(
+        prover.representative_map.clone(),
+        common.config.num_wires,
+        common.config.num_routed_wires,
+        degree,
+    );
+    let wire_partition = forest.wire_partition();
+    let sigma_indices = wire_partition.sigma_indices();
+    let mut buf = Vec::with_capacity(2 * sigma_indices.len() + 8);
+    write_uvarint(&mut buf, sigma_indices.len() as u64);
+    for (index, &successor) in sigma_indices.iter().enumerate() {
+        write_uvarint(&mut buf, zigzag(i64::from(successor) - index as i64));
+    }
+    write_compressed_section(&mut out, &buf);
+
     Ok(out)
 }
 
@@ -467,6 +488,36 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
+
+    // Routed-wire permutation successors, pre-derived by the build job from
+    // the representative map above. Decoding is a single linear pass over a
+    // compact varint stream; no union-find reconstruction is needed here.
+    let section = read_compressed_section(bytes, &mut pos)?;
+    let mut vpos = 0usize;
+    let sigma_len = read_uvarint(&section, &mut vpos)? as usize;
+    let expected_sigma_len = degree
+        .checked_mul(common.config.num_routed_wires)
+        .context("embedded sigma permutation length overflow")?;
+    ensure!(
+        sigma_len == expected_sigma_len,
+        "embedded sigma permutation has {sigma_len} entries, expected {expected_sigma_len}"
+    );
+    let mut sigma_indices = Vec::with_capacity(sigma_len);
+    for index in 0..sigma_len {
+        let delta = unzigzag(read_uvarint(&section, &mut vpos)?);
+        let successor = index as i64 + delta;
+        let successor = u32::try_from(successor)
+            .context("embedded sigma permutation entry out of range")?;
+        ensure!(
+            (successor as usize) < sigma_len,
+            "embedded sigma permutation successor exceeds its domain"
+        );
+        sigma_indices.push(successor);
+    }
+    ensure!(
+        vpos == section.len(),
+        "trailing bytes in embedded sigma permutation section"
+    );
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
@@ -489,12 +540,11 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         1usize << (degree_bits + rate_bits.max(log2_ceil(common.quotient_degree_factor)));
     let root_table = cached_fft_root_table::<F>(max_fft_points);
 
-    // Sigma values from the representative map, through the builder's own
-    // forest partition code (`sigma_vecs` post-`compress_paths` state).
-    let mut forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
-    let wire_partition = forest.wire_partition();
+    // Sigma values from the compile-time-derived permutation successors. This
+    // is the same `WirePartition::get_sigma_polys` path as the builder, only
+    // the frozen partition itself no longer gets re-derived at runtime.
+    let wire_partition = WirePartition::from_sigma_indices(sigma_indices);
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
-    let representative_map = forest.into_parents();
     let fixed_routed_wires =
         fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
             .context("embedded circuit has an invalid compressed representative map")?;
