@@ -319,6 +319,23 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+/// Elementwise `out[i] = a[i] * b[i]`, the assign form of
+/// `batch_multiply_add_inplace` for a destination whose raw limb is exactly
+/// zero. Raw-limb identical to the MAC it replaces: the scalar MAC is
+/// `reduce128(out as u128 + a as u128 * b as u128)` (the aarch64
+/// `mul_acc_reduce` block computes bit-for-bit the same intermediates), so with
+/// `out == 0u64` its input u128 is exactly `a * b` — the same u128 that
+/// `Mul for GoldilocksField` feeds `reduce128`. The packed width-2 path
+/// delegates lane-wise to the same scalar MAC, so it changes nothing.
+#[inline]
+fn batch_multiply_assign<F: Field>(out: &mut [F], a: &[F], b: &[F]) {
+    debug_assert_eq!(out.len(), a.len());
+    debug_assert_eq!(out.len(), b.len());
+    for ((out, &a), &b) in out.iter_mut().zip(a).zip(b) {
+        *out = a * b;
+    }
+}
+
 /// Evaluates the exact Interleave(4) + Uninterleave(2) pair with one traversal
 /// of their shared 128 bit columns while retaining the ordinary 136-row dense
 /// matrix and its existing alpha reducer.
@@ -353,12 +370,34 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
 /// the representative the multiply/add chain produces, including for the
 /// non-canonical `value + ORDER` representatives that arise when the chain's
 /// field value is below `2^32 - 1`.
+/// `assign_from_row`: rows at or above this threshold have their first
+/// program-order write *assign* `range * filter` instead of accumulating it
+/// onto a zero seed, so those rows of `combined` may hold arbitrary garbage on
+/// entry. Rows below the threshold keep every write as an accumulate, because
+/// gates evaluated *before* this pair have already deposited contributions
+/// there (the caller sets the threshold to the widest preceding gate's row
+/// count). `usize::MAX` recovers the legacy accumulate-everywhere behavior.
+/// Raw-limb identical to the accumulate-over-zero form (see
+/// `batch_multiply_assign`). The per-row first writes, in program order,
+/// partition `0..136` exactly:
+///
+/// - even op `o` (rows base `= 34*o`): bit loop assigns interleave rows
+///   `base+2, base+3` (bits 0-1) and uninterleave rows `base+4..base+36`
+///   (every bit); interleave rows `base+4..base+34` (bits >= 2) were already
+///   assigned by the uninterleave write two bits earlier, so they accumulate;
+///   the tail assigns rows `base, base+1`, untouched by the bit loop.
+/// - odd op: bit loop assigns rows `base+2..base+34` (all fresh); the tail
+///   rows `base, base+1` were assigned by the previous even op's uninterleave
+///   writes (bits 30-31), so they accumulate.
+/// - the final uninterleave loop touches only rows `0..4` and `68..72`, all
+///   assigned above, so it always accumulates.
 fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     wires: &[F],
     batch_size: usize,
     interleave_filter: &[F],
     uninterleave_filter: &[F],
     summed_filter: &[F],
+    assign_from_row: usize,
     combined: &mut [F],
 ) {
     debug_assert_eq!(interleave_filter.len(), batch_size);
@@ -430,15 +469,33 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
             let row = interleave_row + 2 + bit_index;
             let interleave_output = &mut combined[row * batch_size..(row + 1) * batch_size];
             if operation % 2 == 0 {
-                batch_multiply_add_inplace(interleave_output, range, interleave_filter);
+                if bit_index < 2 && row >= assign_from_row {
+                    batch_multiply_assign(interleave_output, range, interleave_filter);
+                } else {
+                    batch_multiply_add_inplace(interleave_output, range, interleave_filter);
+                }
                 let uninterleave_row = row + 2;
                 let uninterleave_output = &mut combined
                     [uninterleave_row * batch_size..(uninterleave_row + 1) * batch_size];
-                batch_multiply_add_inplace(uninterleave_output, range, uninterleave_filter);
+                if uninterleave_row >= assign_from_row {
+                    batch_multiply_assign(uninterleave_output, range, uninterleave_filter);
+                } else {
+                    batch_multiply_add_inplace(uninterleave_output, range, uninterleave_filter);
+                }
+            } else if row >= assign_from_row {
+                batch_multiply_assign(interleave_output, range, summed_filter);
             } else {
                 batch_multiply_add_inplace(interleave_output, range, summed_filter);
             }
         }
+
+        // Even-op tail rows `base, base+1` are fresh (the bit loop starts at
+        // `base+2`); odd-op tail rows were assigned by the previous even op's
+        // uninterleave writes, so they must accumulate. Fresh rows still
+        // accumulate below the caller's threshold, where earlier gates wrote
+        // into the zero-seeded prefix; the two tail rows are gated separately
+        // in case the threshold falls between them.
+        let is_even_op = operation % 2 == 0;
 
         let x_col = &wires[(2 * operation) * batch_size..][..batch_size];
         for point in 0..batch_size {
@@ -448,7 +505,11 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
         }
         let output = &mut combined
             [interleave_row * batch_size..(interleave_row + 1) * batch_size];
-        batch_multiply_add_inplace(output, range, interleave_filter);
+        if is_even_op && interleave_row >= assign_from_row {
+            batch_multiply_assign(output, range, interleave_filter);
+        } else {
+            batch_multiply_add_inplace(output, range, interleave_filter);
+        }
 
         let spread_col = &wires[(2 * operation + 1) * batch_size..][..batch_size];
         for point in 0..batch_size {
@@ -458,7 +519,11 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
         }
         let output = &mut combined
             [(interleave_row + 1) * batch_size..(interleave_row + 2) * batch_size];
-        batch_multiply_add_inplace(output, range, interleave_filter);
+        if is_even_op && interleave_row + 1 >= assign_from_row {
+            batch_multiply_assign(output, range, interleave_filter);
+        } else {
+            batch_multiply_add_inplace(output, range, interleave_filter);
+        }
     }
 
     for (accumulator, &lane) in parity_accumulators.iter_mut().zip(wide_parity.iter()) {
@@ -661,6 +726,32 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_gate_constraints = common_data.num_gate_constraints;
 
+    // The banked assign-first trick, applied to the gate-evaluation side: when
+    // the fused interleave pair's 136 rows cover every shared constraint row,
+    // its evaluator can *assign* the first write of every row that no earlier
+    // CPU gate touches. Only the prefix `0..t` — `t` being the widest gate
+    // evaluated before the pair (Noop/Constant/PublicInput on the final-block
+    // shape, so `t = 4`) — still needs a zero seed, so the per-batch zero
+    // restore narrows from all 136 rows to those `t`, deleting most of the
+    // last `rows * batch` zero-store pass on the quotient spine
+    // (136 * 32 * 8 B per batch, ~544 MiB per d16-scale proof). Raw-limb
+    // identical: each replaced MAC read a raw-zero limb, and `x * y` feeds
+    // `reduce128` the same u128 as `reduce128(0 + x * y)` (see
+    // `batch_multiply_assign`); the prefix rows see the exact writes they saw
+    // before. Cheap to recompute per batch: a scan over a handful of gate
+    // indices, dwarfed by the 136-row evaluation it guards.
+    let pair_assign_from_row = interleave_pair.and_then(|plan| {
+        (cpu_num_gate_constraints == INTERLEAVE_PAIR_CONSTRAINTS
+            && cpu_gate_indices.contains(&plan.interleave_index))
+        .then(|| {
+            cpu_gate_indices
+                .iter()
+                .take_while(|&&index| index != plan.interleave_index)
+                .map(|&index| common_data.gates[index].0.num_constraints())
+                .max()
+                .unwrap_or(0)
+        })
+    });
     evaluate_gate_constraints_base_batch_into_cpu_gates::<F, D>(
         common_data,
         vars_batch,
@@ -669,6 +760,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         &mut scratch.gate_filters,
         cpu_num_gate_constraints,
         interleave_pair,
+        pair_assign_from_row,
     );
     let constraint_terms_batch = &mut scratch.constraint_terms_batch;
     // `<=`, not `==`: the buffer is sized by the widest gate still on the CPU,
@@ -682,7 +774,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true, true);
+    reduce_gate_constraints_base_batch(
+        constraint_terms_batch,
+        n,
+        alphas,
+        res_out,
+        true,
+        // In assign-first mode the gate evaluator re-seeds the zero prefix
+        // itself and assigns everything above it, so the buffer no longer has
+        // to be handed back all-zero.
+        pair_assign_from_row.is_none(),
+    );
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -1538,6 +1640,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         &mut filters,
         num_constraint_rows,
         None,
+        None,
     );
 }
 
@@ -1552,8 +1655,27 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     filters: &mut Vec<F>,
     num_constraint_rows: usize,
     interleave_pair: Option<&InterleavePairPlan>,
+    pair_assign_from_row: Option<usize>,
 ) {
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
+    // The assign-first mode is only sound when the fused interleave pair is a
+    // CPU gate whose 136 rows cover every shared constraint row, and the
+    // threshold is at least as wide as every gate evaluated before the pair
+    // (those gates accumulate into the zero-seeded prefix; everything above it
+    // is first written — assigned — by the pair).
+    debug_assert!(pair_assign_from_row.is_none() || {
+        interleave_pair.is_some_and(|plan| {
+            num_constraint_rows == INTERLEAVE_PAIR_CONSTRAINTS
+                && cpu_gate_indices.contains(&plan.interleave_index)
+                && cpu_gate_indices
+                    .iter()
+                    .take_while(|&&index| index != plan.interleave_index)
+                    .all(|&index| {
+                        common_data.gates[index].0.num_constraints()
+                            <= pair_assign_from_row.unwrap()
+                    })
+        })
+    });
     // The gates below accumulate, so this buffer must start at zero — but it
     // does not need re-zeroing here. `reduce_gate_constraints_base_batch` is
     // the sole consumer, it runs immediately after this function on every
@@ -1564,14 +1686,32 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     // element memset from every batch — 136 * 32 elements on the block shape,
     // ~16k batches per proof — and pays for it with stores to lines the
     // reduction has already pulled in and dirtied.
+    //
+    // In `pair_assign_from_row` mode that invariant narrows: the fused pair
+    // below assigns the first write of every row at or above the threshold, so
+    // only the prefix rows `0..t` — where gates evaluated before the pair
+    // accumulate — still need a zero seed. The reduction skips
+    // `clear_as_consumed` entirely and this narrowed memset (`t * batch`
+    // elements instead of `rows * batch`) restores the prefix each batch. The
+    // one-time full zero fill on a length change is kept only for simplicity;
+    // the values above the prefix are never read.
     let required = num_constraint_rows * vars_batch.len();
     if constraints_batch.len() != required {
         constraints_batch.clear();
         constraints_batch.resize(required, F::ZERO);
+    } else if let Some(threshold) = pair_assign_from_row {
+        let prefix = threshold.min(num_constraint_rows) * vars_batch.len();
+        constraints_batch[..prefix].fill(F::ZERO);
     }
     debug_assert!(
-        constraints_batch.iter().all(|v| *v == F::ZERO),
-        "constraint scratch must be zero on entry; the consumer clears it as it reads"
+        match pair_assign_from_row {
+            None => constraints_batch.iter().all(|v| *v == F::ZERO),
+            Some(threshold) => constraints_batch
+                [..threshold.min(num_constraint_rows) * vars_batch.len()]
+                .iter()
+                .all(|v| *v == F::ZERO),
+        },
+        "constraint scratch prefix must be zero on entry; gates before the pair accumulate into it"
     );
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
@@ -1612,6 +1752,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
                     interleave_filter,
                     uninterleave_filter,
                     summed_filter,
+                    pair_assign_from_row.unwrap_or(usize::MAX),
                     constraints_batch,
                 );
                 continue;
@@ -2098,6 +2239,7 @@ mod tests {
                     &interleave_filter,
                     &uninterleave_filter,
                     &summed_filter,
+                    usize::MAX,
                     &mut actual,
                 );
 
@@ -2106,6 +2248,91 @@ mod tests {
                         a.to_noncanonical_u64(),
                         e.to_noncanonical_u64(),
                         "raw-limb mismatch at slot {index} (batch {batch_size}, trial {trial})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The production claim behind the narrowed quotient memset: with a
+    /// threshold `t`, running the fused pair over a buffer whose rows `>= t`
+    /// hold arbitrary garbage raw limbs (including non-canonical ones) must
+    /// produce exactly the same raw limbs as the legacy accumulate-everywhere
+    /// evaluator running over the same prefix with a raw-zero seed above it.
+    /// Swept over every threshold `0..=136` so any misclassified first write
+    /// (an assign clobbering a prior contribution, or an accumulate reading
+    /// garbage) fails at its exact row.
+    #[test]
+    fn assign_first_interleave_pair_matches_zero_seeded_accumulation_in_raw_limbs() {
+        type F = GoldilocksField;
+
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for batch_size in [32usize, 1, 7, 33] {
+            let wires: Vec<F> = (0..INTERLEAVE_PAIR_WIRES * batch_size)
+                .map(|_| GoldilocksField(next()))
+                .collect();
+            let interleave_filter: Vec<F> =
+                (0..batch_size).map(|_| GoldilocksField(next())).collect();
+            let uninterleave_filter: Vec<F> =
+                (0..batch_size).map(|_| GoldilocksField(next())).collect();
+            let summed_filter: Vec<F> = interleave_filter
+                .iter()
+                .zip(&uninterleave_filter)
+                .map(|(&interleave, &uninterleave)| interleave + uninterleave)
+                .collect();
+            // Prefix contributions deposited by gates evaluated before the
+            // pair; arbitrary raw representatives.
+            let prefix_seed: Vec<F> = (0..INTERLEAVE_PAIR_CONSTRAINTS * batch_size)
+                .map(|_| GoldilocksField(next()))
+                .collect();
+
+            for threshold in 0..=INTERLEAVE_PAIR_CONSTRAINTS {
+                let split_at = threshold * batch_size;
+
+                // Legacy: prefix contributions below the threshold, raw-zero
+                // seed above it, accumulate everywhere.
+                let mut expected = prefix_seed.clone();
+                expected[split_at..].fill(F::ZERO);
+                eval_interleave_pair_dense_fused(
+                    &wires,
+                    batch_size,
+                    &interleave_filter,
+                    &uninterleave_filter,
+                    &summed_filter,
+                    usize::MAX,
+                    &mut expected,
+                );
+
+                // New: same prefix, garbage raw limbs above the threshold,
+                // assign-first at and above it.
+                let mut actual = prefix_seed.clone();
+                for slot in actual[split_at..].iter_mut() {
+                    *slot = GoldilocksField(next());
+                }
+                eval_interleave_pair_dense_fused(
+                    &wires,
+                    batch_size,
+                    &interleave_filter,
+                    &uninterleave_filter,
+                    &summed_filter,
+                    threshold,
+                    &mut actual,
+                );
+
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_noncanonical_u64(),
+                        e.to_noncanonical_u64(),
+                        "raw-limb mismatch at slot {index} (row {}), threshold {threshold}, \
+                         batch {batch_size}",
+                        index / batch_size,
                     );
                 }
             }
@@ -2208,6 +2435,7 @@ mod tests {
                 &interleave_filter,
                 &uninterleave_filter,
                 &summed_filter,
+                usize::MAX,
                 &mut actual_rows,
             );
 
