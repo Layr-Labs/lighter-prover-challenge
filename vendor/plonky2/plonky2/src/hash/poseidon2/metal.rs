@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "587491aaf5539af0ae5d27eb60040ce612fd46774d706ac1b2085c8da1e02b75";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -386,7 +386,11 @@ struct MetalShared {
     /// Buffers backing live level-order digest stores return here after the
     /// proof has extracted its sparse Merkle paths.
     digest_output_pool: Arc<Mutex<DigestOutputPool>>,
+    /// Regular tree builders wait here; serial-critical spine builders use a
+    /// separate condition variable so releasing one singleton set never has
+    /// to broadcast just to reach the priority class.
     available: Condvar,
+    spine_available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
     ntt_roots: Mutex<HashMap<u32, NttRoots>>,
@@ -2936,6 +2940,7 @@ impl MetalShared {
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
+                spine_available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
@@ -3232,7 +3237,12 @@ impl MetalShared {
             if spine {
                 pool.spine_waiters += 1;
             }
-            match self.available.wait(pool) {
+            let available = if spine {
+                &self.spine_available
+            } else {
+                &self.available
+            };
+            match available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
                     if spine {
@@ -3258,23 +3268,17 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // With a spine waiter queued, whichever non-spine waiter the OS would
-        // hand a `notify_one` to would just re-block, so the wake must reach
-        // the spine thread. Otherwise, a released singleton set can satisfy
-        // only one waiter and broadcasting just creates mutex contention.
-        // slow-host band; this comment changes no executable behavior.
+        // A released singleton set can satisfy one waiter. Spine and regular
+        // builders sleep on distinct condition variables, so the priority
+        // class can be targeted directly without waking every regular waiter
+        // and making them re-contend for the mutex only to sleep again.
         if pool.waiters == 0 {
             return;
         }
-        if pool.spine_waiters == 0 {
-            // All sleepers are interchangeable non-spine jobs. One released
-            // set can satisfy exactly one of them, so waking the rest only
-            // makes them contend for the mutex and go back to sleep. Keep the
-            // broadcast solely for the priority case below, where the OS may
-            // otherwise wake a non-spine waiter ahead of the chain spine.
-            self.available.notify_one();
+        if pool.spine_waiters != 0 {
+            self.spine_available.notify_one();
         } else {
-            self.available.notify_all();
+            self.available.notify_one();
         }
     }
 
@@ -3655,6 +3659,7 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
+                set_u32(leaf_encoder, 6, 0);
                 dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
@@ -3919,6 +3924,7 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
+            set_u32(leaf_encoder, 6, 0);
             dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
@@ -4132,11 +4138,19 @@ impl MetalShared {
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
             if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
+            encoder.set_bytes(
+                5,
+                size_of::<u32>() as NSUInteger,
+                (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
+            );
+            if !matches!(&source, LeafSource::Rows(_)) {
+                let canonicalize_in_place = u32::from(matches!(&source, LeafSource::Shared(_)));
                 encoder.set_bytes(
-                    5,
+                    6,
                     size_of::<u32>() as NSUInteger,
-                    (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
+                    (&canonicalize_in_place as *const u32).cast::<c_void>(),
                 );
+            }
             }
             dispatch(encoder, leaf_pipeline, leaf_count);
 
@@ -5483,11 +5497,11 @@ mod tests {
 
     // Differential coverage for the byte-decomposition and EdDSA quintic
     // gates evaluated in the same union job as production RangeCheck,
-    // width-generic subtraction and add-many specs. Wire columns mix random
-    // canonical values with a rotating window of the twelve raw boundary
-    // representatives (including noncanonical encodings at and above the
-    // field order) from the packed-field differential suite, so every kernel
-    // operation sees the carry-boundary cases.
+    // width-generic subtraction and add-many specs. The shared stores are
+    // initially filled with random canonical values plus the twelve raw
+    // boundary representatives, then passed through the same in-place
+    // canonicalizing commitment read that establishes the production
+    // MetalColumns invariant before any quotient kernel consumes them.
     #[test]
     fn metal_byte_and_quintic_gate_quotient_matches_cpu() {
         type F = GoldilocksField;
@@ -5691,6 +5705,20 @@ mod tests {
                     }
                 }
             }
+
+            context
+                .build(LeafSource::Shared(&wires), WIRE_COLUMNS, full_rows, 0)
+                .expect("wire commitment must establish canonical columns");
+            context
+                .build(
+                    LeafSource::Shared(&constants),
+                    shapes.len() + 3,
+                    full_rows,
+                    0,
+                )
+                .expect("constant commitment must establish canonical columns");
+            assert!(wires.raw().iter().all(|&value| value < F::ORDER));
+            assert!(constants.raw().iter().all(|&value| value < F::ORDER));
 
             let mut expected = vec![F::ZERO; QUOTIENT_ROWS * 2];
             let two = F::from_canonical_u64(2);
@@ -6975,6 +7003,11 @@ kernel void goldilocks_mul_bench_native(
                     .build(LeafSource::Shared(&shared), cols, rows, cap_height)
                     .unwrap();
 
+                assert!(
+                    shared.raw().iter().all(|&value| value < GoldilocksField::ORDER),
+                    "shared-column hashing must establish the canonical MetalColumns invariant"
+                );
+
                 assert_tree_raw_eq(&direct, &staged, cols, cap_height);
                 assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
             }
@@ -7003,18 +7036,24 @@ kernel void goldilocks_mul_bench_native(
         set_exclusive_gpu_phase(true);
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
-        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
+        assert!(ABSORB_PASS_PIPELINE.get().is_some(), "absorb pipeline");
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    let value = (group * 8 + index + 1) as u64;
+                    let raw = if index & 1 == 0 { value } else { F::ORDER + value };
+                    destination.fill(F::from_noncanonical_u64(raw));
                 }
             },
         )
         .expect("streamed tree");
         assert!(streamed.0.nodes.is_shared());
+        for column in 0..cols {
+            assert!(columns.col(column)[0].0 < F::ORDER);
+            assert!(columns.col(column)[rows - 1].0 < F::ORDER);
+        }
 
         let classic = context
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)

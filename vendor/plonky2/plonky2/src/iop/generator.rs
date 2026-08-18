@@ -105,6 +105,43 @@ fn parallel_rounds_enabled() -> bool {
     false
 }
 
+/// Builds the first worklist after the input seed has populated its representatives.
+///
+/// If every generator defers until all of its watches are present, only generators whose
+/// unresolved count is already zero can do anything in the first round. The others are queued
+/// exactly once by [`watch_populated`] when their final missing representative is populated.
+/// General incremental generators retain the legacy all-generators first round.
+fn initial_generator_worklist(
+    unresolved_watches: &[usize],
+    generators_defer_until_ready: bool,
+) -> Vec<usize> {
+    let mut pending = Vec::with_capacity(unresolved_watches.len());
+    if generators_defer_until_ready {
+        pending.extend(
+            unresolved_watches
+                .iter()
+                .enumerate()
+                .filter_map(|(generator, &unresolved)| (unresolved == 0).then_some(generator)),
+        );
+    } else {
+        pending.extend(0..unresolved_watches.len());
+    }
+    pending
+}
+
+/// Applies one first-population event to a generator's unresolved-watch count and reports whether
+/// it should enter the next worklist.
+///
+/// Deferred generators are inert before the transition to zero, so suppressing their earlier
+/// queue entries removes only proven no-ops. A circuit containing any incremental generator uses
+/// the legacy behavior and queues on every transition.
+#[inline]
+fn watch_populated(unresolved: &mut usize, generators_defer_until_ready: bool) -> bool {
+    debug_assert_ne!(*unresolved, 0);
+    *unresolved -= 1;
+    !generators_defer_until_ready || *unresolved == 0
+}
+
 /// Runs the given pending generators, and transitively any generator watching a newly populated
 /// representative, until no further progress can be made.
 ///
@@ -129,13 +166,9 @@ fn run_generator_worklist<
 ) -> Result<()> {
     let generators = &prover_data.generators;
     let generator_indices_by_watches = &prover_data.generator_indices_by_watches;
-    // When every generator defers until ready, a queued-but-unready generator's `run` is a
-    // proven no-op (`ProverOnlyCircuitData::generators_defer_until_ready`), so the loops below
-    // drop straight through instead of dispatching. Both loops already load the counter to
-    // form the hint, so the test itself reads nothing new; what disappears is the scattered
-    // `generators[idx]` load and the indirect call behind it. Skipping an inert call leaves
-    // the witness, `generator_is_expired`, `remaining_generators` and the pending queue
-    // byte-for-byte as they were, so the fixpoint and every value in it are unchanged.
+    // When every generator defers until ready, it enters a worklist only after its unresolved
+    // count reaches zero. Keep the readiness check as a defensive backstop for duplicate entries
+    // and for the general-generator fallback; an unready dispatch is still a proven no-op.
     let skip_unready = prover_data.generators_defer_until_ready;
 
     let parallel_rounds = parallel_rounds_enabled();
@@ -255,9 +288,12 @@ fn run_generator_worklist<
                             for &watching_generator_idx in watchers {
                                 let watching_generator_idx = watching_generator_idx as usize;
                                 if !generator_is_expired[watching_generator_idx] {
-                                    debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                    unresolved_watches[watching_generator_idx] -= 1;
-                                    next_pending_generator_indices.push(watching_generator_idx);
+                                    if watch_populated(
+                                        &mut unresolved_watches[watching_generator_idx],
+                                        skip_unready,
+                                    ) {
+                                        next_pending_generator_indices.push(watching_generator_idx);
+                                    }
                                 }
                             }
                         }
@@ -303,9 +339,12 @@ fn run_generator_worklist<
                         for &watching_generator_idx in watchers {
                             let watching_generator_idx = watching_generator_idx as usize;
                             if !generator_is_expired[watching_generator_idx] {
-                                debug_assert_ne!(unresolved_watches[watching_generator_idx], 0);
-                                unresolved_watches[watching_generator_idx] -= 1;
-                                next_pending_generator_indices.push(watching_generator_idx);
+                                if watch_populated(
+                                    &mut unresolved_watches[watching_generator_idx],
+                                    skip_unready,
+                                ) {
+                                    next_pending_generator_indices.push(watching_generator_idx);
+                                }
                             }
                         }
                     }
@@ -565,6 +604,7 @@ pub struct PartitionFeeder<'a, 'b, F: Field> {
     generator_is_expired: &'b [bool],
     pending_generator_indices: &'b mut Vec<usize>,
     generator_indices_by_watches: &'b GeneratorWatchIndex,
+    generators_defer_until_ready: bool,
 }
 
 impl<F: Field> Debug for PartitionFeeder<'_, '_, F> {
@@ -580,9 +620,12 @@ impl<F: Field> WitnessWrite<F> for PartitionFeeder<'_, '_, F> {
                 for &watching_generator_idx in watchers {
                     let watching_generator_idx = watching_generator_idx as usize;
                     if !self.generator_is_expired[watching_generator_idx] {
-                        debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                        self.unresolved_watches[watching_generator_idx] -= 1;
-                        self.pending_generator_indices.push(watching_generator_idx);
+                        if watch_populated(
+                            &mut self.unresolved_watches[watching_generator_idx],
+                            self.generators_defer_until_ready,
+                        ) {
+                            self.pending_generator_indices.push(watching_generator_idx);
+                        }
                     }
                 }
             }
@@ -671,14 +714,19 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
 
-        // Initially, all generators are queued.
+        // Deferred generators enter only when ready; incremental generators keep the legacy
+        // all-generators first round.
+        let initial_pending = initial_generator_worklist(
+            &unresolved_watches,
+            prover_data.generators_defer_until_ready,
+        );
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            initial_pending,
             parallel_threshold,
         )?;
 
@@ -695,8 +743,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
     /// Like [`Self::start`], but the initial inputs are written by `seed`
     /// directly into the partition through a [`PartitionSeeder`] — no
     /// intermediate `PartialWitness` map is built or replayed. Worklist
-    /// initialization is unchanged: all generators are queued, gated by the
-    /// same unresolved-watch counters the map-seeded path would produce.
+    /// initialization uses the same unresolved-watch counters as the map-seeded path.
     pub fn start_seeded(
         prover_data: &'a ProverOnlyCircuitData<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
@@ -721,14 +768,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
 
-        // Initially, all generators are queued.
+        let initial_pending = initial_generator_worklist(
+            &unresolved_watches,
+            prover_data.generators_defer_until_ready,
+        );
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            initial_pending,
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
 
@@ -792,13 +842,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let initial_pending = initial_generator_worklist(
+            &unresolved_watches,
+            prover_data.generators_defer_until_ready,
+        );
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            initial_pending,
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
         Ok((
@@ -889,13 +943,17 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
+        let initial_pending = initial_generator_worklist(
+            &unresolved_watches,
+            prover_data.generators_defer_until_ready,
+        );
         run_generator_worklist(
             &mut witness,
             prover_data,
             &mut unresolved_watches,
             &mut generator_is_expired,
             &mut remaining_generators,
-            (0..generators.len()).collect(),
+            initial_pending,
             PARALLEL_WORKLIST_THRESHOLD,
         )?;
         Ok(Self {
@@ -921,9 +979,12 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                     for &watching_generator_idx in watchers {
                         let watching_generator_idx = watching_generator_idx as usize;
                         if !self.generator_is_expired[watching_generator_idx] {
-                            debug_assert_ne!(self.unresolved_watches[watching_generator_idx], 0);
-                            self.unresolved_watches[watching_generator_idx] -= 1;
-                            pending_generator_indices.push(watching_generator_idx);
+                            if watch_populated(
+                                &mut self.unresolved_watches[watching_generator_idx],
+                                self.prover_data.generators_defer_until_ready,
+                            ) {
+                                pending_generator_indices.push(watching_generator_idx);
+                            }
                         }
                     }
                 }
@@ -957,6 +1018,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             generator_is_expired: &self.generator_is_expired,
             pending_generator_indices: &mut pending_generator_indices,
             generator_indices_by_watches: &self.prover_data.generator_indices_by_watches,
+            generators_defer_until_ready: self.prover_data.generators_defer_until_ready,
         })?;
 
         run_generator_worklist(
@@ -1525,6 +1587,103 @@ mod tests {
             dependency_calls.load(Ordering::Relaxed),
             dependency_calls_after_build
         );
+    }
+
+    #[test]
+    fn deferred_worklist_queues_only_ready_transitions() {
+        assert_eq!(
+            initial_generator_worklist(&[0, 3, 1, 0], true),
+            vec![0, 3]
+        );
+        assert_eq!(
+            initial_generator_worklist(&[0, 3, 1, 0], false),
+            vec![0, 1, 2, 3]
+        );
+
+        let mut unresolved = 2;
+        assert!(!watch_populated(&mut unresolved, true));
+        assert_eq!(unresolved, 1);
+        assert!(watch_populated(&mut unresolved, true));
+        assert_eq!(unresolved, 0);
+
+        let mut legacy_unresolved = 2;
+        assert!(watch_populated(&mut legacy_unresolved, false));
+        assert_eq!(legacy_unresolved, 1);
+    }
+
+    #[test]
+    fn ready_only_worklist_matches_legacy_queue_for_simple_dag() -> Result<()> {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let seed = builder.add_virtual_target();
+        let late = builder.add_virtual_target();
+        let first = builder.add_virtual_target();
+        let second = builder.add_virtual_target();
+        let output = builder.add_virtual_target();
+        let dependency_calls = Arc::new(AtomicUsize::new(0));
+        let run_calls = Arc::new(AtomicUsize::new(0));
+
+        for (dependencies, output) in [
+            (vec![seed], first),
+            (vec![first], second),
+            (vec![second, late], output),
+        ] {
+            builder.add_simple_generator(CountingSimpleGenerator {
+                dependencies,
+                output,
+                dependency_calls: Arc::clone(&dependency_calls),
+                run_calls: Arc::clone(&run_calls),
+            });
+        }
+        builder.register_public_input(output);
+
+        let mut circuit = builder.build::<C>();
+        assert!(circuit.prover_only.generators_defer_until_ready);
+
+        let mut early_inputs = PartialWitness::new();
+        early_inputs.set_target(seed, F::from_canonical_u64(5))?;
+        let mut late_inputs = PartialWitness::new();
+        late_inputs.set_target(late, F::from_canonical_u64(7))?;
+
+        // Force the conservative fallback on the same immutable circuit topology. It queues every
+        // generator on the first round and on each watch transition, matching the pre-optimization
+        // scheduler while retaining the SimpleGenerator adapter's value semantics.
+        circuit.prover_only.generators_defer_until_ready = false;
+        let mut legacy = PendingPartitionWitness::start(
+            early_inputs.clone(),
+            &circuit.prover_only,
+            &circuit.common,
+        )?;
+        legacy.feed(late_inputs.clone())?;
+        let legacy = legacy.finish()?;
+        assert_eq!(legacy.get_target(output), F::from_canonical_u64(12));
+        let legacy_proof = crate::plonk::prover::prove_with_partition_witness(
+            &circuit.prover_only,
+            &circuit.common,
+            legacy,
+            &mut crate::util::timing::TimingTree::default(),
+        )?;
+        circuit.verify(legacy_proof.clone())?;
+
+        circuit.prover_only.generators_defer_until_ready = true;
+        let mut ready_only = PendingPartitionWitness::start(
+            early_inputs,
+            &circuit.prover_only,
+            &circuit.common,
+        )?;
+        ready_only.feed(late_inputs)?;
+        let ready_only = ready_only.finish()?;
+        assert_eq!(ready_only.get_target(output), F::from_canonical_u64(12));
+        let ready_only_proof = crate::plonk::prover::prove_with_partition_witness(
+            &circuit.prover_only,
+            &circuit.common,
+            ready_only,
+            &mut crate::util::timing::TimingTree::default(),
+        )?;
+        circuit.verify(ready_only_proof.clone())?;
+
+        assert_eq!(legacy_proof.public_inputs, ready_only_proof.public_inputs);
+        assert_eq!(run_calls.load(Ordering::Relaxed), 6);
+        Ok(())
     }
 
     /// Builds an outer circuit verifying two independent inner proofs, mirroring a chain step's
@@ -2353,6 +2512,7 @@ mod tests {
         builder.register_public_inputs(&[early_output, final_output]);
 
         let circuit = builder.build::<C>();
+        assert!(!circuit.prover_only.generators_defer_until_ready);
         let witness =
             generate_partial_witness(PartialWitness::new(), &circuit.prover_only, &circuit.common)
                 .unwrap();
