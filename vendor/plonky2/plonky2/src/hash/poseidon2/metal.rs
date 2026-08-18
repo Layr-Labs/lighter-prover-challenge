@@ -2097,11 +2097,11 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
-    // The wires store may be a compact sub-domain copy while `constants` is
-    // the full-domain store: the kernel indexes both with `lde_rows =
-    // wires.rows`, so every constants read `col * wires.rows + row` stays in
-    // bounds as long as `constants.rows >= wires.rows`; the low-degree gates
-    // dispatched here read no constants (their selector load is unused).
+    // The wires store may be a compact even-row copy. The kernel indexes
+    // both buffers with `lde_rows = wires.rows` (`col * wires.rows + row`).
+    // Constant-reading gates therefore require a matching even-row constants
+    // companion; selector-only / unfiltered gates tolerate a taller full
+    // store (`constants.rows >= wires.rows`) because they do not load it.
     if groups.is_empty()
         || F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()

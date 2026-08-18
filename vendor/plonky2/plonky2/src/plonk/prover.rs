@@ -2065,14 +2065,21 @@ fn start_gpu_range_check_gate_quotient<
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
+    // Circuit-fixed constants/sigmas live in a deserialized Metal store
+    // with no companion. One even-row copy lets constant-reading deg<=4
+    // gates join the half-domain job: the shader strides both buffers by
+    // `wires.rows`, so the compact constants must match the compact wires.
+    let even_constants = prover_data
+        .constants_sigmas_commitment
+        .even_columns
+        .get_or_fill_even_rows(constants);
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
-        // Kinds that read gate constants stay on the full-domain (real
-        // constants store) dispatch; everything else of degree <= 4 goes to
-        // the compact even-row companion, which is bound as `wires` with
-        // `lde_rows = quotient_rows / 2`.
+        // Without a constants companion, kinds that read gate constants
+        // stay on the full-domain dispatch (the kernel would otherwise
+        // index `col * half_rows + k` into a full-stride store).
         let reads_constants = |kind: &U32QuotientKind| {
             matches!(
                 kind,
@@ -2081,6 +2088,7 @@ fn start_gpu_range_check_gate_quotient<
                     | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
             )
         };
+        let split_constant_readers = even_constants.is_some();
         let mut low_groups = Vec::new();
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
@@ -2102,7 +2110,7 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && !reads_constants(&spec.kind) {
+            if degree <= 4 && (split_constant_readers || !reads_constants(&spec.kind)) {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2120,7 +2128,7 @@ fn start_gpu_range_check_gate_quotient<
         if !low_groups.is_empty() {
             if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
                 even_wires,
-                constants,
+                even_constants.unwrap_or(constants),
                 quotient_rows / 2,
                 1,
                 &low_groups,
