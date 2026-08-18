@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -55,7 +55,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // Light-proof throughput is the run's terminal constraint (the chain drains
 // concurrently and finishes within a step of the last tx proof; the block
 // waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
+// Series draw marker: lean CPU-clean subset, sample 3.
 // The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
 // ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
 // occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
@@ -260,16 +260,33 @@ impl ChainState<'_> {
     }
 }
 
+/// Shared per-path state for the chain-step phase-1 seed layout. The writer's
+/// target sequence is fixed for a chain circuit, so the first step to take the
+/// slot records it and every later step replays it positionally — the same
+/// record/replay discipline `generate_tx_witness` applies to transaction
+/// chunks. All lock holds are O(1) (`try_lock` on the read side, so the
+/// latency-critical spine never blocks here); recording and replay both run
+/// outside the lock. `Recording` parks concurrent steps on the generic path
+/// while the first recording is in flight, and `Retired` fails the layout
+/// closed after any typed mismatch.
+enum ChainSeed<'a> {
+    Unrecorded,
+    Recording,
+    Ready(Arc<PartitionSeedLayout<'a, F, C, D>>),
+    Retired,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn chain_step_proof(
+fn chain_step_proof<'a>(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
-    chain_data: &CircuitData<F, C, D>,
+    chain_data: &'a CircuitData<F, C, D>,
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    seed_slot: &Mutex<ChainSeed<'a>>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -284,21 +301,142 @@ fn chain_step_proof(
         // Phase 1: run every generator that does not depend on the previous chain proof while
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
-        // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
+        // per-path template clone, no replay pass. The recorded seed layout
+        // (see [`ChainSeed`]) additionally deletes the per-write
+        // representative gather and watcher-CSR traversal on every step after
+        // the first, exactly like the transaction-chunk replay.
+        enum SeedPlan<'a> {
+            Record,
+            Replay(Arc<PartitionSeedLayout<'a, F, C, D>>),
+            Generic,
+        }
+        // Local A/B switch only: the ranked worker's environment is cleared,
+        // so a scored run always takes the recorded-layout path.
+        let disabled = std::env::var_os("LIGHTER_DISABLE_CHAIN_SEED_REPLAY").is_some();
+        let plan = if disabled {
+            SeedPlan::Generic
+        } else {
+            match seed_slot.try_lock() {
+                Ok(mut slot) => match &*slot {
+                    ChainSeed::Unrecorded => {
+                        *slot = ChainSeed::Recording;
+                        SeedPlan::Record
+                    }
+                    ChainSeed::Ready(layout) => SeedPlan::Replay(Arc::clone(layout)),
+                    ChainSeed::Recording | ChainSeed::Retired => SeedPlan::Generic,
+                },
+                Err(_) => SeedPlan::Generic,
+            }
+        };
+        let mut pending = match plan {
+            SeedPlan::Record => {
+                let recorded = PendingPartitionWitness::start_seeded_recording(
+                    &chain_data.prover_only,
+                    &chain_data.common,
+                    |seeder| {
+                        BlockTxChainCircuit::witness_inputs_early_into(
+                            chain_target,
+                            chain_data,
+                            chain_step,
+                            dummy_proof,
+                            tx_proof,
+                            seeder,
+                        )
+                    },
+                );
+                match recorded {
+                    Ok((pending, layout)) => {
+                        // Dev-only visibility; the ranked worker's env is
+                        // cleared so this never fires on a scored run.
+                        if std::env::var_os("LIGHTER_CHAIN_SEED_DIAG").is_some() {
+                            eprintln!(
+                                "[chain-seed] {path:?} recorded at step {chain_step}: {layout:?}"
+                            );
+                        }
+                        if let Ok(mut slot) = seed_slot.lock() {
+                            *slot = ChainSeed::Ready(Arc::new(layout));
+                        }
+                        Ok(pending)
+                    }
+                    Err(error) => {
+                        // Leave the slot Retired rather than Recording so a
+                        // sibling never waits on a recording that will not
+                        // arrive (this step is about to panic anyway).
+                        if let Ok(mut slot) = seed_slot.lock() {
+                            *slot = ChainSeed::Retired;
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            SeedPlan::Replay(layout) => {
+                let replayed = PendingPartitionWitness::start_seeded_with_layout(
+                    &chain_data.prover_only,
+                    &chain_data.common,
+                    &layout,
+                    |seeder| {
+                        BlockTxChainCircuit::witness_inputs_early_into(
+                            chain_target,
+                            chain_data,
+                            chain_step,
+                            dummy_proof,
+                            tx_proof,
+                            seeder,
+                        )
+                    },
+                );
+                match replayed {
+                    // Only a typed layout-applicability mismatch may retry on
+                    // the generic path; retire the layout so later steps do
+                    // not pay a failed replay each (same discipline as
+                    // `generate_tx_witness`).
+                    Err(error) if is_seed_layout_mismatch(&error) => {
+                        if std::env::var_os("LIGHTER_CHAIN_SEED_DIAG").is_some() {
+                            eprintln!(
+                                "[chain-seed] {path:?} RETIRED at step {chain_step}: {error}"
+                            );
+                        }
+                        if let Ok(mut slot) = seed_slot.lock() {
+                            *slot = ChainSeed::Retired;
+                        }
+                        PendingPartitionWitness::start_seeded(
+                            &chain_data.prover_only,
+                            &chain_data.common,
+                            |seeder| {
+                                BlockTxChainCircuit::witness_inputs_early_into(
+                                    chain_target,
+                                    chain_data,
+                                    chain_step,
+                                    dummy_proof,
+                                    tx_proof,
+                                    seeder,
+                                )
+                            },
+                        )
+                    }
+                    result => result,
+                }
+            }
+            SeedPlan::Generic => {
+                if std::env::var_os("LIGHTER_CHAIN_SEED_DIAG").is_some() {
+                    eprintln!("[chain-seed] {path:?} generic at step {chain_step}");
+                }
+                PendingPartitionWitness::start_seeded(
+                    &chain_data.prover_only,
+                    &chain_data.common,
+                    |seeder| {
+                        BlockTxChainCircuit::witness_inputs_early_into(
+                            chain_target,
+                            chain_data,
+                            chain_step,
+                            dummy_proof,
+                            tx_proof,
+                            seeder,
+                        )
+                    },
                 )
-            },
-        )?;
+            }
+        }?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
         let previous_proof = previous.map(ChainState::wait);
@@ -535,6 +673,10 @@ fn prove_path(
     // Recorded on this path's first chunk and replayed for the rest; failing
     // closed and retiring itself if the writer's target sequence ever changes.
     let mut tx_seed_layout = None;
+    // Chain-step phase-1 analog of `tx_seed_layout`: shared across the
+    // spawned chain-step threads, recorded once, replayed positionally,
+    // retired on mismatch. See [`ChainSeed`].
+    let chain_seed_slot = Mutex::new(ChainSeed::Unrecorded);
     let mut chunks = chunks.into_iter();
     let (mut current_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
@@ -554,6 +696,7 @@ fn prove_path(
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
+        let seed_slot = &chain_seed_slot;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -582,6 +725,7 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            seed_slot,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -676,6 +820,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        seed_slot,
                     )
                 })
                 .expect("chain step pipeline thread must start");
@@ -735,6 +880,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        seed_slot,
                     )
                 })
                 .expect("chain drain thread must start");
@@ -1652,6 +1798,7 @@ mod tests {
             // path. The reference above keeps the old PartialWitness map
             // path solely for this manual timing harness.
             let direct_start = Instant::now();
+            let direct_seed_slot = Mutex::new(ChainSeed::Unrecorded);
             let direct_proof = chain_step_proof(
                 TxPath::Light,
                 &circuits.chain_target,
@@ -1661,6 +1808,7 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                &direct_seed_slot,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);
