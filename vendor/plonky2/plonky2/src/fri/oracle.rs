@@ -1187,6 +1187,48 @@ mod tests {
     use crate::plonk::config::Poseidon2GoldilocksConfig;
 
     #[test]
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn lazy_even_companion_copies_rows_exactly_once() {
+        type F = GoldilocksField;
+
+        let Some(mut full) = crate::hash::poseidon2::metal::allocate_plain_columns::<F>(3, 8)
+        else {
+            return;
+        };
+        for (column, values) in full
+            .columns_mut()
+            .expect("unique full columns")
+            .into_iter()
+            .enumerate()
+        {
+            for (row, value) in values.iter_mut().enumerate() {
+                *value = F::from_canonical_usize(column * 100 + row);
+            }
+        }
+
+        let cache = EvenColumns::<F>::default();
+        assert!(cache.get().is_none());
+        let first = cache
+            .get_or_fill_even_rows(&full)
+            .expect("lazy even companion");
+        assert_eq!(first.cols(), 3);
+        assert_eq!(first.rows(), 4);
+        for column in 0..3 {
+            for row in 0..4 {
+                assert_eq!(
+                    first.col(column)[row],
+                    F::from_canonical_usize(column * 100 + 2 * row)
+                );
+            }
+        }
+        let first_ptr = first as *const _;
+        let second_ptr = cache
+            .get_or_fill_even_rows(&full)
+            .expect("cached even companion") as *const _;
+        assert_eq!(first_ptr, second_ptr, "OnceLock must reuse the first fill");
+    }
+
+    #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
         const D: usize = 2;
         const RATE_BITS: usize = 3;
@@ -1334,6 +1376,7 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
+            even_columns: Default::default(),
         };
         let column_batch: PolynomialBatch<F, C, D> = PolynomialBatch {
             polynomials: Vec::new(),
@@ -1341,6 +1384,7 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
+            even_columns: Default::default(),
         };
 
         for step in [1usize, 2, 4] {
