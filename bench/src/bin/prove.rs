@@ -41,6 +41,25 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
+// jemalloc force-purges every freed extent at or above `oversize_threshold`
+// (8 MiB by default) the moment it is freed: `extent_record` takes a shortcut
+// to `extent_maximally_purge` instead of parking the extent in the dirty-page
+// cache that the decay settings above govern. The prover frees hundreds of
+// such extents per worker — the witness, coefficient and LDE buffers are tens
+// to hundreds of MiB each — so the default sends ~15 GiB per worker through
+// `madvise` even though the surrounding decay configuration was chosen to keep
+// exactly those pages resident for the next identically-shaped allocation.
+// Disabling the threshold routes them through the ordinary 10 s dirty decay
+// instead, which is measurably what happens: purging falls from 979k to 524k
+// pages (14.9 GiB -> 8.0 GiB) per worker.
+//
+// Allocator page retention changes no computed value: which extent backs an
+// allocation and when its pages are returned to the OS are invisible to every
+// arithmetic the prover performs.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 21] = b"oversize_threshold:0\0";
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 // The serialized proof measures ~196 KB at the ranked circuit shapes, so the
 // prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
