@@ -39,9 +39,10 @@ use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
 use plonky2::fri::oracle::PolynomialBatch;
 use plonky2::plonk::circuit_data::{
-    CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
+    empty_watched, mark_watched, CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData,
+    VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
+use plonky2::plonk::permutation_argument::Forest;
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -404,9 +405,22 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let mut vpos = 0usize;
     let offsets_len = read_uvarint(&section, &mut vpos)? as usize;
     let mut offsets = Vec::with_capacity(offsets_len);
+    // A representative is watched exactly when its offset differs from the next one, i.e.
+    // exactly when the delta decoded for the following index is non-zero -- a bit this loop
+    // already holds. Deriving the presence bitmap and the entry count here rather than in
+    // `GeneratorWatchIndex::from_parts` deletes that constructor's second full pass over the
+    // finished table, which is 36 MB per transaction circuit and far too large to be
+    // cache-resident, so it is a genuine DRAM re-read.
+    let mut watched = empty_watched(offsets_len);
+    let mut watch_entries = 0usize;
     let mut running = 0u64;
-    for _ in 0..offsets_len {
-        running += read_uvarint(&section, &mut vpos)?;
+    for index in 0..offsets_len {
+        let delta = read_uvarint(&section, &mut vpos)?;
+        if index > 0 && delta != 0 {
+            mark_watched(&mut watched, index - 1);
+            watch_entries += 1;
+        }
+        running += delta;
         offsets.push(u32::try_from(running).context("watch index offset exceeds u32")?);
     }
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -417,18 +431,21 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         "watch index watcher section length mismatch"
     );
     let mut watchers = Vec::with_capacity(watchers_len);
+    // Watch counts are a pure function of the (deduplicated) watcher lists;
+    // this mirrors `read_prover_only_circuit_data`'s reconstruction. Counting inside the
+    // decode loop -- which already reads and range-checks every watcher -- deletes a second
+    // streaming pass over the freshly built watcher vector (2.3 M entries per transaction
+    // circuit). The increments are order-independent and each still follows its bound check,
+    // so both vectors come out element-for-element identical.
+    let mut generator_watch_counts = vec![0usize; generator_count];
     for chunk in section[vpos..].chunks_exact(4) {
         let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
         ensure!((watcher as usize) < generator_count, "watcher index out of range");
+        generator_watch_counts[watcher as usize] += 1;
         watchers.push(watcher);
     }
-    // Watch counts are a pure function of the (deduplicated) watcher lists;
-    // this mirrors `read_prover_only_circuit_data`'s reconstruction.
-    let mut generator_watch_counts = vec![0usize; generator_count];
-    for &watcher in &watchers {
-        generator_watch_counts[watcher as usize] += 1;
-    }
-    let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
+    let generator_indices_by_watches =
+        GeneratorWatchIndex::from_parts_with_presence(offsets, watchers, watch_entries, watched);
 
     // constant polynomial values
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -492,12 +509,14 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // Sigma values from the representative map, through the builder's own
     // forest partition code (`sigma_vecs` post-`compress_paths` state).
     let mut forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
-    let wire_partition = forest.wire_partition();
+    // The singleton-routed-wire mask falls out of the partition splice itself, so it costs
+    // this load no allocation and no second walk of the representative map. A blob whose map
+    // is not a compressed forest is caught by the commitment cap check below exactly as
+    // before -- the discarded validation inside `fixed_routed_wire_mask` was downstream of
+    // `wire_partition`, which had already consumed the same entries.
+    let (wire_partition, fixed_routed_wires) = forest.wire_partition_with_fixed_mask();
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
     let representative_map = forest.into_parents();
-    let fixed_routed_wires =
-        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
-            .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the

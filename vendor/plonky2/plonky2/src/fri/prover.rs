@@ -63,7 +63,11 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
         fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
 
     FriProof {
-        commit_phase_merkle_caps: trees.iter().map(|t| t.cap.clone()).collect(),
+        // `fri_prover_query_rounds` above is the last reader of `trees`, and the vector
+        // is dropped on return, so the caps can be moved out instead of cloned: the
+        // clone allocated and copied a fresh `MerkleCap` per commit round only to free
+        // the original moments later.
+        commit_phase_merkle_caps: trees.into_iter().map(|t| t.cap).collect(),
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
@@ -336,7 +340,11 @@ pub(crate) fn fri_proof_of_work<
     // obtaining our duplex's post-state which contains the PoW response.
     let mut duplex_intermediate_state = challenger.sponge_state;
     let witness_input_pos = challenger.input_buffer.len();
-    duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
+    // The comment above is explicit that this path exists to avoid allocating, and the
+    // clone was one: it heap-allocated a copy of a buffer of `Copy` elements shorter than
+    // the permutation width purely to hand `set_from_iter` owned values. `set_from_slice`
+    // takes the same elements from the same positions with no allocation at all.
+    duplex_intermediate_state.set_from_slice(&challenger.input_buffer, 0);
 
     let max_candidate = F::NEG_ONE.to_canonical_u64();
     let pow_witness = if pow_quad_enabled() {

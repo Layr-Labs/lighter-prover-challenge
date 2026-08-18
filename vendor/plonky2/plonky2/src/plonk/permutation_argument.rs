@@ -281,9 +281,49 @@ impl Forest {
     /// Oracles: `u32_forest_matches_usize_reference` (which compares against a verbatim copy
     /// of the two-array code) and `wire_partition_restores_representative_map`.
     pub fn wire_partition(&mut self) -> WirePartition {
+        self.partition::<false>().0
+    }
+
+    /// [`Self::wire_partition`], plus the routed-position singleton mask that
+    /// [`fixed_routed_wire_mask`] otherwise derives in two extra passes over the representative
+    /// map.
+    ///
+    /// The mask is exactly "this position is a sigma fixed point" — the identity the unit test
+    /// `fixed_routed_mask_is_exactly_sigma_identity_with_aliases` pins — and the splice below
+    /// already decides that, position by position, as it builds the cycles. A position becomes a
+    /// self-loop the moment it is spliced as the first routed member of its class, and it stops
+    /// being one the moment a second routed member of that class arrives. So the bit is set where
+    /// the self-loop is created and cleared where it is broken, and the mask is complete when the
+    /// splice is.
+    ///
+    /// The clear costs nothing beyond an address computation: it fires only when the previous
+    /// tail is still a self-loop, i.e. exactly once per class, at its second member — and
+    /// `sigma[old_tail]`, the value that decides it, is already loaded by the splice itself.
+    /// Deleted in exchange: `fixed_routed_wire_mask`'s `representative_map.len() / 4` scratch
+    /// allocation and its two full passes over every routed position, each of which chased a
+    /// random cardinality lookup per position. Value-exact: `sigma` is untouched, and the mask
+    /// is bit-for-bit what the two-pass derivation returns for the same forest (asserted by
+    /// `folded_mask_matches_two_pass_derivation`).
+    pub fn wire_partition_with_fixed_mask(&mut self) -> (WirePartition, Vec<u8>) {
+        let (partition, fixed) = self.partition::<true>();
+        (partition, fixed)
+    }
+
+    fn partition<const FIXED_MASK: bool>(&mut self) -> (WirePartition, Vec<u8>) {
         let degree = self.degree;
         let num_routed_wires = self.num_routed_wires;
         let mut sigma = vec![0u32; degree * num_routed_wires];
+        let mut fixed = if FIXED_MASK {
+            vec![0u8; (degree * num_routed_wires).div_ceil(8)]
+        } else {
+            Vec::new()
+        };
+        // Recovering `(row, column)` from a column-major sigma index needs a division by
+        // `degree`, which is a power of two for every circuit this runs on; the general
+        // remainder/quotient stays as a fallback so no shape is excluded.
+        let degree_is_pow2 = degree.is_power_of_two();
+        let degree_shift = degree.trailing_zeros();
+        let degree_mask = degree.wrapping_sub(1);
 
         // Bit 31 must be free to carry the tag. `Forest::new` bounds the forest by
         // `u32::MAX`; this tightens that to `2^31` and checks it rather than assuming it.
@@ -310,10 +350,30 @@ impl Forest {
                 let tail = self.parents[parent];
                 if tail & Self::TAIL_TAG == 0 {
                     sigma[index as usize] = index;
+                    if FIXED_MASK {
+                        // First routed member of its class: a self-loop, hence fixed until
+                        // some later member breaks it.
+                        let routed_index = row * num_routed_wires + column;
+                        fixed[routed_index >> 3] |= 1 << (routed_index & 7);
+                    }
                 } else {
                     let old_tail = (tail & !Self::TAIL_TAG) as usize;
-                    sigma[index as usize] = sigma[old_tail];
+                    let head = sigma[old_tail];
+                    sigma[index as usize] = head;
                     sigma[old_tail] = index;
+                    if FIXED_MASK && head as usize == old_tail {
+                        // The previous tail still pointed at itself, so it is the class's
+                        // first member and this is the second: its self-loop ends here.
+                        // Later members find `head` already pointing at the class head, so
+                        // this branch fires exactly once per class.
+                        let (tail_row, tail_column) = if degree_is_pow2 {
+                            (old_tail & degree_mask, old_tail >> degree_shift)
+                        } else {
+                            (old_tail % degree, old_tail / degree)
+                        };
+                        let routed_index = tail_row * num_routed_wires + tail_column;
+                        fixed[routed_index >> 3] &= !(1 << (routed_index & 7));
+                    }
                 }
                 self.parents[parent] = index | Self::TAIL_TAG;
             }
@@ -327,7 +387,7 @@ impl Forest {
             }
         }
 
-        WirePartition { sigma }
+        (WirePartition { sigma }, fixed)
     }
 }
 
@@ -1089,5 +1149,71 @@ mod tests {
         assert!(fixed_routed_wire(&mask, 1));
         assert!(!fixed_routed_wire(&mask, 2));
         assert!(!fixed_routed_wire(&mask, num_routed_wires));
+    }
+
+    /// The mask spliced inside `wire_partition` is byte-identical to the two-pass derivation
+    /// from the representative map, and asking for it changes no sigma value. Shapes cover a
+    /// production config (135 wires / 80 routed / 2^12 rows), a non-power-of-two degree, a
+    /// forest with no merges at all (every routed position fixed) and a heavily merged one
+    /// (almost none fixed).
+    #[test]
+    fn folded_mask_matches_two_pass_derivation() {
+        // (num_wires, num_routed_wires, degree, num_virtual_targets, merges)
+        let configs = [
+            (135usize, 80usize, 1usize << 12, 1500usize, 135 * (1 << 12)),
+            (7, 5, 999, 41, 5000),
+            (5, 3, 4, 2, 0),
+            (9, 6, 64, 8, 0),
+            (9, 6, 64, 8, 20_000),
+        ];
+
+        for (num_wires, num_routed_wires, degree, num_virtual_targets, num_merges) in configs {
+            let mut rng = Lcg(0x5eed_1234 ^ ((degree as u64) << 24) ^ num_merges as u64);
+            let merges =
+                random_merges(&mut rng, num_wires, degree, num_virtual_targets, num_merges);
+            let mut forest = build_forest(
+                num_wires,
+                num_routed_wires,
+                degree,
+                num_virtual_targets,
+                &merges,
+            );
+            forest.compress_paths();
+            let representative_map = forest.parents.clone();
+
+            let (partition, folded) = forest.wire_partition_with_fixed_mask();
+            let two_pass = fixed_routed_wire_mask(
+                &representative_map,
+                num_wires,
+                num_routed_wires,
+                degree,
+            )
+            .expect("valid compressed representative map");
+            assert_eq!(
+                folded, two_pass,
+                "folded mask diverges from the two-pass derivation at degree {degree}, \
+                 {num_merges} merges"
+            );
+
+            // The mask must not perturb the partition, and the forest must be restored
+            // identically either way.
+            assert_eq!(forest.parents, representative_map);
+            let plain = forest.wire_partition();
+            assert_eq!(partition.sigma, plain.sigma, "sigma perturbed at degree {degree}");
+            assert_eq!(forest.parents, representative_map);
+
+            // Cross-check both against the sigma fixed-point definition directly.
+            for row in 0..degree {
+                for column in 0..num_routed_wires {
+                    let row_major = row * num_routed_wires + column;
+                    let column_major = column * degree + row;
+                    assert_eq!(
+                        fixed_routed_wire(&folded, row_major),
+                        partition.sigma[column_major] as usize == column_major,
+                        "mask/sigma identity mismatch at ({row}, {column}), degree {degree}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -236,7 +236,7 @@ where
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_ref(),
+            prover_data.fft_root_table.as_deref(),
             wires_even_companion_wanted(common_data),
         )
     );
@@ -329,7 +329,7 @@ where
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_ref(),
+            prover_data.fft_root_table.as_deref(),
         )
     );
 
@@ -453,7 +453,7 @@ where
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_ref(),
+            prover_data.fft_root_table.as_deref(),
         )
     );
 
@@ -1533,12 +1533,12 @@ pub fn range_quotient_microbench<
     let t = std::time::Instant::now();
     let _plain = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
         mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_ref(), false);
+        prover_data.fft_root_table.as_deref(), false);
     let plain_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = std::time::Instant::now();
     let wires_commitment = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
         mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_ref(), true);
+        prover_data.fft_root_table.as_deref(), true);
     let comp_ms = t.elapsed().as_secs_f64() * 1e3;
     eprintln!("[qmb] degree_bits={} lde={} wires commit: plain {plain_ms:.1} ms, with companion {comp_ms:.1} ms, companion present={}",
         common_data.degree_bits(), lde_size, wires_commitment.even_columns.get().is_some());
@@ -2536,6 +2536,14 @@ fn compute_quotient_polys<
     // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
+    // Offloading the permutation products moves the ONLY reader of the "next"
+    // Z gather off the CPU: `permutation_products_offloaded` implies
+    // `col_major_perm` (the `gpu_permutation` construction above is gated on
+    // it), `col_major_perm` implies `!has_lookup`, and the offloaded branch of
+    // `eval_vanishing_poly_base_batch` destructures `zs_next_cols` away. So the
+    // flag below is exactly "something still reads Z(g x)".
+    let needs_next_zs = !permutation_products_offloaded;
+
     let quotient_len = points.len() * num_challenges;
     let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
     // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
@@ -2599,9 +2607,22 @@ fn compute_quotient_polys<
                     .indices
                     .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
                 scratch.indices_next.clear();
-                scratch
-                    .indices_next
-                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+                // The wrapped "next" indices exist for exactly one consumer: the
+                // permutation argument's Z(g x) column. When the permutation
+                // products are offloaded, `zs_next_range` below is `0..0` and the
+                // offloaded branch of `eval_vanishing_poly_base_batch` never
+                // reads `zs_next_cols`, so this construction and the zero-width
+                // gather it feeds are both dead: one add + mask + push and one
+                // `fill_lde_batch` contiguity scan per LDE point, i.e. 2^19 of
+                // each per degree-2^16 transaction proof and 2^21 per block
+                // proof, on the serial quotient spine. Skipping them leaves
+                // `indices_next` and `zs_next_flat` empty -- exactly the state
+                // `fill_lde_batch`'s `resize(n * 0)` produced.
+                if needs_next_zs {
+                    scratch
+                        .indices_next
+                        .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
+                }
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -2709,13 +2730,18 @@ fn compute_quotient_polys<
                     batch_layout,
                     &mut scratch.zs_local_flat,
                 );
-                zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                    &scratch.indices_next,
-                    step,
-                    zs_next_range,
-                    batch_layout,
-                    &mut scratch.zs_next_flat,
-                );
+                if needs_next_zs {
+                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                        &scratch.indices_next,
+                        step,
+                        zs_next_range,
+                        batch_layout,
+                        &mut scratch.zs_next_flat,
+                    );
+                } else {
+                    debug_assert!(zs_next_range.is_empty());
+                    scratch.zs_next_flat.clear();
+                }
 
                 let indices_batch = &scratch.indices;
                 // Per-point row views over the PointMajor gathers, built only
