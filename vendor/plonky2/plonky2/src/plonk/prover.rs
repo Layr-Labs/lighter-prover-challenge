@@ -1404,7 +1404,21 @@ fn start_gpu_range_check_gate_quotient<
             // existing CPU direct-accumulation evaluator instead: skipping it
             // here means it is never added to `gate_indices`, so the generic
             // CPU quotient pass retains its unchanged selector and alpha work.
-            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. }) {
+            // Random-access gates walk a data-dependent selection fold whose
+            // cost scales with 2^bits, extending the process-shared Range/U32
+            // Metal command. On the wide transaction and block shapes the
+            // whole family stays on the CPU direct-accumulation evaluator:
+            // those shapes' CPU scratch is already pinned at 136 wires / 68
+            // constraint rows, so the withdrawal widens nothing. The chain
+            // shape's CPU ceiling (80 wires / 26 rows) sits BELOW the
+            // four-bit gate's 90-wire footprint, so withdrawing it there
+            // would widen every CPU batch to carry one gate; on that shape
+            // the four-bit spec keeps its GPU slot and only the six-bit
+            // gate (74 wires, under the ceiling) stays on the CPU.
+            if matches!(u32_gate, U32QuotientGate::RandomAccess { bits: 6, .. })
+                || (common_data.degree_bits() >= 16
+                    && matches!(u32_gate, U32QuotientGate::RandomAccess { .. }))
+            {
                 continue;
             }
             let (kind, num_ops, expected_wires, expected_constraints) = match u32_gate {
@@ -1652,7 +1666,11 @@ fn start_gpu_range_check_gate_quotient<
         } else if let Some(reducing) =
             gate.0.as_any().downcast_ref::<ReducingExtensionGate<D>>()
         {
-            if D != 2 {
+            // The extension-reduction Horner fold (33 coefficients, 66
+            // constraint rows) fits under the wide shapes' pinned CPU
+            // scratch (136 wires / 68 rows) but not under the chain
+            // shape's (90 / 26), so it stays on the CPU only there.
+            if D != 2 || common_data.degree_bits() >= 16 {
                 None
             } else {
                 Some((
