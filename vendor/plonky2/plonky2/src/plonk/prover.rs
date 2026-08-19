@@ -30,6 +30,8 @@ use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 use crate::plonk::circuit_data::{
     LowRangeSelectorFilterCache, LowRangeSelectorFilterCacheEntry,
 };
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use core::arch::aarch64::{vld2q_u64, vst1q_u64};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
@@ -1742,6 +1744,93 @@ fn combine_low_range_quotient<F: RichField>(
     }
 }
 
+/// Split one gate's point-major `[c0, c1, c0, c1, ...]` even-row samples into
+/// two contiguous challenge columns. Goldilocks uses `vld2q_u64` so both lanes
+/// are kept (the even-row companion `vld2` leftover that discarded odds does
+/// not apply here). Scalar fallback is the exact pair assignment.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn deinterleave_challenge_pair<F: Field>(src: &[F], ch0: &mut [F], ch1: &mut [F]) {
+    let n = ch0.len();
+    debug_assert_eq!(ch1.len(), n);
+    debug_assert_eq!(src.len(), n.saturating_mul(2));
+    let mut i = 0usize;
+    if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() == 8 {
+        // SAFETY: every production `RichField` on this path is 8-byte
+        // Goldilocks (`repr(transparent)` over `u64`). `vld2q` reads four
+        // consecutive limbs and writes two contiguous pairs; remainder is
+        // scalar. Layout is identical to two strided gathers.
+        unsafe {
+            let src_u = src.as_ptr().cast::<u64>();
+            let c0_u = ch0.as_mut_ptr().cast::<u64>();
+            let c1_u = ch1.as_mut_ptr().cast::<u64>();
+            while i + 2 <= n {
+                let pair = vld2q_u64(src_u.add(i * 2));
+                vst1q_u64(c0_u.add(i), pair.0);
+                vst1q_u64(c1_u.add(i), pair.1);
+                i += 2;
+            }
+        }
+    }
+    while i < n {
+        ch0[i] = src[i * 2];
+        ch1[i] = src[i * 2 + 1];
+        i += 1;
+    }
+}
+
+/// Reconstruct odd-coset columns for every low gate. One parallel task per
+/// gate scans the interleaved even-row block once, then IFFT+FFTs the two
+/// challenge columns. Bit-identical to the previous 2-strided gathers.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn extend_low_range_odd_rows<F: RichField>(
+    low: &[F],
+    num_gates: usize,
+    half_rows: usize,
+    omega_powers_scaled: &[F],
+) -> Vec<Vec<F>> {
+    debug_assert_eq!(low.len(), num_gates.saturating_mul(half_rows).saturating_mul(2));
+    if std::env::var_os("LIGHTER_LOW_RANGE_DEINTERLEAVE").is_some_and(|v| v == "0") {
+        return (0..num_gates * 2)
+            .into_par_iter()
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled)
+                    .fft()
+                    .values
+            })
+            .collect();
+    }
+    let pairs: Vec<(Vec<F>, Vec<F>)> = (0..num_gates)
+        .into_par_iter()
+        .map(|g| {
+            let base = g * half_rows * 2;
+            let src = &low[base..base + half_rows * 2];
+            let mut ch0 = vec![F::ZERO; half_rows];
+            let mut ch1 = vec![F::ZERO; half_rows];
+            deinterleave_challenge_pair(src, &mut ch0, &mut ch1);
+            let odd0 = PolynomialValues::new(ch0)
+                .coset_ifft_with_prescaled_powers(omega_powers_scaled)
+                .fft()
+                .values;
+            let odd1 = PolynomialValues::new(ch1)
+                .coset_ifft_with_prescaled_powers(omega_powers_scaled)
+                .fft()
+                .values;
+            (odd0, odd1)
+        })
+        .collect();
+    let mut odd = Vec::with_capacity(num_gates * 2);
+    for (odd0, odd1) in pairs {
+        odd.push(odd0);
+        odd.push(odd1);
+    }
+    odd
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1768,19 +1857,12 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
+    let odd = extend_low_range_odd_rows(
+        low,
+        gates.len(),
+        half_rows,
+        omega_powers_scaled.as_slice(),
+    );
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(
@@ -3658,10 +3740,14 @@ mod quotient_layout_tests {
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
+        combine_low_range_quotient, deinterleave_challenge_pair, extend_low_range_odd_rows,
+        gpu_poseidon_quotient_stats, LowDegreeRangeGate, COMPARE_GPU_QUOTIENT,
     };
     use crate::field::goldilocks_field::GoldilocksField;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+
+    use crate::field::polynomial::PolynomialValues;
+
     use crate::field::types::{Field, Field64, PrimeField64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
@@ -3868,6 +3954,86 @@ mod quotient_layout_tests {
     /// comparison itself runs inside `prove` (see `COMPARE_QUOTIENT_LAYOUTS`);
     /// the proof must also verify.
     #[test]
+    /// Raw-limb differential: one sequential deinterleave + IFFT/FFT pair per
+    /// gate matches two independent strided gathers. Covers an odd column
+    /// count (scalar tail of `vld2q`), noncanonical Goldilocks limbs, and
+    /// a power-of-two half-domain the IFFT requires.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn low_range_odd_extension_deinterleave_matches_strided_raw() {
+        let half_rows = 16usize;
+        let num_gates = 3usize;
+        let field = |i: usize| {
+            let limb = ((i * 91 + 17) % 80_000 + 1) as u64;
+            if i % 4 == 0 {
+                F::from_noncanonical_u64(F::ORDER + limb)
+            } else {
+                F::from_canonical_u64(limb)
+            }
+        };
+        let low = (0..num_gates * half_rows * 2).map(field).collect::<Vec<_>>();
+        let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
+
+        let mut deinterleaved_only = Vec::new();
+        for g in 0..num_gates {
+            let src = &low[g * half_rows * 2..(g + 1) * half_rows * 2];
+            let mut ch0 = vec![F::ZERO; half_rows];
+            let mut ch1 = vec![F::ZERO; half_rows];
+            deinterleave_challenge_pair(src, &mut ch0, &mut ch1);
+            deinterleaved_only.push(ch0);
+            deinterleaved_only.push(ch1);
+        }
+        for g in 0..num_gates {
+            for c in 0..2 {
+                let gathered: Vec<F> = (0..half_rows)
+                    .map(|k| low[g * half_rows * 2 + k * 2 + c])
+                    .collect();
+                let got = &deinterleaved_only[g * 2 + c];
+                let raw = |values: &[F]| {
+                    values
+                        .iter()
+                        .map(PrimeField64::to_noncanonical_u64)
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    raw(got),
+                    raw(&gathered),
+                    "deinterleave mismatch at gate {g} challenge {c}"
+                );
+            }
+        }
+
+        let actual = extend_low_range_odd_rows(
+            &low,
+            num_gates,
+            half_rows,
+            omega_powers_scaled.as_slice(),
+        );
+        let expected: Vec<Vec<F>> = (0..num_gates * 2)
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values
+            })
+            .collect();
+        let raw = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(actual.len(), expected.len());
+        for (i, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(raw(got), raw(want), "IFFT/FFT mismatch at column {i}");
+        }
+    }
+
+
     fn quotient_layout_paths_agree() -> Result<()> {
         let (data, pw) = small_circuit();
         assert!(data.common.luts.is_empty());
