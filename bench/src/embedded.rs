@@ -51,6 +51,22 @@ impl RemainingEmbeddedCircuits {
         let (heavy_chain_target, heavy_chain_data) = self.heavy_chain;
         let (light_tx_target, light_tx_data) = self.light_tx;
         let (light_chain_target, light_chain_data) = self.light_chain;
+
+        // Loading and the startup pre-execution proof have both completed by
+        // the time this conversion runs. Start the transaction circuits'
+        // fixed-column companions now: their copies overlap the first witness
+        // and wires commitment, while staying out of the startup load/proof
+        // memory-bandwidth race. A first quotient that arrives early waits on
+        // the shared OnceLock and cannot duplicate the fill.
+        heavy_tx_data
+            .prover_only
+            .constants_sigmas_commitment
+            .prefill_even_rows_in_background();
+        light_tx_data
+            .prover_only
+            .constants_sigmas_commitment
+            .prefill_even_rows_in_background();
+
         Circuits {
             heavy_tx_target,
             heavy_tx_data: std::sync::RwLock::new(heavy_tx_data),

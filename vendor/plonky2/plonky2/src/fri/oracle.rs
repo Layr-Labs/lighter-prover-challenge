@@ -60,7 +60,9 @@ pub(crate) enum BatchLayout {
 /// Absent on non-Metal targets.
 pub struct EvenColumns<F> {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
+    inner: std::sync::Arc<
+        std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
+    >,
     _phantom: core::marker::PhantomData<F>,
 }
 
@@ -68,7 +70,7 @@ impl<F> Default for EvenColumns<F> {
     fn default() -> Self {
         Self {
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            inner: std::sync::OnceLock::new(),
+            inner: std::sync::Arc::new(std::sync::OnceLock::new()),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -95,7 +97,7 @@ impl<F> EvenColumns<F> {
     pub(crate) fn from_ready(
         columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
     ) -> Self {
-        let inner = std::sync::OnceLock::new();
+        let inner = std::sync::Arc::new(std::sync::OnceLock::new());
         let _ = inner.set(columns);
         Self {
             inner,
@@ -127,6 +129,29 @@ impl<F> EvenColumns<F> {
         self.inner
             .get_or_init(|| fill_even_companion_from_full(full))
             .as_ref()
+    }
+
+    /// Starts the same one-time fill without putting its allocation and copy
+    /// on the first proof's quotient spine. A foreground `get_or_fill` racing
+    /// this task waits on the shared `OnceLock`; the initializer still runs
+    /// exactly once.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn start_fill_even_rows(
+        &self,
+        full: &crate::hash::poseidon2::metal::MetalColumns<F>,
+    ) where
+        F: crate::hash::hash_types::RichField + Send + Sync + 'static,
+    {
+        if self.inner.get().is_some() {
+            return;
+        }
+        let inner = std::sync::Arc::clone(&self.inner);
+        let full = full.clone();
+        let _ = std::thread::Builder::new()
+            .name("even-columns-prefill".to_owned())
+            .spawn(move || {
+                inner.get_or_init(|| fill_even_companion_from_full(&full));
+            });
     }
 }
 
@@ -183,6 +208,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PolynomialBatch<F, C, D>
 {
+    /// Begins deriving a compact even-row view of this fixed commitment.
+    /// This is a cache-only hint: unsupported stores and platforms are no-ops,
+    /// and the normal quotient path remains the synchronization/fallback seam.
+    pub fn prefill_even_rows_in_background(&self)
+    where
+        F: Send + Sync + 'static,
+    {
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        if let Some(full) = self.merkle_tree.shared_columns() {
+            self.even_columns.start_fill_even_rows(full);
+        }
+    }
+
     /// Creates a list polynomial commitment for the polynomials interpolating the values in `values`.
     pub fn from_values(
         values: Vec<PolynomialValues<F>>,
