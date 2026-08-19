@@ -40,6 +40,66 @@ pub const SALT_SIZE: usize = 4;
 /// trees (`new_columns`) remain on.
 const GPU_NTT_COMMITMENTS: bool = false;
 
+/// Copy even-indexed source words: `dest[k] = src[2*k]`.
+///
+/// The even-row companion is exactly this gather, in two places: the
+/// in-FFT `copy_even` hook and the lazy constants `fill_even_companion_from_full`.
+/// Both previously walked `k` with a scalar strided load. On Goldilocks /
+/// AArch64, `vuzp1q_u64` of two `vld1q_u64` pairs keeps the even lanes
+/// and stores them contiguously. Same words as the scalar loop.
+/// Other fields and non-AArch64 keep the scalar walk.
+#[inline]
+fn copy_even_indexed<F: Field>(src: &[F], dest: &mut [F]) {
+    debug_assert_eq!(src.len(), dest.len() * 2);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() && !dest.is_empty() {
+            // SAFETY: TypeId proves `F` is `GoldilocksField`, whose
+            // representation is one `u64` limb. The slices have equal
+            // element counts after the 2:1 even gather, and every dest
+            // slot is written before return.
+            unsafe {
+                copy_even_indexed_goldilocks(
+                    core::slice::from_raw_parts(src.as_ptr().cast::<u64>(), src.len()),
+                    core::slice::from_raw_parts_mut(dest.as_mut_ptr().cast::<u64>(), dest.len()),
+                );
+            }
+            return;
+        }
+    }
+    for (k, slot) in dest.iter_mut().enumerate() {
+        *slot = src[2 * k];
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn copy_even_indexed_goldilocks(src: &[u64], dest: &mut [u64]) {
+    use core::arch::aarch64::{vld1q_u64, vst1q_u64, vuzp1q_u64};
+    debug_assert_eq!(src.len(), dest.len() * 2);
+    let n = dest.len();
+    let mut k = 0usize;
+    // Each pair of 128-bit loads is `[e0,o0] | [e1,o1]`; `vuzp1q_u64`
+    // keeps the even lanes as `[e0,e1]`. Same stores as `dest[k]=src[2k]`.
+    while k + 4 <= n {
+        let p = src.as_ptr().add(2 * k);
+        let e01 = vuzp1q_u64(vld1q_u64(p), vld1q_u64(p.add(2)));
+        let e23 = vuzp1q_u64(vld1q_u64(p.add(4)), vld1q_u64(p.add(6)));
+        vst1q_u64(dest.as_mut_ptr().add(k), e01);
+        vst1q_u64(dest.as_mut_ptr().add(k + 2), e23);
+        k += 4;
+    }
+    while k + 2 <= n {
+        let p = src.as_ptr().add(2 * k);
+        let e01 = vuzp1q_u64(vld1q_u64(p), vld1q_u64(p.add(2)));
+        vst1q_u64(dest.as_mut_ptr().add(k), e01);
+        k += 2;
+    }
+    while k < n {
+        dest[k] = src[2 * k];
+        k += 1;
+    }
+}
+
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BatchLayout {
@@ -145,9 +205,7 @@ fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
         let src = full.col(j);
         debug_assert_eq!(src.len(), half * 2);
         debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
-        }
+        copy_even_indexed(src, dest);
     });
     Some(companion)
 }
@@ -346,9 +404,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         let out = unsafe {
                             core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
                         };
-                        for (k, slot) in out.iter_mut().enumerate() {
-                            *slot = _destination[2 * k];
-                        }
+                        copy_even_indexed(_destination, out);
                     }
                 };
                 let copy_even = &copy_even;
@@ -1492,6 +1548,24 @@ mod tests {
             raw(FE::from(r) * c),
             "sabotage control did not trip: the differential cannot detect a limb flip"
         );
+    }
+
+
+    #[test]
+    fn copy_even_indexed_matches_scalar_raw_words() {
+        use crate::field::types::PrimeField64;
+
+        let lengths = [1usize, 2, 3, 4, 5, 7, 8, 15, 16, 17, 64, 257];
+        for n in lengths {
+            let src: Vec<GoldilocksField> = (0..n * 2)
+                .map(|i| GoldilocksField((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)))
+                .collect();
+            let mut dest = vec![GoldilocksField(0xdead_beef_dead_beef); n];
+            let expected: Vec<u64> = (0..n).map(|k| src[2 * k].to_noncanonical_u64()).collect();
+            copy_even_indexed(&src, &mut dest);
+            let got: Vec<u64> = dest.iter().map(|v| v.to_noncanonical_u64()).collect();
+            assert_eq!(got, expected, "n={n}");
+        }
     }
 
     /// A2 end to end, over the real shapes: the base-shift zero-tail coset FFT
