@@ -1354,29 +1354,10 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(19)
         });
-        // Upper bound as well as a lower one. The split pays for itself only
-        // where its companion fill and extension can hide behind other work.
-        // On the final block's 2^21 shape it cannot: that proof runs alone on
-        // the serial tail, and the companion it needs there is 136 columns of
-        // 2^20 rows -- a gigabyte -- filled unconditionally by
-        // `from_coeffs_with_even_companion`, before we know whether the block
-        // circuit even has the low-degree gates the split would use.
-        //
-        // Kept env-overridable in step with the floor so that raising
-        // LIGHTER_QSPLIT_MIN_LDE_BITS cannot silently close the window.
-        static MAX_BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let max_bits = *MAX_BITS.get_or_init(|| {
-            std::env::var("LIGHTER_QSPLIT_MAX_LDE_BITS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(19)
-        });
-        let lde_bits = common_data.degree_bits() + common_data.config.fri_config.rate_bits;
         range_quotient_split_enabled()
             && common_data.num_lookup_polys == 0
             && common_data.config.num_challenges == 2
-            && lde_bits >= min_bits
-            && lde_bits <= max_bits
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits >= min_bits
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
