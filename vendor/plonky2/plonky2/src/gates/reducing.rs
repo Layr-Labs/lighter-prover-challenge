@@ -5,6 +5,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -153,12 +154,60 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingGate<D
             F::Extension::from_basefield_array(arr)
         };
 
-        let alphas: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
-        let mut accs: Vec<F::Extension> = (0..n)
-            .map(|p| ext(Self::wires_old_acc().start, p))
-            .collect();
+        // Same stack-or-heap scratch / running-acc contract as
+        // `ReducingExtensionGate`: production batches are 32 points, the
+        // scratch is fully overwritten before it is read, and the two
+        // extension vectors were a malloc+free per quotient batch.
+        const STACK_SCRATCH: usize = 128;
+        const STACK_POINTS: usize = 64;
+        let scratch_len = D * n;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
+            // SAFETY: `MaybeUninit<F>` matches `F` layout/alignment. The
+            // point loop writes `[..scratch_len]` before any read.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
+                    scratch_len,
+                )
+            }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
 
-        let mut scratch = vec![F::ZERO; D * n];
+        let mut alpha_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
+        let mut acc_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
+        let mut alpha_heap;
+        let mut acc_heap;
+        let (alphas, accs): (&mut [F::Extension], &mut [F::Extension]) = if n <= STACK_POINTS {
+            // SAFETY: both slices are written in the fill loop below before
+            // the Horner body reads them.
+            unsafe {
+                (
+                    core::slice::from_raw_parts_mut(
+                        alpha_stack[..n].as_mut_ptr().cast::<F::Extension>(),
+                        n,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        acc_stack[..n].as_mut_ptr().cast::<F::Extension>(),
+                        n,
+                    ),
+                )
+            }
+        } else {
+            alpha_heap = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
+            acc_heap = (0..n)
+                .map(|p| ext(Self::wires_old_acc().start, p))
+                .collect();
+            (alpha_heap.as_mut_slice(), acc_heap.as_mut_slice())
+        };
+        for p in 0..n {
+            alphas[p] = ext(Self::wires_alpha().start, p);
+            accs[p] = ext(Self::wires_old_acc().start, p);
+        }
+
         for i in 0..self.num_coeffs {
             let coeff = &wires[(Self::START_COEFFS + i) * n..][..n];
             let acc_start = self.wires_accs(i).start;
@@ -324,5 +373,75 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(ReducingGate::new(22))
+    }
+
+    /// Raw-limb oracle for the stack-or-heap reducing accumulate.
+    #[test]
+    fn accumulate_matches_materialized_raw_limbs() {
+        use crate::field::batch_util::batch_multiply_add_inplace;
+        use crate::field::types::{Field, Field64, PrimeField64};
+        use crate::gates::gate::Gate;
+        use crate::hash::hash_types::HashOut;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        fn value(i: usize) -> F {
+            let small = ((i as u64).wrapping_mul(0x9e37_79b9) ^ 0x5a5a_a5a5) & 0xffff;
+            if i % 3 == 0 {
+                GoldilocksField(GoldilocksField::ORDER + small)
+            } else {
+                F::from_canonical_u64(small)
+            }
+        }
+
+        for num_coeffs in [1usize, 4, 8, 22] {
+            let gate = ReducingGate::<D>::new(num_coeffs);
+            for n in [1usize, 3, 7, 31, 32, 33, 64, 65] {
+                let wires = (0..gate.num_wires() * n)
+                    .map(|i| value(i + 1))
+                    .collect::<Vec<_>>();
+                let constants = (0..gate.num_constants() * n)
+                    .map(|i| value(i + 10_001))
+                    .collect::<Vec<_>>();
+                let filters = (0..n)
+                    .map(|i| match i % 7 {
+                        0 => F::ZERO,
+                        1 => GoldilocksField(GoldilocksField::ORDER),
+                        _ => value(i + 20_001),
+                    })
+                    .collect::<Vec<_>>();
+                let hash = HashOut::ZERO;
+                let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+                let materialized = gate.eval_unfiltered_base_batch(vars);
+                let initial = (0..gate.num_constraints() * n)
+                    .map(|i| match i % 11 {
+                        0 => F::ZERO,
+                        1 => GoldilocksField(GoldilocksField::ORDER),
+                        _ => value(i + 30_001),
+                    })
+                    .collect::<Vec<_>>();
+                let mut expected = initial.clone();
+                for (acc, constraints) in expected
+                    .chunks_exact_mut(n)
+                    .zip(materialized.chunks_exact(n))
+                {
+                    batch_multiply_add_inplace(acc, constraints, &filters);
+                }
+
+                let mut actual = initial;
+                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+
+                for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                    assert_eq!(
+                        actual.to_noncanonical_u64(),
+                        expected.to_noncanonical_u64(),
+                        "num_coeffs={num_coeffs}, n={n}, output={i}"
+                    );
+                }
+            }
+        }
     }
 }
