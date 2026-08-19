@@ -1593,6 +1593,50 @@ fn build_low_range_selector_filter_cache<F: RichField>(
     })
 }
 
+/// Adds one low gate's filtered contribution to a low-range quotient chunk.
+///
+/// `INIT` selects the store form used for the first gate. Because `F::ZERO` is
+/// the additive identity, `ZERO + x` is exactly `x`, so the first gate can
+/// store its product directly instead of reading a zeroed slot and adding to
+/// it. Later gates accumulate. The per-slot summation order over gates is
+/// unchanged (`0`, then `1..num_gates`), so every output limb -- canonical or
+/// noncanonical -- is bit-identical to the staged implementation.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+fn accumulate_low_range_gate_pass<F: RichField, FA, const INIT: bool>(
+    chunk: &mut [F],
+    row0: usize,
+    half_rows: usize,
+    g: usize,
+    low: &[F],
+    odd: &[Vec<F>],
+    filter_at: &FA,
+) where
+    FA: Fn(usize, usize) -> F,
+{
+    let rows = chunk.len() / 2;
+    let odd0 = &odd[g * 2];
+    let odd1 = &odd[g * 2 + 1];
+    let low_base = g * half_rows * 2;
+    for r in 0..rows {
+        let i = row0 + r;
+        let (sv0, sv1) = if i & 1 == 0 {
+            let base = low_base + (i >> 1) * 2;
+            (low[base], low[base + 1])
+        } else {
+            (odd0[i >> 1], odd1[i >> 1])
+        };
+        let filter = filter_at(g, r);
+        if INIT {
+            chunk[2 * r] = filter * sv0;
+            chunk[2 * r + 1] = filter * sv1;
+        } else {
+            chunk[2 * r] += filter * sv0;
+            chunk[2 * r + 1] += filter * sv1;
+        }
+    }
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 #[inline(always)]
 fn accumulate_low_range_quotient_chunk<F: RichField>(
@@ -1604,26 +1648,27 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     odd: &[Vec<F>],
     filter_at: impl Fn(usize, usize) -> F,
 ) {
-    let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
-    for g in 0..num_gates {
-        let odd0 = &odd[g * 2];
-        let odd1 = &odd[g * 2 + 1];
-        let low_base = g * half_rows * 2;
-        for r in 0..rows {
-            let i = row0 + r;
-            let (sv0, sv1) = if i & 1 == 0 {
-                let base = low_base + (i >> 1) * 2;
-                (low[base], low[base + 1])
-            } else {
-                (odd0[i >> 1], odd1[i >> 1])
-            };
-            let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
-        }
+    // This helper previously allocated a chunk-sized `acc` buffer, zeroed it,
+    // accumulated every gate into it, then copied it over `chunk`. `chunk` is
+    // an exclusive `par_chunks_mut` slice that the caller overwrites in full
+    // either way, so the staging buffer and its copy were pure overhead: one
+    // allocation plus one zero-fill plus one full-width read/write per rayon
+    // chunk, repeated for every chunk of every quotient job.
+    //
+    // Fold the first gate in with initializing stores and accumulate the rest
+    // in place. The zero-fill disappears entirely rather than moving to the
+    // caller, and the gate summation order per slot is preserved exactly.
+    if num_gates == 0 {
+        // Degenerate shape: the staged version copied an all-zero `acc` here.
+        chunk.fill(F::ZERO);
+        return;
     }
-    chunk.copy_from_slice(&acc);
+    accumulate_low_range_gate_pass::<F, _, true>(chunk, row0, half_rows, 0, low, odd, &filter_at);
+    for g in 1..num_gates {
+        accumulate_low_range_gate_pass::<F, _, false>(
+            chunk, row0, half_rows, g, low, odd, &filter_at,
+        );
+    }
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -3658,8 +3703,8 @@ mod quotient_layout_tests {
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
+        accumulate_low_range_quotient_chunk, combine_low_range_quotient,
+        gpu_poseidon_quotient_stats, LowDegreeRangeGate, COMPARE_GPU_QUOTIENT,
     };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64, PrimeField64};
@@ -3711,6 +3756,140 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    /// Independent reference for `accumulate_low_range_quotient_chunk`: the
+    /// exact staged-buffer algorithm this candidate replaced (allocate, zero,
+    /// accumulate every gate, copy out). Kept verbatim so the differential
+    /// below compares against the pre-candidate semantics rather than against
+    /// a paraphrase of the new code.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn reference_accumulate_low_range_quotient_chunk<F: crate::hash::hash_types::RichField>(
+        chunk: &mut [F],
+        row0: usize,
+        half_rows: usize,
+        num_gates: usize,
+        low: &[F],
+        odd: &[Vec<F>],
+        filter_at: impl Fn(usize, usize) -> F,
+    ) {
+        let rows = chunk.len() / 2;
+        let mut acc = vec![F::ZERO; chunk.len()];
+        for g in 0..num_gates {
+            let odd0 = &odd[g * 2];
+            let odd1 = &odd[g * 2 + 1];
+            let low_base = g * half_rows * 2;
+            for r in 0..rows {
+                let i = row0 + r;
+                let (sv0, sv1) = if i & 1 == 0 {
+                    let base = low_base + (i >> 1) * 2;
+                    (low[base], low[base + 1])
+                } else {
+                    (odd0[i >> 1], odd1[i >> 1])
+                };
+                let filter = filter_at(g, r);
+                acc[2 * r] += filter * sv0;
+                acc[2 * r + 1] += filter * sv1;
+            }
+        }
+        chunk.copy_from_slice(&acc);
+    }
+
+    /// Bit-exact differential for the in-place low-range chunk accumulation.
+    ///
+    /// The candidate deletes a per-chunk staging allocation, its zero-fill and
+    /// the copy-out by giving the first gate initializing stores. Correctness
+    /// therefore rests on two claims this test pins down on RAW limbs:
+    ///   1. `ZERO + x == x` for every representative, including noncanonical
+    ///      inputs and pre-poisoned destination slots, and
+    ///   2. the per-slot gate summation order is unchanged.
+    ///
+    /// Coverage: 1 gate (INIT-only, no accumulate pass), several gates, an odd
+    /// `row0` so the even/odd source selection is exercised in both phases, a
+    /// short final chunk, a `num_gates == 0` degenerate shape, and a
+    /// destination pre-filled with garbage to prove no slot is read before it
+    /// is written.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn in_place_low_range_chunk_matches_staged_reference_raw() {
+        let raw = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>()
+        };
+        // Mix canonical and noncanonical representatives: `to_noncanonical_u64`
+        // is representative-sensitive, so an accumulation-order or identity
+        // change would show up as a raw-limb mismatch even when the canonical
+        // field values agree.
+        let field = |i: usize| {
+            let limb = ((i * 7919 + 13) % 1_000_003 + 1) as u64;
+            match i % 4 {
+                0 => F::from_noncanonical_u64(F::ORDER + limb),
+                1 => F::from_canonical_u64(limb),
+                2 => F::from_noncanonical_u64(F::ORDER - 1),
+                _ => F::from_canonical_u64(limb * 3 + 1),
+            }
+        };
+
+        let half_rows = 97usize;
+        for &num_gates in &[0usize, 1, 2, 5] {
+            let low = (0..num_gates.max(1) * half_rows * 2)
+                .map(field)
+                .collect::<Vec<_>>();
+            let odd = (0..num_gates.max(1) * 2)
+                .map(|column| {
+                    (0..half_rows)
+                        .map(|row| field(500_000 + column * half_rows + row))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let filter_at = |g: usize, r: usize| field(900_000 + g * 4096 + r);
+
+            // Odd `row0` values force the first gate (INIT stores) and the
+            // later gates (accumulating stores) to each straddle the
+            // even-row/odd-row source split.
+            for &row0 in &[0usize, 1, 7, 64] {
+                for &rows in &[1usize, 3, 8, 33] {
+                    if row0 + rows > half_rows * 2 {
+                        continue;
+                    }
+                    // Poison the destination: the candidate must never read a
+                    // slot before writing it, so garbage in must not survive.
+                    let poison = (0..rows * 2)
+                        .map(|i| field(700_000 + i))
+                        .collect::<Vec<_>>();
+
+                    let mut candidate = poison.clone();
+                    accumulate_low_range_quotient_chunk(
+                        &mut candidate,
+                        row0,
+                        half_rows,
+                        num_gates,
+                        &low,
+                        &odd,
+                        filter_at,
+                    );
+
+                    let mut reference = poison.clone();
+                    reference_accumulate_low_range_quotient_chunk(
+                        &mut reference,
+                        row0,
+                        half_rows,
+                        num_gates,
+                        &low,
+                        &odd,
+                        filter_at,
+                    );
+
+                    assert_eq!(
+                        raw(&candidate),
+                        raw(&reference),
+                        "raw limb mismatch: num_gates={num_gates} row0={row0} rows={rows}"
+                    );
+                }
+            }
+        }
     }
 
     /// Raw-limb differential and dispatch guard for the immutable low-range
