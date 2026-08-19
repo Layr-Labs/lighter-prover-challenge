@@ -15,7 +15,7 @@ use web_time::Instant;
 
 use crate::field::cosets::get_unique_coset_shifts;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::fft::fft_root_table;
+use crate::field::fft::cached_fft_root_table;
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
@@ -1282,7 +1282,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         // Precompute FFT roots.
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
-        let fft_root_table = fft_root_table(max_fft_points);
+        let fft_root_table = cached_fft_root_table(max_fft_points);
 
         // `prover_only.sigmas` is the transpose of the sigma *values*, and the
         // commitment below consumes those same values. Transposing first reads the
@@ -1462,13 +1462,17 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
-        let generators_defer_until_ready = self
-            .generators
-            .iter()
-            .all(|generator| generator.0.defers_until_ready());
+        let mut generators_defer_until_ready = true;
+        let mut generator_batch_descriptors = Vec::with_capacity(self.generators.len());
+        for generator in &self.generators {
+            let (defers_until_ready, batch_descriptor) = generator.0.scheduling_metadata();
+            generators_defer_until_ready &= defers_until_ready;
+            generator_batch_descriptors.push(batch_descriptor);
+        }
 
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
+            generator_batch_descriptors,
             generator_indices_by_watches,
             generator_watch_counts,
             generators_defer_until_ready,
@@ -1478,7 +1482,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
             fixed_routed_wires,
-            fft_root_table: Some(Arc::new(fft_root_table)),
+            fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
             lut_to_lookups: self.lut_to_lookups.clone(),
