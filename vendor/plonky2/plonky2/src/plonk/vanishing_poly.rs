@@ -1,6 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 use core::cmp::min;
+use core::mem::MaybeUninit;
 
 use plonky2_field::polynomial::PolynomialCoeffs;
 
@@ -369,13 +370,33 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
 
     const STACK_COLS: usize = 10;
     let required = STACK_COLS * batch_size;
-    let mut stack = [F::ZERO; STACK_COLS * INTERLEAVE_PAIR_STACK_BATCH];
+    // Dead-store deletion: every used slot of this scratch is assigned
+    // before it is read. `x_accumulators[op]` is stored from `wide_x` at
+    // the end of that operation; `parity_accumulators` are stored from
+    // `wide_parity` after the op loop; `base4_accumulator` and `range`
+    // are stored immediately before each consumer. The `[F::ZERO; N]` /
+    // `vec![F::ZERO; N]` constructors were therefore a memset whose
+    // readers never existed — `10 * batch` Goldilocks words (2.5 KiB at
+    // the production `batch=32`) per interleave eval. Same
+    // `MaybeUninit<F>` → `[F]` transmute this tree already uses in
+    // `prover.rs` (quotient products), `packed_util.rs`, and
+    // `random_access.rs`.
+    let mut stack = [MaybeUninit::<F>::uninit(); STACK_COLS * INTERLEAVE_PAIR_STACK_BATCH];
     let mut heap;
-    let scratch: &mut [F] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
+    let scratch_uninit: &mut [MaybeUninit<F>] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
         &mut stack[..required]
     } else {
-        heap = vec![F::ZERO; required];
+        heap = vec![MaybeUninit::uninit(); required];
         &mut heap
+    };
+    // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`.
+    // `scratch_uninit` is uniquely owned. Every index of the resulting
+    // `[F]` is written before it is read (stores into `x`,
+    // `parity_accumulators`, `base4_accumulator`, and `range` below).
+    // Unused tail of the stack array (`required..STACK_COLS*32`) is
+    // never transmuted into the live slice.
+    let scratch: &mut [F] = unsafe {
+        &mut *(scratch_uninit as *mut [MaybeUninit<F>] as *mut [F])
     };
     let (x_accumulators, rest) = scratch.split_at_mut(INTERLEAVE_OPS * batch_size);
     let (parity_accumulators, rest) = rest.split_at_mut(4 * batch_size);
@@ -384,15 +405,24 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     // Wide lanes for the three delayed chains: one `x` lane and one base-4
     // spread lane (both reset per operation), plus the four parity lanes,
     // which are seeded once because a parity chain spans two operations.
+    // Constructor zeros were dead: `wide_parity.fill(0)` seeds the four
+    // parity lanes before any `<< 1` read; `wide_x` / `wide_spread` are
+    // `fill(0)`'d at the start of every operation before the bit loop.
     const WIDE_COLS: usize = 6;
     let wide_required = WIDE_COLS * batch_size;
-    let mut wide_stack = [0u128; WIDE_COLS * INTERLEAVE_PAIR_STACK_BATCH];
+    let mut wide_stack = [MaybeUninit::<u128>::uninit(); WIDE_COLS * INTERLEAVE_PAIR_STACK_BATCH];
     let mut wide_heap;
-    let wide: &mut [u128] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
+    let wide_uninit: &mut [MaybeUninit<u128>] = if batch_size <= INTERLEAVE_PAIR_STACK_BATCH {
         &mut wide_stack[..wide_required]
     } else {
-        wide_heap = vec![0u128; wide_required];
+        wide_heap = vec![MaybeUninit::uninit(); wide_required];
         &mut wide_heap
+    };
+    // SAFETY: `MaybeUninit<u128>` has the same layout as `u128`.
+    // `wide_uninit` is uniquely owned. Every live lane is stored (`fill(0)`)
+    // before the first read in the bit / closeout loops below.
+    let wide: &mut [u128] = unsafe {
+        &mut *(wide_uninit as *mut [MaybeUninit<u128>] as *mut [u128])
     };
     let (wide_x, rest) = wide.split_at_mut(batch_size);
     let (wide_spread, wide_parity) = rest.split_at_mut(batch_size);
