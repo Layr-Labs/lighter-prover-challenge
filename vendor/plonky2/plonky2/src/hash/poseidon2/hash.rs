@@ -3,6 +3,8 @@ use core::fmt::Debug;
 use plonky2_field::ops::Square;
 
 use super::config::*;
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use super::external_neon::{external_linear_layer_u128_neon, external_neon_enabled};
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField as F;
 use crate::field::types::{Field, PrimeField64};
@@ -447,7 +449,7 @@ pub trait Poseidon2: PrimeField64 {
 
 #[inline]
 #[unroll::unroll_for_loops]
-fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
+pub(crate) fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
     // First, we apply M_4 to each consecutive four elements of the state.
     // In Appendix B's terminology, this replaces each x_i with x_i'.
     for i in (0..WIDTH).step_by(4) {
@@ -484,6 +486,26 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
 }
 
 impl Poseidon2 for F {
+    /// Multiply-free external layer. Default is delayed-reduction u128; on
+    /// this host the first two M4 blocks run as a 2-wide NEON u128 pair.
+    /// `LIGHTER_DISABLE_P2_EXT_NEON=1` keeps the scalar loop.
+    #[inline]
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn external_linear_layer(state: &mut [Self; WIDTH]) {
+        let mut state_u128: [u128; WIDTH] = [0u128; WIDTH];
+        for i in 0..WIDTH {
+            state_u128[i] = state[i].to_noncanonical_u64() as u128;
+        }
+        if external_neon_enabled() {
+            external_linear_layer_u128_neon(&mut state_u128);
+        } else {
+            external_linear_layer_u128(&mut state_u128);
+        }
+        for i in 0..WIDTH {
+            state[i] = Self::from_noncanonical_u128_with_96_bits(state_u128[i]);
+        }
+    }
+
     #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
         // AArch64 NEON has no native widening 64x64 multiply. The packed
