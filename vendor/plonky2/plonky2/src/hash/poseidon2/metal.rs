@@ -800,12 +800,16 @@ pub fn prewarm_large_column_store(bytes: u64) {
 
 /// Pre-sizes and pre-faults the streamed sponge's buffer pair at `leaf_count`.
 ///
-/// Every streamed build before the final block is 2^19-leaf, so the pair is
-/// grown for the first time by the final block itself — 2^21 LDE rows, i.e. a
-/// 192 MiB state buffer and a ~128 MiB output buffer — and that growth lands
-/// inside the exclusive serial tail, where nothing else is running to hide the
-/// first-touch faults. This does the same job as
-/// [`prewarm_large_column_store`] for a different allocation.
+/// Called at two shapes. [`SPINE_STREAM_LEAF_COUNT`] from [`prewarm`] at
+/// process entry: the first streamed build of the run is a chain step's 2^17
+/// commitment, on the strictly sequential critical path, and it would
+/// otherwise grow the pair itself (~12.6 MB state + ~8.4 MB output). 2^21 from
+/// the orchestrator once the heavy path retires: every streamed build before
+/// the final block is at most 2^19-leaf, so the block grows the pair again —
+/// 192 MiB state and a ~128 MiB output — inside the exclusive serial tail,
+/// where nothing else is running to hide the faults. The larger call wins
+/// (`smaller` below), so the order between them does not matter. This does the
+/// same job as [`prewarm_large_column_store`] for a different allocation.
 ///
 /// Allocation and the page walk both happen *outside* the mutex: the lock
 /// serializes whole streamed builds, so walking hundreds of MiB under it would
@@ -828,7 +832,9 @@ pub fn prewarm_large_column_store(bytes: u64) {
 static PREWARMED_STREAMED_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
 
 /// Number of final-block streamed commitments: wires, Zs/partial-products, and
-/// quotient.
+/// quotient. The spine-shaped prewarm stashes the same count; those buffers are
+/// under [`MAX_CACHED_DIGEST_OUTPUT_BYTES`], so once the first chain steps have
+/// spent them the pool recycles at that size and keeps serving.
 const PREWARMED_STREAMED_DIGEST_COUNT: usize = 3;
 
 /// Takes a pre-faulted digest replacement of at least `bytes`, if one is stashed.
@@ -1603,6 +1609,18 @@ pub fn prewarm() {
                 }
             }
             let _ = force_context();
+            // Size and pre-fault the streamed sponge's buffer pair at the
+            // spine shape while still on this thread. The pair is otherwise
+            // grown by whichever build wants it first, and with the serial
+            // 2^17 shape admitted that is a chain step on the strictly
+            // sequential critical path, paying ~12.6 MB of state and ~8.4 MB
+            // of digest output as inline first-touch faults. Here the walk is
+            // small next to the shader compile it follows, and this thread is
+            // off the critical path by construction. A later 2^19 or 2^21
+            // build (or the block prewarm) simply grows past it; the pair is
+            // fully written by each build before it is read, so this is
+            // scheduling only.
+            prewarm_streamed_buffers(SPINE_STREAM_LEAF_COUNT);
         })
         .ok();
 }
@@ -1713,11 +1731,14 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     // Those trees sit on the strictly sequential critical path in every phase
     // and are much cheaper on the GPU than on the CPU, so they take it.
     //
-    // This admission is only worth having together with the streaming rule in
-    // `build_merkle_tree_shared_streamed` below, which keeps the pipelined
-    // wide commitment off the single buffer set: admitted without it, these
-    // trees hand back as acquisition wait everything they save in hashing.
-    // The two are one change; do not relax either alone.
+    // This admission is only worth having together with the streaming rules in
+    // `build_merkle_tree_shared_streamed` below, which now leave the pooled
+    // buffer set three ways: the pipelined 2^19 wide commitment streams, this
+    // serial 2^17 shape streams, and what remains asking the set is the chain
+    // steps' own Zs/partial-product and quotient trees. Strictly less pressure
+    // on the set than either earlier arrangement — admitted without any of it,
+    // these trees hand back as acquisition wait everything they save in
+    // hashing. The three are one change; do not relax one alone.
     let serial_critical_shape = leaf_count == 1 << 17 && leaf_width > 4;
     if serial_critical_shape {
         return true;
@@ -2497,10 +2518,23 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// staging buffer.
 /// Retained buffers for the streamed sponge build: the inter-pass state
 /// (12 u64 lanes per leaf, column-major) and the level-order digest output.
-/// One streamed build runs at a time (exclusive proving phases only), so a
-/// single grow-on-demand pair suffices; holding the lock for the whole build
-/// serializes any unexpected second caller onto the classic path.
+/// One streamed build runs at a time, so a single grow-on-demand pair
+/// suffices; the holder keeps the lock for the whole build and a second
+/// caller `try_lock`s, misses, and takes the classic path instead of queueing.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
+
+/// Leaf count of the chain-spine steps' wires commitment: degree-2^14 circuits
+/// at 3 rate bits. The one shape the serial admission below adds, and the one
+/// [`prewarm`] sizes the pair for.
+const SPINE_STREAM_LEAF_COUNT: usize = 1 << 17;
+
+/// `LIGHTER_SPINE_STREAM=0` drops the serial 2^17 shape back out of the
+/// streamed admission, leaving the parent predicate exactly (A/B switch);
+/// default on. Read once: the admission test runs on every commitment.
+fn spine_stream_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_SPINE_STREAM").is_some_and(|v| v == "0"))
+}
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
@@ -2535,13 +2569,28 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // admitted in `gpu_worthwhile` actually get the set when they ask; the
     // narrower pipelined commitments still wait for an idle stream, because
     // moving all of them costs the pipeline more latency than the serial path
-    // gains. See the note in `gpu_worthwhile`: these two rules are one change.
+    // gains. See the note in `gpu_worthwhile`: these rules are one change.
+    //
+    // The serial 2^17 shape now streams too. Those are the chain-spine steps'
+    // own wires commitments: degree-2^14 circuits, 3 rate bits, 136 wires, so
+    // 2^17 leaves — strictly sequential, one after another, with nothing else
+    // on that thread to hide their CPU fill behind. Streaming them is the same
+    // max(fill, hash) collapse the 2^19 commitments already get, and it moves
+    // them off the pooled buffer set as well, so the set is left to the chain
+    // Zs/quotient trees. Unlike the 2^19 rule this one does not wait for an
+    // idle stream: the spine is the critical path, and on contention the
+    // `try_lock` below drops it back to exactly the classic path it takes
+    // today. Exclusive phases are untouched (pre-execution's own 2^17 trees
+    // stay classic).
     let stream_admitted = if EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed) {
         leaf_count >= 1 << 20
     } else {
-        leaf_count >= 1 << 19
+        (leaf_count >= 1 << 19
             && (leaf_width > 64
-                || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0)
+                || GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0))
+            || (spine_stream_enabled()
+                && leaf_count == SPINE_STREAM_LEAF_COUNT
+                && leaf_width > 4)
     };
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -2565,7 +2614,17 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
+    // `try_lock`, matching what the doc on `STREAMED_BUFFERS` already claims:
+    // a second caller is serialized *onto the classic path*, not queued here.
+    // `lock` did the opposite — it blocked, so a contending build handed back
+    // as acquisition wait exactly what streaming exists to save, and the wait
+    // was invisible because it happened before any of this function's own
+    // fallbacks. Contention is no longer hypothetical: with the 2^17 admission
+    // above, a serial chain step's commitment can arrive while a pipelined
+    // 2^19 build holds the pair. `TryLockError` (`WouldBlock` or poisoned)
+    // returns `None` and the caller takes the classic fill + shared build,
+    // bit-identically.
+    let mut buffers = STREAMED_BUFFERS.try_lock().ok()?;
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
