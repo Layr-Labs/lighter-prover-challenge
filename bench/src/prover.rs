@@ -1,8 +1,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -247,6 +247,63 @@ enum ChainState<'scope> {
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
 }
 
+/// The recorded phase-1 seed layout of a path's chain circuit, shared by the
+/// chain-step threads.
+///
+/// `BlockTxChainCircuit::witness_inputs_early_into` writes a target sequence
+/// fixed by the circuit shape -- the self verifier data, then the transaction
+/// proof, then the recursion step, then the dummy cyclic proof, each walked
+/// structurally with `zip_eq` over the target trees -- and every step of a path
+/// feeds proofs of the same two shapes. So the first step to finish recording
+/// leaves a layout every later step can replay positionally, deleting the
+/// per-write `representative_map` gather (a scattered read into a table far
+/// larger than cache) and the per-write watcher-CSR traversal for the tens of
+/// thousands of targets a recursive proof occupies.
+///
+/// Steps overlap by design (a step's phase 1 runs while its predecessor
+/// proves), so the cell is written once by whichever step gets there first;
+/// losers drop their own recording. It fails closed exactly like the
+/// transaction path: a replay whose target sequence differs in order, length or
+/// circuit instance is rejected by the layout's own checksum before any watcher
+/// decrement or generator runs, and retires the layout so later steps take the
+/// generic path once instead of paying a failed replay plus a re-seed forever.
+struct ChainSeedLayout<'a> {
+    layout: OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+    retired: AtomicBool,
+}
+
+impl<'a> ChainSeedLayout<'a> {
+    fn new() -> Self {
+        Self {
+            layout: OnceLock::new(),
+            retired: AtomicBool::new(false),
+        }
+    }
+
+    /// The layout to replay, or `None` when none has been recorded yet or one
+    /// was retired.
+    fn get(&self) -> Option<&PartitionSeedLayout<'a, F, C, D>> {
+        if self.retired.load(Ordering::Relaxed) {
+            return None;
+        }
+        self.layout.get()
+    }
+
+    fn is_retired(&self) -> bool {
+        self.retired.load(Ordering::Relaxed)
+    }
+
+    fn retire(&self) {
+        self.retired.store(true, Ordering::Relaxed);
+    }
+
+    /// Publishes a recording. A racing step may have already published one; the
+    /// two are interchangeable, so the loser's is simply dropped.
+    fn record(&self, layout: PartitionSeedLayout<'a, F, C, D>) {
+        let _ = self.layout.set(layout);
+    }
+}
+
 impl ChainState<'_> {
     fn wait(self) -> Proof {
         #[cfg(feature = "diagnostic_profile")]
@@ -261,15 +318,16 @@ impl ChainState<'_> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn chain_step_proof(
+fn chain_step_proof<'a>(
     path: TxPath,
     chain_target: &BlockTxChainTarget,
-    chain_data: &CircuitData<F, C, D>,
+    chain_data: &'a CircuitData<F, C, D>,
     chain_step: u64,
     previous: Option<ChainState<'_>>,
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
+    seed_layout: &ChainSeedLayout<'a>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -285,20 +343,83 @@ fn chain_step_proof(
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
         // per-path template clone, no replay pass.
-        let mut pending = PendingPartitionWitness::start_seeded(
-            &chain_data.prover_only,
-            &chain_data.common,
-            |seeder| {
-                BlockTxChainCircuit::witness_inputs_early_into(
-                    chain_target,
-                    chain_data,
-                    chain_step,
-                    dummy_proof,
-                    tx_proof,
-                    seeder,
-                )
-            },
-        )?;
+        // The writer's target sequence is fixed for this circuit, so the first
+        // step of the path records it and every later step replays it
+        // positionally (see `ChainSeedLayout`).
+        let mut pending = if let Some(layout) = seed_layout.get() {
+            let replay = PendingPartitionWitness::start_seeded_with_layout(
+                &chain_data.prover_only,
+                &chain_data.common,
+                layout,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        tx_proof,
+                        seeder,
+                    )
+                },
+            );
+            // Only a typed layout-applicability mismatch may retry on the
+            // generic path; a writer or worklist failure keeps its own type and
+            // propagates without rerunning the writer.
+            match replay {
+                Err(error) if is_seed_layout_mismatch(&error) => {
+                    seed_layout.retire();
+                    PendingPartitionWitness::start_seeded(
+                        &chain_data.prover_only,
+                        &chain_data.common,
+                        |seeder| {
+                            BlockTxChainCircuit::witness_inputs_early_into(
+                                chain_target,
+                                chain_data,
+                                chain_step,
+                                dummy_proof,
+                                tx_proof,
+                                seeder,
+                            )
+                        },
+                    )
+                }
+                result => result,
+            }
+        } else if seed_layout.is_retired() {
+            PendingPartitionWitness::start_seeded(
+                &chain_data.prover_only,
+                &chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        tx_proof,
+                        seeder,
+                    )
+                },
+            )
+        } else {
+            PendingPartitionWitness::start_seeded_recording(
+                &chain_data.prover_only,
+                &chain_data.common,
+                |seeder| {
+                    BlockTxChainCircuit::witness_inputs_early_into(
+                        chain_target,
+                        chain_data,
+                        chain_step,
+                        dummy_proof,
+                        tx_proof,
+                        seeder,
+                    )
+                },
+            )
+            .map(|(pending, layout)| {
+                seed_layout.record(layout);
+                pending
+            })
+        }?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
         let previous_proof = previous.map(ChainState::wait);
@@ -535,6 +656,9 @@ fn prove_path(
     // Recorded on this path's first chunk and replayed for the rest; failing
     // closed and retiring itself if the writer's target sequence ever changes.
     let mut tx_seed_layout = None;
+    // Same discipline for the chain circuit's phase-1 writer, shared across the
+    // chain-step threads this path spawns.
+    let chain_seed_layout = ChainSeedLayout::new();
     let mut chunks = chunks.into_iter();
     let (mut current_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
@@ -554,6 +678,8 @@ fn prove_path(
 
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
+        // Captured by the `move` step closures below as a shared reference.
+        let chain_seed = &chain_seed_layout;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
@@ -582,6 +708,7 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
+                            chain_seed,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -676,6 +803,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        chain_seed,
                     )
                 })
                 .expect("chain step pipeline thread must start");
@@ -735,6 +863,7 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
+                        chain_seed,
                     )
                 })
                 .expect("chain drain thread must start");
@@ -929,7 +1058,6 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
-            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
                 .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -962,12 +1090,22 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                pre_proof_ref,
+                                &pre_proof,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
+                    // The pre-execution proof is now fully consumed: its wire
+                    // values live in `pending`'s partition slots and its public
+                    // inputs were read into `pre_output` before this scope. It
+                    // is captured by value here (rather than borrowed from the
+                    // caller's frame) purely so it can be released at its last
+                    // use instead of at the end of `prove_block_after_pre`,
+                    // which is after the whole light pipeline and the final
+                    // block proof. Same deallocation, same thread, no value
+                    // changes -- only its position moves earlier, off the peak.
+                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
@@ -1581,6 +1719,7 @@ mod tests {
             old_delta_root,
         );
 
+        let harness_seed_layout = ChainSeedLayout::new();
         let mut previous: Option<Proof> = None;
         for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
@@ -1661,6 +1800,7 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
+                &harness_seed_layout,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);

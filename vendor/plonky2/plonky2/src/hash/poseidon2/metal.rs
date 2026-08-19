@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
+    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -2097,11 +2097,11 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
-    // The wires store may be a compact sub-domain copy while `constants` is
-    // the full-domain store: the kernel indexes both with `lde_rows =
-    // wires.rows`, so every constants read `col * wires.rows + row` stays in
-    // bounds as long as `constants.rows >= wires.rows`; the low-degree gates
-    // dispatched here read no constants (their selector load is unused).
+    // The wires store may be a compact even-row copy. The kernel indexes
+    // both buffers with `lde_rows = wires.rows` (`col * wires.rows + row`).
+    // Constant-reading gates therefore require a matching even-row constants
+    // companion; selector-only / unfiltered gates tolerate a taller full
+    // store (`constants.rows >= wires.rows`) because they do not load it.
     if groups.is_empty()
         || F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -4573,6 +4573,161 @@ mod tests {
     /// this pins the source bytes: edit `poseidon2.metal` without regenerating
     /// `poseidon2.metallib` and this fails loudly instead of silently proving
     /// with stale kernels.
+    /// The bug class this exists for: our own promoted archive added
+    /// `filter_plan [[buffer(11)]]` / `filter_plan_count [[buffer(12)]]` to
+    /// `range_check_gate_quotient`, while a concurrently promoted host change
+    /// added a second dispatch site that binds only buffers 0-10. Git merges
+    /// the two with no conflict, `xcrun metal` emits no diagnostic, the build
+    /// succeeds, and `benchmark.sh` still reports `verified_proofs: 1` on one
+    /// fixture -- but the kernel reads an unbound buffer. Nothing else in this
+    /// tree catches it.
+    ///
+    /// So: parse every `kernel void` signature out of the shader we ship, parse
+    /// every dispatch region out of this file (a `set_compute_pipeline_state`
+    /// through the matching `end_encoding` on the same encoder binding), and
+    /// require that the set of indices a region binds is exactly the buffer set
+    /// of some kernel. An under-bound site matches no signature and fails here.
+    ///
+    /// Verified to have teeth: run against the reverted archive's shader, this
+    /// flags all five under-bound sites (both `range_check_gate_quotient`
+    /// dispatches missing 11/12, and the three
+    /// `poseidon2_hash_leaves_colmajor` dispatches missing its buffer 6).
+    #[test]
+    fn every_shader_buffer_is_bound_at_every_host_dispatch_site() {
+        const SHADER: &str = include_str!("poseidon2.metal");
+        const HOST: &str = include_str!("metal.rs");
+
+        fn number_at(source: &str, mut at: usize) -> Option<u32> {
+            let bytes = source.as_bytes();
+            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+                at += 1;
+            }
+            let start = at;
+            while at < bytes.len() && bytes[at].is_ascii_digit() {
+                at += 1;
+            }
+            source[start..at].parse().ok()
+        }
+
+        fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
+            let mut out = Vec::new();
+            let mut from = 0;
+            while let Some(hit) = haystack[from..].find(needle) {
+                out.push(from + hit);
+                from += hit + needle.len();
+            }
+            out
+        }
+
+        // kernel name -> the buffer indices its signature declares.
+        let mut kernels: Vec<(&str, Vec<u32>)> = Vec::new();
+        for start in find_all(SHADER, "kernel void ") {
+            let after = start + "kernel void ".len();
+            let open = after + SHADER[after..].find('(').expect("kernel signature");
+            let name = SHADER[after..open].trim();
+            let mut depth = 0usize;
+            let mut end = open;
+            for (offset, ch) in SHADER[open..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + offset;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let signature = &SHADER[open..end];
+            let mut indices: Vec<u32> = find_all(signature, "[[buffer(")
+                .into_iter()
+                .filter_map(|at| number_at(signature, at + "[[buffer(".len()))
+                .collect();
+            indices.sort_unstable();
+            kernels.push((name, indices));
+        }
+
+        // ABI freeze. A kernel that gains or loses a buffer trips this first,
+        // with an explicit instruction, instead of silently reaching the GPU.
+        let expected: &[(&str, &[u32])] = &[
+            (
+                "poseidon2_gate_quotient",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            ),
+            (
+                "permutation_quotient",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            ),
+            ("range_check_gate_quotient", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            ("poseidon2_hash_leaves", &[0, 1, 2, 3, 4]),
+            ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
+            ("ntt_stage", &[0, 1, 2, 3, 4]),
+            ("ifft_finalize", &[0, 1, 2, 3]),
+            ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5]),
+            ("poseidon2_hash_parents", &[0, 1, 2, 3]),
+            ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        ];
+        let observed: Vec<(&str, &[u32])> = kernels
+            .iter()
+            .map(|(name, indices)| (*name, indices.as_slice()))
+            .collect();
+        assert_eq!(
+            observed, expected,
+            "poseidon2.metal kernel ABIs changed. Every dispatch site for the changed \
+             kernel must bind the new buffer set; update this table only after auditing \
+             them, because an unbound buffer produces no compiler diagnostic."
+        );
+
+        // Only production dispatch sites: the test module below encodes its own.
+        let host = &HOST[..HOST.find("\nmod tests {").expect("test module marker")];
+        let mut regions = 0usize;
+        for hit in find_all(host, ".set_compute_pipeline_state(") {
+            let head = &host[..hit];
+            let encoder_start = head
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map_or(0, |at| at + 1);
+            let encoder = &head[encoder_start..];
+            assert!(!encoder.is_empty(), "unnamed compute encoder");
+            let body_start = hit + ".set_compute_pipeline_state(".len();
+            let end_marker = format!("{encoder}.end_encoding()");
+            let body_len = host[body_start..]
+                .find(&end_marker)
+                .unwrap_or_else(|| panic!("no end_encoding for encoder {encoder}"));
+            let body = &host[body_start..body_start + body_len];
+
+            let mut bound: Vec<u32> = Vec::new();
+            for needle in [
+                format!("{encoder}.set_buffer("),
+                format!("{encoder}.set_bytes("),
+                format!("set_u32({encoder},"),
+            ] {
+                for at in find_all(body, &needle) {
+                    if let Some(index) = number_at(body, at + needle.len()) {
+                        bound.push(index);
+                    }
+                }
+            }
+            bound.sort_unstable();
+            bound.dedup();
+            let line = head.matches('\n').count() + 1;
+            assert!(
+                kernels.iter().any(|(_, indices)| *indices == bound),
+                "the dispatch at metal.rs:{line} (encoder `{encoder}`) binds buffers \
+                 {bound:?}, which is not the complete buffer set of any kernel in \
+                 poseidon2.metal. An under-bound dispatch reads uninitialized GPU \
+                 memory with no compiler diagnostic and no merge conflict."
+            );
+            regions += 1;
+        }
+        assert_eq!(
+            regions, 19,
+            "the number of production dispatch sites changed; each one is audited \
+             above, so update this count deliberately rather than by reflex."
+        );
+    }
+
     #[test]
     fn metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
