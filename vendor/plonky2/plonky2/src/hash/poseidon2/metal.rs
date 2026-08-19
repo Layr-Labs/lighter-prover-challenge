@@ -3144,7 +3144,7 @@ impl MetalShared {
             set_u32(encoder, 10, group.start as u32);
             set_u32(encoder, 11, group.end as u32);
             set_u32(encoder, 12, include_unused_selector as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3216,7 +3216,7 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -3397,7 +3397,7 @@ impl MetalShared {
             set_u32(encoder, 13, num_partial_products as u32);
             set_u32(encoder, 14, chunk_size as u32);
             set_u32(encoder, 15, alpha_stride as u32);
-            dispatch(encoder, pipeline, quotient_rows);
+            dispatch_full(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
@@ -4463,6 +4463,33 @@ fn dispatch(
         .max_total_threads_per_threadgroup()
         .min(128)
         .max(execution_width);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn dispatch_full(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    // Occupancy A/B: dispatch the three multiply-issue-bound quotient kernels
+    // with the device's full threadgroup width instead of the 128-cap used by
+    // the shared `dispatch`. On the M4 Pro these kernels are multiply-bound;
+    // wider threadgroups change scheduling granularity but never any computed
+    // value (the shader and the per-thread work are identical), so this is a
+    // value-exact scheduling/LD dispatch probe only.
+    let execution_width = pipeline.thread_execution_width();
+    let group_width = pipeline.max_total_threads_per_threadgroup().max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
