@@ -1324,10 +1324,14 @@ pub(crate) struct LowDegreeRangeGate {
 pub(crate) enum RangeQuotientJobs<F: RichField> {
     /// Every advertised gate in one full-domain dispatch (the original path).
     Whole(crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>),
-    /// Degree <= 4 gates on the half domain (per-gate, unfiltered) plus the
-    /// remaining higher-degree gates on the full domain (filtered, as before).
+    /// Degree <= 2 gates on a quarter of the quotient domain, degree 3..=4
+    /// gates on the half domain (per-gate, unfiltered), plus remaining
+    /// higher-degree gates on the full domain (filtered, as before).
     Split {
-        low: crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
+        quarter: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
+        quarter_gates: Vec<LowDegreeRangeGate>,
+        quarter_rows: usize,
+        low: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
         low_gates: Vec<LowDegreeRangeGate>,
         low_rows: usize,
         high: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
@@ -1339,6 +1343,14 @@ pub(crate) enum RangeQuotientJobs<F: RichField> {
 fn range_quotient_split_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT").is_some_and(|v| v == "0"))
+}
+
+/// `LIGHTER_QQUARTER=0` disables only the degree-2 quarter-domain follow-up,
+/// leaving the promoted half-domain path intact for exact same-binary A/B.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn range_quotient_quarter_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_QQUARTER").is_some_and(|v| v == "0"))
 }
 
 /// Whether the wires commitment should retain its compact even-row companion
@@ -1795,6 +1807,170 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     .0
 }
 
+/// Reconstructs the three missing stride-4 cosets of a degree `< n` column
+/// from its `n = N/4` samples, then applies the same selector filters as the
+/// half-domain combine. Algebra: samples `f(shift * ω^{4k})` interpolate as
+/// `q(γ^k)` on the size-`n` subgroup `γ = ω^4`, so `q(x) = f(shift * x)` and
+/// `q(ω^r γ^k) = f(shift * ω^{4k+r})`. One IFFT plus three coset FFTs, not
+/// three independent IFFT/FFT pairs.
+///
+/// Does not touch `LowRangeSelectorFilterCache`: that OnceLock is owned by the
+/// remaining degree 3..=4 half-domain gates, which run concurrently.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn extend_and_combine_quarter_range_quotient<F: RichField>(
+    sampled: &[F],
+    gates: &[LowDegreeRangeGate],
+    quarter_rows: usize,
+    full_rows: usize,
+    constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
+) -> Vec<F> {
+    debug_assert_eq!(full_rows, quarter_rows * 4);
+    debug_assert_eq!(sampled.len(), gates.len() * quarter_rows * 2);
+    let omega = F::primitive_root_of_unity(log2_strict(full_rows));
+    let omega2 = omega.square();
+    let omega3 = omega2 * omega;
+    // `missing[(g * 2 + c) * 3 + (coset - 1)][sample]` holds challenge `c` of
+    // gate `g` on original row `4 * sample + coset`.
+    let missing_triples: Vec<[Vec<F>; 3]> = (0..gates.len() * 2)
+        .into_par_iter()
+        .map(|t| {
+            let g = t / 2;
+            let c = t % 2;
+            let base = g * quarter_rows * 2;
+            let values: Vec<F> = (0..quarter_rows)
+                .map(|k| sampled[base + k * 2 + c])
+                .collect();
+            let coeffs = PolynomialValues::new(values).ifft();
+            [
+                coeffs.coset_fft(omega).values,
+                coeffs.coset_fft(omega2).values,
+                coeffs.coset_fft(omega3).values,
+            ]
+        })
+        .collect();
+    let missing: Vec<Vec<F>> = missing_triples.into_iter().flatten().collect();
+    #[cfg(feature = "diagnostic_profile")]
+    let _combine_span = crate::util::profile::span("quotient", "range_quarter_combine_only");
+    combine_quarter_range_quotient(sampled, &missing, gates, quarter_rows, full_rows, constants)
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn combine_quarter_range_quotient<F: RichField>(
+    sampled: &[F],
+    missing: &[Vec<F>],
+    gates: &[LowDegreeRangeGate],
+    quarter_rows: usize,
+    full_rows: usize,
+    constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
+) -> Vec<F> {
+    const ROWS_PER_CHUNK: usize = 512;
+    const MAX_GROUP: usize = 16;
+
+    let plans = low_range_selector_group_plans(gates);
+    assert!(plans.iter().all(|plan| plan.group_len <= MAX_GROUP));
+    let selector_cols = plans
+        .iter()
+        .map(|plan| constants.col(plan.selector_column))
+        .collect::<Vec<_>>();
+
+    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
+    // SAFETY: every slot is written by the parallel loop before return.
+    unsafe { out.set_len(full_rows * 2) };
+    let num_gates = gates.len();
+    let unused = F::from_canonical_u64(u32::MAX as u64);
+    out.par_chunks_mut(2 * ROWS_PER_CHUNK)
+        .enumerate()
+        .for_each(|(chunk_i, chunk)| {
+            let row0 = chunk_i * ROWS_PER_CHUNK;
+            let rows = chunk.len() / 2;
+            let mut filters = vec![F::ONE; num_gates * ROWS_PER_CHUNK];
+            let mut factors = [F::ZERO; MAX_GROUP];
+            let mut prefix = [F::ONE; MAX_GROUP + 1];
+            let mut suffix = [F::ONE; MAX_GROUP + 1];
+            for (plan, selector_col) in plans.iter().zip(&selector_cols) {
+                let n = plan.group_len;
+                for r in 0..rows {
+                    let s_val = selector_col[row0 + r];
+                    for k in 0..n {
+                        factors[k] = F::from_canonical_usize(plan.group_start + k) - s_val;
+                    }
+                    prefix[0] = if plan.include_unused_selector {
+                        unused - s_val
+                    } else {
+                        F::ONE
+                    };
+                    for k in 0..n {
+                        prefix[k + 1] = prefix[k] * factors[k];
+                    }
+                    suffix[n] = F::ONE;
+                    for k in (0..n).rev() {
+                        suffix[k] = suffix[k + 1] * factors[k];
+                    }
+                    for &(g, position) in &plan.members {
+                        filters[g * ROWS_PER_CHUNK + r] = prefix[position] * suffix[position + 1];
+                    }
+                }
+            }
+            accumulate_quarter_range_quotient_chunk(
+                chunk,
+                row0,
+                quarter_rows,
+                num_gates,
+                sampled,
+                missing,
+                |g, r| filters[g * ROWS_PER_CHUNK + r],
+            );
+        });
+    out
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+fn accumulate_quarter_range_quotient_chunk<F: RichField>(
+    chunk: &mut [F],
+    row0: usize,
+    quarter_rows: usize,
+    num_gates: usize,
+    sampled: &[F],
+    missing: &[Vec<F>],
+    filter_at: impl Fn(usize, usize) -> F,
+) {
+    let rows = chunk.len() / 2;
+    let mut acc = vec![F::ZERO; chunk.len()];
+    for g in 0..num_gates {
+        let low_base = g * quarter_rows * 2;
+        let miss_base = g * 6;
+        for r in 0..rows {
+            let i = row0 + r;
+            let coset = i & 3;
+            let sample = i >> 2;
+            let (sv0, sv1) = if coset == 0 {
+                let base = low_base + sample * 2;
+                (sampled[base], sampled[base + 1])
+            } else {
+                let off = coset - 1;
+                (
+                    missing[miss_base + off][sample],
+                    missing[miss_base + 3 + off][sample],
+                )
+            };
+            let filter = filter_at(g, r);
+            acc[2 * r] += filter * sv0;
+            acc[2 * r + 1] += filter * sv1;
+        }
+    }
+    chunk.copy_from_slice(&acc);
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn add_point_major_range_quotients<F: RichField>(left: Vec<F>, right: Vec<F>) -> Vec<F> {
+    debug_assert_eq!(left.len(), right.len());
+    left.into_par_iter()
+        .zip(right)
+        .map(|(a, b)| a + b)
+        .collect()
+}
+
 /// Standalone timing harness for the range/u32 quotient kernel variants on a
 /// quiet GPU (no proofs in flight): builds a random wires commitment of the
 /// circuit's shape through the production path (with even-row companion) and
@@ -1869,24 +2045,30 @@ pub fn range_quotient_microbench<
         let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, q, st, &alphas)?;
         match &jobs {
             RangeQuotientJobs::Whole(job) => { job.finish().ok()?; }
-            RangeQuotientJobs::Split { low, high, .. } => { low.finish().ok()?; if let Some(h) = high { h.finish().ok()?; } }
+            RangeQuotientJobs::Split { quarter, low, high, .. } => {
+                if let Some(q) = quarter { q.finish().ok()?; }
+                if let Some(l) = low { l.finish().ok()?; }
+                if let Some(h) = high { h.finish().ok()?; }
+            }
         }
         Some(t.elapsed().as_secs_f64() * 1e3)
     };
     time(&format!("production range job (split={}) full rows", range_quotient_split_enabled()), &|| run_whole(quotient_rows, step));
     // Split pieces individually + CPU extension.
-    if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high })) =
+    if let Some((_g, RangeQuotientJobs::Split { quarter, low, low_gates, low_rows, high, .. })) =
         start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)
     {
         let _ = (wires, even);
-        low.finish().ok();
+        if let Some(q) = &quarter { q.finish().ok(); }
+        if let Some(l) = &low { l.finish().ok(); }
         if let Some(h) = &high { h.finish().ok(); }
         time("  low job only (re-dispatched)", &|| {
             let t = std::time::Instant::now();
             let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)?;
-            if let RangeQuotientJobs::Split { low, .. } = &jobs { low.finish().ok()?; }
+            if let RangeQuotientJobs::Split { low: Some(low), .. } = &jobs { low.finish().ok()?; }
             Some(t.elapsed().as_secs_f64() * 1e3)
         });
+        let Some(low) = low else { return };
         let low_values = low.finish().unwrap();
         time("  CPU extension FFTs only (30 tasks)", &|| {
             let t = std::time::Instant::now();
@@ -2392,12 +2574,28 @@ fn start_gpu_range_check_gate_quotient<
             )
         };
         let split_constant_readers = even_constants.is_some();
+        let quarter_ok = range_quotient_quarter_enabled()
+            && quotient_rows % 4 == 0
+            && quotient_rows >= 8;
+        let mut quarter_groups = Vec::new();
+        let mut quarter_gates = Vec::new();
         let mut low_groups = Vec::new();
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
         let mut high_u32_specs = Vec::new();
         for (spec, &degree) in specs.iter().zip(&spec_degrees) {
-            if degree <= 4 {
+            if quarter_ok && degree <= 2 {
+                let mut alone = spec.clone();
+                alone.group = spec.gate_index..spec.gate_index + 1;
+                alone.include_unused_selector = false;
+                quarter_groups.push((vec![alone], Vec::new()));
+                quarter_gates.push(LowDegreeRangeGate {
+                    gate_index: spec.gate_index,
+                    selector_column: spec.selector_column,
+                    group: spec.group.clone(),
+                    include_unused_selector: spec.include_unused_selector,
+                });
+            } else if degree <= 4 {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2413,7 +2611,19 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && (split_constant_readers || !reads_constants(&spec.kind)) {
+            let compact = split_constant_readers || !reads_constants(&spec.kind);
+            if quarter_ok && degree <= 2 && compact {
+                let mut alone = spec.clone();
+                alone.group = spec.gate_index..spec.gate_index + 1;
+                alone.include_unused_selector = false;
+                quarter_groups.push((Vec::new(), vec![alone]));
+                quarter_gates.push(LowDegreeRangeGate {
+                    gate_index: spec.gate_index,
+                    selector_column: spec.selector_column,
+                    group: spec.group.clone(),
+                    include_unused_selector: spec.include_unused_selector,
+                });
+            } else if degree <= 4 && compact {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2428,16 +2638,53 @@ fn start_gpu_range_check_gate_quotient<
                 high_u32_specs.push(spec.clone());
             }
         }
-        if !low_groups.is_empty() {
-            if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
-                even_wires,
-                even_constants.unwrap_or(constants),
-                quotient_rows / 2,
-                1,
-                &low_groups,
-                alphas,
-                alpha_offset,
-            ) {
+        if gpu_poseidon_quotient_diagnostics_enabled() {
+            eprintln!(
+                "[gpu-range-quotient] partition quarter={} half={} high={} quarter_enabled={}",
+                quarter_groups.len(),
+                low_groups.len(),
+                high_specs.len() + high_u32_specs.len(),
+                quarter_ok,
+            );
+        }
+        if !low_groups.is_empty() || !quarter_groups.is_empty() {
+            let constants_src = even_constants.unwrap_or(constants);
+            // Submit the quarter-domain command first so its one-IFFT / three-FFT
+            // extension can overlap the following half/full GPU work.
+            let quarter = if quarter_groups.is_empty() {
+                None
+            } else {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                    even_wires,
+                    constants_src,
+                    quotient_rows / 4,
+                    2,
+                    &quarter_groups,
+                    alphas,
+                    alpha_offset,
+                )
+            };
+            if !quarter_groups.is_empty() && quarter.is_none() {
+                // Metal declined the stride-2 compact launch. Fold those gates
+                // back into the promoted half-domain path instead of dropping
+                // the whole split to the full-domain job.
+                low_groups.append(&mut quarter_groups);
+                low_gates.append(&mut quarter_gates);
+            }
+            let low = if low_groups.is_empty() {
+                None
+            } else {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                    even_wires,
+                    constants_src,
+                    quotient_rows / 2,
+                    1,
+                    &low_groups,
+                    alphas,
+                    alpha_offset,
+                )
+            };
+            if low.is_some() || (low_groups.is_empty() && quarter.is_some()) {
                 let high = if high_specs.is_empty() && high_u32_specs.is_empty() {
                     None
                 } else {
@@ -2454,6 +2701,9 @@ fn start_gpu_range_check_gate_quotient<
                 };
                 if high.is_some() || (high_specs.is_empty() && high_u32_specs.is_empty()) {
                     split_job = Some(RangeQuotientJobs::Split {
+                        quarter,
+                        quarter_gates,
+                        quarter_rows: quotient_rows / 4,
                         low,
                         low_gates,
                         low_rows: quotient_rows / 2,
@@ -2858,8 +3108,19 @@ fn compute_quotient_polys<
     // behind work the proof does anyway; its result is consumed after.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let low_extension = || -> core::result::Result<Option<Vec<F>>, String> {
-        if let Some((_, RangeQuotientJobs::Split { low, low_gates, low_rows, .. })) = &gpu_range {
-            let low_values = low.finish()?;
+        if let Some((
+            _,
+            RangeQuotientJobs::Split {
+                quarter,
+                quarter_gates,
+                quarter_rows,
+                low,
+                low_gates,
+                low_rows,
+                ..
+            },
+        )) = &gpu_range
+        {
             let constants = prover_data
                 .constants_sigmas_commitment
                 .merkle_tree
@@ -2867,14 +3128,39 @@ fn compute_quotient_polys<
                 .ok_or_else(|| "split range quotient requires Metal-backed constants".to_string())?;
             #[cfg(feature = "diagnostic_profile")]
             let _extend_span = crate::util::profile::span("quotient", "range_low_extend_combine");
-            Ok(Some(extend_and_combine_low_range_quotient(
-                low_values,
-                low_gates,
-                *low_rows,
-                points.len(),
-                constants,
-                &prover_data.low_range_selector_filter_cache,
-            )))
+            let extend_low = || -> core::result::Result<Option<Vec<F>>, String> {
+                let Some(low) = low else {
+                    return Ok(None);
+                };
+                let low_values = low.finish()?;
+                Ok(Some(extend_and_combine_low_range_quotient(
+                    low_values,
+                    low_gates,
+                    *low_rows,
+                    points.len(),
+                    constants,
+                    &prover_data.low_range_selector_filter_cache,
+                )))
+            };
+            let extend_quarter = || -> core::result::Result<Option<Vec<F>>, String> {
+                let Some(quarter) = quarter else {
+                    return Ok(None);
+                };
+                let quarter_values = quarter.finish()?;
+                Ok(Some(extend_and_combine_quarter_range_quotient(
+                    quarter_values,
+                    quarter_gates,
+                    *quarter_rows,
+                    points.len(),
+                    constants,
+                )))
+            };
+            let (low_out, quarter_out) = plonky2_maybe_rayon::join(extend_low, extend_quarter);
+            Ok(match (low_out?, quarter_out?) {
+                (Some(left), Some(right)) => Some(add_point_major_range_quotients(left, right)),
+                (Some(only), None) | (None, Some(only)) => Some(only),
+                (None, None) => None,
+            })
         } else {
             Ok(None)
         }
@@ -3253,10 +3539,36 @@ fn compute_quotient_polys<
                 debug_assert_eq!(values.len(), quotient_values.len());
                 Some(values)
             }
-            RangeQuotientJobs::Split { low, high, .. } => {
+            RangeQuotientJobs::Split { quarter, low, high, .. } => {
                 match low_extension_result {
                     Ok(values) => gpu_range_low_values = values,
-                    Err(error) => range_fallback!(low, error),
+                    Err(error) => {
+                        if let Some(job) = low.as_ref() {
+                            range_fallback!(job, error);
+                        } else if let Some(job) = quarter.as_ref() {
+                            range_fallback!(job, error);
+                        } else if let Some(job) = high.as_ref() {
+                            range_fallback!(job, error);
+                        } else {
+                            log::warn!(
+                                "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
+                            );
+                            return compute_quotient_polys(
+                                common_data,
+                                prover_data,
+                                public_inputs_hash,
+                                wires_commitment,
+                                zs_partial_products_and_lookup_commitment,
+                                betas,
+                                gammas,
+                                beta_k_is,
+                                deltas,
+                                alphas,
+                                col_major_perm,
+                                false,
+                            );
+                        }
+                    }
                 }
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 match high {
@@ -3859,6 +4171,44 @@ mod quotient_layout_tests {
         );
         assert!(!changed_dispatched, "cache crossed its circuit signature guard");
         assert_eq!(raw(&changed_cached), raw(&changed_reference));
+    }
+
+    /// Degree `< n` polynomials on a size-`4n` domain are uniquely determined
+    /// by every fourth sample. Recovering the other three cosets with one
+    /// IFFT and three `coset_fft(ω^r)` evaluations must match the original
+    /// evaluations on both the subgroup and a random coset.
+    #[test]
+    fn quarter_domain_ifft_fft_recovers_degree_lt_n_column() {
+        use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
+        use crate::util::log2_strict;
+
+        let n = 32usize;
+        let full = n * 4;
+        let omega = F::primitive_root_of_unity(log2_strict(full));
+        let mut coeffs = (0..n)
+            .map(|i| F::from_canonical_u64(i as u64 + 1))
+            .collect::<Vec<_>>();
+        coeffs.resize(full, F::ZERO);
+        let poly = PolynomialCoeffs::new(coeffs);
+
+        let check = |evals: &[F]| {
+            let samples: Vec<F> = (0..n).map(|k| evals[4 * k]).collect();
+            let recovered = PolynomialValues::new(samples).ifft();
+            for r in 1..4 {
+                let shift = omega.exp_u64(r as u64);
+                let got = recovered.coset_fft(shift).values;
+                for k in 0..n {
+                    assert_eq!(
+                        got[k],
+                        evals[4 * k + r],
+                        "coset r={r} sample k={k} mismatched"
+                    );
+                }
+            }
+        };
+
+        check(&poly.clone().fft().values);
+        check(&poly.coset_fft(F::from_canonical_u64(7)).values);
     }
 
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
