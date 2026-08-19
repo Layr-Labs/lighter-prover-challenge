@@ -1792,11 +1792,26 @@ kernel void poseidon2_hash_leaves_colmajor(
         return;
     }
 
+    // Only a trailing chunk can be partial, so peel the full-rate passes out
+    // of the runtime bound: their absorb loop then has a compile-time trip
+    // count and compile-time `state` indices. Identical reads in identical
+    // order; the trailing chunk keeps the shipped semantics of leaving the
+    // rate lanes it does not cover at their previous values, expressed with a
+    // uniform predicate rather than a dynamic index.
     ulong state[12] = { 0 };
-    for (uint offset = 0; offset < leaf_width; offset += 8) {
-        uint chunk_size = min(8u, leaf_width - offset);
-        for (uint i = 0; i < chunk_size; ++i) {
+    uint full = leaf_width & ~7u;
+    for (uint offset = 0; offset < full; offset += 8) {
+        for (uint i = 0; i < 8; ++i) {
             state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+        }
+        poseidon2(state, parameters);
+    }
+    uint tail = leaf_width - full;
+    if (tail != 0u) {
+        for (uint i = 0; i < 8; ++i) {
+            if (i < tail) {
+                state[i] = gl_canonicalize(leaves[(ulong)(full + i) * leaf_count + gid]);
+            }
         }
         poseidon2(state, parameters);
     }
@@ -1829,13 +1844,22 @@ kernel void poseidon2_hash_parents(
 }
 
 // One sponge absorption pass over a group of at most eight natural-order
-// columns, with the running 12-lane state parked in `state` between passes
+// columns, with the running sponge state parked in `state` between passes
 // (column-major: lane i of row gid at state[i * leaf_count + gid]). The
 // final pass writes the four-lane digests to `hashes` at the bit-reversed
 // row, exactly like poseidon2_hash_leaves_colmajor. Splitting the sponge by
 // column group lets the CPU compute group g+1's LDE columns while the GPU
 // absorbs group g; the arithmetic per pass is identical to the fused
 // kernel's corresponding loop iteration.
+//
+// Only the four capacity lanes are live across a pass boundary whenever the
+// next pass absorbs a full rate chunk, because plonky2's sponge overwrites
+// lanes 0..8 with input rather than adding into them. The host sets
+// `carry_rate` on the one pass (if any) whose successor absorbs a partial
+// chunk and therefore does read rate lanes this pass produced; everywhere
+// else the eight rate lanes are dead on arrival and are neither stored nor
+// reloaded. Every `st` index below is a compile-time constant on both paths,
+// so the array stays register-resident.
 kernel void poseidon2_absorb_pass(
     const device ulong* leaves [[buffer(0)]],
     device ulong* state [[buffer(1)]],
@@ -1847,18 +1871,32 @@ kernel void poseidon2_absorb_pass(
     constant uint& chunk_size [[buffer(7)]],
     constant uint& first_pass [[buffer(8)]],
     constant uint& final_pass [[buffer(9)]],
+    constant uint& carry_rate [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
     }
     ulong st[12] = { 0 };
     if (first_pass == 0u) {
-        for (uint i = 0; i < 12; ++i) {
+        if (chunk_size < 8u) {
+            for (uint i = 0; i < 8; ++i) {
+                st[i] = state[(ulong)i * leaf_count + gid];
+            }
+        }
+        for (uint i = 8; i < 12; ++i) {
             st[i] = state[(ulong)i * leaf_count + gid];
         }
     }
-    for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+    if (chunk_size == 8u) {
+        for (uint i = 0; i < 8; ++i) {
+            st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        }
+    } else {
+        for (uint i = 0; i < 8; ++i) {
+            if (i < chunk_size) {
+                st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+            }
+        }
     }
     poseidon2(st, parameters);
     if (final_pass != 0u) {
@@ -1870,7 +1908,12 @@ kernel void poseidon2_absorb_pass(
             output[i] = gl_canonicalize(st[i]);
         }
     } else {
-        for (uint i = 0; i < 12; ++i) {
+        if (carry_rate != 0u) {
+            for (uint i = 0; i < 8; ++i) {
+                state[(ulong)i * leaf_count + gid] = st[i];
+            }
+        }
+        for (uint i = 8; i < 12; ++i) {
             state[(ulong)i * leaf_count + gid] = st[i];
         }
     }
