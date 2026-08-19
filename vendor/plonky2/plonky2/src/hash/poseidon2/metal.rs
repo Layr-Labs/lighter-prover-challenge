@@ -151,6 +151,42 @@ const PIPELINE_ARCHIVE: &[u8] = include_bytes!("poseidon2-pipelines.metalarchive
 /// (its absence fails context construction anyway) and is built first.
 const ARCHIVE_PROBE_KERNEL: &str = "poseidon2_hash_leaves";
 
+/// Suffix appended to `poseidon2.metal` to form the absorb-x2 side library's
+/// translation unit. Same discipline as the mid8 library above: the frontier
+/// metallib and pipeline archive stay byte-identical, and this second library
+/// carries the batched-absorb kernels (x2/x4: two or four full eight-column
+/// groups per launch with the 12-lane state kept in registers between the
+/// permutations — the skipped interior state store/reload pairs are value
+/// identities, so the output is bit-identical to consecutive single passes).
+const ABSORB_X2_SHADER_SOURCE_SUFFIX: &str =
+    include_str!("poseidon2_absorb_x2_suffix.metal");
+
+/// `poseidon2.metal` + `poseidon2_absorb_x2_suffix.metal` precompiled to AIR.
+/// Regenerate whenever either source changes:
+///   cat poseidon2.metal poseidon2_absorb_x2_suffix.metal > side.metal
+///   xcrun -sdk macosx metal -c side.metal -o side.air
+///   xcrun -sdk macosx metallib side.air -o poseidon2-absorb-x2.metallib
+/// The `absorb_x2_metallib_matches_sources` test enforces it.
+const ABSORB_X2_SHADER_METALLIB: &[u8] = include_bytes!("poseidon2-absorb-x2.metallib");
+
+/// SHA-256 of the concatenated sources [`ABSORB_X2_SHADER_METALLIB`] was
+/// built from.
+const ABSORB_X2_SHADER_SOURCE_SHA256: &str =
+    "5a9ffc42547613609c170a7289c72e0d7f02c226059888710b289307f9797aeb";
+
+/// Kernel names exposed by the absorb-x2 side library.
+const ABSORB_X2_KERNEL: &str = "poseidon2_absorb_pass_x2";
+const ABSORB_X4_KERNEL: &str = "poseidon2_absorb_pass_x4";
+
+/// Prebuilt `MTLBinaryArchive` for the side library's two kernels, recorded on
+/// an Apple M4 Pro with `record_absorb_x2_archive`. Same contract as
+/// [`PIPELINE_ARCHIVE`]: a matching device/compiler build gets pipeline
+/// creation as a lookup; anywhere else every lookup misses
+/// (`FailOnBinaryArchiveMiss` inside `build_pipeline`) and the lowering
+/// proceeds exactly as before. Regenerate whenever the side metallib changes.
+const ABSORB_X2_PIPELINE_ARCHIVE: &[u8] =
+    include_bytes!("poseidon2-absorb-x2-pipelines.metalarchive");
+
 /// Directory the worker may write the staged pipeline archive into. Set once by
 /// the bench worker (its proof-output directory: the one path writable under the
 /// ranked Seatbelt profile) before the first GPU use; unset (tests, library
@@ -247,6 +283,25 @@ fn load_pipeline_archive(device: &Device) -> Option<BinaryArchive> {
             None
         }
     }
+}
+
+/// Stages and opens the absorb-x2 side library's archive, mirroring
+/// [`load_pipeline_archive`] under its own filename. Any failure yields
+/// `None` and the side pipelines lower from AIR exactly as before; no
+/// [`ARCHIVE_STATE`] reporting, since the startup self-report tracks the main
+/// library only.
+fn load_absorb_x2_archive(device: &Device) -> Option<BinaryArchive> {
+    let dir = PIPELINE_ARCHIVE_DIR.get()?;
+    let path = dir.join("poseidon2-absorb-x2-pipelines.metalarchive");
+    if !path.is_file() && std::fs::write(&path, ABSORB_X2_PIPELINE_ARCHIVE).is_err() {
+        return None;
+    }
+    let descriptor = BinaryArchiveDescriptor::new();
+    let url = URL::new_with_string(&format!("file://{}", path.display()));
+    descriptor.set_url(&url);
+    // Same autorelease note as `load_pipeline_archive`.
+    core::mem::forget(url);
+    device.new_binary_archive_with_descriptor(&descriptor).ok()
 }
 
 /// Creates one pipeline strictly out of `archive`, without letting Metal fall
@@ -1416,6 +1471,8 @@ static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_MID8_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB_X2_PIPELINE: LazyPipeline = LazyPipeline::new();
+static ABSORB_X4_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1437,6 +1494,26 @@ fn absorb_pass_mid8_pipeline() -> Option<&'static ComputePipelineState> {
     // Specialization is optional: arriving before its background lowering
     // completes retains the bit-identical generic interior dispatch.
     ABSORB_PASS_MID8_PIPELINE.try_get()
+}
+
+fn absorb_x2_pipeline() -> Option<&'static ComputePipelineState> {
+    // Non-blocking like the other optional absorbs: single passes (or mid8)
+    // serve bit-identically until the side lowering lands. Local A/B kill
+    // switch only; the ranked worker's environment is cleared.
+    if std::env::var_os("LIGHTER_DISABLE_ABSORB_X2").is_some() {
+        return None;
+    }
+    ABSORB_X2_PIPELINE.try_get()
+}
+
+fn absorb_x4_pipeline() -> Option<&'static ComputePipelineState> {
+    // Same contract; its own switch so local A/Bs can isolate quad batching.
+    if std::env::var_os("LIGHTER_DISABLE_ABSORB_X2").is_some()
+        || std::env::var_os("LIGHTER_DISABLE_ABSORB_X4").is_some()
+    {
+        return None;
+    }
+    ABSORB_X4_PIPELINE.try_get()
 }
 
 /// Starts the optional pipeline builds on detached threads.
@@ -1497,6 +1574,69 @@ fn spawn_optional_pipelines(
     // no binary-archive entry. Lower it after the frontier pipelines have been
     // launched; until it lands, `try_get` routes interior passes through the
     // already-ready generic pipeline.
+    let absorb_x2_device = device.clone();
+    // The batched-absorb kernels (x2/x4) live in their own side library
+    // (`ABSORB_X2_SHADER_METALLIB`), same discipline as the mid8 library:
+    // frontier artifacts stay byte-identical, the lowering runs detached, and
+    // callers use `try_get` with the single-pass/mid8 kernels as bit-identical
+    // fallbacks until it lands. Its own recorded archive removes the lowering
+    // outright on a matching device/compiler build; a foreign archive misses
+    // per kernel and the lowering proceeds as before.
+    {
+        let device = absorb_x2_device;
+        let spawned = std::thread::Builder::new()
+            .name("poseidon2-metal-absorb-x2".into())
+            .spawn(move || {
+                let (x2, x4) = autoreleasepool(|| {
+                    let library = device
+                        .new_library_with_data(ABSORB_X2_SHADER_METALLIB)
+                        .ok()
+                        .filter(|library| {
+                            library.get_function(ABSORB_X2_KERNEL, None).is_ok()
+                                && library.get_function(ABSORB_X4_KERNEL, None).is_ok()
+                        });
+                    match library {
+                        Some(library) => {
+                            let archive = load_absorb_x2_archive(&device);
+                            (
+                                build_pipeline(
+                                    &device,
+                                    &library,
+                                    archive.as_ref(),
+                                    ABSORB_X2_KERNEL,
+                                )
+                                .ok(),
+                                build_pipeline(
+                                    &device,
+                                    &library,
+                                    archive.as_ref(),
+                                    ABSORB_X4_KERNEL,
+                                )
+                                .ok(),
+                            )
+                        }
+                        None => (None, None),
+                    }
+                });
+                if x2.is_none() {
+                    log::debug!("absorb-x2 pipeline unavailable; using single-pass absorbs");
+                }
+                let _ = ABSORB_X2_PIPELINE.built.set(x2);
+                let _ = ABSORB_X4_PIPELINE.built.set(x4);
+            });
+        match spawned {
+            Ok(handle) => {
+                if let Ok(mut builder) = ABSORB_X2_PIPELINE.builder.lock() {
+                    *builder = Some(handle);
+                }
+            }
+            Err(_) => {
+                let _ = ABSORB_X2_PIPELINE.built.set(None);
+                let _ = ABSORB_X4_PIPELINE.built.set(None);
+            }
+        }
+    }
+
     let Some(library) = mid8_library.cloned() else {
         let _ = ABSORB_PASS_MID8_PIPELINE.built.set(None);
         return;
@@ -1523,6 +1663,7 @@ fn spawn_optional_pipelines(
             let _ = ABSORB_PASS_MID8_PIPELINE.built.set(None);
         }
     }
+
 }
 
 static CONTEXT: LazyLock<Result<MetalShared, String>> = LazyLock::new(MetalShared::new);
@@ -2583,7 +2724,55 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
     let job = GpuJobGuard::begin();
-    let mut buffers = STREAMED_BUFFERS.lock().ok()?;
+    let groups = leaf_width.div_ceil(8);
+    // Captured as an address so `run_fill` is Send + Sync and batches of
+    // groups can fill in parallel below; the disjointness argument in
+    // `run_fill`'s SAFETY note is unchanged by who calls it.
+    let base_addr = columns.buffer.contents() as usize;
+    // The CPU fill writes only this proof's own retained column store; it
+    // needs nothing from the shared streamed pair. Waiting for the pair used
+    // to be dead time — the whole build, fills included, sat behind the
+    // holder's mutex. Each retry that finds the pair still held now fills one
+    // more group instead, so by acquisition time part or all of the LDE is
+    // already in place and the absorb passes commit back-to-back over it.
+    // GPU submission order is unchanged (this build's passes still all commit
+    // after the holder's), so this only converts the waiter's blocking into
+    // its own work.
+    //
+    // SAFETY: each slice covers a disjoint `leaf_count` range of this
+    // proof's shared buffer, and no GPU pass of this build exists yet when a
+    // group is pre-filled.
+    let run_fill = |group: usize| {
+        let base = base_addr as *mut F;
+        let col_start = group * 8;
+        let chunk = (leaf_width - col_start).min(8);
+        let mut slices: Vec<&mut [F]> = (0..chunk)
+            .map(|k| unsafe {
+                slice::from_raw_parts_mut(
+                    base.add((col_start + k) * leaf_count).cast::<F>(),
+                    leaf_count,
+                )
+            })
+            .collect();
+        fill_group(group, &mut slices);
+    };
+    let mut prefilled = 0usize;
+    let mut buffers = loop {
+        match STREAMED_BUFFERS.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if prefilled < groups {
+                    run_fill(prefilled);
+                    prefilled += 1;
+                } else {
+                    // Everything is filled; park exactly like the previous
+                    // unconditional lock did.
+                    break STREAMED_BUFFERS.lock().ok()?;
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
+        }
+    };
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
         state.length() < state_bytes as u64 || output.length() < output_bytes as u64
     });
@@ -2603,39 +2792,87 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
-    let groups = leaf_width.div_ceil(8);
-    let base = columns.buffer.contents().cast::<F>();
+    // Group-wise fill + absorb. The CPU fill of the next batch overlaps the
+    // GPU's absorption of the previous one: commands on one queue execute in
+    // submission order. Batches prefer the largest kernel whose groups are
+    // all full eight columns (x4, then x2 — the 12-lane state stays in
+    // registers between their permutations, removing interior state round
+    // trips and launches; measured at the fused kernel's per-group floor),
+    // then the mid8 single-group specialization for unpaired interiors, then
+    // the generic pass. Groups below `prefilled` were already filled while
+    // waiting for the streamed pair.
+    let x2 = absorb_x2_pipeline();
+    let x4 = absorb_x4_pipeline();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
+    let mut group = 0usize;
+    while group < groups {
+        let cols_left = leaf_width - group * 8;
+        let batch_pipeline = if group + 3 < groups && cols_left >= 32 && x4.is_some() {
+            x4.map(|pipeline| (pipeline, 4usize))
+        } else if group + 1 < groups && cols_left >= 16 && x2.is_some() {
+            x2.map(|pipeline| (pipeline, 2usize))
+        } else {
+            None
+        };
+        let batch = batch_pipeline.map_or(1, |(_, size)| size);
+        let paired = batch > 1;
+        let last_in_buffer = group + batch - 1;
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
-        let middle_pipeline = (group != 0 && group + 1 != groups && chunk == 8)
+        let middle_pipeline = (!paired && group != 0 && group + 1 != groups && chunk == 8)
             .then_some(mid8_pipeline)
             .flatten();
-        {
-            // SAFETY: each column slice covers a disjoint `leaf_count` range
-            // of the shared buffer; the GPU only reads columns of groups
-            // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
-                .map(|k| unsafe {
-                    slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
-                        leaf_count,
-                    )
-                })
-                .collect();
-            fill_group(group, &mut slices);
+        // SAFETY: each column slice covers a disjoint `leaf_count` range of
+        // the shared buffer; the GPU only reads columns of groups whose pass
+        // was already committed, after their fill completed. Groups in a
+        // batch fill in parallel (each fill is internally an eight-way column
+        // par_iter, so a quad batch widens to 32 columns — the exclusive
+        // phases have the idle cores for it; elsewhere the global rayon pool
+        // arbitrates by work-stealing exactly as for the nested fills).
+        let first_unfilled = group.max(prefilled);
+        if first_unfilled <= last_in_buffer {
+            (first_unfilled..=last_in_buffer)
+                .collect::<Vec<_>>()
+                .par_iter()
+                .for_each(|&g| run_fill(g));
         }
+        // Bound the committed-but-unexecuted backlog. The CPU fill outruns
+        // the GPU absorb, so an uncapped loop leaves an ever-deeper queue of
+        // committed passes that every other command buffer — most critically
+        // the strictly serial chain spine's 2^17 fold trees — must sit
+        // behind on the single FIFO queue. Singles keep two buffers in
+        // flight (the queue never runs dry: buffer n-1 is always committed
+        // before n-2 retires); batched buffers hold 2-4x the work and pace
+        // at depth one, keeping an interloper's worst wait near two single
+        // passes either way. This build's own GPU completion time is
+        // unchanged; only the final wait below shrinks. Unconditional on
+        // purpose: a backlog-conditioned variant would be state-triggered
+        // scheduling, the class with a documented ranked portability
+        // failure.
+        let depth = if paired { 1 } else { 2 };
+        if absorb_commands.len() >= depth {
+            absorb_commands[absorb_commands.len() - depth].wait_until_completed();
+        }
+        let is_final = last_in_buffer == groups - 1;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            if let Some(middle_pipeline) = middle_pipeline {
+            if let Some((batch_pipeline, _)) = batch_pipeline {
+                encoder.set_compute_pipeline_state(batch_pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, (group == 0) as u32);
+                set_u32(encoder, 8, is_final as u32);
+                dispatch(encoder, batch_pipeline, leaf_count);
+            } else if let Some(middle_pipeline) = middle_pipeline {
                 encoder.set_compute_pipeline_state(middle_pipeline);
                 encoder.set_buffer(0, Some(&columns.buffer), 0);
                 encoder.set_buffer(1, Some(state_buffer), 0);
@@ -2665,7 +2902,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // second command buffer with one encoder per level. Identical
             // shaders, dispatch counts and buffer offsets; strictly fewer
             // command buffers and encoders.
-            if group == groups - 1 {
+            if is_final {
                 let mut level_offset = 0usize;
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
@@ -2704,11 +2941,20 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             }
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+            profile_command_buffer(
+                command_buffer,
+                match batch {
+                    4 => "merkle_absorb_x4",
+                    2 => "merkle_absorb_x2",
+                    _ => "merkle_absorb",
+                },
+                (leaf_count * if paired { batch * 8 } else { chunk }) as u64,
+            );
             command_buffer.commit();
             command_buffer.to_owned()
         });
         absorb_commands.push(command_buffer);
+        group = last_in_buffer + 1;
     }
 
     let all_ok = absorb_commands.iter().all(|command_buffer| {
@@ -4789,6 +5035,89 @@ mod tests {
             started.elapsed()
         );
     }
+
+    /// Pin discipline for the absorb-x2 side library: its translation unit is
+    /// the concatenation of `poseidon2.metal` and
+    /// `poseidon2_absorb_x2_suffix.metal`, so a change to either without a
+    /// regenerated `poseidon2-absorb-x2.metallib` fails here instead of
+    /// silently shipping a stale AIR (whose function probe would then quietly
+    /// disable batching).
+    #[test]
+    fn absorb_x2_metallib_matches_sources() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!(
+                    "cat '{dir}/poseidon2.metal' '{dir}/poseidon2_absorb_x2_suffix.metal' \
+                     | /usr/bin/shasum -a 256"
+                ),
+            ])
+            .output()
+            .expect("shasum must be available to verify the absorb-x2 metallib is current");
+        assert!(output.status.success(), "shasum failed");
+        let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        assert_eq!(
+            digest, ABSORB_X2_SHADER_SOURCE_SHA256,
+            "the absorb-x2 shader sources changed but poseidon2-absorb-x2.metallib was \
+             not regenerated; rebuild it (see ABSORB_X2_SHADER_METALLIB) and update \
+             ABSORB_X2_SHADER_SOURCE_SHA256 to {digest}."
+        );
+    }
+
+    /// The committed absorb-x2 side library must load and expose both kernels;
+    /// otherwise the side build silently reports the pipelines absent and every
+    /// streamed pass stays unbatched.
+    #[test]
+    fn absorb_x2_metallib_loads_and_exposes_kernels() {
+        let device = Device::system_default().expect("no Metal device");
+        let library = device
+            .new_library_with_data(ABSORB_X2_SHADER_METALLIB)
+            .expect("prebuilt absorb-x2 metallib must load");
+        library
+            .get_function(ABSORB_X2_KERNEL, None)
+            .expect("absorb-x2 kernel missing from its metallib");
+        library
+            .get_function(ABSORB_X4_KERNEL, None)
+            .expect("absorb-x4 kernel missing from its metallib");
+    }
+
+    /// Records the absorb-x2 side library's two pipelines into its own binary
+    /// archive, exactly like `record_pipeline_archive` does for the main
+    /// library. Run manually (`--ignored`) on the target device class after
+    /// every side-metallib rebuild; a stale or foreign archive just misses and
+    /// the lowering falls back to MTLCompilerService as before.
+    #[test]
+    #[ignore = "regenerates poseidon2-absorb-x2-pipelines.metalarchive; run explicitly"]
+    fn record_absorb_x2_archive() {
+        let device = Device::system_default().expect("recording requires a Metal device");
+        let library = device
+            .new_library_with_data(ABSORB_X2_SHADER_METALLIB)
+            .expect("prebuilt absorb-x2 metallib must load");
+        let descriptor = BinaryArchiveDescriptor::new();
+        let archive = device
+            .new_binary_archive_with_descriptor(&descriptor)
+            .expect("new archive");
+        for name in [ABSORB_X2_KERNEL, ABSORB_X4_KERNEL] {
+            let function = library.get_function(name, None).expect(name);
+            let pipeline_descriptor = ComputePipelineDescriptor::new();
+            pipeline_descriptor.set_compute_function(Some(&function));
+            archive
+                .add_compute_pipeline_functions_with_descriptor(&pipeline_descriptor)
+                .unwrap_or_else(|error| panic!("recording {name} failed: {error}"));
+        }
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/hash/poseidon2/poseidon2-absorb-x2-pipelines.metalarchive"
+        );
+        let url = URL::new_with_string(&format!("file://{path}"));
+        archive.serialize_to_url(&url).expect("serialize archive");
+        // See `load_pipeline_archive`: `URLWithString:` is autoreleased; the
+        // owned wrapper's drop would over-release it.
+        core::mem::forget(url);
+    }
+
 
     /// Regenerates `poseidon2-pipelines.metalarchive` from the committed
     /// metallib on this machine. Run after any `poseidon2.metal`/metallib

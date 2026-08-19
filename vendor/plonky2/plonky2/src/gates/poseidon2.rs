@@ -996,7 +996,7 @@ mod tests {
         let n = 32; // several 4-lane packed groups; covers leftovers too
         let wires = F::rand_vec(gate.num_wires() * n);
         let public_inputs_hash = HashOut::rand();
-        let vars_batch = EvaluationVarsBaseBatch::new(
+        let vars_batch = crate::plonk::vars::EvaluationVarsBaseBatch::new(
             n,
             &[],
             &wires,
@@ -1019,7 +1019,7 @@ mod tests {
 
     fn scalar_fused_accumulate<F: RichField + Extendable<D> + Poseidon2, const D: usize>(
     gate: &Poseidon2Gate<F, D>,
-    vars_base: EvaluationVarsBaseBatch<F>,
+    vars_base: crate::plonk::vars::EvaluationVarsBaseBatch<F>,
     filters: &[F],
     combined_gate_constraints: &mut [F],
 ) {

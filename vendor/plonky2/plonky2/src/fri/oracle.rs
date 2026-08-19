@@ -1447,7 +1447,7 @@ mod tests {
     /// the sabotage control: one limb of the reference is perturbed and the
     /// differential must fail.
     #[test]
-    fn base_scalar_mul_matches_embedded_extension_mul_raw_words() {
+    fn base_scalar_mul_matches_embedded_extension_mul_raw_words_sampled() {
         use crate::field::extension::FieldExtension;
         use crate::field::types::{Field64, PrimeField64, Sample};
 
