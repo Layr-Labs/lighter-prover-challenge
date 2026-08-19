@@ -11,6 +11,8 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -130,55 +132,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
         }
     }
 
-    /// Contiguous-column fused evaluation: reads each wire as a contiguous
-    /// `n`-point column, evaluates one accumulator step at a time and
-    /// multiply-adds the filtered constraint rows straight into the shared
-    /// buffer, avoiding the per-point strided writes and per-point `Vec`
-    /// allocations of the default path.
+    /// Dispatcher: width-divisible D=2 batches take the packed lane
+    /// path, everything else falls back to the verbatim scalar oracle.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
-        let n = vars_base.len();
-        assert_eq!(filters.len(), n);
-        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
-
-        let wires = vars_base.local_wires;
-        let ext = |start: usize, p: usize| {
-            let mut arr = [F::ZERO; D];
-            for (d, a) in arr.iter_mut().enumerate() {
-                *a = wires[(start + d) * n + p];
-            }
-            F::Extension::from_basefield_array(arr)
-        };
-
-        let alphas: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
-        let mut accs: Vec<F::Extension> = (0..n)
-            .map(|p| ext(Self::wires_old_acc().start, p))
-            .collect();
-
-        let mut scratch = vec![F::ZERO; D * n];
-        for i in 0..self.num_coeffs {
-            let coeff_start = Self::wires_coeff(i).start;
-            let acc_start = self.wires_accs(i).start;
-            for p in 0..n {
-                let next_acc = ext(acc_start, p);
-                let constraint = accs[p] * alphas[p] + ext(coeff_start, p) - next_acc;
-                let arr = constraint.to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
-                }
-                accs[p] = next_acc;
-            }
-            for d in 0..D {
-                batch_multiply_add_inplace(
-                    &mut combined_gate_constraints[(i * D + d) * n..][..n],
-                    &scratch[d * n..][..n],
-                    filters,
-                );
-            }
+        let width = <F as Packable>::Packing::WIDTH;
+        if D == 2 && vars_base.len() % width == 0 {
+            self.eval_accumulate_packed(vars_base, filters, combined_gate_constraints);
+        } else {
+            self.eval_accumulate_scalar(vars_base, filters, combined_gate_constraints);
         }
     }
 
@@ -236,6 +202,118 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
 
     fn num_constraints(&self) -> usize {
         D * self.num_coeffs
+    }
+}
+
+impl<const D: usize> ReducingExtensionGate<D> {
+    /// Verbatim scalar body — differential oracle for the packed path.
+    fn eval_accumulate_scalar<F: RichField + Extendable<D> + Packable>(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+        let wires = vars_base.local_wires;
+        let ext = |start: usize, p: usize| {
+            let mut arr = [F::ZERO; D];
+            for (d, a) in arr.iter_mut().enumerate() {
+                *a = wires[(start + d) * n + p];
+            }
+            F::Extension::from_basefield_array(arr)
+        };
+        let alphas: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
+        let mut accs: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_old_acc().start, p)).collect();
+        let mut scratch = vec![F::ZERO; D * n];
+        for i in 0..self.num_coeffs {
+            let coeff_start = Self::wires_coeff(i).start;
+            let acc_start = self.wires_accs(i).start;
+            for p in 0..n {
+                let next_acc = ext(acc_start, p);
+                let constraint = accs[p] * alphas[p] + ext(coeff_start, p) - next_acc;
+                let arr = constraint.to_basefield_array();
+                for (d, a) in arr.iter().enumerate() {
+                    scratch[d * n + p] = *a;
+                }
+                accs[p] = next_acc;
+            }
+            for d in 0..D {
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * D + d) * n..][..n],
+                    &scratch[d * n..][..n],
+                    filters,
+                );
+            }
+        }
+    }
+
+    /// Packed-lane accumulate for D=2 production batches (n % WIDTH == 0, WIDTH=4 on aarch64).
+    fn eval_accumulate_packed<F: RichField + Extendable<D> + Packable>(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        debug_assert_eq!(D, 2);
+        let n = vars_base.len();
+        let width = <F as Packable>::Packing::WIDTH;
+        debug_assert_eq!(n % width, 0);
+        let num_groups = n / width;
+        let wires = vars_base.local_wires;
+        let w = <F as Extendable<D>>::W;
+        let packing = <F as Packable>::Packing::from_slice;
+        // per-group packed carries
+        let mut acc0: Vec<F::Packing> = Vec::with_capacity(num_groups);
+        let mut acc1: Vec<F::Packing> = Vec::with_capacity(num_groups);
+        let mut alpha0: Vec<F::Packing> = Vec::with_capacity(num_groups);
+        let mut alpha1: Vec<F::Packing> = Vec::with_capacity(num_groups);
+        let old_acc_start = Self::wires_old_acc().start;
+        let alpha_start = Self::wires_alpha().start;
+        for g in 0..num_groups {
+            let off = g * width;
+            acc0.push(*packing(&wires[old_acc_start * n + off..][..width]));
+            acc1.push(*packing(&wires[(old_acc_start + 1) * n + off..][..width]));
+            alpha0.push(*packing(&wires[alpha_start * n + off..][..width]));
+            alpha1.push(*packing(&wires[(alpha_start + 1) * n + off..][..width]));
+        }
+        use core::mem::MaybeUninit;
+        const STACK_SCRATCH: usize = 32;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let scratch_len = 2 * width;
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
+            unsafe { core::slice::from_raw_parts_mut(scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(), scratch_len) }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
+        for i in 0..self.num_coeffs {
+            let coeff_start = Self::wires_coeff(i).start;
+            let acc_start = self.wires_accs(i).start;
+            for g in 0..num_groups {
+                let off = g * width;
+                let c0 = *packing(&wires[coeff_start * n + off..][..width]);
+                let c1 = *packing(&wires[(coeff_start + 1) * n + off..][..width]);
+                let n0 = *packing(&wires[acc_start * n + off..][..width]);
+                let n1 = *packing(&wires[(acc_start + 1) * n + off..][..width]);
+                let cur0 = acc0[g];
+                let cur1 = acc1[g];
+                let al0 = alpha0[g];
+                let al1 = alpha1[g];
+                let prod0 = cur0 * al0 + (cur1 * al1) * w;
+                let prod1 = cur0 * al1 + cur1 * al0;
+                let term0 = (prod0 + c0) - n0;
+                let term1 = (prod1 + c1) - n1;
+                scratch[..width].copy_from_slice(term0.as_slice());
+                scratch[width..2*width].copy_from_slice(term1.as_slice());
+                acc0[g] = n0;
+                acc1[g] = n1;
+                batch_multiply_add_inplace(&mut combined_gate_constraints[(i * 2) * n + off..][..width], &scratch[..width], &filters[off..off+width]);
+                batch_multiply_add_inplace(&mut combined_gate_constraints[(i * 2 + 1) * n + off..][..width], &scratch[width..2*width], &filters[off..off+width]);
+            }
+        }
     }
 }
 
@@ -319,5 +397,46 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(ReducingExtensionGate::new(22))
+    }
+
+    #[test]
+    fn packed_accumulate_matches_scalar_across_batch_sizes() {
+        use crate::field::packable::Packable;
+        use crate::field::packed::PackedField;
+        use crate::field::types::{Field, Field64, PrimeField64};
+        use crate::gates::gate::Gate;
+        use crate::hash::hash_types::HashOut;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = ReducingExtensionGate::<D>::new(22);
+        fn value(i: usize) -> F {
+            let small = ((i as u64).wrapping_mul(0x9e37_79b9) ^ 0x5a5a_a5a5) & 0xffff;
+            if i % 3 == 0 { GoldilocksField(F::ORDER + small) } else { F::from_canonical_u64(small) }
+        }
+        let packing_width = <<F as Packable>::Packing as PackedField>::WIDTH;
+        let mut batch_sizes = vec![1,3,5,7,11,31,32,33, packing_width.saturating_sub(1).max(1), packing_width, packing_width+1, packing_width+2, 2*packing_width-1, 2*packing_width, 2*packing_width+1];
+        batch_sizes.extend((0..packing_width).map(|r| packing_width + r));
+        batch_sizes.extend((0..packing_width).map(|r| 2*packing_width + r));
+        batch_sizes.sort_unstable(); batch_sizes.dedup();
+        for &n in &batch_sizes {
+            let num_wires = <ReducingExtensionGate<D> as Gate<F, D>>::num_wires(&gate);
+            let num_constraints = <ReducingExtensionGate<D> as Gate<F, D>>::num_constraints(&gate);
+            let wires = (0..num_wires*n).map(|i| value(i+1)).collect::<Vec<_>>();
+            let filters = (0..n).map(|i| match i%7 {0=>F::ZERO, 1=>GoldilocksField(F::ORDER), _=>value(i+20001)}).collect::<Vec<_>>();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &hash);
+            let initial = (0..num_constraints*n).map(|i| match i%11 {0=>F::ZERO, 1=>GoldilocksField(F::ORDER), _=>value(i+30001)}).collect::<Vec<_>>();
+            let mut expected = initial.clone();
+            gate.eval_accumulate_scalar(vars, &filters, &mut expected);
+            let mut actual = initial;
+            {
+                let vars2 = EvaluationVarsBaseBatch::new(n, &[], &wires, &hash);
+                gate.eval_unfiltered_base_batch_accumulate(vars2, &filters, &mut actual);
+            }
+            for (i, (&e,&a)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(a.to_canonical_u64(), e.to_canonical_u64(), "n={n} idx={i}");
+            }
+        }
     }
 }
