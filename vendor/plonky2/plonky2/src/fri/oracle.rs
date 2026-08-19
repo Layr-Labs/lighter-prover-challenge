@@ -49,6 +49,13 @@ pub(crate) enum BatchLayout {
     PolyMajor,
 }
 
+/// Prepare a reused output buffer for direct append without materializing
+/// placeholder values that the caller would immediately overwrite.
+fn prepare_contiguous_output<T>(out: &mut Vec<T>, target_len: usize) {
+    out.clear();
+    out.reserve(target_len);
+}
+
 /// Optional compact copy of the even LDE rows of a column-major commitment
 /// (row `k` of the companion is row `2k` of the commitment), retained in a
 /// shared Metal buffer so the half-domain quotient kernels read contiguous
@@ -688,19 +695,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) {
         let start = col_range.start;
         let w = col_range.len();
-        out.resize(n * w, F::ZERO);
 
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 let index_end = index_start
                     .checked_add(n)
                     .expect("contiguous LDE batch range overflow");
-                for (ci, c) in col_range.enumerate() {
-                    out[ci * n..(ci + 1) * n]
-                        .copy_from_slice(&columns.col(c)[index_start..index_end]);
+                prepare_contiguous_output(out, n * w);
+                for c in col_range {
+                    out.extend_from_slice(&columns.col(c)[index_start..index_end]);
                 }
             }
             MerkleLeaves::Rows { .. } => {
+                out.resize(n * w, F::ZERO);
                 for k in 0..n {
                     let row = &self.get_lde_values(index_start + k, 1)[start..start + w];
                     for (ci, &value) in row.iter().enumerate() {
@@ -1181,6 +1188,17 @@ fn accumulate_linear_quotient<F: Field>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepare_contiguous_output_clears_and_reserves() {
+        let mut output = vec![0xdead_beef_u64; 3];
+        output.shrink_to_fit();
+
+        prepare_contiguous_output(&mut output, 64);
+
+        assert!(output.is_empty());
+        assert!(output.capacity() >= 64);
+    }
+
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
