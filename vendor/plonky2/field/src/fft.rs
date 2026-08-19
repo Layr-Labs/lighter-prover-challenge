@@ -1046,10 +1046,11 @@ fn fft_classic_simd_single_layer_neon_ext(
     const W: u64 = 7;
     let half = 1usize << lg_half_m;
     let m = half << 1;
-    debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    // `omega_row` is `base.powers()` from `fft_root_table` (`take(half.max(2))`).
+    // The Goldilocks base subfield is a field, so the whole row is base-subfield
+    // iff `omega_row[1]` (the generator) is.
+    debug_assert!(omega_row.len() >= half.max(2));
+    let base_subfield = omega_row[1].0[1].0 == 0;
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
@@ -3803,6 +3804,28 @@ mod tests {
             [actual.0[0].0, actual.0[1].0],
             [expected.0[0].0, expected.0[1].0]
         );
+    }
+
+    #[test]
+    fn fft_root_table_base_subfield_row_equals_omega_at_one() {
+        type FE = QuadraticExtension<GoldilocksField>;
+        for lg_n in 2..=16 {
+            let n = 1 << lg_n;
+            let table = fft_root_table::<FE>(n);
+            for (lg_half_m, row) in table.iter().enumerate() {
+                let half = 1usize << lg_half_m;
+                assert!(
+                    row.len() >= half.max(2),
+                    "lg_n={lg_n} lg_half_m={lg_half_m}"
+                );
+                let scan = row[..half].iter().all(|w| w.0[1].0 == 0);
+                let short = row[1].0[1].0 == 0;
+                assert_eq!(
+                    scan, short,
+                    "lg_n={lg_n} lg_half_m={lg_half_m} half={half}"
+                );
+            }
+        }
     }
 
     #[test]
