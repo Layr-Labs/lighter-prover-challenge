@@ -605,10 +605,21 @@ impl Poseidon2 for F {
 
     #[inline]
     fn sbox_p(a: &Self) -> Self {
-        let a2 = a.square();
-        let a4 = a2.square();
-        let a3 = *a * a2;
-        a3 * a4
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        {
+            let x = a.0;
+            let (x2, _) = crate::field::goldilocks_field::mul_reduce_pair(x, x, 1, 1);
+            let (x3, x4) = crate::field::goldilocks_field::mul_reduce_pair(x, x2, x2, x2);
+            let (x7, _) = crate::field::goldilocks_field::mul_reduce_pair(x3, x4, 1, 1);
+            Self(x7)
+        }
+        #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+        {
+            let a2 = a.square();
+            let a4 = a2.square();
+            let a3 = *a * a2;
+            a3 * a4
+        }
     }
 
     #[inline]

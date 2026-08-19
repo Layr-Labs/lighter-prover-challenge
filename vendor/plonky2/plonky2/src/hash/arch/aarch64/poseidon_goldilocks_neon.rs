@@ -7,7 +7,7 @@ use core::mem::transmute;
 use static_assertions::const_assert;
 use unroll::unroll_for_loops;
 
-use crate::field::goldilocks_field::GoldilocksField;
+use crate::field::goldilocks_field::{mul_reduce_pair, GoldilocksField};
 use crate::hash::poseidon::Poseidon;
 use crate::util::branch_hint;
 
@@ -135,30 +135,49 @@ unsafe fn multiply(x: u64, y: u64) -> u64 {
 // ========================================== FULL ROUNDS ==========================================
 
 /// Full S-box.
+///
+/// Algebraic waves are unchanged (`x²`, then independent `x³`/`x⁴`, then `x⁷`).
+/// Adjacent lanes inside each wave go through [`mul_reduce_pair`] so AArch64 can
+/// hide `mul`/`umulh` latency. Output limbs are raw-`u64` identical to twelve
+/// scalar [`multiply`] calls.
 #[inline(always)]
 #[unroll_for_loops]
 unsafe fn sbox_layer_full(state: [u64; WIDTH]) -> [u64; WIDTH] {
-    // This is done in scalar. S-boxes in vector are only slightly slower throughput-wise but have
+    // Vector S-boxes are only slightly slower throughput-wise but have
     // an insane latency (~100 cycles) on the M1.
 
     let mut state2 = [0u64; WIDTH];
     assert!(WIDTH == 12);
-    for i in 0..12 {
-        state2[i] = multiply(state[i], state[i]);
+    for i in 0..6 {
+        let i0 = i * 2;
+        let i1 = i0 + 1;
+        let (x0, x1) = mul_reduce_pair(state[i0], state[i0], state[i1], state[i1]);
+        state2[i0] = x0;
+        state2[i1] = x1;
     }
 
     let mut state3 = [0u64; WIDTH];
     let mut state4 = [0u64; WIDTH];
     assert!(WIDTH == 12);
-    for i in 0..12 {
-        state3[i] = multiply(state[i], state2[i]);
-        state4[i] = multiply(state2[i], state2[i]);
+    for i in 0..6 {
+        let i0 = i * 2;
+        let i1 = i0 + 1;
+        let (x0, x1) = mul_reduce_pair(state[i0], state2[i0], state[i1], state2[i1]);
+        state3[i0] = x0;
+        state3[i1] = x1;
+        let (y0, y1) = mul_reduce_pair(state2[i0], state2[i0], state2[i1], state2[i1]);
+        state4[i0] = y0;
+        state4[i1] = y1;
     }
 
     let mut state7 = [0u64; WIDTH];
     assert!(WIDTH == 12);
-    for i in 0..12 {
-        state7[i] = multiply(state3[i], state4[i]);
+    for i in 0..6 {
+        let i0 = i * 2;
+        let i1 = i0 + 1;
+        let (x0, x1) = mul_reduce_pair(state3[i0], state4[i0], state3[i1], state4[i1]);
+        state7[i0] = x0;
+        state7[i1] = x1;
     }
 
     state7
@@ -939,4 +958,93 @@ pub unsafe fn vector_add(a: &[u64; WIDTH], b: &[u64; WIDTH]) -> [u64; WIDTH] {
         vst1q_u64(res[i..].as_mut_ptr(), result);
     }
     res
+}
+
+#[cfg(test)]
+mod sbox_pair_tests {
+    use super::{multiply, sbox_layer_full, WIDTH};
+    use crate::field::goldilocks_field::{mul_reduce_pair, GoldilocksField};
+    use crate::field::ops::Square;
+    use crate::field::types::Field64;
+    use crate::hash::poseidon2::hash::Poseidon2;
+
+    fn cases() -> [u64; 12] {
+        [
+            0,
+            1,
+            2,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u32::MAX as u64,
+            1u64 << 32,
+            (1u64 << 32) + 1,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+            9_087_029_921_428_221_768,
+        ]
+    }
+
+    unsafe fn sbox_layer_full_scalar(state: [u64; WIDTH]) -> [u64; WIDTH] {
+        let mut state2 = [0u64; WIDTH];
+        for i in 0..12 {
+            state2[i] = multiply(state[i], state[i]);
+        }
+        let mut state3 = [0u64; WIDTH];
+        let mut state4 = [0u64; WIDTH];
+        for i in 0..12 {
+            state3[i] = multiply(state[i], state2[i]);
+            state4[i] = multiply(state2[i], state2[i]);
+        }
+        let mut state7 = [0u64; WIDTH];
+        for i in 0..12 {
+            state7[i] = multiply(state3[i], state4[i]);
+        }
+        state7
+    }
+
+    #[test]
+    fn multiply_matches_mul_reduce_pair_raw_u64() {
+        let values = cases();
+        for &a0 in &values {
+            for &b0 in &values {
+                for &a1 in &values {
+                    for &b1 in &values {
+                        let (p0, p1) = mul_reduce_pair(a0, b0, a1, b1);
+                        unsafe {
+                            assert_eq!(p0, multiply(a0, b0));
+                            assert_eq!(p1, multiply(a1, b1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sbox_layer_full_matches_scalar_raw_u64() {
+        let values = cases();
+        unsafe {
+            let paired = sbox_layer_full(values);
+            let scalar = sbox_layer_full_scalar(values);
+            assert_eq!(paired, scalar);
+        }
+    }
+
+    fn sbox_p_scalar(a: GoldilocksField) -> GoldilocksField {
+        let a2 = a.square();
+        let a4 = a2.square();
+        let a3 = a * a2;
+        a3 * a4
+    }
+
+    #[test]
+    fn sbox_p_matches_scalar_raw_u64() {
+        for &x in &cases() {
+            let a = GoldilocksField(x);
+            let paired = GoldilocksField::sbox_p(&a);
+            let scalar = sbox_p_scalar(a);
+            assert_eq!(paired.0, scalar.0, "raw limb mismatch for {x:#x}");
+        }
+    }
 }

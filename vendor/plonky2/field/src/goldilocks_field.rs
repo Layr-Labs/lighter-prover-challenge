@@ -504,6 +504,17 @@ fn mul_acc_reduce(acc: u64, a: u64, b: u64) -> u64 {
     result
 }
 
+/// Two independent Goldilocks products, interleaved on AArch64.
+///
+/// Raw-`u64` identical to two scalar reductions of `a0*b0` and `a1*b1`, including
+/// non-canonical representatives. Poseidon2 S-box waves use this so adjacent
+/// lane products share one reduction kernel instead of two borrow-branch muls.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
+    crate::arch::aarch64::neon_goldilocks_field::mul_reduce_pair(a0, b0, a1, b1)
+}
+
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
 #[inline]
