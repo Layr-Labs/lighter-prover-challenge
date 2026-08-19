@@ -15,7 +15,9 @@ use crate::hash::hash_types::RichField;
 use crate::hash::poseidon2::config::*;
 use crate::hash::poseidon2::hash::Poseidon2;
 use crate::iop::ext_target::ExtensionTarget;
-use crate::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
+use crate::iop::generator::{
+    GeneratedValues, GeneratorBatchDescriptor, SimpleGenerator, WitnessGeneratorRef,
+};
 use crate::iop::target::Target;
 use crate::iop::wire::Wire;
 use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
@@ -571,6 +573,119 @@ fn swap_deltas<F: Field>(state: &[F; WIDTH], swap_value: F) -> ([F; 4], bool) {
     }
 }
 
+/// Runs four gate generators in lockstep while retaining one output buffer per
+/// row. Each state's operation order is the scalar `run_once` order; only the
+/// independent states are interleaved, using Poseidon2's existing bit-identical
+/// x4 internal layer.
+#[inline]
+fn run_poseidon2_generator_batch4<F: RichField + Extendable<D> + Poseidon2, const D: usize>(
+    rows: [usize; 4],
+    witness: &PartitionWitness<F>,
+    out_buffers: &mut [GeneratedValues<F>; 4],
+) {
+    let wire = |lane: usize, column: usize| Wire {
+        row: rows[lane],
+        column,
+    };
+    let mut set_wire = |lane: usize, column: usize, value: F| {
+        // This is the infallible concrete operation behind
+        // `GeneratedValues::set_wire`; pushing directly keeps the grouped path
+        // free of an artificial cross-lane `Result` policy.
+        out_buffers[lane]
+            .target_values
+            .push((Target::Wire(wire(lane, column)), value));
+    };
+
+    let mut states: [[F; WIDTH]; 4] = core::array::from_fn(|lane| {
+        core::array::from_fn(|i| witness.get_wire(wire(lane, Poseidon2Gate::<F, D>::wire_input(i))))
+    });
+
+    for lane in 0..4 {
+        let swap_value = witness.get_wire(wire(lane, Poseidon2Gate::<F, D>::WIRE_SWAP));
+        debug_assert!(swap_value == F::ZERO || swap_value == F::ONE);
+        let (deltas, do_swap) = swap_deltas(&states[lane], swap_value);
+        for (i, delta) in deltas.into_iter().enumerate() {
+            set_wire(lane, Poseidon2Gate::<F, D>::wire_delta(i), delta);
+        }
+        if do_swap {
+            for i in 0..4 {
+                states[lane].swap(i, 4 + i);
+            }
+        }
+    }
+
+    for state in &mut states {
+        F::external_linear_layer(state);
+    }
+
+    for r in 0..ROUNDS_F_HALF {
+        for state in &mut states {
+            F::add_rc(state, r);
+        }
+        if r != 0 {
+            for lane in 0..4 {
+                for i in 0..WIDTH {
+                    set_wire(
+                        lane,
+                        Poseidon2Gate::<F, D>::wire_full_sbox_0(r, i),
+                        states[lane][i],
+                    );
+                }
+            }
+        }
+        for state in &mut states {
+            F::sbox(state);
+        }
+        for state in &mut states {
+            F::external_linear_layer(state);
+        }
+    }
+
+    for r in 0..ROUNDS_P {
+        for lane in 0..4 {
+            states[lane][0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            set_wire(
+                lane,
+                Poseidon2Gate::<F, D>::wire_partial_sbox(r),
+                states[lane][0],
+            );
+        }
+        let [a, b, c, d] = &mut states;
+        a[0] = F::sbox_p(&a[0]);
+        b[0] = F::sbox_p(&b[0]);
+        c[0] = F::sbox_p(&c[0]);
+        d[0] = F::sbox_p(&d[0]);
+        F::internal_linear_layer_x4(a, b, c, d);
+    }
+
+    for r in ROUNDS_F_HALF..ROUNDS_F {
+        for state in &mut states {
+            F::add_rc(state, r);
+        }
+        for lane in 0..4 {
+            for i in 0..WIDTH {
+                set_wire(
+                    lane,
+                    Poseidon2Gate::<F, D>::wire_full_sbox_1(r - ROUNDS_F_HALF, i),
+                    states[lane][i],
+                );
+            }
+        }
+        for state in &mut states {
+            F::sbox(state);
+        }
+        for state in &mut states {
+            F::external_linear_layer(state);
+        }
+    }
+
+    for lane in 0..4 {
+        for i in 0..WIDTH {
+            set_wire(lane, Poseidon2Gate::<F, D>::wire_output(i), states[lane][i]);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Poseidon2Generator<F: RichField + Extendable<D> + Poseidon2, const D: usize> {
     row: usize,
@@ -669,6 +784,24 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
         }
 
         Ok(())
+    }
+
+    fn batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        GeneratorBatchDescriptor::poseidon2(self.row)
+    }
+
+    fn run_batch4(
+        &self,
+        descriptors: [GeneratorBatchDescriptor; 4],
+        witness: &PartitionWitness<F>,
+        out_buffers: &mut [GeneratedValues<F>; 4],
+    ) -> Option<[bool; 4]> {
+        let rows = descriptors.map(GeneratorBatchDescriptor::poseidon2_row);
+        let [Some(a), Some(b), Some(c), Some(d)] = rows else {
+            return None;
+        };
+        run_poseidon2_generator_batch4::<F, D>([a, b, c, d], witness, out_buffers);
+        Some([true; 4])
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -931,6 +1064,67 @@ mod tests {
                 column: Gate::wire_output(i),
             });
             assert_eq!(out, expected_outputs[i]);
+        }
+    }
+
+    #[test]
+    fn generator_x4_matches_four_scalar_runs_for_every_emitted_wire() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type Gate = Poseidon2Gate<F, D>;
+
+        let num_wires = Gate::new().num_wires();
+        let degree = 4;
+        let representative_map: Vec<u32> = (0..num_wires * degree).map(|i| i as u32).collect();
+        let mut witness = PartitionWitness::new(num_wires, degree, &representative_map);
+        for row in 0..degree {
+            witness
+                .set_wire(
+                    Wire {
+                        row,
+                        column: Gate::WIRE_SWAP,
+                    },
+                    if row & 1 == 0 { F::ZERO } else { F::ONE },
+                )
+                .unwrap();
+            for i in 0..WIDTH {
+                witness
+                    .set_wire(
+                        Wire {
+                            row,
+                            column: Gate::wire_input(i),
+                        },
+                        F::from_canonical_usize(10_003 * row + 257 * i + i * i + 1),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let generators: [Poseidon2Generator<F, D>; 4] =
+            core::array::from_fn(|row| Poseidon2Generator {
+                row,
+                _phantom: PhantomData,
+            });
+        let mut scalar: [GeneratedValues<F>; 4] =
+            core::array::from_fn(|_| GeneratedValues::empty());
+        for lane in 0..4 {
+            generators[lane]
+                .run_once(&witness, &mut scalar[lane])
+                .unwrap();
+        }
+
+        let descriptors = core::array::from_fn(GeneratorBatchDescriptor::poseidon2);
+        let mut grouped: [GeneratedValues<F>; 4] =
+            core::array::from_fn(|_| GeneratedValues::empty());
+        assert_eq!(
+            generators[0].run_batch4(descriptors, &witness, &mut grouped),
+            Some([true; 4])
+        );
+        for lane in 0..4 {
+            assert_eq!(
+                grouped[lane].target_values, scalar[lane].target_values,
+                "lane {lane} changed an intermediate or output wire"
+            );
         }
     }
 

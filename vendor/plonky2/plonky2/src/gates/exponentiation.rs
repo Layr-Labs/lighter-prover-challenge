@@ -243,11 +243,38 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
 
         // Rewrite `bit * base + (1 - bit)` as `1 + bit * (base - 1)`.
         // Besides deleting one packed subtraction per bit, this exposes the
-        // existing AArch64 multiply-accumulate specialization. Evaluate two
-        // independent transitions at a time to increase instruction-level
-        // parallelism without changing constraint emission order.
+        // existing AArch64 multiply-accumulate specialization. Evaluate four
+        // independent transitions at a time to give the backend more reduction
+        // chains to overlap without changing constraint emission order.
         let base_minus_one = base - P::ONES;
         let mut i = 0;
+        while i + 3 < self.num_power_bits {
+            let prev_0 = if i == 0 {
+                P::ONES
+            } else {
+                intermediate_values[i - 1].square()
+            };
+            let prev_1 = intermediate_values[i].square();
+            let prev_2 = intermediate_values[i + 1].square();
+            let prev_3 = intermediate_values[i + 2].square();
+
+            // power_bits is in LE order, but we accumulate in BE order.
+            let bit_0 = power_bits[self.num_power_bits - i - 1];
+            let bit_1 = power_bits[self.num_power_bits - i - 2];
+            let bit_2 = power_bits[self.num_power_bits - i - 3];
+            let bit_3 = power_bits[self.num_power_bits - i - 4];
+            let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
+            let mul_by_1 = P::ONES.multiply_accumulate(bit_1, base_minus_one);
+            let mul_by_2 = P::ONES.multiply_accumulate(bit_2, base_minus_one);
+            let mul_by_3 = P::ONES.multiply_accumulate(bit_3, base_minus_one);
+
+            yield_constr.one(prev_0 * mul_by_0 - intermediate_values[i]);
+            yield_constr.one(prev_1 * mul_by_1 - intermediate_values[i + 1]);
+            yield_constr.one(prev_2 * mul_by_2 - intermediate_values[i + 2]);
+            yield_constr.one(prev_3 * mul_by_3 - intermediate_values[i + 3]);
+            i += 4;
+        }
+        // Preserve the pair and scalar fallback shapes for arbitrary gate widths.
         while i + 1 < self.num_power_bits {
             let prev_0 = if i == 0 {
                 P::ONES
@@ -255,8 +282,6 @@ impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
                 intermediate_values[i - 1].square()
             };
             let prev_1 = intermediate_values[i].square();
-
-            // power_bits is in LE order, but we accumulate in BE order.
             let bit_0 = power_bits[self.num_power_bits - i - 1];
             let bit_1 = power_bits[self.num_power_bits - i - 2];
             let mul_by_0 = P::ONES.multiply_accumulate(bit_0, base_minus_one);
@@ -363,7 +388,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -420,6 +445,114 @@ mod tests {
         let gate = ExponentiationGate::new_from_config(&config);
         assert_eq!(gate.num_power_bits, 67);
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    /// The four-way schedule must only change instruction overlap: for every
+    /// lane it must retain the exact representative produced by the scalar
+    /// transition sequence, not merely a congruent field value.
+    #[test]
+    fn packed_eval_matches_scalar_raw_and_canonical_noncanonical_lanes() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+        const EDGES: &[u64] = &[
+            0,
+            1,
+            2,
+            u32::MAX as u64,
+            1 << 32,
+            0xffff_fffe_ffff_ffff,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            0xffff_ffff_ffff_fffe,
+            u64::MAX,
+        ];
+
+        fn scalar_reference(
+            gate: &ExponentiationGate<F, D>,
+            n: usize,
+            wires: &[F],
+        ) -> Vec<F> {
+            let mut constraints = vec![F::ZERO; gate.num_constraints() * n];
+            for point in 0..n {
+                let wire = |column: usize| wires[column * n + point];
+                let base_minus_one = wire(gate.wire_base()) - F::ONE;
+                for i in 0..gate.num_power_bits {
+                    let prev = if i == 0 {
+                        F::ONE
+                    } else {
+                        wire(gate.wire_intermediate_value(i - 1)).square()
+                    };
+                    let bit = wire(gate.wire_power_bit(gate.num_power_bits - i - 1));
+                    let mul_by = Field::multiply_accumulate(&F::ONE, bit, base_minus_one);
+                    constraints[i * n + point] =
+                        prev * mul_by - wire(gate.wire_intermediate_value(i));
+                }
+                constraints[gate.num_power_bits * n + point] =
+                    wire(gate.wire_output())
+                        - wire(gate.wire_intermediate_value(gate.num_power_bits - 1));
+            }
+            constraints
+        }
+
+        // Widths 1..7 exercise the scalar, pair, and four-way transition
+        // fallbacks. Width 67 is the production gate shape; batches include
+        // both packed/ragged layouts and the exact quotient batch size of 32.
+        for bits in (1..=7).chain(core::iter::once(67)) {
+            let gate = ExponentiationGate::<F, D>::new(bits);
+            let batch_sizes: &[usize] = if bits == 67 {
+                &[1, 3, 4, 5, 32]
+            } else {
+                &[7]
+            };
+            for &n in batch_sizes {
+                let wires = (0..gate.num_wires() * n)
+                    .map(|index| {
+                        // Column and lane use different odd strides, so each
+                        // packed vector contains a different borrow/carry mix.
+                        let column = index / n;
+                        let lane = index % n;
+                        GoldilocksField(EDGES[(5 * column + 7 * lane + bits) % EDGES.len()])
+                    })
+                    .collect::<Vec<_>>();
+                assert!(wires.iter().any(|x| x.0 >= F::ORDER));
+                let canonical_wires = wires
+                    .iter()
+                    .map(PrimeField64::to_canonical)
+                    .collect::<Vec<_>>();
+                let hash = HashOut::ZERO;
+
+                let got = gate.eval_unfiltered_base_batch(EvaluationVarsBaseBatch::new(
+                    n,
+                    &[],
+                    &wires,
+                    &hash,
+                ));
+                let want = scalar_reference(&gate, n, &wires);
+                let canonical_got = gate.eval_unfiltered_base_batch(EvaluationVarsBaseBatch::new(
+                    n,
+                    &[],
+                    &canonical_wires,
+                    &hash,
+                ));
+
+                for constraint in 0..gate.num_constraints() {
+                    for lane in 0..n {
+                        let index = constraint * n + lane;
+                        assert_eq!(
+                            got[index].0,
+                            want[index].0,
+                            "raw mismatch: bits={bits} n={n} constraint={constraint} lane={lane}",
+                        );
+                        assert_eq!(
+                            got[index].to_canonical_u64(),
+                            canonical_got[index].to_canonical_u64(),
+                            "canonical mismatch: bits={bits} n={n} constraint={constraint} lane={lane}",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -503,7 +636,14 @@ mod tests {
 
         const D: usize = 2;
         type F = GoldilocksField;
-        let gate = ExponentiationGate::<F, D>::new_from_config(&CircuitConfig::standard_recursion_config());
+        let config = CircuitConfig {
+            num_wires: 136,
+            num_routed_wires: 80,
+            ..CircuitConfig::standard_recursion_config()
+        };
+        let gate = ExponentiationGate::<F, D>::new_from_config(&config);
+        assert_eq!(gate.num_power_bits, 67);
+        // Quotient evaluation dispatches batches of exactly 32 points.
         let n = 32;
         let wires = F::rand_vec(gate.num_wires() * n);
         let constants: Vec<F> = Vec::new();
