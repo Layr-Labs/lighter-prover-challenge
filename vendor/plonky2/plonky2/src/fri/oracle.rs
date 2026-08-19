@@ -925,25 +925,15 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let lde_final_values = timed!(
             timing,
             "perform final FFT",
-            // The top (1 - 1/2^rate_bits) of the padded coefficients are the
-            // zeros written by the `resize` just above, so the FFT's zero-run
-            // shortcut applies and the coset scaling over that tail is a
-            // multiply-by-zero: scale only the `live_coeffs` prefix.
-            if fri_params.config.rate_bits == 3 {
-                coset_fft_zero_tail_base_dif_bitrev::<F, D>(
-                    &lde_final_poly,
-                    F::coset_shift(),
-                    live_coeffs,
-                )
-            } else {
-                coset_fft_zero_tail_base::<F, D>(
-                    &lde_final_poly,
-                    F::coset_shift(),
-                    live_coeffs,
-                    Some(fri_params.config.rate_bits),
-                    None,
-                )
-            }
+            // Ablation: retain zero-tail pruning, but restore natural-order FFT
+            // output and the existing gather before the first commitment.
+            coset_fft_zero_tail_base::<F, D>(
+                &lde_final_poly,
+                F::coset_shift(),
+                live_coeffs,
+                Some(fri_params.config.rate_bits),
+                None,
+            )
         );
 
         let fri_proof = fri_proof_with_initial_order::<F, C, D>(
@@ -953,7 +943,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 .collect::<Vec<_>>(),
             lde_final_poly,
             lde_final_values,
-            fri_params.config.rate_bits == 3,
+            false,
             challenger,
             fri_params,
             final_poly_coeff_len,

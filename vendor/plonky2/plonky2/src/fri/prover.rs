@@ -140,7 +140,7 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
 /// `0..n`, so every slot is written exactly once and the source is only read —
 /// the result is index-for-index identical to the serial fill.
 fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
-    const FLATTEN_BLOCK: usize = 1 << 10;
+    const FLATTEN_BLOCK: usize = 1 << 8;
 
     let n = values.len();
     let log_n = log2_strict(n);
@@ -408,28 +408,22 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // unread — everything below this loop uses only `coeffs` — so the
         // last round's transform is entirely dead work. Skip it.
         if round + 1 < num_rounds {
-            values_are_bitrev = fri_params.config.rate_bits == 3;
+            // Ablation: keep zero-tail pruning while restoring the natural-order
+            // producer and existing gather before the next Merkle commitment.
+            values_are_bitrev = false;
             values = Some({
                 #[cfg(feature = "diagnostic_profile")]
                 let _span = crate::util::profile::span(
                     "fri_commit",
                     round_name(["coset_fft_r0", "coset_fft_r1", "coset_fft_r2"]),
                 );
-                if fri_params.config.rate_bits == 3 {
-                    coset_fft_zero_tail_base_dif_bitrev::<F, D>(
-                        &coeffs,
-                        shift,
-                        live_chunks,
-                    )
-                } else {
-                    coset_fft_zero_tail_base::<F, D>(
-                        &coeffs,
-                        shift,
-                        live_chunks,
-                        Some(fri_params.config.rate_bits),
-                        None,
-                    )
-                }
+                coset_fft_zero_tail_base::<F, D>(
+                    &coeffs,
+                    shift,
+                    live_chunks,
+                    Some(fri_params.config.rate_bits),
+                    None,
+                )
             });
         }
     }
