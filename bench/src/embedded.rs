@@ -14,10 +14,14 @@
 //! (measurement A/B). The `embedded_matches_rebuilt` ignored test is the
 //! value-equality oracle between the two paths.
 
+use anyhow::Context;
 use circuit::block_pre_execution_constraints::BlockPreExecutionTarget;
 use circuit::block_tx_chain_constraints::BlockTxChainTarget;
 use circuit::block_tx_constraints::BlockTxTarget;
-use circuit::embed::deserialize_embedded;
+use circuit::embed::{
+    deserialize_embedded, deserialize_embedded_cpu, finish_deferred_constants_sigmas,
+    DeferredConstantsSigmas,
+};
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
@@ -31,17 +35,72 @@ static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light
 
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
-/// decoded circuit while these independent blobs load in parallel.
+/// decoded circuit while these independent blobs parse on CPU in parallel.
+/// Merkle trees for their constants/sigmas commitments are filled after the
+/// pre-execution SNARK joins, so they do not share Metal with it.
 pub(crate) struct RemainingEmbeddedCircuits {
     heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
     heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
     light_tx: (BlockTxTarget, CircuitData<F, C, D>),
     light_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    deferred_heavy_tx: Option<DeferredConstantsSigmas>,
+    deferred_heavy_chain: Option<DeferredConstantsSigmas>,
+    deferred_light_tx: Option<DeferredConstantsSigmas>,
+    deferred_light_chain: Option<DeferredConstantsSigmas>,
     dummy_heavy_proof: Proof,
     dummy_light_proof: Proof,
 }
 
 impl RemainingEmbeddedCircuits {
+    /// Merkle-commit the four remaining circuits. Value-identical to loading
+    /// them through [`deserialize_embedded`]; only scheduled after the
+    /// pre-execution SNARK so Metal is not contended.
+    pub(crate) fn finish_gpu_commitments(&mut self) -> anyhow::Result<()> {
+        let RemainingEmbeddedCircuits {
+            heavy_tx,
+            heavy_chain,
+            light_tx,
+            light_chain,
+            deferred_heavy_tx,
+            deferred_heavy_chain,
+            deferred_light_tx,
+            deferred_light_chain,
+            dummy_heavy_proof: _,
+            dummy_light_proof: _,
+        } = self;
+        let heavy_tx_d = deferred_heavy_tx
+            .take()
+            .context("heavy_tx constants/sigmas commitment already finished")?;
+        let heavy_chain_d = deferred_heavy_chain
+            .take()
+            .context("heavy_chain constants/sigmas commitment already finished")?;
+        let light_tx_d = deferred_light_tx
+            .take()
+            .context("light_tx constants/sigmas commitment already finished")?;
+        let light_chain_d = deferred_light_chain
+            .take()
+            .context("light_chain constants/sigmas commitment already finished")?;
+        let ((heavy_tx_r, heavy_chain_r), (light_tx_r, light_chain_r)) = rayon::join(
+            || {
+                rayon::join(
+                    || finish_deferred_constants_sigmas(&mut heavy_tx.1, heavy_tx_d),
+                    || finish_deferred_constants_sigmas(&mut heavy_chain.1, heavy_chain_d),
+                )
+            },
+            || {
+                rayon::join(
+                    || finish_deferred_constants_sigmas(&mut light_tx.1, light_tx_d),
+                    || finish_deferred_constants_sigmas(&mut light_chain.1, light_chain_d),
+                )
+            },
+        );
+        heavy_tx_r?;
+        heavy_chain_r?;
+        light_tx_r?;
+        light_chain_r?;
+        Ok(())
+    }
+
     pub(crate) fn into_circuits(
         self,
         pre: (BlockPreExecutionTarget, CircuitData<F, C, D>),
@@ -80,6 +139,18 @@ fn load_blob<T: serde::de::DeserializeOwned>(
         .map_err(|error| error.context(format!("loading embedded circuit {name}")))
 }
 
+fn load_blob_cpu<T: serde::de::DeserializeOwned>(
+    name: &'static str,
+    blob: &[u8],
+) -> anyhow::Result<(T, CircuitData<F, C, D>, DeferredConstantsSigmas)> {
+    anyhow::ensure!(
+        !blob.is_empty(),
+        "embedded circuit blob {name} is an empty stub (compiled with LIGHTER_SKIP_EMBED=1)"
+    );
+    deserialize_embedded_cpu::<T>(blob)
+        .map_err(|error| error.context(format!("loading embedded circuit {name}")))
+}
+
 impl Circuits {
     /// Loads only the pre-execution circuit blob. This is the fast path used
     /// by the startup overlap: the pre-execution proof can start (and hide)
@@ -95,14 +166,14 @@ impl Circuits {
         let (heavy, light) = rayon::join(
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+                    || load_blob_cpu::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
+                    || load_blob_cpu::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
                 )
             },
             || {
                 rayon::join(
-                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
+                    || load_blob_cpu::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+                    || load_blob_cpu::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
                 )
             },
         );
@@ -117,10 +188,14 @@ impl Circuits {
                 .expect("embedded light chain dummy proof is invalid");
 
         Ok(RemainingEmbeddedCircuits {
-            heavy_tx,
-            heavy_chain,
-            light_tx,
-            light_chain,
+            heavy_tx: (heavy_tx.0, heavy_tx.1),
+            heavy_chain: (heavy_chain.0, heavy_chain.1),
+            light_tx: (light_tx.0, light_tx.1),
+            light_chain: (light_chain.0, light_chain.1),
+            deferred_heavy_tx: Some(heavy_tx.2),
+            deferred_heavy_chain: Some(heavy_chain.2),
+            deferred_light_tx: Some(light_tx.2),
+            deferred_light_chain: Some(light_chain.2),
             dummy_heavy_proof,
             dummy_light_proof,
         })
@@ -135,7 +210,9 @@ impl Circuits {
         // independent (unlike builds, the chain loads do not wait on the
         // transaction circuits).
         let (pre, remaining) = rayon::join(Self::load_pre, Self::load_remaining_embedded);
-        Ok(remaining?.into_circuits(pre?))
+        let mut remaining = remaining?;
+        remaining.finish_gpu_commitments()?;
+        Ok(remaining.into_circuits(pre?))
     }
 
     /// Production loader: embedded circuits when available, otherwise a fresh
