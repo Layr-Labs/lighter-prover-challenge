@@ -14,7 +14,7 @@ use crate::field::fft::ifft_borrowed;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
-use crate::fri::oracle::{BatchLayout, PolynomialBatch};
+use crate::fri::oracle::{BatchLayout, PolynomialBatch, resize_overwrite};
 use crate::gates::lookup::LookupGate;
 use crate::gates::lookup_table::LookupTableGate;
 use crate::gates::poseidon2::Poseidon2Gate;
@@ -2673,7 +2673,9 @@ fn compute_quotient_polys<
                     );
                     let cc = common_data.constants_range().len();
                     let q = prover_data.constants_sigmas_quotient_domain;
-                    scratch.local_constants.resize(cc * n, F::ZERO);
+                    // Every ci*n+k is stored by the copies below before any read.
+                    // The F::ZERO constructor resize used to emit is a dead store.
+                    resize_overwrite(&mut scratch.local_constants, cc * n);
                     for ci in 0..cc {
                         scratch.local_constants[ci * n..(ci + 1) * n].copy_from_slice(
                             &cache[ci * q + cache_start..ci * q + cache_start + n],
@@ -2683,7 +2685,7 @@ fn compute_quotient_polys<
                         scratch.s_sigmas_flat.clear();
                     } else {
                         let sc = common_data.sigmas_range().len();
-                        scratch.s_sigmas_flat.resize(sc * n, F::ZERO);
+                        resize_overwrite(&mut scratch.s_sigmas_flat, sc * n);
                         for ci in 0..sc {
                             scratch.s_sigmas_flat[ci * n..(ci + 1) * n].copy_from_slice(
                                 &cache[(cc + ci) * q + cache_start

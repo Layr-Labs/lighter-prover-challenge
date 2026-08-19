@@ -40,6 +40,33 @@ pub const SALT_SIZE: usize = 4;
 /// trees (`new_columns`) remain on.
 const GPU_NTT_COMMITMENTS: bool = false;
 
+/// Size `buf` to `len` without writing a constructor value.
+///
+/// Every caller must store every slot in `0..len` before any read or drop.
+/// Used by the quotient-domain gathers whose loops already cover every cell
+/// (`fill_lde_batch`, `fill_lde_batch_contiguous`, and the constants-cache
+/// `copy_from_slice` in `prover.rs`). Same `set_len` contract as
+/// [`PolynomialBatch::extract_lde_batch_columns`].
+#[inline]
+pub(crate) fn resize_overwrite<F>(buf: &mut Vec<F>, len: usize) {
+    if buf.len() == len {
+        return;
+    }
+    if len < buf.len() {
+        buf.truncate(len);
+        return;
+    }
+    if buf.capacity() < len {
+        buf.reserve(len - buf.len());
+    }
+    debug_assert!(buf.capacity() >= len);
+    // SAFETY: capacity >= len. Caller writes every new slot before read/drop.
+    // `F` is a field wrapper (any bit pattern is a valid `F`).
+    unsafe {
+        buf.set_len(len);
+    }
+}
+
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BatchLayout {
@@ -636,7 +663,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // So the zero-fill of a correctly sized buffer is a dead store: adjust
         // the length only (`resize` is a no-op when it already matches, and
         // still zero-initializes any newly created or grown scratch).
-        out.resize(n * w, F::ZERO);
+        resize_overwrite(out, n * w);
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
@@ -688,7 +715,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) {
         let start = col_range.start;
         let w = col_range.len();
-        out.resize(n * w, F::ZERO);
+        resize_overwrite(out, n * w);
 
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
