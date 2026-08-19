@@ -235,6 +235,69 @@ impl Field for GoldilocksField {
     }
 }
 
+impl GoldilocksField {
+    /// The two independent PLONK permutation factors for a pair of challenges:
+    ///
+    /// `num[c] = wire + beta_k[c] * x + gamma[c]`
+    /// `den[c] = wire + beta[c] * sigma + gamma[c]`
+    ///
+    /// Association is exactly the scalar expression (multiply, then add `wire`,
+    /// then add `gamma`). On AArch64 the two lanes run through
+    /// `NeonGoldilocksField`'s interleaved `mul_reduce_pair` / lane-wise add,
+    /// which is documented raw-`u64`-identical to the scalar operators. Other
+    /// arches evaluate the same expressions independently.
+    #[inline]
+    pub fn two_challenge_permutation_factors(
+        wire: Self,
+        sigma: Self,
+        x: Self,
+        beta_k: [Self; 2],
+        beta: [Self; 2],
+        gamma: [Self; 2],
+    ) -> ([Self; 2], [Self; 2]) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+            let w = NeonGoldilocksField([wire, wire]);
+            let g = NeonGoldilocksField(gamma);
+            let xx = NeonGoldilocksField([x, x]);
+            let num = w + NeonGoldilocksField(beta_k) * xx + g;
+            let den = w + NeonGoldilocksField(beta) * NeonGoldilocksField([sigma, sigma]) + g;
+            (num.0, den.0)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            (
+                [
+                    wire + beta_k[0] * x + gamma[0],
+                    wire + beta_k[1] * x + gamma[1],
+                ],
+                [
+                    wire + beta[0] * sigma + gamma[0],
+                    wire + beta[1] * sigma + gamma[1],
+                ],
+            )
+        }
+    }
+
+    /// `acc[c] *= factor[c]` for c in {0,1}. AArch64 uses the interleaved
+    /// two-lane multiply so the two running products share one `mul`/`umulh`
+    /// block; raw limbs match two scalar `MulAssign`s.
+    #[inline]
+    pub fn mul_assign_pair(acc: &mut [Self; 2], factor: [Self; 2]) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+            *acc = (NeonGoldilocksField(*acc) * NeonGoldilocksField(factor)).0;
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            acc[0] *= factor[0];
+            acc[1] *= factor[1];
+        }
+    }
+}
+
 impl PrimeField for GoldilocksField {
     fn to_canonical_biguint(&self) -> BigUint {
         self.to_canonical_u64().into()
@@ -732,6 +795,67 @@ mod tests {
                     check(next(), e, next());
                     check(e, next(), next());
                     check(next(), next(), e);
+                }
+            }
+        }
+    }
+
+    /// Raw-limb oracle for `two_challenge_permutation_factors` and
+    /// `mul_assign_pair` against the scalar `wire + beta * point + gamma`
+    /// association the paired permutation loop used before the two-wide path.
+    mod two_challenge_permutation_factors_differential {
+        use crate::goldilocks_field::GoldilocksField;
+        use crate::types::Field;
+
+        fn scalar_factor(wire: u64, beta: u64, point: u64, gamma: u64) -> u64 {
+            (GoldilocksField(wire) + GoldilocksField(beta) * GoldilocksField(point)
+                + GoldilocksField(gamma))
+            .0
+        }
+
+        fn check(wire: u64, sigma: u64, x: u64, bk: [u64; 2], b: [u64; 2], g: [u64; 2]) {
+            let (num, den) = GoldilocksField::two_challenge_permutation_factors(
+                GoldilocksField(wire),
+                GoldilocksField(sigma),
+                GoldilocksField(x),
+                [GoldilocksField(bk[0]), GoldilocksField(bk[1])],
+                [GoldilocksField(b[0]), GoldilocksField(b[1])],
+                [GoldilocksField(g[0]), GoldilocksField(g[1])],
+            );
+            assert_eq!(num[0].0, scalar_factor(wire, bk[0], x, g[0]));
+            assert_eq!(num[1].0, scalar_factor(wire, bk[1], x, g[1]));
+            assert_eq!(den[0].0, scalar_factor(wire, b[0], sigma, g[0]));
+            assert_eq!(den[1].0, scalar_factor(wire, b[1], sigma, g[1]));
+
+            let mut acc = [GoldilocksField::ONE, GoldilocksField::ONE];
+            GoldilocksField::mul_assign_pair(&mut acc, num);
+            assert_eq!(acc[0].0, (GoldilocksField::ONE * num[0]).0);
+            assert_eq!(acc[1].0, (GoldilocksField::ONE * num[1]).0);
+        }
+
+        const EDGES: &[u64] = &[
+            0,
+            1,
+            0xFFFF_FFFF,
+            0xFFFF_FFFF_0000_0001,
+            0xFFFF_FFFF_0000_0002,
+            u64::MAX,
+        ];
+
+        #[test]
+        fn factors_and_pair_mul_match_scalar_raw_limbs() {
+            for &wire in EDGES {
+                for &sigma in EDGES {
+                    for &x in EDGES {
+                        check(
+                            wire,
+                            sigma,
+                            x,
+                            [EDGES[1], EDGES[2]],
+                            [EDGES[3], EDGES[4]],
+                            [EDGES[0], EDGES[5]],
+                        );
+                    }
                 }
             }
         }
