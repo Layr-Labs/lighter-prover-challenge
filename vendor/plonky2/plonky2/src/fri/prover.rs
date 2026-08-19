@@ -335,9 +335,8 @@ pub(crate) fn fri_proof_of_work<
     // one more element of our sponge state with the candidate, then apply the permutation,
     // obtaining our duplex's post-state which contains the PoW response.
     let mut duplex_intermediate_state = challenger.sponge_state;
-    let buffered_inputs = challenger.buffered_inputs();
-    let witness_input_pos = buffered_inputs.len();
-    duplex_intermediate_state.set_from_iter(buffered_inputs.iter().copied(), 0);
+    let witness_input_pos = challenger.input_buffer.len();
+    duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
     let max_candidate = F::NEG_ONE.to_canonical_u64();
     let pow_witness = if pow_quad_enabled() {
@@ -411,7 +410,7 @@ fn fri_prover_query_round<
     mut x_index: usize,
     fri_params: &FriParams,
 ) -> FriQueryRound<F, C::Hasher, D> {
-    let mut query_steps = Vec::with_capacity(trees.len());
+    let mut query_steps = Vec::new();
     let initial_proof = initial_merkle_trees
         .iter()
         .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))

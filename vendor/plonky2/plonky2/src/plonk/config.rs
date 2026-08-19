@@ -57,9 +57,7 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
 
     /// Pad the message using the `pad10*1` rule, then hash it.
     fn hash_pad(input: &[F]) -> Self::Hash {
-        let padded_len = (input.len() + 2).next_multiple_of(Self::Permutation::RATE);
-        let mut padded_input = Vec::with_capacity(padded_len);
-        padded_input.extend_from_slice(input);
+        let mut padded_input = input.to_vec();
         padded_input.push(F::ONE);
         while !(padded_input.len() + 1).is_multiple_of(Self::Permutation::RATE) {
             padded_input.push(F::ZERO);

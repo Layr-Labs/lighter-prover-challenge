@@ -186,17 +186,15 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
 /// Flatten the slice by sending every extension target to its D-sized canonical representation.
 pub fn flatten_target<const D: usize>(l: &[ExtensionTarget<D>]) -> Vec<Target> {
-    let mut flattened = Vec::with_capacity(l.len() * D);
-    for x in l {
-        flattened.extend(x.to_target_array());
-    }
-    flattened
+    l.iter()
+        .flat_map(|x| x.to_target_array().to_vec())
+        .collect()
 }
 
 /// Batch every D-sized chunks into extension targets.
 pub fn unflatten_target<const D: usize>(l: &[Target]) -> Vec<ExtensionTarget<D>> {
     debug_assert_eq!(l.len() % D, 0);
     l.chunks_exact(D)
-        .map(|c| ExtensionTarget(core::array::from_fn(|i| c[i])))
+        .map(|c| c.to_vec().try_into().unwrap())
         .collect()
 }

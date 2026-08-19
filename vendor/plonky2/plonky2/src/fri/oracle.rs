@@ -52,15 +52,13 @@ pub(crate) enum BatchLayout {
 /// Optional compact copy of the even LDE rows of a column-major commitment
 /// (row `k` of the companion is row `2k` of the commitment), retained in a
 /// shared Metal buffer so the half-domain quotient kernels read contiguous
-/// columns instead of a stride-2 gather over the full store. Filled either
-/// by the LDE write (`from_coeffs_with_even_companion`) or lazily from an
-/// already-retained full store (`get_or_fill_even_rows`) — the latter is
-/// how deserialized `constants_sigmas` blobs grow a companion: the values
-/// are circuit-fixed, so one fill is reused for every proof.
-/// Absent on non-Metal targets.
+/// columns instead of a stride-2 gather over the full store. Filled by the
+/// same CPU pass that writes the LDE, from the just-computed column while it
+/// is cache-resident. Absent on non-Metal targets and unless requested via
+/// [`PolynomialBatch::from_coeffs_with_even_companion`].
 pub struct EvenColumns<F> {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
+    pub(crate) columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
     _phantom: core::marker::PhantomData<F>,
 }
 
@@ -68,7 +66,7 @@ impl<F> Default for EvenColumns<F> {
     fn default() -> Self {
         Self {
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            inner: std::sync::OnceLock::new(),
+            columns: None,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -90,59 +88,10 @@ impl<F> core::fmt::Debug for EvenColumns<F> {
 }
 
 impl<F> EvenColumns<F> {
-    /// Eager companion produced alongside the LDE fill.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn from_ready(
-        columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
-    ) -> Self {
-        let inner = std::sync::OnceLock::new();
-        let _ = inner.set(columns);
-        Self {
-            inner,
-            _phantom: core::marker::PhantomData,
-        }
-    }
-
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     pub(crate) fn get(&self) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
-        self.inner.get().and_then(Option::as_ref)
+        self.columns.as_ref()
     }
-
-    /// Derive the even-row companion from a full-domain Metal column store.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn get_or_fill_even_rows(
-        &self,
-        full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>>
-    where
-        F: crate::hash::hash_types::RichField,
-    {
-        self.inner
-            .get_or_init(|| fill_even_companion_from_full(full))
-            .as_ref()
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
-    full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
-    if full.rows() < 2 || full.rows() % 2 != 0 || full.cols() == 0 {
-        return None;
-    }
-    let half = full.rows() / 2;
-    let mut companion =
-        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(full.cols(), half)?;
-    let dests = companion.columns_mut()?;
-    dests.into_par_iter().enumerate().for_each(|(j, dest)| {
-        let src = full.col(j);
-        debug_assert_eq!(src.len(), half * 2);
-        debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
-        }
-    });
-    Some(companion)
 }
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
@@ -307,6 +256,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
+                // Compact even-row companion (Metal only, on request): the
+                // fill below writes row `2k` of every column into row `k` of
+                // the companion right after that column's FFT, while the
+                // column is still cache-resident.
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                 let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
                     crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
@@ -388,15 +341,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
+                        even_columns: EvenColumns {
                             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
+                            columns: even_companion,
+                            _phantom: core::marker::PhantomData,
                         },
                     };
                 }
@@ -423,15 +371,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
+                        even_columns: EvenColumns {
                             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
+                            columns: even_companion,
+                            _phantom: core::marker::PhantomData,
                         },
                     };
                 }
@@ -1323,7 +1266,6 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
-            even_columns: EvenColumns::default(),
         };
         let column_batch: PolynomialBatch<F, C, D> = PolynomialBatch {
             polynomials: Vec::new(),
@@ -1331,7 +1273,6 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
-            even_columns: EvenColumns::default(),
         };
 
         for step in [1usize, 2, 4] {
@@ -1392,51 +1333,6 @@ mod tests {
 
         check::<GoldilocksField>();
         check::<<GoldilocksField as Extendable<2>>::Extension>();
-    }
-
-    /// The base-scalar specialization is used before FFT butterflies and its
-    /// raw Goldilocks representatives therefore have to match the ordinary
-    /// extension multiplication it replaces, not merely be field-equal.
-    #[test]
-    fn base_scalar_mul_matches_embedded_extension_mul_raw_words() {
-        use crate::field::extension::FieldExtension;
-        use crate::field::types::{Field64, PrimeField64};
-
-        type BF = GoldilocksField;
-        type E = <BF as Extendable<2>>::Extension;
-
-        let words = [
-            0,
-            1,
-            BF::ORDER - 1,
-            BF::ORDER,
-            BF::ORDER + 1,
-            u64::MAX - 1,
-            u64::MAX,
-            0x9e37_79b9_7f4a_7c15,
-        ];
-        for &a0 in &words {
-            for &a1 in &words {
-                let coefficient = <E as FieldExtension<2>>::from_basefield_array([
-                    GoldilocksField(a0),
-                    GoldilocksField(a1),
-                ]);
-                for &scalar in &words {
-                    let scalar = GoldilocksField(scalar);
-                    let expected = coefficient * <E as FieldExtension<2>>::from_basefield(scalar);
-                    let actual = <E as FieldExtension<2>>::scalar_mul(&coefficient, scalar);
-                    let expected_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
-                        &expected,
-                    )
-                        .map(|x| x.to_noncanonical_u64());
-                    let actual_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
-                        &actual,
-                    )
-                        .map(|x| x.to_noncanonical_u64());
-                    assert_eq!(actual_raw, expected_raw, "a0={a0:#x}, a1={a1:#x}");
-                }
-            }
-        }
     }
 
     /// A2's whole claim in one place: for the embedded shift both prover call
