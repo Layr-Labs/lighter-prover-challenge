@@ -1605,7 +1605,26 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     filter_at: impl Fn(usize, usize) -> F,
 ) {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
+    if num_gates == 0 {
+        // The old shape copied its zeroed temporary back untouched here,
+        // so an empty gate set must still leave the chunk zeroed rather
+        // than uninitialised.
+        chunk.fill(F::ZERO);
+        return;
+    }
+    // Accumulate straight into the destination instead of into a temporary.
+    //
+    // The old shape allocated a zeroed `Vec` the size of the chunk, summed
+    // the gate contributions into it, then copied the whole thing back over
+    // `chunk`. Per chunk that is one allocation, one zero-fill and one
+    // full-width copy — all three deletable, because the first gate can
+    // simply *assign* where later gates add. Every index `2r` and `2r + 1`
+    // for `r in 0..rows` is written on the `g == 0` pass, so the
+    // destination's prior contents are never read.
+    //
+    // Value-identical: same gate order, same per-gate expressions, same
+    // running sum. Replacing `0 + a` with `a` on the first gate uses the
+    // additive identity; it is not a reassociation.
     for g in 0..num_gates {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
@@ -1619,11 +1638,15 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            if g == 0 {
+                chunk[2 * r] = filter * sv0;
+                chunk[2 * r + 1] = filter * sv1;
+            } else {
+                chunk[2 * r] += filter * sv0;
+                chunk[2 * r + 1] += filter * sv1;
+            }
         }
     }
-    chunk.copy_from_slice(&acc);
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
