@@ -1417,6 +1417,62 @@ fn low_range_selector_filter_cache_enabled() -> bool {
     })
 }
 
+/// Default on. `LIGHTER_LOW_RANGE_DEINTERLEAVE=0` restores the two independent
+/// strided gathers of `low[base + k * 2 + c]` before each odd-coset IFFT.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn low_range_deinterleave_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_LOW_RANGE_DEINTERLEAVE").is_some_and(|v| v == "0")
+    })
+}
+
+/// Split an interleaved `[c0, c1, c0, c1, …]` gate block into two contiguous
+/// challenge columns. Value-identical to `src[k * 2 + c]` for `c ∈ {0,1}`.
+///
+/// On AArch64 the hot path is `vld2q_u64`: one structure-load deinterleaves two
+/// pairs (four `u64`s) instead of two strided scalar walks of length
+/// `half_rows`. `GoldilocksField` is one `u64`, so the transmute is a layout
+/// identity. Other `F` fall back to the scalar walk.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn deinterleave_challenge_pairs<F: Field>(src: &[F]) -> (Vec<F>, Vec<F>) {
+    debug_assert_eq!(src.len() % 2, 0);
+    let n = src.len() / 2;
+    let mut c0 = vec![F::ZERO; n];
+    let mut c1 = vec![F::ZERO; n];
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() == 8 {
+            unsafe {
+                use core::arch::aarch64::{vld2q_u64, vst1q_u64};
+                let src_u = src.as_ptr().cast::<u64>();
+                let dst0 = c0.as_mut_ptr().cast::<u64>();
+                let dst1 = c1.as_mut_ptr().cast::<u64>();
+                let mut i = 0usize;
+                while i + 2 <= n {
+                    let v = vld2q_u64(src_u.add(i * 2));
+                    vst1q_u64(dst0.add(i), v.0);
+                    vst1q_u64(dst1.add(i), v.1);
+                    i += 2;
+                }
+                while i < n {
+                    *dst0.add(i) = *src_u.add(i * 2);
+                    *dst1.add(i) = *src_u.add(i * 2 + 1);
+                    i += 1;
+                }
+            }
+            return (c0, c1);
+        }
+    }
+
+    for k in 0..n {
+        c0[k] = src[k * 2];
+        c1[k] = src[k * 2 + 1];
+    }
+    (c0, c1)
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn reserve_low_range_selector_filter_cache(bytes: usize) -> bool {
     use core::sync::atomic::Ordering;
@@ -1768,19 +1824,34 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
+    let reconstruct = |values: Vec<F>| {
+        PolynomialValues::new(values)
+            .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+            .fft()
+            .values
+    };
+    let odd: Vec<Vec<F>> = if low_range_deinterleave_enabled() {
+        (0..gates.len())
+            .into_par_iter()
+            .flat_map_iter(|g| {
+                let base = g * half_rows * 2;
+                let (c0, c1) =
+                    deinterleave_challenge_pairs(&low[base..base + half_rows * 2]);
+                [reconstruct(c0), reconstruct(c1)]
+            })
+            .collect()
+    } else {
+        (0..gates.len() * 2)
+            .into_par_iter()
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                reconstruct(values)
+            })
+            .collect()
+    };
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(
@@ -3697,6 +3768,23 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn deinterleave_challenge_pairs_matches_strided_gather() {
+        for n in [1usize, 2, 3, 17, 32, 64] {
+            let src: Vec<F> = (0..n * 2)
+                .map(|i| F::from_canonical_u64(i as u64 * 17 + 3))
+                .collect();
+            let (c0, c1) = super::deinterleave_challenge_pairs(&src);
+            assert_eq!(c0.len(), n);
+            assert_eq!(c1.len(), n);
+            for k in 0..n {
+                assert_eq!(c0[k], src[k * 2], "c0 k={k} n={n}");
+                assert_eq!(c1[k], src[k * 2 + 1], "c1 k={k} n={n}");
+            }
+        }
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
