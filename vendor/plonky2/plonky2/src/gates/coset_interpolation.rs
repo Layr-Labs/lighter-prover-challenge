@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -322,8 +323,38 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
+
+        // Scratch is fully overwritten before `batch_multiply_add_inplace`
+        // reads it: every `(row, p)` slot is assigned from
+        // `to_basefield_array()`. The previous `vec![F::ZERO; num_constraints * n]`
+        // constructor was therefore a dead store plus a malloc/free per
+        // 32-point quotient batch. Same stack-or-heap overwrite contract as
+        // `MulExtensionGate` / `ArithmeticExtensionGate` on this tip:
+        // `[MaybeUninit::<F>; N]` only. Do **not** stack-allocate
+        // `[MaybeUninit::<F::Extension>; N]` — rustc cannot prove
+        // `F::Extension: Copy` for the array-repeat (OUR #7362 / Actions
+        // 32254588441 failed at "Build and stage candidate artifact" on
+        // that associated-type repeat). `values` stays the previous heap
+        // `vec![F::Extension::ZERO; num_points()]`.
         let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        const STACK_SCRATCH: usize = 1024;
+        let scratch_len = num_constraints * n;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
+            // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`,
+            // and every element of `[..scratch_len]` is written before any is
+            // read. Same idiom as `MulExtensionGate` on `ba379a9`.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
+                    scratch_len,
+                )
+            }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];
@@ -746,7 +777,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -786,6 +817,17 @@ mod tests {
             let mut actual = initial;
             gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
             assert_eq!(actual, expected, "max_degree {max_degree}");
+            let raw = |values: &[F]| {
+                values
+                    .iter()
+                    .map(PrimeField64::to_noncanonical_u64)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                raw(&actual),
+                raw(&expected),
+                "raw-limb mismatch max_degree {max_degree}"
+            );
         }
     }
 
