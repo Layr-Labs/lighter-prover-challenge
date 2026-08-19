@@ -1366,6 +1366,18 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+/// `F::from_canonical_usize(group_start + k)` for `k ∈ [0, len)`.
+/// Independent of row / chunk / selector value — hoist out of the 2^19 walk.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn range_selector_constants<F: Field, const N: usize>(start: usize, len: usize) -> [F; N] {
+    debug_assert!(len <= N);
+    let mut constants = [F::ZERO; N];
+    for (offset, constant) in constants[..len].iter_mut().enumerate() {
+        *constant = F::from_canonical_usize(start + offset);
+    }
+    constants
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1438,10 +1450,14 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             }),
         }
     }
-    let selector_cols: Vec<&[F]> = plans.iter().map(|p| constants.col(p.selector_column)).collect();
     const ROWS_PER_CHUNK: usize = 512;
     const MAX_GROUP: usize = 16;
     assert!(plans.iter().all(|p| p.group_len <= MAX_GROUP));
+    let selector_cols: Vec<&[F]> = plans.iter().map(|p| constants.col(p.selector_column)).collect();
+    let selector_factors: Vec<[F; MAX_GROUP]> = plans
+        .iter()
+        .map(|plan| range_selector_constants::<F, MAX_GROUP>(plan.group_start, plan.group_len))
+        .collect();
     let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
     // SAFETY: every slot is written exactly once by the disjoint parallel
     // pass below before any read.
@@ -1452,17 +1468,29 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
         .for_each(|(chunk_i, chunk)| {
             let row0 = chunk_i * ROWS_PER_CHUNK;
             let rows = chunk.len() / 2;
-            // Filters for this chunk, gate-major: filters[g * ROWS_PER_CHUNK + r].
-            let mut filters = vec![F::ONE; num_gates * ROWS_PER_CHUNK];
+            // Filters for this chunk, gate-major: filters[g * rows + r].
+            // Sized to the live rectangle only — the old
+            // `vec![F::ONE; num_gates * ROWS_PER_CHUNK]` also stored a
+            // never-read tail `r ∈ [rows, ROWS_PER_CHUNK)` (the last
+            // parallel chunk is short) and a constructor `ONE` that the
+            // plan walk immediately overwrote. Every `(g, r)` below is
+            // stored before the combine walk reads it, so `set_len` is
+            // the same write-before-read contract as `out` above.
+            let mut filters = Vec::with_capacity(num_gates * rows);
+            // SAFETY: capacity is exact; the plan walk writes every
+            // `(g, r)` in `0..num_gates × 0..rows` before any read or drop.
+            unsafe { filters.set_len(num_gates * rows) };
             let mut factors = [F::ZERO; MAX_GROUP];
             let mut prefix = [F::ONE; MAX_GROUP + 1];
             let mut suffix = [F::ONE; MAX_GROUP + 1];
-            for (plan, selector_col) in plans.iter().zip(&selector_cols) {
+            for ((plan, selector_col), factor_constants) in
+                plans.iter().zip(&selector_cols).zip(&selector_factors)
+            {
                 let n = plan.group_len;
                 for r in 0..rows {
                     let s_val = selector_col[row0 + r];
                     for k in 0..n {
-                        factors[k] = F::from_canonical_usize(plan.group_start + k) - s_val;
+                        factors[k] = factor_constants[k] - s_val;
                     }
                     prefix[0] = if plan.include_unused_selector { unused - s_val } else { F::ONE };
                     for k in 0..n {
@@ -1473,31 +1501,56 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                         suffix[k] = suffix[k + 1] * factors[k];
                     }
                     for &(g, position) in &plan.members {
-                        filters[g * ROWS_PER_CHUNK + r] = prefix[position] * suffix[position + 1];
+                        filters[g * rows + r] = prefix[position] * suffix[position + 1];
                     }
                 }
             }
-            // Accumulate gate-major so each pass streams one source array.
-            let mut acc = vec![F::ZERO; 2 * ROWS_PER_CHUNK];
-            for g in 0..num_gates {
-                let f = &filters[g * ROWS_PER_CHUNK..g * ROWS_PER_CHUNK + rows];
-                let odd0 = &odd[g * 2];
-                let odd1 = &odd[g * 2 + 1];
-                let low_base = g * half_rows * 2;
-                for r in 0..rows {
-                    let i = row0 + r;
-                    let (sv0, sv1) = if i & 1 == 0 {
-                        let base = low_base + (i >> 1) * 2;
-                        (low[base], low[base + 1])
-                    } else {
-                        (odd0[i >> 1], odd1[i >> 1])
-                    };
-                    let filter = f[r];
-                    acc[2 * r] += filter * sv0;
-                    acc[2 * r + 1] += filter * sv1;
+            // Combine gate-major so each pass streams one source array.
+            // Gate 0 *assigns* into `chunk`; later gates accumulate. That
+            // deletes the `vec![F::ZERO; 2 * ROWS_PER_CHUNK]` seed (its only
+            // reader was the first `+=`) and the trailing `copy_from_slice`.
+            // Empty `gates` is the only case that still needs an explicit
+            // zero write — the old constructor-plus-skip-loop produced zeros.
+            if num_gates == 0 {
+                chunk.fill(F::ZERO);
+            } else {
+                {
+                    let f = &filters[..rows];
+                    let odd0 = &odd[0];
+                    let odd1 = &odd[1];
+                    let low_base = 0;
+                    for r in 0..rows {
+                        let i = row0 + r;
+                        let (sv0, sv1) = if i & 1 == 0 {
+                            let base = low_base + (i >> 1) * 2;
+                            (low[base], low[base + 1])
+                        } else {
+                            (odd0[i >> 1], odd1[i >> 1])
+                        };
+                        let filter = f[r];
+                        chunk[2 * r] = filter * sv0;
+                        chunk[2 * r + 1] = filter * sv1;
+                    }
+                }
+                for g in 1..num_gates {
+                    let f = &filters[g * rows..g * rows + rows];
+                    let odd0 = &odd[g * 2];
+                    let odd1 = &odd[g * 2 + 1];
+                    let low_base = g * half_rows * 2;
+                    for r in 0..rows {
+                        let i = row0 + r;
+                        let (sv0, sv1) = if i & 1 == 0 {
+                            let base = low_base + (i >> 1) * 2;
+                            (low[base], low[base + 1])
+                        } else {
+                            (odd0[i >> 1], odd1[i >> 1])
+                        };
+                        let filter = f[r];
+                        chunk[2 * r] += filter * sv0;
+                        chunk[2 * r + 1] += filter * sv1;
+                    }
                 }
             }
-            chunk.copy_from_slice(&acc[..2 * rows]);
         });
     out
 }
