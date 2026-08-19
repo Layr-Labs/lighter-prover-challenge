@@ -111,7 +111,7 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
 // 500-active-tx ranked fixture, so a window-depth effect is structurally
 // understated locally. Per the file's own guidance the ranked draw, not the
 // local number, settles it.
-const LIGHT_TX_PROOF_WINDOW: usize = 6;
+const LIGHT_TX_PROOF_WINDOW: usize = 3;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
 /// experiments; read once. Depth is deliberately NOT scaled up on
