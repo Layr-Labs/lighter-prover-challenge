@@ -2,13 +2,19 @@
 use alloc::vec;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+use core::any::TypeId;
+use core::mem::{align_of, size_of, ManuallyDrop};
 
 use plonky2_field::types::Field;
 use plonky2_maybe_rayon::*;
 
+use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{unflatten, Extendable, FieldExtension};
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::oracle::coset_fft_zero_tail_base;
+use crate::fri::oracle::{
+    coset_fft_zero_tail_base, coset_fft_zero_tail_base_dif_bitrev,
+};
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
@@ -36,6 +42,37 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
     max_num_query_steps: Option<usize>,
     timing: &mut TimingTree,
 ) -> FriProof<F, C::Hasher, D> {
+    fri_proof_with_initial_order::<F, C, D>(
+        initial_merkle_trees,
+        lde_polynomial_coeffs,
+        lde_polynomial_values,
+        false,
+        challenger,
+        fri_params,
+        final_poly_coeff_len,
+        max_num_query_steps,
+        timing,
+    )
+}
+
+/// Internal FRI entry point for producers that explicitly know whether their
+/// first codeword is already in bit-reversed Merkle-leaf order. The public API
+/// above retains its historical natural-order contract.
+pub(crate) fn fri_proof_with_initial_order<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    lde_polynomial_values: PolynomialValues<F::Extension>,
+    initial_values_bitrev: bool,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    final_poly_coeff_len: Option<usize>,
+    max_num_query_steps: Option<usize>,
+    timing: &mut TimingTree,
+) -> FriProof<F, C::Hasher, D> {
     let n = lde_polynomial_values.len();
     assert_eq!(lde_polynomial_coeffs.len(), n);
 
@@ -46,6 +83,7 @@ pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const
         fri_committed_trees::<F, C, D>(
             lde_polynomial_coeffs,
             lde_polynomial_values,
+            initial_values_bitrev,
             challenger,
             fri_params,
             final_poly_coeff_len,
@@ -128,6 +166,60 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
     flat
 }
 
+/// Flatten evaluations already emitted in FRI's bit-reversed Merkle-leaf
+/// order. Unlike [`bitrev_flatten`], every input read is contiguous.
+fn flatten_bitrev_order<F: RichField + Extendable<D>, const D: usize>(
+    values: Vec<F::Extension>,
+) -> Vec<F> {
+    if D == 2
+        && TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && TypeId::of::<F::Extension>()
+            == TypeId::of::<QuadraticExtension<GoldilocksField>>()
+    {
+        assert_eq!(size_of::<F::Extension>(), 2 * size_of::<F>());
+        assert_eq!(align_of::<F::Extension>(), align_of::<F>());
+        let mut values = ManuallyDrop::new(values);
+        let len = values.len();
+        let capacity = values.capacity();
+        // SAFETY: the TypeId checks prove the production pair
+        // `QuadraticExtension<GoldilocksField>`, whose transparent
+        // representation is exactly `[GoldilocksField; 2]`. The allocation's
+        // byte size and alignment are unchanged; only length and capacity are
+        // expressed in base-field elements. Ownership moves to the returned
+        // Vec and the ManuallyDrop prevents a second free.
+        return unsafe {
+            Vec::from_raw_parts(
+                values.as_mut_ptr().cast::<F>(),
+                len * 2,
+                capacity * 2,
+            )
+        };
+    }
+
+    const FLATTEN_BLOCK: usize = 1 << 10;
+
+    let n = values.len();
+    let mut flat: Vec<F> = Vec::with_capacity(n * D);
+    {
+        let spare = &mut flat.spare_capacity_mut()[..n * D];
+        spare
+            .par_chunks_mut(FLATTEN_BLOCK * D)
+            .enumerate()
+            .for_each(|(block, out)| {
+                let base = block * FLATTEN_BLOCK;
+                for (j, slot) in out.chunks_exact_mut(D).enumerate() {
+                    let limbs = values[base + j].to_basefield_array();
+                    for k in 0..D {
+                        slot[k].write(limbs[k]);
+                    }
+                }
+            });
+    }
+    // SAFETY: every spare-capacity slot was written exactly once above.
+    unsafe { flat.set_len(n * D) };
+    flat
+}
+
 /// Production arity-16 folding dispatcher. Apple AArch64 Goldilocks ext2
 /// batches independent rows; every other target/field keeps the old map.
 fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
@@ -192,30 +284,56 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
 
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
-    mut values: PolynomialValues<F::Extension>,
+    values: PolynomialValues<F::Extension>,
+    mut values_are_bitrev: bool,
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
     final_poly_coeff_len: Option<usize>,
     max_num_query_steps: Option<usize>,
 ) -> FriCommitedTrees<F, C, D> {
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
+    let mut values = Some(values);
 
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
     let num_rounds = fri_params.reduction_arity_bits.len();
     for (round, arity_bits) in fri_params.reduction_arity_bits.iter().enumerate() {
         let arity = 1 << arity_bits;
+        #[cfg(feature = "diagnostic_profile")]
+        let round_name = |names: [&'static str; 3]| names.get(round).copied().unwrap_or(names[2]);
 
         // Fused bit-reversal + flatten: one gather pass writes the flat leaf
         // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
         // codeword starting at `i * arity`), instead of a random-access
         // in-place permutation followed by a separate flattening pass with a
         // heap allocation per element.
-        let flat_values = bitrev_flatten::<F, D>(&values.values);
-        let tree = MerkleTree::<F, C::Hasher>::new_flat(
-            flat_values,
-            arity * D,
-            fri_params.config.cap_height,
-        );
+        let flat_values = {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = crate::util::profile::span(
+                "fri_commit",
+                round_name(["direct_flatten_r0", "direct_flatten_r1", "direct_flatten_r2"]),
+            );
+            let round_values = values
+                .take()
+                .expect("every FRI commit round has one codeword")
+                .values;
+            if values_are_bitrev {
+                flatten_bitrev_order::<F, D>(round_values)
+            } else {
+                bitrev_flatten::<F, D>(&round_values)
+            }
+        };
+        let tree = {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = crate::util::profile::span(
+                "fri_commit",
+                round_name(["merkle_tree_r0", "merkle_tree_r1", "merkle_tree_r2"]),
+            );
+            MerkleTree::<F, C::Hasher>::new_flat(
+                flat_values,
+                arity * D,
+                fri_params.config.cap_height,
+            )
+        };
 
         challenger.observe_cap(&tree.cap);
         trees.push(tree);
@@ -238,16 +356,23 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         } else {
             None
         };
-        let mut folded = match &beta_powers_16 {
-            Some(beta_powers) => fri_fold_arity16_chunks::<F, D>(
-                &coeffs.coeffs[..live_chunks * arity],
-                beta,
-                beta_powers,
-            ),
-            None => coeffs.coeffs[..live_chunks * arity]
-                .par_chunks_exact(arity)
-                .map(|chunk| reduce_with_powers(chunk, beta))
-                .collect::<Vec<_>>(),
+        let mut folded = {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = crate::util::profile::span(
+                "fri_commit",
+                round_name(["coefficient_fold_r0", "coefficient_fold_r1", "coefficient_fold_r2"]),
+            );
+            match &beta_powers_16 {
+                Some(beta_powers) => fri_fold_arity16_chunks::<F, D>(
+                    &coeffs.coeffs[..live_chunks * arity],
+                    beta,
+                    beta_powers,
+                ),
+                None => coeffs.coeffs[..live_chunks * arity]
+                    .par_chunks_exact(arity)
+                    .map(|chunk| reduce_with_powers(chunk, beta))
+                    .collect::<Vec<_>>(),
+            }
         };
         // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
         // tail. Zeros are actually *read as values* only where the next
@@ -283,13 +408,29 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // unread — everything below this loop uses only `coeffs` — so the
         // last round's transform is entirely dead work. Skip it.
         if round + 1 < num_rounds {
-            values = coset_fft_zero_tail_base::<F, D>(
-                &coeffs,
-                shift,
-                live_chunks,
-                Some(fri_params.config.rate_bits),
-                None,
-            );
+            values_are_bitrev = fri_params.config.rate_bits == 3;
+            values = Some({
+                #[cfg(feature = "diagnostic_profile")]
+                let _span = crate::util::profile::span(
+                    "fri_commit",
+                    round_name(["coset_fft_r0", "coset_fft_r1", "coset_fft_r2"]),
+                );
+                if fri_params.config.rate_bits == 3 {
+                    coset_fft_zero_tail_base_dif_bitrev::<F, D>(
+                        &coeffs,
+                        shift,
+                        live_chunks,
+                    )
+                } else {
+                    coset_fft_zero_tail_base::<F, D>(
+                        &coeffs,
+                        shift,
+                        live_chunks,
+                        Some(fri_params.config.rate_bits),
+                        None,
+                    )
+                }
+            });
         }
     }
 
@@ -543,6 +684,44 @@ mod tests {
                 assert_eq!(a.0, e.0, "limb {k} of {n}");
             }
         }
+    }
+
+    #[test]
+    fn flatten_bitrev_order_transfers_ext2_allocation_and_raw_words() {
+        use crate::field::extension::quadratic::QuadraticExtension;
+
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        let values = (0..257usize)
+            .map(|i| {
+                FE::from_basefield_array([
+                    GoldilocksField((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                    GoldilocksField(
+                        (i as u64)
+                            .wrapping_mul(0xd1b5_4a32_d192_ed03)
+                            .wrapping_add(F::ORDER),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let input_ptr = values.as_ptr().cast::<F>();
+        let input_capacity = values.capacity();
+        let expected = values
+            .iter()
+            .flat_map(|value| value.0)
+            .map(|limb| limb.0)
+            .collect::<Vec<_>>();
+
+        let flat = flatten_bitrev_order::<F, 2>(values);
+        assert_eq!(flat.as_ptr(), input_ptr, "the allocation must be transferred");
+        assert_eq!(flat.len(), expected.len());
+        assert_eq!(flat.capacity(), input_capacity * 2);
+        assert_eq!(
+            flat.iter().map(|limb| limb.0).collect::<Vec<_>>(),
+            expected,
+            "flattening must retain every noncanonical raw limb",
+        );
     }
 
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]

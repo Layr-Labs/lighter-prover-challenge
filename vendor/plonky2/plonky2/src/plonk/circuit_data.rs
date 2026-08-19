@@ -663,6 +663,58 @@ impl GeneratorWatchIndex {
     }
 }
 
+/// Runtime-only cache of immutable low-degree range-gate selector filters.
+///
+/// The filters are derived from the constants commitment and never participate
+/// in circuit identity, serialization, or equality. On non-Metal targets the
+/// wrapper is zero-sized.
+pub struct LowRangeSelectorFilterCache<F> {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    inner: std::sync::OnceLock<Option<LowRangeSelectorFilterCacheEntry<F>>>,
+    _phantom: core::marker::PhantomData<F>,
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+pub(crate) struct LowRangeSelectorFilterCacheEntry<F> {
+    pub(crate) full_rows: usize,
+    pub(crate) gate_signature: Vec<(usize, usize, usize, usize, bool)>,
+    pub(crate) filters: Vec<Vec<F>>,
+}
+
+impl<F> Default for LowRangeSelectorFilterCache<F> {
+    fn default() -> Self {
+        Self {
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            inner: std::sync::OnceLock::new(),
+            _phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+// This is a derived runtime cache of immutable circuit data, so its fill state
+// must not change circuit equality (the same rule as `EvenColumns`).
+impl<F> PartialEq for LowRangeSelectorFilterCache<F> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl<F> Eq for LowRangeSelectorFilterCache<F> {}
+impl<F> core::fmt::Debug for LowRangeSelectorFilterCache<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("LowRangeSelectorFilterCache")
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+impl<F> LowRangeSelectorFilterCache<F> {
+    pub(crate) fn get_or_init(
+        &self,
+        init: impl FnOnce() -> Option<LowRangeSelectorFilterCacheEntry<F>>,
+    ) -> Option<&LowRangeSelectorFilterCacheEntry<F>> {
+        self.inner.get_or_init(init).as_ref()
+    }
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -749,6 +801,10 @@ pub struct ProverOnlyCircuitData<
     pub constants_sigmas_quotient_step: usize,
     /// Quotient domain size used to extract [`Self::constants_sigmas_quotient_cache`].
     pub constants_sigmas_quotient_domain: usize,
+    /// Immutable low-degree range-gate selector filters, filled on first use
+    /// only when the process-wide cache budget admits the exact table.
+    /// Runtime-only: derived from the constants commitment and not serialized.
+    pub low_range_selector_filter_cache: LowRangeSelectorFilterCache<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
