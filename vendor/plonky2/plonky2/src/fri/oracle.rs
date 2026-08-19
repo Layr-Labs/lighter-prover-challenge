@@ -52,15 +52,15 @@ pub(crate) enum BatchLayout {
 /// Optional compact copy of the even LDE rows of a column-major commitment
 /// (row `k` of the companion is row `2k` of the commitment), retained in a
 /// shared Metal buffer so the half-domain quotient kernels read contiguous
-/// columns instead of a stride-2 gather over the full store. Filled either
-/// by the LDE write (`from_coeffs_with_even_companion`) or lazily from an
-/// already-retained full store (`get_or_fill_even_rows`) — the latter is
-/// how deserialized `constants_sigmas` blobs grow a companion: the values
-/// are circuit-fixed, so one fill is reused for every proof.
-/// Absent on non-Metal targets.
+/// columns instead of a stride-2 gather over the full store. For the wires
+/// commitment it is filled by the same CPU pass that writes the LDE, from the
+/// just-computed column while it is cache-resident (request it via
+/// [`PolynomialBatch::from_coeffs_with_even_companion`]); the circuit-fixed
+/// constants companion is built once per circuit by [`Self::from_even_rows`].
+/// Absent on non-Metal targets and unless requested.
 pub struct EvenColumns<F> {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
+    pub(crate) columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
     _phantom: core::marker::PhantomData<F>,
 }
 
@@ -68,7 +68,7 @@ impl<F> Default for EvenColumns<F> {
     fn default() -> Self {
         Self {
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            inner: std::sync::OnceLock::new(),
+            columns: None,
             _phantom: core::marker::PhantomData,
         }
     }
@@ -90,66 +90,56 @@ impl<F> core::fmt::Debug for EvenColumns<F> {
 }
 
 impl<F> EvenColumns<F> {
-    /// Eager companion produced alongside the LDE fill.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn from_ready(
-        columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
-    ) -> Self {
-        let inner = std::sync::OnceLock::new();
-        let _ = inner.set(columns);
-        Self {
-            inner,
-            _phantom: core::marker::PhantomData,
-        }
-    }
-
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     pub(crate) fn get(&self) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
-        self.inner.get().and_then(Option::as_ref)
-    }
-
-    /// Derive the even-row companion from a full-domain Metal column store.
-    ///
-    /// `companion[j][k] = full[j][2k]`. The kernel indexes both the wires
-    /// companion and this buffer with stride `wires.rows`, so the compact
-    /// constants must have the same row count as the compact wires. A
-    /// degree-`< 4n` polynomial is determined by its `4n` even-coset
-    /// samples; copying those samples does not change any value the
-    /// full-domain kernel would have read at those rows.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn get_or_fill_even_rows(
-        &self,
-        full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>>
-    where
-        F: crate::hash::hash_types::RichField,
-    {
-        self.inner
-            .get_or_init(|| fill_even_companion_from_full(full))
-            .as_ref()
+        self.columns.as_ref()
     }
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
-    full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
-    if full.rows() < 2 || full.rows() % 2 != 0 || full.cols() == 0 {
-        return None;
-    }
-    let half = full.rows() / 2;
-    let mut companion =
-        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(full.cols(), half)?;
-    let dests = companion.columns_mut()?;
-    dests.into_par_iter().enumerate().for_each(|(j, dest)| {
-        let src = full.col(j);
-        debug_assert_eq!(src.len(), half * 2);
-        debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
+impl<F: RichField> EvenColumns<F> {
+    /// Builds a companion holding the even rows of the first `cols` columns of
+    /// an already-materialized column store: row `k` of the result is row `2k`
+    /// of `source`. Used for the constants/sigmas commitment, whose LDE is
+    /// circuit-fixed and therefore worth copying once outside any proof; only
+    /// the leading constants columns are copied, because the Range/U32
+    /// quotient kernels read selector and gate-constant columns but never the
+    /// sigma columns that follow them.
+    ///
+    /// A pure read-only duplication of correct data — it cannot change any
+    /// value, only where the kernel reads it from. Yields the empty companion
+    /// if the shared allocation is declined.
+    pub(crate) fn from_even_rows(
+        source: &crate::hash::poseidon2::metal::MetalColumns<F>,
+        cols: usize,
+    ) -> Self {
+        let half_rows = source.rows() / 2;
+        if cols == 0 || cols > source.cols() || half_rows == 0 {
+            return Self::default();
         }
-    });
-    Some(companion)
+        let Some(mut columns) =
+            crate::hash::poseidon2::metal::allocate_plain_columns::<F>(cols, half_rows)
+        else {
+            return Self::default();
+        };
+        let Some(mut destinations) = columns.columns_mut() else {
+            return Self::default();
+        };
+        destinations
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(column, destination)| {
+                let full = source.col(column);
+                for (k, slot) in destination.iter_mut().enumerate() {
+                    *slot = full[2 * k];
+                }
+            });
+        drop(destinations);
+        Self {
+            columns: Some(columns),
+            _phantom: core::marker::PhantomData,
+        }
+    }
 }
 
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
@@ -399,16 +389,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
+                        even_columns: EvenColumns {
                             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
-                        }
+                            columns: even_companion,
+                            _phantom: core::marker::PhantomData,
+                        },
                     };
                 }
                 let initialized = timed!(
@@ -434,16 +419,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
+                        even_columns: EvenColumns {
                             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
-                        }
+                            columns: even_companion,
+                            _phantom: core::marker::PhantomData,
+                        },
                     };
                 }
             }
@@ -468,6 +448,26 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             rate_bits,
             blinding,
             even_columns: EvenColumns::default(),
+        }
+    }
+
+    /// Compact even-row companion of this commitment's first `cols` LDE
+    /// columns (row `k` is LDE row `2k`), for dispatching a half-domain
+    /// quotient job whose kernel indexes every store with half the LDE row
+    /// count. Empty unless the LDE is retained in shared Metal columns. See
+    /// [`EvenColumns`].
+    pub fn even_row_companion(&self, cols: usize) -> EvenColumns<F> {
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        {
+            match self.merkle_tree.shared_columns() {
+                Some(columns) => EvenColumns::from_even_rows(columns, cols),
+                None => EvenColumns::default(),
+            }
+        }
+        #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+        {
+            let _ = cols;
+            EvenColumns::default()
         }
     }
 

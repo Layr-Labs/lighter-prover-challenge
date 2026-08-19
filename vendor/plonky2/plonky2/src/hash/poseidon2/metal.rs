@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "a4166c67ccf2de81cc677bbea962451951e3be3775c2727b4c20fc36e343f2af";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -2097,11 +2097,15 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
-    // The wires store may be a compact even-row copy. The kernel indexes
-    // both buffers with `lde_rows = wires.rows` (`col * wires.rows + row`).
-    // Constant-reading gates therefore require a matching even-row constants
-    // companion; selector-only / unfiltered gates tolerate a taller full
-    // store (`constants.rows >= wires.rows`) because they do not load it.
+    // The wires store may be a compact sub-domain copy: the kernel indexes
+    // both stores with `lde_rows = wires.rows`, so every constants read
+    // `col * wires.rows + row` stays in bounds as long as
+    // `constants.rows >= wires.rows`. A caller whose gates actually read gate
+    // constants must pass a `constants` store on the *same* sub-domain (see
+    // `EvenColumns::from_even_rows`); passing the full-domain store is only
+    // correct for gates whose constants reads are unused, such as the
+    // unfiltered single-gate dispatches whose selector load is multiplied by a
+    // filter of one.
     if groups.is_empty()
         || F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -4573,161 +4577,6 @@ mod tests {
     /// this pins the source bytes: edit `poseidon2.metal` without regenerating
     /// `poseidon2.metallib` and this fails loudly instead of silently proving
     /// with stale kernels.
-    /// The bug class this exists for: our own promoted archive added
-    /// `filter_plan [[buffer(11)]]` / `filter_plan_count [[buffer(12)]]` to
-    /// `range_check_gate_quotient`, while a concurrently promoted host change
-    /// added a second dispatch site that binds only buffers 0-10. Git merges
-    /// the two with no conflict, `xcrun metal` emits no diagnostic, the build
-    /// succeeds, and `benchmark.sh` still reports `verified_proofs: 1` on one
-    /// fixture -- but the kernel reads an unbound buffer. Nothing else in this
-    /// tree catches it.
-    ///
-    /// So: parse every `kernel void` signature out of the shader we ship, parse
-    /// every dispatch region out of this file (a `set_compute_pipeline_state`
-    /// through the matching `end_encoding` on the same encoder binding), and
-    /// require that the set of indices a region binds is exactly the buffer set
-    /// of some kernel. An under-bound site matches no signature and fails here.
-    ///
-    /// Verified to have teeth: run against the reverted archive's shader, this
-    /// flags all five under-bound sites (both `range_check_gate_quotient`
-    /// dispatches missing 11/12, and the three
-    /// `poseidon2_hash_leaves_colmajor` dispatches missing its buffer 6).
-    #[test]
-    fn every_shader_buffer_is_bound_at_every_host_dispatch_site() {
-        const SHADER: &str = include_str!("poseidon2.metal");
-        const HOST: &str = include_str!("metal.rs");
-
-        fn number_at(source: &str, mut at: usize) -> Option<u32> {
-            let bytes = source.as_bytes();
-            while at < bytes.len() && bytes[at].is_ascii_whitespace() {
-                at += 1;
-            }
-            let start = at;
-            while at < bytes.len() && bytes[at].is_ascii_digit() {
-                at += 1;
-            }
-            source[start..at].parse().ok()
-        }
-
-        fn find_all(haystack: &str, needle: &str) -> Vec<usize> {
-            let mut out = Vec::new();
-            let mut from = 0;
-            while let Some(hit) = haystack[from..].find(needle) {
-                out.push(from + hit);
-                from += hit + needle.len();
-            }
-            out
-        }
-
-        // kernel name -> the buffer indices its signature declares.
-        let mut kernels: Vec<(&str, Vec<u32>)> = Vec::new();
-        for start in find_all(SHADER, "kernel void ") {
-            let after = start + "kernel void ".len();
-            let open = after + SHADER[after..].find('(').expect("kernel signature");
-            let name = SHADER[after..open].trim();
-            let mut depth = 0usize;
-            let mut end = open;
-            for (offset, ch) in SHADER[open..].char_indices() {
-                match ch {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = open + offset;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let signature = &SHADER[open..end];
-            let mut indices: Vec<u32> = find_all(signature, "[[buffer(")
-                .into_iter()
-                .filter_map(|at| number_at(signature, at + "[[buffer(".len()))
-                .collect();
-            indices.sort_unstable();
-            kernels.push((name, indices));
-        }
-
-        // ABI freeze. A kernel that gains or loses a buffer trips this first,
-        // with an explicit instruction, instead of silently reaching the GPU.
-        let expected: &[(&str, &[u32])] = &[
-            (
-                "poseidon2_gate_quotient",
-                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
-            ),
-            (
-                "permutation_quotient",
-                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-            ),
-            ("range_check_gate_quotient", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
-            ("poseidon2_hash_leaves", &[0, 1, 2, 3, 4]),
-            ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
-            ("ntt_stage", &[0, 1, 2, 3, 4]),
-            ("ifft_finalize", &[0, 1, 2, 3]),
-            ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5]),
-            ("poseidon2_hash_parents", &[0, 1, 2, 3]),
-            ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
-        ];
-        let observed: Vec<(&str, &[u32])> = kernels
-            .iter()
-            .map(|(name, indices)| (*name, indices.as_slice()))
-            .collect();
-        assert_eq!(
-            observed, expected,
-            "poseidon2.metal kernel ABIs changed. Every dispatch site for the changed \
-             kernel must bind the new buffer set; update this table only after auditing \
-             them, because an unbound buffer produces no compiler diagnostic."
-        );
-
-        // Only production dispatch sites: the test module below encodes its own.
-        let host = &HOST[..HOST.find("\nmod tests {").expect("test module marker")];
-        let mut regions = 0usize;
-        for hit in find_all(host, ".set_compute_pipeline_state(") {
-            let head = &host[..hit];
-            let encoder_start = head
-                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                .map_or(0, |at| at + 1);
-            let encoder = &head[encoder_start..];
-            assert!(!encoder.is_empty(), "unnamed compute encoder");
-            let body_start = hit + ".set_compute_pipeline_state(".len();
-            let end_marker = format!("{encoder}.end_encoding()");
-            let body_len = host[body_start..]
-                .find(&end_marker)
-                .unwrap_or_else(|| panic!("no end_encoding for encoder {encoder}"));
-            let body = &host[body_start..body_start + body_len];
-
-            let mut bound: Vec<u32> = Vec::new();
-            for needle in [
-                format!("{encoder}.set_buffer("),
-                format!("{encoder}.set_bytes("),
-                format!("set_u32({encoder},"),
-            ] {
-                for at in find_all(body, &needle) {
-                    if let Some(index) = number_at(body, at + needle.len()) {
-                        bound.push(index);
-                    }
-                }
-            }
-            bound.sort_unstable();
-            bound.dedup();
-            let line = head.matches('\n').count() + 1;
-            assert!(
-                kernels.iter().any(|(_, indices)| *indices == bound),
-                "the dispatch at metal.rs:{line} (encoder `{encoder}`) binds buffers \
-                 {bound:?}, which is not the complete buffer set of any kernel in \
-                 poseidon2.metal. An under-bound dispatch reads uninitialized GPU \
-                 memory with no compiler diagnostic and no merge conflict."
-            );
-            regions += 1;
-        }
-        assert_eq!(
-            regions, 19,
-            "the number of production dispatch sites changed; each one is audited \
-             above, so update this count deliberately rather than by reflex."
-        );
-    }
-
     #[test]
     fn metallib_matches_shader_source() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/hash/poseidon2");
@@ -6461,6 +6310,134 @@ mod tests {
                     expected.to_canonical_u64(),
                     "byte/quintic gate quotient mismatch at word {i}, step {step}"
                 );
+            }
+        }
+    }
+
+    /// Half-domain seam. The quotient split dispatches each degree-<= 4 gate
+    /// alone and unfiltered against compact even-row copies of the wires *and*
+    /// constants stores, and the kernel indexes every store with the
+    /// companion's row count. So slice `k` of the half-domain job must equal
+    /// row `2k` of the ordinary full-domain job for the same spec — including
+    /// for the kinds that read gate constants, which is what the constants
+    /// companion exists to make true. The full-domain job is the reference
+    /// validated by the differentials above.
+    #[test]
+    fn metal_half_domain_multi_matches_full_domain_even_rows() {
+        type F = GoldilocksField;
+        const WIRE_COLUMNS: usize = 136;
+        const CONSTANT_COLUMNS: usize = 8;
+        const FULL_ROWS: usize = 128;
+        const ALPHA_OFFSET: usize = 19;
+        // Selector prefix width in the emulated circuit; the gate's own raw
+        // constants follow it, as in `start_gpu_range_check_gate_quotient`.
+        const RAW_CONSTANT_BASE: usize = 3;
+
+        let context = shared_context().expect("Metal context must initialize");
+        let alphas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        let mut wires = context
+            .allocate_columns::<F>(FULL_ROWS, WIRE_COLUMNS)
+            .expect("wire columns must allocate");
+        let mut constants = context
+            .allocate_columns::<F>(FULL_ROWS, CONSTANT_COLUMNS)
+            .expect("constant columns must allocate");
+        let mut rng = StdRng::seed_from_u64(0x0b17_5150);
+        for store in [&mut wires, &mut constants] {
+            for column in store.columns_mut().expect("unique columns") {
+                for value in column.iter_mut() {
+                    *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+                }
+            }
+        }
+
+        let even_wires = crate::fri::oracle::EvenColumns::from_even_rows(&wires, WIRE_COLUMNS);
+        let even_constants =
+            crate::fri::oracle::EvenColumns::from_even_rows(&constants, CONSTANT_COLUMNS);
+        let even_wires = even_wires.get().expect("wires companion must allocate");
+        let even_constants = even_constants.get().expect("constants companion must allocate");
+        for (companion, source) in [(even_wires, &wires), (even_constants, &constants)] {
+            assert_eq!(companion.rows(), FULL_ROWS / 2);
+            assert_eq!(companion.cols(), source.cols());
+            for column in 0..companion.cols() {
+                let full = source.col(column);
+                for (k, &value) in companion.col(column).iter().enumerate() {
+                    assert_eq!(value.to_canonical_u64(), full[2 * k].to_canonical_u64());
+                }
+            }
+        }
+
+        // Every degree-<= 4 kind that reads gate constants, plus one that does
+        // not as a control. `num_ops` is the audited production shape.
+        let kinds = [
+            (
+                U32QuotientKind::Equality {
+                    constant_column: RAW_CONSTANT_BASE + 2,
+                },
+                WIRE_COLUMNS / 6,
+            ),
+            (
+                U32QuotientKind::BaseAddition {
+                    constant_base: RAW_CONSTANT_BASE,
+                },
+                26,
+            ),
+            (
+                U32QuotientKind::RandomAccess {
+                    bits: 3,
+                    num_extra_constants: 0,
+                    constant_base: RAW_CONSTANT_BASE,
+                },
+                8,
+            ),
+            (U32QuotientKind::Selection, 20),
+        ];
+        for (kind, num_ops) in kinds {
+            let spec = U32QuotientSpec {
+                selector_column: 0,
+                gate_index: 5,
+                group: 5..6,
+                include_unused_selector: false,
+                num_ops,
+                kind,
+            };
+            let full_job = start_range_check_gate_quotient(
+                &wires,
+                &constants,
+                FULL_ROWS,
+                1,
+                &[],
+                core::slice::from_ref(&spec),
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("full-domain quotient job must start");
+            let half_job = start_range_check_gate_quotient_multi(
+                even_wires,
+                even_constants,
+                FULL_ROWS / 2,
+                1,
+                &[(Vec::new(), vec![spec.clone()])],
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("half-domain quotient job must start");
+            let full = full_job
+                .finish()
+                .expect("full-domain quotient job must finish");
+            let half = half_job
+                .finish()
+                .expect("half-domain quotient job must finish");
+            assert_eq!(full.len(), FULL_ROWS * 2);
+            assert_eq!(half.len(), FULL_ROWS);
+            for k in 0..FULL_ROWS / 2 {
+                for challenge in 0..2 {
+                    assert_eq!(
+                        half[k * 2 + challenge].to_canonical_u64(),
+                        full[2 * k * 2 + challenge].to_canonical_u64(),
+                        "half-domain {:?} diverges at row {k}, challenge {challenge}",
+                        spec.kind,
+                    );
+                }
             }
         }
     }

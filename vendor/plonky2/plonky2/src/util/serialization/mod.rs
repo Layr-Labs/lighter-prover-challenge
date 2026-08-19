@@ -22,7 +22,7 @@ use hashbrown::HashMap;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::polynomial::PolynomialCoeffs;
 use crate::field::types::{Field64, PrimeField64};
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::{EvenColumns, PolynomialBatch};
 use crate::fri::proof::{
     CompressedFriProof, CompressedFriQueryRounds, FriInitialTreeProof, FriInitialTreeProofTarget,
     FriProof, FriProofTarget, FriQueryRound, FriQueryRoundTarget, FriQueryStep, FriQueryStepTarget,
@@ -182,26 +182,14 @@ pub trait Read {
     }
 
     /// Reads a vector of elements from the field `F` from `self`.
-    ///
-    /// Written as a reserving push loop, like [`Self::read_usize_vec`] and
-    /// [`Self::read_usize_encoded_u32_vec`] above, rather than `collect`ing a
-    /// `Result<Vec<_>, _>`: that collect routes through `iter::process_results`,
-    /// whose shunt iterator reports a lower size-hint bound of zero whatever the
-    /// underlying `Range` knows, so the vector starts at capacity one and grows by
-    /// doubling -- 17 reallocations, and one full copy of everything already read,
-    /// for a 2^16-element column. The elements, their order and the error behaviour
-    /// are unchanged; only the allocation is.
     #[inline]
     fn read_field_vec<F>(&mut self, length: usize) -> IoResult<Vec<F>>
     where
         F: Field64,
     {
-        let mut res = Vec::with_capacity(length);
-        for _ in 0..length {
-            res.push(self.read_field()?);
-        }
-
-        Ok(res)
+        (0..length)
+            .map(|_| self.read_field())
+            .collect::<Result<Vec<_>, _>>()
     }
 
     /// Reads an element from the field extension of `F` from `self.`
@@ -937,7 +925,7 @@ pub trait Read {
                     let len = self.read_usize()?;
                     table.push(self.read_field_vec(len)?);
                 }
-                Some(Arc::new(table))
+                Some(table)
             }
             false => None,
         };
@@ -971,6 +959,10 @@ pub trait Read {
             generator_watch_counts,
             generators_defer_until_ready,
             constants_sigmas_commitment,
+            // Runtime-only: rebuilding the even-row companion needs the shared
+            // column store that a deserialized commitment may not have, so the
+            // constants-reading gates fall back to the full-domain dispatch.
+            constants_even_columns: EvenColumns::default(),
             sigmas,
             subgroup,
             public_inputs,
@@ -1955,6 +1947,9 @@ pub trait Write {
             constants_sigmas_quotient_cache: _,
             constants_sigmas_quotient_step: _,
             constants_sigmas_quotient_domain: _,
+            // Runtime-only: a derived copy of the commitment's own LDE rows,
+            // so it contributes no bytes and the format is unchanged.
+            constants_even_columns: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

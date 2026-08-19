@@ -18,7 +18,7 @@ use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::fft_root_table;
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::{EvenColumns, PolynomialBatch};
 use crate::fri::{FriConfig, FriParams};
 use crate::gadgets::arithmetic::BaseArithmeticOperation;
 use crate::gadgets::arithmetic_extension::ExtensionArithmeticOperation;
@@ -49,7 +49,7 @@ use crate::plonk::circuit_data::{
 };
 use crate::plonk::config::{AlgebraicHasher, GenericConfig, GenericHashOut, Hasher};
 use crate::plonk::copy_constraint::CopyConstraint;
-use crate::plonk::permutation_argument::Forest;
+use crate::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::timed;
 use crate::util::context_tree::ContextTree;
@@ -1039,14 +1039,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             .collect()
     }
 
-    /// Returns the sigma polynomial values, the forest whose `parents` become the
-    /// representative map, and the routed-position singleton mask -- the last spliced out of
-    /// the partition pass rather than re-derived from the finished map.
-    fn sigma_vecs(
-        &self,
-        k_is: &[F],
-        subgroup: &[F],
-    ) -> (Vec<PolynomialValues<F>>, Forest, Vec<u8>) {
+    fn sigma_vecs(&self, k_is: &[F], subgroup: &[F]) -> (Vec<PolynomialValues<F>>, Forest) {
         let degree = self.gate_instances.len();
         let degree_log = log2_strict(degree);
         let config = &self.config;
@@ -1076,11 +1069,10 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         forest.compress_paths();
 
-        let (wire_partition, fixed_routed_wires) = forest.wire_partition_with_fixed_mask();
+        let wire_partition = forest.wire_partition();
         (
             wire_partition.get_sigma_polys(degree_log, k_is, subgroup),
             forest,
-            fixed_routed_wires,
         )
     }
 
@@ -1274,7 +1266,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         let subgroup = F::two_adic_subgroup(degree_bits);
 
         let k_is = get_unique_coset_shifts(degree, self.config.num_routed_wires);
-        let (sigma_vecs, forest, fixed_routed_wires) = timed!(
+        let (sigma_vecs, forest) = timed!(
             timing,
             "generate sigma polynomials",
             self.sigma_vecs(&k_is, &subgroup)
@@ -1462,6 +1454,26 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
+        // Even-row companion of the constants columns (see [`EvenColumns`]).
+        // The constants/sigmas LDE is circuit-fixed, so this stride-2 copy is
+        // paid once here instead of once per proof, and it is what lets the
+        // half-domain quotient dispatch carry the gates that read gate
+        // constants: that dispatch indexes the constants store with the wires
+        // row count, which is half the LDE.
+        let constants_even_columns = if crate::plonk::prover::half_domain_split_wanted(&common) {
+            constants_sigmas_commitment.even_row_companion(common.constants_range().len())
+        } else {
+            EvenColumns::default()
+        };
+
+        let fixed_routed_wires = fixed_routed_wire_mask(
+            &forest.parents,
+            common.config.num_wires,
+            common.config.num_routed_wires,
+            subgroup.len(),
+        )
+        .expect("builder produced an invalid compressed representative map");
+
         let generators_defer_until_ready = self
             .generators
             .iter()
@@ -1473,12 +1485,13 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             generator_watch_counts,
             generators_defer_until_ready,
             constants_sigmas_commitment,
+            constants_even_columns,
             sigmas,
             subgroup,
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
             fixed_routed_wires,
-            fft_root_table: Some(Arc::new(fft_root_table)),
+            fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
             lut_to_lookups: self.lut_to_lookups.clone(),
