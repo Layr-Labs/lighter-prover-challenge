@@ -22,7 +22,7 @@ use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::CommonCircuitData;
 use crate::plonk::vars::{
-    EvaluationTargets, EvaluationVars, EvaluationVarsBase,
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
     EvaluationVarsBasePacked,
 };
 use crate::util::serialization::{Buffer, IoResult, Read, Write};

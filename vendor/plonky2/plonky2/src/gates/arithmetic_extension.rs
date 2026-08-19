@@ -4,6 +4,7 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
+use core::any::TypeId;
 use core::mem::MaybeUninit;
 use core::ops::Range;
 
@@ -11,6 +12,8 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::goldilocks_extensions::ext2_constraint_mul_add_accumulate;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -116,8 +119,135 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
     /// Contiguous-column fused evaluation: reads each wire as a contiguous
     /// `n`-point column and multiply-adds the filtered constraint rows
     /// straight into the shared buffer, avoiding the per-point strided writes
-    /// of the default path.
+    /// of the default path. For the production Goldilocks/quadratic
+    /// configuration the whole filtered constraint is folded into a 160-bit
+    /// accumulator with one `reduce160` per limb
+    /// (`ext2_constraint_mul_add_accumulate`); every other configuration
+    /// takes the generic body. This gate carries all nonzero-addend mul-add
+    /// traffic from the arithmetic gadget, so it is the hottest of the three
+    /// extension-constraint fast paths.
     fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() && D == 2 {
+            let n = vars_base.len();
+            assert_eq!(filters.len(), n);
+            assert!(
+                combined_gate_constraints.len()
+                    >= <Self as Gate<F, D>>::num_constraints(self) * n
+            );
+            // SAFETY (all casts below): the `TypeId` comparison proves `F` is
+            // exactly `GoldilocksField`; only the generic spelling differs,
+            // so the pointer reinterpretations preserve layout, length and
+            // alignment exactly.
+            let wires = unsafe {
+                core::slice::from_raw_parts(
+                    vars_base.local_wires.as_ptr().cast::<GoldilocksField>(),
+                    vars_base.local_wires.len(),
+                )
+            };
+            let constants = unsafe {
+                core::slice::from_raw_parts(
+                    vars_base.local_constants.as_ptr().cast::<GoldilocksField>(),
+                    2 * n,
+                )
+            };
+            let filters = unsafe {
+                core::slice::from_raw_parts(filters.as_ptr().cast::<GoldilocksField>(), n)
+            };
+            let combined = unsafe {
+                core::slice::from_raw_parts_mut(
+                    combined_gate_constraints
+                        .as_mut_ptr()
+                        .cast::<GoldilocksField>(),
+                    combined_gate_constraints.len(),
+                )
+            };
+            return arithmetic_ext_accumulate_goldilocks_d2(
+                self.num_ops,
+                n,
+                wires,
+                &constants[..n],
+                &constants[n..2 * n],
+                filters,
+                combined,
+            );
+        }
+        self.eval_unfiltered_base_batch_accumulate_generic(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+        );
+    }
+
+    fn eval_unfiltered_circuit(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        vars: EvaluationTargets<D>,
+    ) -> Vec<ExtensionTarget<D>> {
+        let const_0 = vars.local_constants[0];
+        let const_1 = vars.local_constants[1];
+
+        let mut constraints = Vec::with_capacity(self.num_ops * D);
+        for i in 0..self.num_ops {
+            let multiplicand_0 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_0(i));
+            let multiplicand_1 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_1(i));
+            let addend = vars.get_local_ext_algebra(Self::wires_ith_addend(i));
+            let output = vars.get_local_ext_algebra(Self::wires_ith_output(i));
+            let computed_output = {
+                let mul = builder.mul_ext_algebra(multiplicand_0, multiplicand_1);
+                let scaled_mul = builder.scalar_mul_ext_algebra(const_0, mul);
+                builder.scalar_mul_add_ext_algebra(const_1, addend, scaled_mul)
+            };
+
+            let diff = builder.sub_ext_algebra(output, computed_output);
+            constraints.extend(diff.to_ext_target_array());
+        }
+
+        constraints
+    }
+
+    fn generators(&self, row: usize, local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
+        (0..self.num_ops)
+            .map(|i| {
+                WitnessGeneratorRef::new(
+                    ArithmeticExtensionGenerator {
+                        row,
+                        const_0: local_constants[0],
+                        const_1: local_constants[1],
+                        i,
+                    }
+                    .adapter(),
+                )
+            })
+            .collect()
+    }
+
+    fn num_wires(&self) -> usize {
+        self.num_ops * 4 * D
+    }
+
+    fn num_constants(&self) -> usize {
+        2
+    }
+
+    fn degree(&self) -> usize {
+        3
+    }
+
+    fn num_constraints(&self) -> usize {
+        self.num_ops * D
+    }
+}
+
+impl<const D: usize> ArithmeticExtensionGate<D> {
+    /// Generic-field body of `eval_unfiltered_base_batch_accumulate`; the
+    /// trait method dispatches every non-Goldilocks (or non-`D == 2`)
+    /// configuration here.
+    fn eval_unfiltered_base_batch_accumulate_generic<F: RichField + Extendable<D>>(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
@@ -128,8 +258,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
 
         let wires = vars_base.local_wires;
-        let const_0 = vars_base.local_constants_col(0);
-        let const_1 = vars_base.local_constants_col(1);
+        let constants = vars_base.local_constants;
+        let const_0 = &constants[..n];
+        let const_1 = &constants[n..2 * n];
         let ext = |start: usize, p: usize| {
             let mut arr = [F::ZERO; D];
             for (d, a) in arr.iter_mut().enumerate() {
@@ -195,63 +326,73 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         }
     }
 
-    fn eval_unfiltered_circuit(
-        &self,
-        builder: &mut CircuitBuilder<F, D>,
-        vars: EvaluationTargets<D>,
-    ) -> Vec<ExtensionTarget<D>> {
-        let const_0 = vars.local_constants[0];
-        let const_1 = vars.local_constants[1];
+}
 
-        let mut constraints = Vec::with_capacity(self.num_ops * D);
-        for i in 0..self.num_ops {
-            let multiplicand_0 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_0(i));
-            let multiplicand_1 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_1(i));
-            let addend = vars.get_local_ext_algebra(Self::wires_ith_addend(i));
-            let output = vars.get_local_ext_algebra(Self::wires_ith_output(i));
-            let computed_output = {
-                let mul = builder.mul_ext_algebra(multiplicand_0, multiplicand_1);
-                let scaled_mul = builder.scalar_mul_ext_algebra(const_0, mul);
-                builder.scalar_mul_add_ext_algebra(const_1, addend, scaled_mul)
-            };
-
-            let diff = builder.sub_ext_algebra(output, computed_output);
-            constraints.extend(diff.to_ext_target_array());
+/// Goldilocks/`D == 2` fast path for `ArithmeticExtensionGate`'s filtered
+/// batch accumulate. MulExt's constraint plus one addend term: per
+/// (operation, point) the constraint's two limbs each cost a single
+/// `reduce160` via `ext2_constraint_mul_add_accumulate` — one extra
+/// `u160_add_product` per limb over the mul-only form. Value-identical
+/// (canonically) to the generic evaluate-then-multiply-add path; raw
+/// representatives may differ, which every consumer tolerates.
+fn arithmetic_ext_accumulate_goldilocks_d2(
+    num_ops: usize,
+    n: usize,
+    wires: &[GoldilocksField],
+    const_0: &[GoldilocksField],
+    const_1: &[GoldilocksField],
+    filters: &[GoldilocksField],
+    combined_gate_constraints: &mut [GoldilocksField],
+) {
+    // Per-point `-(filter * const_c)`, shared by all `num_ops` operations.
+    // Batches are 32 points; keep the small buffers on the stack when they
+    // fit.
+    const STACK_POINTS: usize = 128;
+    let mut neg_fc_stack = [GoldilocksField(0); 2 * STACK_POINTS];
+    let mut neg_fc_heap;
+    let neg_fc: &mut [GoldilocksField] = if n <= STACK_POINTS {
+        &mut neg_fc_stack[..2 * n]
+    } else {
+        neg_fc_heap = vec![GoldilocksField(0); 2 * n];
+        &mut neg_fc_heap
+    };
+    let (neg_fc0, neg_fc1) = neg_fc.split_at_mut(n);
+    for p in 0..n {
+        neg_fc0[p] = -(filters[p] * const_0[p]);
+        neg_fc1[p] = -(filters[p] * const_1[p]);
+    }
+    for i in 0..num_ops {
+        let m0_start = ArithmeticExtensionGate::<2>::wires_ith_multiplicand_0(i).start;
+        let m1_start = ArithmeticExtensionGate::<2>::wires_ith_multiplicand_1(i).start;
+        let addend_start = ArithmeticExtensionGate::<2>::wires_ith_addend(i).start;
+        let output_start = ArithmeticExtensionGate::<2>::wires_ith_output(i).start;
+        for p in 0..n {
+            let m0 = [wires[m0_start * n + p], wires[(m0_start + 1) * n + p]];
+            let m1 = [wires[m1_start * n + p], wires[(m1_start + 1) * n + p]];
+            let addend = [
+                wires[addend_start * n + p],
+                wires[(addend_start + 1) * n + p],
+            ];
+            let output = [
+                wires[output_start * n + p],
+                wires[(output_start + 1) * n + p],
+            ];
+            let idx0 = (2 * i) * n + p;
+            let idx1 = (2 * i + 1) * n + p;
+            let acc = [combined_gate_constraints[idx0], combined_gate_constraints[idx1]];
+            let res = ext2_constraint_mul_add_accumulate(
+                acc,
+                filters[p],
+                output,
+                neg_fc0[p],
+                m0,
+                m1,
+                neg_fc1[p],
+                addend,
+            );
+            combined_gate_constraints[idx0] = res[0];
+            combined_gate_constraints[idx1] = res[1];
         }
-
-        constraints
-    }
-
-    fn generators(&self, row: usize, local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
-        (0..self.num_ops)
-            .map(|i| {
-                WitnessGeneratorRef::new(
-                    ArithmeticExtensionGenerator {
-                        row,
-                        const_0: local_constants[0],
-                        const_1: local_constants[1],
-                        i,
-                    }
-                    .adapter(),
-                )
-            })
-            .collect()
-    }
-
-    fn num_wires(&self) -> usize {
-        self.num_ops * 4 * D
-    }
-
-    fn num_constants(&self) -> usize {
-        2
-    }
-
-    fn degree(&self) -> usize {
-        3
-    }
-
-    fn num_constraints(&self) -> usize {
-        self.num_ops * D
     }
 }
 
@@ -355,5 +496,69 @@ mod tests {
         let gate =
             ArithmeticExtensionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    /// The Goldilocks delayed-reduction accumulate must agree canonically
+    /// with the generic evaluate-then-multiply-add body over ragged batch
+    /// sizes, random filters and initial buffer contents, both random
+    /// constant columns, and deliberately noncanonical (`>= p`) wire
+    /// representatives.
+    #[test]
+    fn accumulate_fast_path_matches_generic() {
+        use crate::field::types::{Field, Field64, PrimeField64};
+        use crate::gates::gate::Gate;
+        use crate::hash::hash_types::HashOut;
+        use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = ArithmeticExtensionGate::<D>::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+        );
+        let num_wires = <ArithmeticExtensionGate<D> as Gate<F, D>>::num_wires(&gate);
+        let num_constraints = <ArithmeticExtensionGate<D> as Gate<F, D>>::num_constraints(&gate);
+
+        let mut seed = 0x5EEDFACE0DDBA11u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        // Every fifth raw limb is forced into `[p, 2^64)`, the noncanonical
+        // band the quotient wire columns legitimately contain.
+        let mut raw = |k: usize| {
+            let v = next();
+            if k % 5 == 0 {
+                GoldilocksField(F::ORDER.wrapping_add(v % ((1u64 << 32) - 2)))
+            } else {
+                GoldilocksField(v)
+            }
+        };
+
+        let pih = HashOut::<F>::ZERO;
+        for &n in &[1usize, 3, 4, 5, 7, 31, 32, 33] {
+            let wires: Vec<F> = (0..num_wires * n).map(&mut raw).collect();
+            // Both constant columns random, including noncanonical entries.
+            let constants: Vec<F> = (0..2 * n).map(&mut raw).collect();
+            let filters: Vec<F> = (0..n).map(|p| raw(3 * p + 1)).collect();
+            let initial: Vec<F> = (0..num_constraints * n).map(&mut raw).collect();
+
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &pih);
+            let mut fast = initial.clone();
+            <ArithmeticExtensionGate<D> as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                &gate, vars, &filters, &mut fast,
+            );
+            let mut generic = initial;
+            gate.eval_unfiltered_base_batch_accumulate_generic(vars, &filters, &mut generic);
+
+            for (i, (a, b)) in fast.iter().zip(&generic).enumerate() {
+                assert_eq!(
+                    a.to_canonical_u64(),
+                    b.to_canonical_u64(),
+                    "n = {n}, slot {i}"
+                );
+            }
+        }
     }
 }

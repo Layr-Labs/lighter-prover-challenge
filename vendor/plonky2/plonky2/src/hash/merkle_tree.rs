@@ -38,16 +38,7 @@ impl<F: RichField, H: Hasher<F>> MerkleCap<F, H> {
     }
 
     pub fn flatten(&self) -> Vec<F> {
-        let Some((first, rest)) = self.0.split_first() else {
-            return Vec::new();
-        };
-        let mut flattened = first.to_vec();
-        let elements_per_hash = flattened.len();
-        flattened.reserve(rest.len() * elements_per_hash);
-        for hash in rest {
-            hash.for_each_element(|element| flattened.push(element));
-        }
-        flattened
+        self.0.iter().flat_map(|&h| h.to_vec()).collect()
     }
 }
 

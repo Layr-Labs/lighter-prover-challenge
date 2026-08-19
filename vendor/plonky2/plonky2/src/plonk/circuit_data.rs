@@ -25,7 +25,7 @@ use super::circuit_builder::LookupWire;
 use crate::field::extension::Extendable;
 use crate::field::fft::FftRootTable;
 use crate::field::types::Field;
-use crate::fri::oracle::PolynomialBatch;
+use crate::fri::oracle::LazyPolynomialBatch;
 use crate::fri::reduction_strategies::FriReductionStrategy;
 use crate::fri::structure::{
     FriBatchInfo, FriBatchInfoTarget, FriInstanceInfo, FriInstanceInfoTarget, FriOracleInfo,
@@ -661,7 +661,12 @@ pub struct ProverOnlyCircuitData<
     /// serialized format is unchanged.
     pub generators_defer_until_ready: bool,
     /// Commitments to the constants polynomials and sigma polynomials.
-    pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
+    ///
+    /// Held behind [`LazyPolynomialBatch`] so a deserializing loader can defer
+    /// the commitment's recompute (IFFT + LDE + Merkle tree) off the startup
+    /// critical path; the builder and the legacy deserializer store it ready.
+    /// Access is a deref — lock-free once materialized.
+    pub constants_sigmas_commitment: LazyPolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
     pub sigmas: Vec<Vec<F>>,
     /// Subgroup of order `degree`.

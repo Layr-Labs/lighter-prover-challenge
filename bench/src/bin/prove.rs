@@ -27,31 +27,41 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// The default 8 MiB oversize arena eagerly purges the prover's recurring large
-// witness/coefficient extents instead of honoring jemalloc's 10 s dirty decay.
-// Disabling that threshold lets the next same-shaped allocation reuse resident
-// pages. Limit arenas to eight so the many short-lived scoped workers cycle
-// through a small enough set to reuse those retained same-shaped extents rather
-// than fragment them across jemalloc's default four arenas per CPU. Allocation
-// placement and purge timing cannot affect proof values.
-#[cfg(not(target_env = "msvc"))]
-#[unsafe(export_name = "_rjem_malloc_conf")]
-static MALLOC_CONF: &[u8; 31] = b"oversize_threshold:0,narenas:8\0";
-
-// jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
-// mapped long enough for the next identically-shaped allocation to reuse them.
+// jemalloc page-decay policy, applied before jemalloc's first allocation by
+// exporting `_rjem_malloc_conf` (the prefixed compile-time-options symbol
+// tikv-jemalloc-sys builds with); an env var set from `main` would be read
+// too late.
 //
-// A previous revision exported `_rjem_malloc_conf = "dirty_decay_ms:0,
-// muzzy_decay_ms:0"` on the stated premise that five scored workers run
-// concurrently and contend for residency. The harness runs them strictly
+// The transaction/chain pipeline allocates and frees the same
+// multi-hundred-megabyte witness/coefficient shapes 50+ times per worker.
+// Under the default decay periods (dirty 10 s, muzzy 10 s) any page that
+// sits free longer than its decay window is madvised away and re-faulted
+// zeroed on the next identically-shaped allocation. A previous revision
+// tried `decay:0` (purge immediately), which put that madvise/re-fault
+// cycle on every free/alloc pair and was reverted; `-1` is the opposite
+// endpoint: never purge, so a page faulted in once stays resident for the
+// worker's whole lifetime and every later allocation of the same shape
+// reuses it with no kernel work. The harness runs scored workers strictly
 // sequentially (`run_private_sequence` awaits each worker's exit before
 // spawning the next), so exactly one worker owns the machine at a time and
-// residency pressure from a sibling worker does not exist. What decay:0 does
-// cost is kernel work on the proving path: the transaction/chain pipeline
-// allocates and frees the same multi-hundred-megabyte witness/coefficient
-// shapes 50+ times per worker, and with decay disabled every one of those
-// cycles madvises the pages away and then re-faults them zeroed on the next
-// step. Allocator page retention changes no computed value.
+// retained pages contend with nothing. Allocator page retention changes no
+// computed value.
+#[cfg(not(target_env = "msvc"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static _rjem_malloc_conf: MallocConf =
+    MallocConf(c"dirty_decay_ms:-1,muzzy_decay_ms:-1".as_ptr());
+
+/// Thin `*const c_char` wrapper so the exported `_rjem_malloc_conf` static
+/// matches jemalloc's `const char *malloc_conf` ABI while satisfying `Sync`
+/// (the string it points at is immutable `'static` data).
+#[cfg(not(target_env = "msvc"))]
+#[repr(transparent)]
+pub struct MallocConf(*const std::ffi::c_char);
+
+#[cfg(not(target_env = "msvc"))]
+unsafe impl Sync for MallocConf {}
+
 // Keep the promoted writer path while exercising a second submission from that baseline.
 // The serialized proof measures ~196 KB at the ranked circuit shapes, so the
 // prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
@@ -201,8 +211,34 @@ fn main() {
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
+    // Rayon's default spawn handler starts worker threads at default QoS,
+    // which leaves every bulk proving thread eligible for efficiency-core
+    // placement and schedules it behind any QoS-classed thread in the
+    // process. The dedicated threads already opt in: the chain-fold spine
+    // runs USER_INTERACTIVE (0x21) and the tx-proof/GPU-holder threads
+    // USER_INITIATED (0x19, relative 0). Spawning the pool workers at
+    // USER_INITIATED relative -1 keeps the bulk work on performance cores
+    // in the same class, while staying strictly below both the spine and
+    // the buffer-set holders — a pool worker must never preempt the thread
+    // holding the single GPU buffer set (the inversion those helpers exist
+    // to prevent). Scheduling only: thread count, stack size, and all
+    // computed values are unchanged, so proof bytes are untouched.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn_handler(|thread| {
+            let mut builder = std::thread::Builder::new();
+            if let Some(name) = thread.name() {
+                builder = builder.name(name.to_owned());
+            }
+            if let Some(stack_size) = thread.stack_size() {
+                builder = builder.stack_size(stack_size);
+            }
+            builder.spawn(|| {
+                prover::mark_thread_user_initiated_below();
+                thread.run()
+            })?;
+            Ok(())
+        })
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
@@ -222,10 +258,11 @@ fn main() {
         let _span = plonky2::util::profile::span("startup", "fixture_split_transactions");
         without_top_level_txs(&json)
     };
-    // The unchanged authoritative parse starts immediately. In parallel, serde parses the much
-    // smaller transaction-free envelope needed by the pre-execution proof while that circuit is
-    // loaded. The full typed transaction parse therefore overlaps the pre proof instead of
-    // blocking its start; the parsed `Block` is joined before the transaction pipeline consumes it.
+    // The unchanged authoritative parse starts immediately on its own thread. In
+    // parallel, serde parses the much smaller transaction-free envelope needed by
+    // the pre-execution proof while the pre circuit loads, so the pre-execution
+    // witness starts without waiting for the full transaction parse; the
+    // transaction pipeline joins the authoritative `Block` before consuming it.
     let block_handle = std::thread::Builder::new()
         .name("fixture-full-parse".into())
         .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -242,6 +279,7 @@ fn main() {
             .expect("invalid prover fixture")
         })
         .expect("cannot start full fixture parse");
+    // Envelope parse overlaps the pre-execution circuit load; both are fast.
     let (pre_block, pre_circuits) = rayon::join(
         || {
             #[cfg(feature = "diagnostic_profile")]
@@ -283,11 +321,13 @@ fn main() {
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
             circuit::block_pre_execution::BlockPreExec::from_block(&pre_block)
         };
-        // The native pre witness owns everything the startup proof needs. Do not retain the
-        // transaction-free parse beside the authoritative full block for the rest of the worker.
+        // The native pre witness owns everything the startup proof needs. Do not
+        // retain the transaction-free parse beside the authoritative full block
+        // for the rest of the worker.
         drop(pre_block);
         drop(pre_json);
         let pre_handle = std::thread::Builder::new()
+            .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
             .spawn(move || {
                 let (pre_target, mut pre_data) = pre_circuits;
@@ -313,7 +353,7 @@ fn main() {
                 // contend for the machine's memory. Value-exact and free: no
                 // quantity is computed differently and no work is added — storage
                 // that no subsequent read can reach is returned earlier.
-                pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+                pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default().into();
                 (pre_target, pre_data, pre_proof)
             })
             .expect("pre-execution startup thread must start");
@@ -334,6 +374,10 @@ fn main() {
     let (pre_target, pre_data, pre_proof) = pre_handle
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // Join the authoritative full-block parse now that the pre-execution proof is
+    // running (or done); the transaction pipeline cannot consume the block before
+    // this join, which keeps the tx-free envelope and the full parse bit-identical
+    // to the single parse master produced.
     let block = block_handle
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));

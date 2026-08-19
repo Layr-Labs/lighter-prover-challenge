@@ -40,6 +40,164 @@ pub const SALT_SIZE: usize = 4;
 /// trees (`new_columns`) remain on.
 const GPU_NTT_COMMITMENTS: bool = false;
 
+/// A [`PolynomialBatch`] whose materialization (IFFT + LDE + Merkle tree) may
+/// be deferred off the thread that constructs it and overlapped with unrelated
+/// work, without changing any computed value.
+///
+/// Motivation: the embedded-circuit loader recomputes each circuit's
+/// constants/sigmas commitment at startup, and that recompute sits on the
+/// worker's critical path (the loads are joined before proving begins) while
+/// its first *consumer* — the quotient evaluation, then the FRI openings — runs
+/// hundreds of milliseconds later. Wrapping the commitment lets the loader
+/// return as soon as the commitment's *inputs* exist and materialize it on the
+/// global pool underneath the witness phase instead.
+///
+/// Semantics: a `ready` batch behaves exactly like a plain [`PolynomialBatch`].
+/// A `deferred` batch holds the closure that produces it; the first access
+/// (any deref) runs the closure to completion — under [`std::sync::OnceLock`],
+/// so exactly one thread computes it and concurrent accessors block until the
+/// value exists, then read it forever after through a lock-free acquire load.
+/// [`Self::spawn_prefetch`] starts that materialization in the background on
+/// the rayon global pool. There is no deadlock window: a consumer that arrives
+/// before the prefetch task was scheduled simply runs the closure itself
+/// inline (`get_or_init`), so progress never depends on pool capacity.
+///
+/// Value-exactness: the closure is the same computation the eager path ran,
+/// moved in time only. Nothing about the produced batch differs.
+pub struct LazyPolynomialBatch<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    state: std::sync::Arc<LazyBatchState<F, C, D>>,
+}
+
+type LazyBatchJob<F, C, const D: usize> =
+    Box<dyn FnOnce() -> PolynomialBatch<F, C, D> + Send>;
+
+struct LazyBatchState<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> {
+    cell: std::sync::OnceLock<PolynomialBatch<F, C, D>>,
+    /// The pending materialization, if any. Taken (exactly once) inside the
+    /// `cell` initialization closure, so the lock is touched only before the
+    /// value exists — never on the steady-state read path.
+    job: std::sync::Mutex<Option<LazyBatchJob<F, C, D>>>,
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    LazyBatchState<F, C, D>
+{
+    fn force(&self) -> &PolynomialBatch<F, C, D> {
+        self.cell.get_or_init(|| {
+            let job = self
+                .job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("lazy polynomial batch constructed without a value or a job");
+            job()
+        })
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    LazyPolynomialBatch<F, C, D>
+{
+    /// Wraps an already-materialized batch; every access is a plain read.
+    pub fn ready(batch: PolynomialBatch<F, C, D>) -> Self {
+        let state = LazyBatchState {
+            cell: std::sync::OnceLock::from(batch),
+            job: std::sync::Mutex::new(None),
+        };
+        Self {
+            state: std::sync::Arc::new(state),
+        }
+    }
+
+    /// Wraps a pending materialization. `job` runs at most once — on the first
+    /// deref or when a [`Self::spawn_prefetch`] task gets scheduled, whichever
+    /// happens first.
+    pub fn deferred(job: impl FnOnce() -> PolynomialBatch<F, C, D> + Send + 'static) -> Self {
+        let state = LazyBatchState {
+            cell: std::sync::OnceLock::new(),
+            job: std::sync::Mutex::new(Some(Box::new(job) as LazyBatchJob<F, C, D>)),
+        };
+        Self {
+            state: std::sync::Arc::new(state),
+        }
+    }
+
+    /// Starts materialization on the rayon global pool (without `parallel`,
+    /// materializes inline). Idempotent; a consumer that derefs first simply
+    /// does the work itself and the prefetch task finds the cell populated.
+    pub fn spawn_prefetch(&self)
+    where
+        F: 'static,
+        C: 'static,
+    {
+        #[cfg(feature = "parallel")]
+        {
+            let state = std::sync::Arc::clone(&self.state);
+            plonky2_maybe_rayon::rayon::spawn(move || {
+                state.force();
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        self.state.force();
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    core::ops::Deref for LazyPolynomialBatch<F, C, D>
+{
+    type Target = PolynomialBatch<F, C, D>;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.force()
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    From<PolynomialBatch<F, C, D>> for LazyPolynomialBatch<F, C, D>
+{
+    fn from(batch: PolynomialBatch<F, C, D>) -> Self {
+        Self::ready(batch)
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn default() -> Self {
+        Self::ready(PolynomialBatch::default())
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> core::fmt::Debug
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.state.cell.get() {
+            Some(batch) => f.debug_tuple("LazyPolynomialBatch").field(batch).finish(),
+            None => f.write_str("LazyPolynomialBatch(<pending>)"),
+        }
+    }
+}
+
+/// Comparison materializes both sides: equality is a property of the batch
+/// *values*, which deferral does not change.
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> PartialEq
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn eq(&self, other: &Self) -> bool {
+        *self.state.force() == *other.state.force()
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Eq
+    for LazyPolynomialBatch<F, C, D>
+{
+}
+
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BatchLayout {
@@ -109,6 +267,13 @@ impl<F> EvenColumns<F> {
     }
 
     /// Derive the even-row companion from a full-domain Metal column store.
+    ///
+    /// `companion[j][k] = full[j][2k]`. The kernel indexes both the wires
+    /// companion and this buffer with stride `wires.rows`, so the compact
+    /// constants must have the same row count as the compact wires. A
+    /// degree-`< 4n` polynomial is determined by its `4n` even-coset
+    /// samples; copying those samples does not change any value the
+    /// full-domain kernel would have read at those rows.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     pub(crate) fn get_or_fill_even_rows(
         &self,
@@ -307,6 +472,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
+                // Compact even-row companion (Metal only, on request): the
+                // fill below writes row `2k` of every column into row `k` of
+                // the companion right after that column's FFT, while the
+                // column is still cache-resident.
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                 let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
                     crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
@@ -397,7 +566,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                             {
                                 EvenColumns::default()
                             }
-                        },
+                        }
                     };
                 }
                 let initialized = timed!(
@@ -432,7 +601,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                             {
                                 EvenColumns::default()
                             }
-                        },
+                        }
                     };
                 }
             }
@@ -1392,51 +1561,6 @@ mod tests {
 
         check::<GoldilocksField>();
         check::<<GoldilocksField as Extendable<2>>::Extension>();
-    }
-
-    /// The base-scalar specialization is used before FFT butterflies and its
-    /// raw Goldilocks representatives therefore have to match the ordinary
-    /// extension multiplication it replaces, not merely be field-equal.
-    #[test]
-    fn base_scalar_mul_matches_embedded_extension_mul_raw_words() {
-        use crate::field::extension::FieldExtension;
-        use crate::field::types::{Field64, PrimeField64};
-
-        type BF = GoldilocksField;
-        type E = <BF as Extendable<2>>::Extension;
-
-        let words = [
-            0,
-            1,
-            BF::ORDER - 1,
-            BF::ORDER,
-            BF::ORDER + 1,
-            u64::MAX - 1,
-            u64::MAX,
-            0x9e37_79b9_7f4a_7c15,
-        ];
-        for &a0 in &words {
-            for &a1 in &words {
-                let coefficient = <E as FieldExtension<2>>::from_basefield_array([
-                    GoldilocksField(a0),
-                    GoldilocksField(a1),
-                ]);
-                for &scalar in &words {
-                    let scalar = GoldilocksField(scalar);
-                    let expected = coefficient * <E as FieldExtension<2>>::from_basefield(scalar);
-                    let actual = <E as FieldExtension<2>>::scalar_mul(&coefficient, scalar);
-                    let expected_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
-                        &expected,
-                    )
-                        .map(|x| x.to_noncanonical_u64());
-                    let actual_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
-                        &actual,
-                    )
-                        .map(|x| x.to_noncanonical_u64());
-                    assert_eq!(actual_raw, expected_raw, "a0={a0:#x}, a1={a1:#x}");
-                }
-            }
-        }
     }
 
     /// A2's whole claim in one place: for the embedded shift both prover call

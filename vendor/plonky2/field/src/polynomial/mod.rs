@@ -18,7 +18,7 @@ use crate::fft::{
 };
 use crate::types::Field;
 
-///      A polynomial in point-value form.
+/// A polynomial in point-value form.
 ///
 /// The points are implicitly `g^i`, where `g` generates the subgroup whose size equals the number
 /// of points.
@@ -91,6 +91,9 @@ impl<F: Field> PolynomialValues<F> {
         ifft_with_options_and_prescaled_postscale(self, None, None, prescaled_inverse_shift_powers)
     }
 
+    /// [`Self::coset_ifft_with_prescaled_powers`] with the transform's outer
+    /// stages spread across the worker pool. Byte-identical output; only use
+    /// where the call is not already inside a wider parallel phase.
     pub fn coset_ifft_with_prescaled_powers_parallel(
         self,
         prescaled_inverse_shift_powers: &[F],

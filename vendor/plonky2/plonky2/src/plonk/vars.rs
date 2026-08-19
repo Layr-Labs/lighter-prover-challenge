@@ -23,10 +23,7 @@ pub struct EvaluationVars<'a, F: RichField + Extendable<D>, const D: usize> {
 #[derive(Debug, Copy, Clone)]
 pub struct EvaluationVarsBaseBatch<'a, F: Field> {
     batch_size: usize,
-    local_constants: &'a [F],
-    constants_columns: usize,
-    constants_stride: usize,
-    constants_offset: usize,
+    pub local_constants: &'a [F],
     pub local_wires: &'a [F],
     pub public_inputs_hash: &'a HashOut<F>,
 }
@@ -76,45 +73,13 @@ impl<'a, F: Field> EvaluationVarsBaseBatch<'a, F> {
         Self {
             batch_size,
             local_constants,
-            constants_columns: local_constants.len() / batch_size,
-            constants_stride: batch_size,
-            constants_offset: 0,
-            local_wires,
-            public_inputs_hash,
-        }
-    }
-
-    /// Builds a batch whose constants stay in a wider column-major backing
-    /// store. Column `c` is read from
-    /// `local_constants[c * constants_stride + constants_offset..][..batch_size]`.
-    /// Wires retain their ordinary proof-local contiguous layout.
-    pub fn new_with_strided_constants(
-        batch_size: usize,
-        local_constants: &'a [F],
-        constants_columns: usize,
-        constants_stride: usize,
-        constants_offset: usize,
-        local_wires: &'a [F],
-        public_inputs_hash: &'a HashOut<F>,
-    ) -> Self {
-        assert!(constants_offset + batch_size <= constants_stride);
-        assert_eq!(local_constants.len(), constants_columns * constants_stride);
-        assert_eq!(local_wires.len() % batch_size, 0);
-        Self {
-            batch_size,
-            local_constants,
-            constants_columns,
-            constants_stride,
-            constants_offset,
             local_wires,
             public_inputs_hash,
         }
     }
 
     pub fn remove_prefix(&mut self, num_selectors: usize) {
-        assert!(num_selectors <= self.constants_columns);
-        self.local_constants = &self.local_constants[num_selectors * self.constants_stride..];
-        self.constants_columns -= num_selectors;
+        self.local_constants = &self.local_constants[num_selectors * self.len()..];
     }
 
     pub const fn len(&self) -> usize {
@@ -128,25 +93,13 @@ impl<'a, F: Field> EvaluationVarsBaseBatch<'a, F> {
     pub fn view(&self, index: usize) -> EvaluationVarsBase<'a, F> {
         // We cannot implement `Index` as `EvaluationVarsBase` is a struct, not a reference.
         assert!(index < self.len());
-        let local_constants = PackedStridedView::new(
-            self.local_constants,
-            self.constants_stride,
-            self.constants_offset + index,
-        );
+        let local_constants = PackedStridedView::new(self.local_constants, self.len(), index);
         let local_wires = PackedStridedView::new(self.local_wires, self.len(), index);
         EvaluationVarsBase {
             local_constants,
             local_wires,
             public_inputs_hash: self.public_inputs_hash,
         }
-    }
-
-    /// Returns one constants column for the current point window.
-    #[inline]
-    pub fn local_constants_col(&self, column: usize) -> &'a [F] {
-        assert!(column < self.constants_columns);
-        let start = column * self.constants_stride + self.constants_offset;
-        &self.local_constants[start..start + self.batch_size]
     }
 
     pub const fn iter(&self) -> EvaluationVarsBaseBatchIter<'a, F> {
@@ -234,8 +187,8 @@ impl<'a, P: PackedField> Iterator for EvaluationVarsBaseBatchIterPacked<'a, P> {
         if self.i + P::WIDTH <= self.vars_batch.len() {
             let local_constants = PackedStridedView::new(
                 self.vars_batch.local_constants,
-                self.vars_batch.constants_stride,
-                self.vars_batch.constants_offset + self.i,
+                self.vars_batch.len(),
+                self.i,
             );
             let local_wires =
                 PackedStridedView::new(self.vars_batch.local_wires, self.vars_batch.len(), self.i);

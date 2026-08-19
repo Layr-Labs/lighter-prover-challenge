@@ -149,6 +149,24 @@ where
     }
 }
 
+/// Parses the `txs` array with one worker per transaction.
+///
+/// The array dominates a block witness — a single empty transaction serializes
+/// to ~107 KB because of its Merkle-path arrays, so a 500-transaction block is
+/// tens of megabytes — and the whole parse ran on one thread at the very front
+/// of the process, where only the (fast) pre-execution circuit load overlaps
+/// it. The pre-execution witness, its proof, and everything downstream wait on
+/// this.
+///
+/// Deferring each element as a `RawValue` costs one scan to find the element
+/// boundaries, then parses the bodies in parallel. Value-exact: every element
+/// is handed to the same `Tx` deserializer over the same bytes, and collecting
+/// into a `Vec` preserves order, so the block is identical. Errors stay errors;
+/// only the reported byte position changes, because an element is parsed
+/// standalone rather than at its offset in the enclosing document.
+///
+/// The borrow is sound for every caller: they all reach this through
+/// `from_json*` with a `&[u8]`, i.e. a borrowing deserializer.
 fn deserialize_txs_parallel<'de, D, F>(deserializer: D) -> Result<Vec<Tx<F>>, D::Error>
 where
     D: serde::Deserializer<'de>,
