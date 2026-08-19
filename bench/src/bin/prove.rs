@@ -195,8 +195,22 @@ fn main() {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     #[cfg(feature = "diagnostic_profile")]
     drop(_pre_wait);
+    // The remaining four circuit blobs parse on CPU in parallel with the
+    // pre-execution SNARK. Their constants/sigmas Merkle trees are not needed
+    // until transaction proofs start, so `from_values` is deferred until after
+    // that SNARK joins — overlapping two Metal SNARK/Merkle streams failed
+    // official verification. Value-exact: the same `from_values` path and cap
+    // check, only later.
     let circuits = match remaining {
-        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
+        Some(Ok(mut remaining)) => match remaining.finish_gpu_commitments() {
+            Ok(()) => remaining.into_circuits((pre_target, pre_data)),
+            Err(error) => {
+                log::warn!(
+                    "embedded remaining circuit commitments failed ({error:#}); building from scratch"
+                );
+                Circuits::load()
+            }
+        },
         Some(Err(error)) => {
             log::warn!(
                 "embedded remaining circuits unavailable ({error:#}); building from scratch"
@@ -267,4 +281,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// zarar-arc-1
+// p90-fire-rawqubit-redraw-1787175274
