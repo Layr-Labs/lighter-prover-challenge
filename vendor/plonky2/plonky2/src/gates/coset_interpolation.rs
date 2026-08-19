@@ -174,6 +174,98 @@ impl<F: RichField + Extendable<D>, const D: usize> CosetInterpolationGate<F, D> 
         let start = self.start_intermediates() + D * 2 * self.num_intermediates();
         start..start + D
     }
+
+    /// Production recursive shape is `subgroup_bits = 4` → 16 points, batch
+    /// `n = 32`, degree 6 → 12 constraints → 384 `F` scratch words. The
+    /// accumulate-test worst case (bits 4, degree 2) is 60 × 32 = 1920 words.
+    /// Both fit these stack caps. Larger (non-production) shapes fall back to
+    /// the original heap buffers. `F: Field: Copy` and `F::Extension: Field:
+    /// Copy`, so `[T::ZERO; N]` is legal — this is *not* the
+    /// `[MaybeUninit<F::Extension>; N]` repeat that needs a `Copy` proof on
+    /// `MaybeUninit` itself.
+    const VALUE_STACK: usize = 32;
+    const SCRATCH_STACK: usize = 2048;
+
+    fn accumulate_rows(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        domain: &[F],
+        weights: &[F],
+        values: &mut [F::Extension],
+        scratch: &mut [F],
+    ) {
+        let n = vars_base.len();
+        debug_assert_eq!(values.len(), self.num_points());
+        debug_assert_eq!(scratch.len(), <Self as Gate<F, D>>::num_constraints(self) * n);
+
+        for (p, vars) in vars_base.iter().enumerate() {
+            let shift = vars.local_wires[self.wire_shift()];
+            let evaluation_point = vars.get_local_ext(self.wires_evaluation_point());
+            let shifted_evaluation_point =
+                vars.get_local_ext(self.wires_shifted_evaluation_point());
+            let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
+                .to_basefield_array();
+            for (d, a) in arr.iter().enumerate() {
+                scratch[d * n + p] = *a;
+            }
+
+            for (i, value) in values.iter_mut().enumerate() {
+                *value = vars.get_local_ext(self.wires_value(i));
+            }
+
+            let (mut computed_eval, mut computed_prod) = partial_interpolate(
+                &domain[..self.degree],
+                &values[..self.degree],
+                &weights[..self.degree],
+                shifted_evaluation_point,
+                F::Extension::ZERO,
+                F::Extension::ONE,
+            );
+
+            let mut row = D;
+            for i in 0..self.num_intermediates() {
+                let intermediate_eval = vars.get_local_ext(self.wires_intermediate_eval(i));
+                let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
+                let arr = (intermediate_eval - computed_eval).to_basefield_array();
+                for (d, a) in arr.iter().enumerate() {
+                    scratch[(row + d) * n + p] = *a;
+                }
+                row += D;
+                let arr = (intermediate_prod - computed_prod).to_basefield_array();
+                for (d, a) in arr.iter().enumerate() {
+                    scratch[(row + d) * n + p] = *a;
+                }
+                row += D;
+
+                let start_index = 1 + (self.degree - 1) * (i + 1);
+                let end_index = (start_index + self.degree - 1).min(self.num_points());
+                (computed_eval, computed_prod) = partial_interpolate(
+                    &domain[start_index..end_index],
+                    &values[start_index..end_index],
+                    &weights[start_index..end_index],
+                    shifted_evaluation_point,
+                    intermediate_eval,
+                    intermediate_prod,
+                );
+            }
+
+            let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
+            let arr = (evaluation_value - computed_eval).to_basefield_array();
+            for (d, a) in arr.iter().enumerate() {
+                scratch[(row + d) * n + p] = *a;
+            }
+        }
+
+        for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
+            batch_multiply_add_inplace(
+                &mut combined_gate_constraints[j * n..][..n],
+                row_slice,
+                filters,
+            );
+        }
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpolationGate<F, D> {
@@ -322,72 +414,36 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        let num_points = self.num_points();
+        let scratch_len = num_constraints * n;
 
-        for (p, vars) in vars_base.iter().enumerate() {
-            let shift = vars.local_wires[self.wire_shift()];
-            let evaluation_point = vars.get_local_ext(self.wires_evaluation_point());
-            let shifted_evaluation_point =
-                vars.get_local_ext(self.wires_shifted_evaluation_point());
-            let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
-                .to_basefield_array();
-            for (d, a) in arr.iter().enumerate() {
-                scratch[d * n + p] = *a;
-            }
-
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = vars.get_local_ext(self.wires_value(i));
-            }
-
-            let (mut computed_eval, mut computed_prod) = partial_interpolate(
-                &domain[..self.degree()],
-                &values[..self.degree()],
-                &weights[..self.degree()],
-                shifted_evaluation_point,
-                F::Extension::ZERO,
-                F::Extension::ONE,
-            );
-
-            let mut row = D;
-            for i in 0..self.num_intermediates() {
-                let intermediate_eval = vars.get_local_ext(self.wires_intermediate_eval(i));
-                let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
-                let arr = (intermediate_eval - computed_eval).to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
-                }
-                row += D;
-                let arr = (intermediate_prod - computed_prod).to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
-                }
-                row += D;
-
-                let start_index = 1 + (self.degree() - 1) * (i + 1);
-                let end_index = (start_index + self.degree() - 1).min(self.num_points());
-                (computed_eval, computed_prod) = partial_interpolate(
-                    &domain[start_index..end_index],
-                    &values[start_index..end_index],
-                    &weights[start_index..end_index],
-                    shifted_evaluation_point,
-                    intermediate_eval,
-                    intermediate_prod,
-                );
-            }
-
-            let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
-            let arr = (evaluation_value - computed_eval).to_basefield_array();
-            for (d, a) in arr.iter().enumerate() {
-                scratch[(row + d) * n + p] = *a;
-            }
-        }
-
-        for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
-            batch_multiply_add_inplace(
-                &mut combined_gate_constraints[j * n..][..n],
-                row_slice,
+        // Stack-or-heap: production (16 values, 384 scratch) and the bits-4
+        // degree-2 test (16 values, 1920 scratch) stay off malloc. The
+        // interpolation and the filtered `batch_multiply_add_inplace` are
+        // unchanged; only the backing storage moves.
+        if num_points <= Self::VALUE_STACK && scratch_len <= Self::SCRATCH_STACK {
+            let mut values = [F::Extension::ZERO; Self::VALUE_STACK];
+            let mut scratch = [F::ZERO; Self::SCRATCH_STACK];
+            self.accumulate_rows(
+                vars_base,
                 filters,
+                combined_gate_constraints,
+                domain,
+                weights,
+                &mut values[..num_points],
+                &mut scratch[..scratch_len],
+            );
+        } else {
+            let mut values = vec![F::Extension::ZERO; num_points];
+            let mut scratch = vec![F::ZERO; scratch_len];
+            self.accumulate_rows(
+                vars_base,
+                filters,
+                combined_gate_constraints,
+                domain,
+                weights,
+                &mut values,
+                &mut scratch,
             );
         }
     }
