@@ -1046,7 +1046,7 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+const BATCH_SIZE: usize = 64;
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
@@ -1928,6 +1928,7 @@ pub fn range_quotient_microbench<
     }
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
