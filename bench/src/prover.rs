@@ -1072,6 +1072,20 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    // Retire the short heavy path before building the final
+                    // circuit. The long light spine leaves ample slack for the
+                    // fixed builder, while serializing these two lanes lowers
+                    // allocator/page-fault churn and peak footprint.
+                    let heavy_chain_proof = {
+                        #[cfg(feature = "diagnostic_profile")]
+                        let _heavy_wait = plonky2::util::profile::span(
+                            "wait",
+                            "heavy_path_join_before_final_build",
+                        );
+                        heavy_handle_outer
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    };
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -1107,12 +1121,6 @@ pub(crate) fn prove_block_after_pre(
                     // block proof. Same deallocation, same thread, no value
                     // changes -- only its position moves earlier, off the peak.
                     drop(pre_proof);
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`
