@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "c951cd3e99c5e95a467132355a16528dbf016c5091e50eb4b204ae579b7368ec";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -1034,6 +1034,53 @@ impl<F: RichField> MetalColumns<F> {
             slice::from_raw_parts_mut(self.base as *mut F, self.rows * self.cols)
         };
         Some(values.chunks_exact_mut(self.rows).collect())
+    }
+
+    /// Rewrites every stored word as its canonical representative, in place.
+    ///
+    /// This is the CPU stand-in for the write-back
+    /// `poseidon2_hash_leaves_colmajor` performs under its
+    /// `canonicalize_in_place` flag. A retained store is read afterwards by
+    /// `poseidon2_gate_quotient`, which uses the
+    /// `gl_add_canonical_rhs`/`gl_sub_canonical_rhs` forms; those do exactly
+    /// one +-EPSILON limb fold and are bit-identical to the general forms only
+    /// while every right operand is below the field order. The GPU hash
+    /// establishes that invariant on the accepted path; the declined path has
+    /// nothing that would, so it calls this.
+    ///
+    /// Residue-exact and idempotent. For the Goldilocks order
+    /// `p = 2^64 - 2^32 + 1`, any `u64` at or above `p` lands in
+    /// `[0, 2^32 - 1)` after a single subtraction, so one conditional fold is
+    /// the whole reduction -- the same statement (and the same code)
+    /// `PrimeField64::to_canonical_u64` makes. Subtracting `p` cannot move a
+    /// residue, and a second pass finds nothing to do.
+    fn canonicalize_stored_values(&self) {
+        // Only the 8-byte Goldilocks field is stored as its raw u64
+        // representative; nothing else has a `p` to fold against, and no
+        // quotient kernel runs for it.
+        if F::ORDER != 0xffff_ffff_0000_0001 || size_of::<F>() != size_of::<u64>() {
+            return;
+        }
+        let order = F::ORDER;
+        // SAFETY: the same binding the streamed absorb path uses to fill this
+        // buffer through a shared reference (`columns.buffer.contents()` cast
+        // to a column pointer, see `build_merkle_tree_shared_streamed`). The
+        // shared-storage contents are foreign memory reached through a raw
+        // pointer rather than through the `&self` borrow, and every u64 bit
+        // pattern is a valid `F`. Called only where the GPU write-back would
+        // otherwise have run: the build has already declined or already
+        // finished waiting on its command buffers, so no kernel is reading the
+        // buffer, and the store has not yet been handed to `shared_columns()`.
+        let words = unsafe {
+            slice::from_raw_parts_mut(self.buffer.contents().cast::<u64>(), self.rows * self.cols)
+        };
+        words.par_chunks_mut(STAGING_CHUNK).for_each(|chunk| {
+            for word in chunk {
+                if *word >= order {
+                    *word -= order;
+                }
+            }
+        });
     }
 }
 
@@ -2597,6 +2644,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
+        // The next pass reads this pass's rate lanes only if it absorbs a
+        // partial chunk, which only the final group can. Everywhere else the
+        // eight rate lanes are dead across the boundary and the kernel neither
+        // stores nor reloads them.
+        let next_chunk_is_partial = group + 1 < groups && leaf_width - 8 * (group + 1) < 8;
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
@@ -2630,6 +2682,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
+            set_u32(encoder, 10, next_chunk_is_partial as u32);
             dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
@@ -2692,6 +2745,18 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
+        // The only return in this function that leaves *filled* columns behind:
+        // every group's fill ran, and the absorb passes that did complete wrote
+        // their canonical values back over part of the store. The one caller
+        // refills it and then enters `build_merkle_tree_shared`, which carries
+        // the invariant either way, so this is belt and braces -- but it costs a
+        // single pass on a path that has just lost a command buffer, and it
+        // keeps the rule "no `MetalColumns` with meaningful contents leaves this
+        // module noncanonical" true without a cross-function argument. Every
+        // earlier return above is reached before `fill_group` has written
+        // anything, so their stores hold only pool residue the caller
+        // overwrites; folding those would be a multi-GiB pass over dead data.
+        columns.canonicalize_stored_values();
         return None;
     }
 
@@ -2725,7 +2790,35 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     ))
 }
 
+/// Hashes a retained shared column store on the GPU, carrying the canonical
+/// store invariant across every decline.
+///
+/// A `None` here is not the end of the commitment: `MerkleTree::new_column_store`
+/// hashes the very same buffer on the CPU instead and keeps it as the tree's
+/// leaves, so `shared_columns()` still hands it to the quotient kernels, and
+/// `poseidon2_gate_quotient` still reads it with the canonical-right-operand
+/// arithmetic. On the accepted path the leaf kernel's `canonicalize_in_place`
+/// write-back establishes that invariant; on the declined path nothing else
+/// does, because plonky2's Goldilocks is deliberately non-canonicalizing
+/// (`GoldilocksField(pub u64)`, compared through `to_canonical_u64`) and the
+/// CPU FFT that filled this store is free to leave any representative behind.
+///
+/// So the decline carries it: one linear conditional fold over a buffer the CPU
+/// Merkle hash is about to read in full anyway, and which the CPU hash is blind
+/// to (every leaf goes through `hash_or_noop`, which canonicalizes). Written as
+/// a wrapper around the routing body so no future early return can skip it.
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
+    columns: &MetalColumns<F>,
+    cap_height: usize,
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    let built = build_merkle_tree_shared_on_gpu(columns, cap_height);
+    if built.is_none() {
+        columns.canonicalize_stored_values();
+    }
+    built
+}
+
+fn build_merkle_tree_shared_on_gpu<F: RichField>(
     columns: &MetalColumns<F>,
     cap_height: usize,
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
@@ -3866,6 +3959,10 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
+                // The last butterfly stage above ran with `canonicalize` set,
+                // so `column_buffer` already holds canonical values; there is
+                // nothing for the leaf kernel to store back.
+                set_u32(leaf_encoder, 6, 0);
                 dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
@@ -4130,6 +4227,10 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
+            // The last butterfly stage above ran with `canonicalize` set, so
+            // `column_buffer` already holds canonical values; there is nothing
+            // for the leaf kernel to store back.
+            set_u32(leaf_encoder, 6, 0);
             dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
@@ -4342,11 +4443,21 @@ impl MetalShared {
                 size_of::<u32>() as NSUInteger,
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
-            if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
+            if !matches!(&source, LeafSource::Rows(_)) {
                 encoder.set_bytes(
                     5,
                     size_of::<u32>() as NSUInteger,
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
+                );
+                // Store the canonicalized inputs back only for the retained
+                // shared store, which the quotient kernels read afterwards. A
+                // `Columns` source is hashed out of the pooled staging buffer,
+                // which nothing reads again.
+                let canonicalize_in_place = u32::from(matches!(&source, LeafSource::Shared(_)));
+                encoder.set_bytes(
+                    6,
+                    size_of::<u32>() as NSUInteger,
+                    (&canonicalize_in_place as *const u32).cast::<c_void>(),
                 );
             }
             dispatch(encoder, leaf_pipeline, leaf_count);
@@ -4665,9 +4776,9 @@ mod tests {
             ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
             ("ntt_stage", &[0, 1, 2, 3, 4]),
             ("ifft_finalize", &[0, 1, 2, 3]),
-            ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5]),
+            ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5, 6]),
             ("poseidon2_hash_parents", &[0, 1, 2, 3]),
-            ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
         ];
         let observed: Vec<(&str, &[u32])> = kernels
             .iter()
@@ -7296,6 +7407,133 @@ kernel void goldilocks_mul_bench_native(
         }
     }
 
+    /// The *declined* shared build must leave the retained store canonical.
+    ///
+    /// `MerkleTree::new_column_store` keeps the same `ColumnStore::Shared`
+    /// buffer as the commitment's leaves when `build_merkle_tree_shared`
+    /// returns `None`, hashes it on the CPU, and hands it back out of
+    /// `shared_columns()` -- which is exactly the buffer
+    /// `poseidon2_gate_quotient` reads with `gl_add_canonical_rhs` /
+    /// `gl_sub_canonical_rhs`. Nothing on that path canonicalizes it except the
+    /// fold `build_merkle_tree_shared` performs before declining.
+    ///
+    /// The decline is *forced*, not hoped for: `gpu_worthwhile` is asserted
+    /// false for every shape below, so `build_merkle_tree_shared` returns at its
+    /// first guard on every run, GPU up or not. None of these shapes is the
+    /// `1 << 17` serial-critical exemption, and all are far under the
+    /// exclusive-phase cutoff too, so a concurrently set `EXCLUSIVE_GPU_PHASE`
+    /// cannot admit them either. `level_digests.is_none()` then pins at runtime
+    /// that the CPU fallback -- not the GPU builder -- produced the tree.
+    ///
+    /// The differential against the same tree built from an `Owned` store of the
+    /// untouched noncanonical values is the value-exactness check: the `Owned`
+    /// arm is not folded, so equal caps and digests mean the fold moved
+    /// representatives only, never a residue.
+    #[test]
+    fn declined_shared_build_leaves_the_retained_store_canonical() {
+        use crate::hash::merkle_tree::{ColumnStore, MerkleTree};
+
+        let mut rng = StdRng::seed_from_u64(0x4445_434c_494e_45);
+        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+
+        // 4 columns exercises the `hash_or_noop` leaf (which copies canonical
+        // limbs straight into the digest), 5 and 16 the real sponge; 136 is the
+        // wires width, at the `GATHER_MAX_WIDTH` boundary of the CPU fallback.
+        for (cols, rows, cap_height) in [
+            (4usize, 256usize, 0usize),
+            (5, 256, 3),
+            (16, 512, 4),
+            (136, 256, 2),
+        ] {
+            assert!(
+                !gpu_worthwhile(cols, rows, cap_height),
+                "{cols}x{rows} cap {cap_height} must be below the GPU cutoff, \
+                 otherwise this test never reaches the decline path"
+            );
+
+            // The boundary representatives `diverted_cpu_tree_matches_shared_gpu_tree`
+            // uses, including `ORDER`, `ORDER + 1` and `u64::MAX`.
+            let columns: Vec<Vec<GoldilocksField>> = (0..cols)
+                .map(|column| {
+                    (0..rows)
+                        .map(|row| {
+                            let raw = match (column * rows + row) & 7 {
+                                0 => 0,
+                                1 => 1,
+                                2 => GoldilocksField::ORDER - 1,
+                                3 => GoldilocksField::ORDER,
+                                4 => GoldilocksField::ORDER + 1,
+                                5 => u64::MAX,
+                                _ => rng.next_u64(),
+                            };
+                            GoldilocksField(raw)
+                        })
+                        .collect()
+                })
+                .collect();
+            assert!(
+                columns
+                    .iter()
+                    .flatten()
+                    .any(|value| value.0 >= GoldilocksField::ORDER),
+                "the fixture must contain noncanonical representatives"
+            );
+
+            let mut shared = context
+                .allocate_columns::<GoldilocksField>(rows, cols)
+                .unwrap();
+            shared
+                .columns_mut()
+                .unwrap()
+                .into_iter()
+                .zip(&columns)
+                .for_each(|(destination, source)| destination.copy_from_slice(source));
+
+            let tree = MerkleTree::<GoldilocksField, Poseidon2Hash>::new_column_store(
+                ColumnStore::Shared(shared),
+                cap_height,
+            );
+            assert!(
+                tree.level_digests.is_none(),
+                "{cols}x{rows} must have been hashed by the CPU fallback, not the GPU builder"
+            );
+
+            let retained = tree
+                .shared_columns()
+                .expect("a declined build must retain the shared store as the tree's leaves");
+            for (column, source) in columns.iter().enumerate() {
+                let stored = retained.col(column);
+                for (row, expected) in source.iter().enumerate() {
+                    assert!(
+                        stored[row].0 < GoldilocksField::ORDER,
+                        "{cols}x{rows}: column {column} row {row} left noncanonical \
+                         ({}) for poseidon2_gate_quotient to read",
+                        stored[row].0
+                    );
+                    assert_eq!(
+                        stored[row].to_canonical_u64(),
+                        expected.to_canonical_u64(),
+                        "{cols}x{rows}: column {column} row {row} changed residue"
+                    );
+                }
+            }
+
+            // Same CPU fallback, same values, but an `Owned` store -- which the
+            // fold never touches, so it hashes the raw noncanonical limbs.
+            let reference =
+                MerkleTree::<GoldilocksField, Poseidon2Hash>::new_columns(columns, cap_height);
+            assert!(reference.level_digests.is_none());
+            assert_eq!(
+                tree.cap, reference.cap,
+                "{cols}x{rows}: canonicalizing the store moved the cap"
+            );
+            assert_eq!(
+                tree.digests, reference.digests,
+                "{cols}x{rows}: canonicalizing the store moved a digest"
+            );
+        }
+    }
+
     #[test]
     fn shared_column_hash_matches_staged_full_tree_and_paths() {
         let mut rng = StdRng::seed_from_u64(0x5348_4152_4544);
@@ -7341,6 +7579,16 @@ kernel void goldilocks_mul_bench_native(
                     .build(LeafSource::Shared(&shared), cols, rows, cap_height)
                     .unwrap();
 
+                // The columns above deliberately include `ORDER`, `ORDER + 1`
+                // and `u64::MAX`. Hashing a shared store must leave it
+                // canonical: `poseidon2_gate_quotient` reads exactly this
+                // buffer and its canonical-right-operand arithmetic is unsound
+                // without that.
+                assert!(
+                    shared.raw().iter().all(|&value| value < GoldilocksField::ORDER),
+                    "shared-column hashing must establish the canonical MetalColumns invariant"
+                );
+
                 assert_tree_raw_eq(&direct, &staged, cols, cap_height);
                 assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
             }
@@ -7375,12 +7623,23 @@ kernel void goldilocks_mul_bench_native(
             cap_height,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    // Half the columns are filled with noncanonical
+                    // representatives, so the in-place canonicalization the
+                    // absorb pass performs is actually exercised.
+                    let value = (group * 8 + index + 1) as u64;
+                    let raw = if index & 1 == 0 { value } else { F::ORDER + value };
+                    destination.fill(F::from_noncanonical_u64(raw));
                 }
             },
         )
         .expect("streamed tree");
         assert!(streamed.0.nodes.is_shared());
+        // The absorb pass is what establishes the canonical MetalColumns
+        // invariant on the streamed commitment path.
+        for column in 0..cols {
+            assert!(columns.col(column)[0].0 < F::ORDER);
+            assert!(columns.col(column)[rows - 1].0 < F::ORDER);
+        }
 
         let classic = context
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
@@ -7646,6 +7905,980 @@ mod occupancy_probe {
                 pipeline.thread_execution_width(),
                 pipeline.static_threadgroup_memory_length(),
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod absorb_carry_probe {
+    use std::time::{Duration, Instant};
+
+    use objc::rc::autoreleasepool;
+    use objc::runtime::Sel;
+    use objc::Message;
+
+    use super::*;
+
+    /// Three absorb-pass variants compiled from the shipped shader source.
+    ///
+    /// `absorb_ab_base` is a copy of the production `poseidon2_absorb_pass`:
+    /// it spills and reloads all twelve sponge lanes between passes.
+    ///
+    /// `absorb_ab_carry4` carries only the four capacity lanes. Sound whenever
+    /// every pass absorbs a full rate chunk, because the next pass overwrites
+    /// lanes 0..8 with input before reading them.
+    ///
+    /// `absorb_ab_carry4_fixed8` additionally replaces the runtime-bounded
+    /// input loop with a compile-time eight, which is what every pass of a
+    /// leaf width divisible by eight actually runs. Probes whether the dynamic
+    /// bound blocks register promotion of `st`.
+    const ABSORB_AB_KERNELS: &str = r#"
+
+kernel void absorb_ab_base(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 0; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    for (uint i = 0; i < chunk_size; ++i) {
+        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        for (uint i = 0; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+kernel void absorb_ab_carry4(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 8; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    for (uint i = 0; i < chunk_size; ++i) {
+        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        for (uint i = 8; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+kernel void absorb_ab_carry4_fixed8(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 8; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    for (uint i = 0; i < 8; ++i) {
+        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        for (uint i = 8; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+// The exact production form proposed for `poseidon2_absorb_pass`: four-lane
+// carry plus the peeled full-rate chunk, with every `st` index a compile-time
+// constant on both paths so the array stays register-promotable, and with the
+// partial-chunk cases handled by uniform predicates. `carry_rate` is set by
+// the host when the NEXT pass absorbs a partial chunk and therefore reads
+// rate lanes this pass produced.
+kernel void absorb_ab_prod(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    constant uint& carry_rate [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        if (chunk_size < 8u) {
+            for (uint i = 0; i < 8; ++i) {
+                st[i] = state[(ulong)i * leaf_count + gid];
+            }
+        }
+        for (uint i = 8; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    if (chunk_size == 8u) {
+        for (uint i = 0; i < 8; ++i) {
+            st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        }
+    } else {
+        for (uint i = 0; i < 8; ++i) {
+            if (i < chunk_size) {
+                st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+            }
+        }
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        if (carry_rate != 0u) {
+            for (uint i = 0; i < 8; ++i) {
+                state[(ulong)i * leaf_count + gid] = st[i];
+            }
+        }
+        for (uint i = 8; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+// Prices the absorb half of the deferred `canonicalize_in_place` mechanism:
+// identical to `absorb_ab_carry4_fixed8` with the per-input canonicalization
+// dropped. Value-exact exactly when every producer writes canonical limbs,
+// which is the condition that mechanism needs and which this probe's inputs
+// satisfy, so its digests must still match arm base12.
+kernel void absorb_ab_nocanon(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 8; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    for (uint i = 0; i < 8; ++i) {
+        st[i] = leaves[(ulong)(col_start + i) * leaf_count + gid];
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        for (uint i = 8; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+// UPPER BOUND ONLY -- computes different digests on purpose. Every trimmed
+// arm above, plus a perfectly contiguous input gather: one 64-byte run per
+// thread instead of eight reads 4 MiB apart. Nothing value-exact can beat
+// this, so it prices the ceiling of the entire "restructure the absorb's
+// memory-transaction shape" family in one number.
+kernel void absorb_ab_ub_contiguous(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 8; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    const device ulong* run = leaves + (ulong)gid * 8;
+    for (uint i = 0; i < 8; ++i) {
+        st[i] = run[i];
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        for (uint i = 8; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+// UPPER BOUND ONLY -- the absorb with no input reads at all. Prices the
+// arithmetic floor: whatever this costs is what 17 Poseidon2 permutations per
+// leaf cost with a perfect memory system, and no layout change can go below
+// it.
+kernel void absorb_ab_ub_noinput(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* state [[buffer(1)]],
+    device ulong* hashes [[buffer(2)]],
+    constant ulong* parameters [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& col_start [[buffer(6)]],
+    constant uint& chunk_size [[buffer(7)]],
+    constant uint& first_pass [[buffer(8)]],
+    constant uint& final_pass [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    ulong st[12] = { 0 };
+    if (first_pass == 0u) {
+        for (uint i = 8; i < 12; ++i) {
+            st[i] = state[(ulong)i * leaf_count + gid];
+        }
+    }
+    // Depends on gid so the first pass cannot constant-fold away.
+    for (uint i = 0; i < 8; ++i) {
+        st[i] += (ulong)(col_start + i) + (ulong)gid;
+    }
+    poseidon2(st, parameters);
+    if (final_pass != 0u) {
+        uint out_row = log_leaf_count == 0
+            ? gid
+            : (reverse_bits(gid) >> (32 - log_leaf_count));
+        device ulong* output = hashes + (ulong)out_row * 4;
+        for (uint i = 0; i < 4; ++i) {
+            output[i] = gl_canonicalize(st[i]);
+        }
+    } else {
+        for (uint i = 8; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
+    }
+}
+
+// The fused column-major leaf kernel exactly as shipped, for the paired
+// comparison below.
+kernel void leaves_cm_base(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* hashes [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_width [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    uint out_row = log_leaf_count == 0
+        ? gid
+        : (reverse_bits(gid) >> (32 - log_leaf_count));
+    device ulong* output = hashes + (ulong)out_row * 4;
+    if (leaf_width <= 4) {
+        uint i = 0;
+        for (; i < leaf_width; ++i) {
+            output[i] = gl_canonicalize(leaves[(ulong)i * leaf_count + gid]);
+        }
+        for (; i < 4; ++i) {
+            output[i] = 0;
+        }
+        return;
+    }
+    ulong state[12] = { 0 };
+    for (uint offset = 0; offset < leaf_width; offset += 8) {
+        uint chunk_size = min(8u, leaf_width - offset);
+        for (uint i = 0; i < chunk_size; ++i) {
+            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+        }
+        poseidon2(state, parameters);
+    }
+    for (uint i = 0; i < 4; ++i) {
+        output[i] = gl_canonicalize(state[i]);
+    }
+}
+
+// Same kernel with the full rate chunks peeled out of the runtime-bounded
+// inner loop, so every pass but a trailing partial one absorbs a
+// compile-time eight. Value-exact: identical reads in identical order.
+kernel void leaves_cm_fixed8(
+    const device ulong* leaves [[buffer(0)]],
+    device ulong* hashes [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_width [[buffer(3)]],
+    constant uint& leaf_count [[buffer(4)]],
+    constant uint& log_leaf_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+    uint out_row = log_leaf_count == 0
+        ? gid
+        : (reverse_bits(gid) >> (32 - log_leaf_count));
+    device ulong* output = hashes + (ulong)out_row * 4;
+    if (leaf_width <= 4) {
+        uint i = 0;
+        for (; i < leaf_width; ++i) {
+            output[i] = gl_canonicalize(leaves[(ulong)i * leaf_count + gid]);
+        }
+        for (; i < 4; ++i) {
+            output[i] = 0;
+        }
+        return;
+    }
+    ulong state[12] = { 0 };
+    uint full = leaf_width & ~7u;
+    for (uint offset = 0; offset < full; offset += 8) {
+        for (uint i = 0; i < 8; ++i) {
+            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+        }
+        poseidon2(state, parameters);
+    }
+    uint tail = leaf_width - full;
+    if (tail != 0u) {
+        for (uint i = 0; i < 8; ++i) {
+            if (i < tail) {
+                state[i] = gl_canonicalize(leaves[(ulong)(full + i) * leaf_count + gid]);
+            }
+        }
+        poseidon2(state, parameters);
+    }
+    for (uint i = 0; i < 4; ++i) {
+        output[i] = gl_canonicalize(state[i]);
+    }
+}
+"#;
+
+    fn gpu_seconds(command_buffer: &CommandBuffer, wall: Duration) -> f64 {
+        let gpu_start: f64 = unsafe {
+            command_buffer
+                .as_ref()
+                .send_message(Sel::register("GPUStartTime"), ())
+        }
+        .expect("GPUStartTime unavailable");
+        let gpu_end: f64 = unsafe {
+            command_buffer
+                .as_ref()
+                .send_message(Sel::register("GPUEndTime"), ())
+        }
+        .expect("GPUEndTime unavailable");
+        if gpu_start.is_finite() && gpu_end.is_finite() && gpu_end >= gpu_start {
+            gpu_end - gpu_start
+        } else {
+            wall.as_secs_f64()
+        }
+    }
+
+    /// Paired A/B/C over the production wires-commitment shape: 136 columns,
+    /// 2^19 leaves, 17 absorb passes. Reports summed GPU execution time per
+    /// arm (not wall clock) and asserts all three arms produce identical
+    /// digests, which is the exactness oracle for the carry trim.
+    #[test]
+    #[ignore = "device-specific GPU timing probe"]
+    fn absorb_carry_ab() {
+        const LEAF_WIDTH: usize = 136;
+        const LOG_LEAF_COUNT: u32 = 19;
+        const ROUNDS: usize = 5;
+        let leaf_count: usize = 1 << LOG_LEAF_COUNT;
+        let groups = LEAF_WIDTH.div_ceil(8);
+
+        let device = Device::system_default().expect("no Metal device");
+        let queue = device.new_command_queue();
+        let source = [SHADER_SOURCE, ABSORB_AB_KERNELS].concat();
+        let library = autoreleasepool(|| {
+            device
+                .new_library_with_source(&source, &CompileOptions::new())
+                .unwrap_or_else(|error| panic!("absorb A/B shader failed: {error}"))
+        });
+        let make_pipeline = |name: &str| {
+            let function = library
+                .get_function(name, None)
+                .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+        };
+        // Arms whose name starts with `ub_` compute different digests on
+        // purpose and are excluded from the exactness comparison.
+        let arms = [
+            ("base12", make_pipeline("absorb_ab_base")),
+            ("carry4", make_pipeline("absorb_ab_carry4")),
+            ("carry4_fixed8", make_pipeline("absorb_ab_carry4_fixed8")),
+            ("prod", make_pipeline("poseidon2_absorb_pass")),
+            ("nocanon", make_pipeline("absorb_ab_nocanon")),
+            ("ub_contiguous", make_pipeline("absorb_ab_ub_contiguous")),
+            ("ub_noinput", make_pipeline("absorb_ab_ub_noinput")),
+        ];
+        for (name, state) in &arms {
+            println!(
+                "{name}: max_threads={} exec_width={} tg_mem={}",
+                state.max_total_threads_per_threadgroup(),
+                state.thread_execution_width(),
+                state.static_threadgroup_memory_length(),
+            );
+        }
+
+        let mut parameter_values: Vec<u64> = Vec::with_capacity(130);
+        parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+        parameter_values.extend(INTERNAL_CONSTANTS);
+        parameter_values.extend(MATRIX_DIAG_12_U64);
+        let parameters = device.new_buffer_with_data(
+            parameter_values.as_ptr().cast::<c_void>(),
+            size_of_val(parameter_values.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let column_bytes = (LEAF_WIDTH * leaf_count * size_of::<u64>()) as u64;
+        let columns = device.new_buffer(column_bytes, MTLResourceOptions::StorageModeShared);
+        {
+            // Canonical pseudorandom leaves. Identical inputs across arms is
+            // what makes the digest comparison an exactness oracle.
+            let cells = unsafe {
+                slice::from_raw_parts_mut(
+                    columns.contents().cast::<u64>(),
+                    LEAF_WIDTH * leaf_count,
+                )
+            };
+            let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+            for cell in cells.iter_mut() {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                *cell = x % 0xffff_ffff_0000_0001;
+            }
+        }
+        let state_buffer = device.new_buffer(
+            (12 * leaf_count * size_of::<u64>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let digest_bytes = (leaf_count * 4 * size_of::<u64>()) as u64;
+        let digests = device.new_buffer(digest_bytes, MTLResourceOptions::StorageModeShared);
+
+        let run_build = |state: &ComputePipelineState| -> f64 {
+            let mut total = 0.0f64;
+            for group in 0..groups {
+                let col_start = group * 8;
+                let chunk = (LEAF_WIDTH - col_start).min(8);
+                let start = Instant::now();
+                let command_buffer = autoreleasepool(|| {
+                    let command_buffer = queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    encoder.set_compute_pipeline_state(state);
+                    encoder.set_buffer(0, Some(&columns), 0);
+                    encoder.set_buffer(1, Some(&state_buffer), 0);
+                    encoder.set_buffer(2, Some(&digests), 0);
+                    encoder.set_buffer(3, Some(&parameters), 0);
+                    set_u32(encoder, 4, leaf_count as u32);
+                    set_u32(encoder, 5, LOG_LEAF_COUNT);
+                    set_u32(encoder, 6, col_start as u32);
+                    set_u32(encoder, 7, chunk as u32);
+                    set_u32(encoder, 8, u32::from(group == 0));
+                    set_u32(encoder, 9, u32::from(group == groups - 1));
+                    set_u32(
+                        encoder,
+                        10,
+                        u32::from(
+                            group + 1 < groups && LEAF_WIDTH - 8 * (group + 1) < 8,
+                        ),
+                    );
+                    dispatch(encoder, state, leaf_count);
+                    encoder.end_encoding();
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                });
+                command_buffer.wait_until_completed();
+                assert_eq!(
+                    command_buffer.status(),
+                    MTLCommandBufferStatus::Completed,
+                    "absorb command failed"
+                );
+                total += gpu_seconds(&command_buffer, start.elapsed());
+            }
+            total
+        };
+        let snapshot = || -> Vec<u64> {
+            unsafe { slice::from_raw_parts(digests.contents().cast::<u64>(), leaf_count * 4) }
+                .to_vec()
+        };
+
+        // One untimed warm-up build per arm, then interleaved timed rounds.
+        let mut reference: Option<Vec<u64>> = None;
+        for (name, state) in &arms {
+            run_build(state);
+            let observed = snapshot();
+            if name.starts_with("ub_") {
+                continue;
+            }
+            match &reference {
+                None => reference = Some(observed),
+                Some(expected) => assert!(
+                    *expected == observed,
+                    "{name} digests differ from base12: that arm is not value-exact"
+                ),
+            }
+        }
+
+        let mut totals = vec![Vec::<f64>::new(); arms.len()];
+        for _ in 0..ROUNDS {
+            for (index, (_, state)) in arms.iter().enumerate() {
+                totals[index].push(run_build(state));
+            }
+        }
+        for (index, (name, _)) in arms.iter().enumerate() {
+            let mut samples = totals[index].clone();
+            samples.sort_by(f64::total_cmp);
+            let median = samples[samples.len() / 2];
+            println!(
+                "absorb {name}: median {:.3} ms over {groups} passes ({:.4} ms/pass), samples {:?}",
+                median * 1e3,
+                median * 1e3 / groups as f64,
+                samples
+                    .iter()
+                    .map(|value| (value * 1e6).round() / 1e3)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Exactness sweep for both proposed kernels across leaf widths that do
+    /// and do not divide the rate, including the widths that exercise the
+    /// partial trailing chunk (the only case where a rate lane is live across
+    /// a pass boundary). Fast: tiny trees, no timing.
+    #[test]
+    fn trimmed_kernels_match_untrimmed_reference_across_leaf_widths() {
+        const LOG_LEAF_COUNT: u32 = 12;
+        let leaf_count: usize = 1 << LOG_LEAF_COUNT;
+
+        let device = Device::system_default().expect("no Metal device");
+        let queue = device.new_command_queue();
+        let source = [SHADER_SOURCE, ABSORB_AB_KERNELS].concat();
+        let library = autoreleasepool(|| {
+            device
+                .new_library_with_source(&source, &CompileOptions::new())
+                .unwrap_or_else(|error| panic!("absorb A/B shader failed: {error}"))
+        });
+        let make_pipeline = |name: &str| {
+            let function = library
+                .get_function(name, None)
+                .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+        };
+        let absorb_base = make_pipeline("absorb_ab_base");
+        let absorb_prod = make_pipeline("poseidon2_absorb_pass");
+        let cm_base = make_pipeline("leaves_cm_base");
+        let cm_prod = make_pipeline("poseidon2_hash_leaves_colmajor");
+        // The trim is only sound because the host tells the kernel, per pass,
+        // whether its successor reads the rate lanes. Both answers must occur
+        // somewhere in the sweep, and both of the kernel's absorb shapes must
+        // occur, or this test could pass while a whole branch is unreachable
+        // -- which is exactly how a shader mechanism goes dead in this tree.
+        let mut carry_rate_off_passes = 0usize;
+        let mut carry_rate_on_passes = 0usize;
+        let mut partial_chunk_passes = 0usize;
+        let mut interior_full_rate_passes = 0usize;
+
+        let mut parameter_values: Vec<u64> = Vec::with_capacity(130);
+        parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+        parameter_values.extend(INTERNAL_CONSTANTS);
+        parameter_values.extend(MATRIX_DIAG_12_U64);
+        let parameters = device.new_buffer_with_data(
+            parameter_values.as_ptr().cast::<c_void>(),
+            size_of_val(parameter_values.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        for leaf_width in [1usize, 4, 5, 8, 9, 16, 17, 23, 24, 129, 134, 135, 136] {
+            let columns = device.new_buffer(
+                (leaf_width * leaf_count * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            {
+                let cells = unsafe {
+                    slice::from_raw_parts_mut(
+                        columns.contents().cast::<u64>(),
+                        leaf_width * leaf_count,
+                    )
+                };
+                let mut x: u64 = 0x243f_6a88_85a3_08d3 ^ (leaf_width as u64);
+                for cell in cells.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *cell = x % 0xffff_ffff_0000_0001;
+                }
+            }
+            let state_buffer = device.new_buffer(
+                (12 * leaf_count * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let digests = device.new_buffer(
+                (leaf_count * 4 * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let snapshot = || -> Vec<u64> {
+                unsafe {
+                    slice::from_raw_parts(digests.contents().cast::<u64>(), leaf_count * 4)
+                }
+                .to_vec()
+            };
+            let submit = |encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| {
+                let command_buffer = autoreleasepool(|| {
+                    let command_buffer = queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    encode(encoder);
+                    encoder.end_encoding();
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                });
+                command_buffer.wait_until_completed();
+                assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            };
+
+            // Fused column-major kernel.
+            let mut cm = Vec::new();
+            for state in [&cm_base, &cm_prod] {
+                submit(&|encoder| {
+                    encoder.set_compute_pipeline_state(state);
+                    encoder.set_buffer(0, Some(&columns), 0);
+                    encoder.set_buffer(1, Some(&digests), 0);
+                    encoder.set_buffer(2, Some(&parameters), 0);
+                    set_u32(encoder, 3, leaf_width as u32);
+                    set_u32(encoder, 4, leaf_count as u32);
+                    set_u32(encoder, 5, LOG_LEAF_COUNT);
+                    // `canonicalize_in_place` (buffer 6) must be bound even
+                    // though the reference arm's signature stops at 5: an
+                    // unbound `constant uint&` is not a compile error and the
+                    // shipped kernel would read it. Cleared, because the
+                    // fixture above is already canonical -- the write-back
+                    // would be the identity -- and the untrimmed reference has
+                    // no write-back, so clearing keeps the two arms comparable
+                    // in memory effects as well as in digests.
+                    set_u32(encoder, 6, 0);
+                    dispatch(encoder, state, leaf_count);
+                });
+                cm.push(snapshot());
+            }
+            assert!(
+                cm[0] == cm[1],
+                "leaves_cm peel differs from the shipped kernel at leaf_width={leaf_width}"
+            );
+
+            // Streamed absorb: only admitted for leaf_width >= 16.
+            if leaf_width < 16 {
+                continue;
+            }
+            let groups = leaf_width.div_ceil(8);
+            let mut absorbed = Vec::new();
+            for (arm, state) in [&absorb_base, &absorb_prod].into_iter().enumerate() {
+                for group in 0..groups {
+                    let col_start = group * 8;
+                    let chunk = (leaf_width - col_start).min(8);
+                    // Replays `build_merkle_tree_shared_streamed`'s uniform
+                    // computation verbatim, so the trimmed arm is exercised
+                    // under exactly the routing production takes. The
+                    // untrimmed reference arm ignores `carry_rate` and always
+                    // parks all twelve lanes, so feeding it the same value is
+                    // harmless and keeps the two arms byte-comparable.
+                    let next_chunk_is_partial =
+                        group + 1 < groups && leaf_width - 8 * (group + 1) < 8;
+                    if arm == 1 {
+                        if next_chunk_is_partial {
+                            carry_rate_on_passes += 1;
+                        } else if group + 1 != groups {
+                            carry_rate_off_passes += 1;
+                        }
+                        if chunk < 8 {
+                            partial_chunk_passes += 1;
+                        } else if group != 0 {
+                            interior_full_rate_passes += 1;
+                        }
+                    }
+                    submit(&|encoder| {
+                        encoder.set_compute_pipeline_state(state);
+                        encoder.set_buffer(0, Some(&columns), 0);
+                        encoder.set_buffer(1, Some(&state_buffer), 0);
+                        encoder.set_buffer(2, Some(&digests), 0);
+                        encoder.set_buffer(3, Some(&parameters), 0);
+                        set_u32(encoder, 4, leaf_count as u32);
+                        set_u32(encoder, 5, LOG_LEAF_COUNT);
+                        set_u32(encoder, 6, col_start as u32);
+                        set_u32(encoder, 7, chunk as u32);
+                        set_u32(encoder, 8, u32::from(group == 0));
+                        set_u32(encoder, 9, u32::from(group == groups - 1));
+                        set_u32(encoder, 10, u32::from(next_chunk_is_partial));
+                        dispatch(encoder, state, leaf_count);
+                    });
+                }
+                absorbed.push(snapshot());
+            }
+            assert!(
+                absorbed[0] == absorbed[1],
+                "absorb carry trim differs from the shipped kernel at leaf_width={leaf_width}"
+            );
+            // The streamed sponge must also agree with the fused kernel, which
+            // is the contract `build_merkle_tree_shared_streamed` relies on.
+            assert!(
+                absorbed[1] == cm[0],
+                "trimmed absorb differs from the fused leaf kernel at leaf_width={leaf_width}"
+            );
+        }
+
+        // A branch nobody reaches is a mechanism nobody gets, and -- for
+        // `carry_rate` -- a soundness argument nobody tests. 24/129/134/135/136
+        // all have interior full-rate groups whose successor is also full-rate
+        // (`carry_rate` clear, the trimmed path the mechanism exists for);
+        // 17/23/129/134/135 all place a partial tail after an interior full
+        // group (`carry_rate` set, the one pass whose rate lanes are live).
+        assert!(
+            carry_rate_off_passes > 0,
+            "the sweep never exercised an absorb pass with carry_rate clear"
+        );
+        assert!(
+            carry_rate_on_passes > 0,
+            "the sweep never exercised the penultimate-before-partial carry_rate pass"
+        );
+        assert!(
+            partial_chunk_passes > 0,
+            "the sweep never exercised the partial trailing chunk"
+        );
+        assert!(
+            interior_full_rate_passes > 0,
+            "the sweep never exercised an interior full-rate absorb pass"
+        );
+    }
+
+    /// Paired A/B for the fused column-major leaf kernel, which serves every
+    /// GPU-routed Merkle tree that is not streamed -- including all 147
+    /// commitment trees on the serial chain spine at 2^17. Same exactness
+    /// oracle: the two arms must agree on every digest limb.
+    #[test]
+    #[ignore = "device-specific GPU timing probe"]
+    fn leaves_colmajor_fixed8_ab() {
+        const LEAF_WIDTH: usize = 136;
+        const ROUNDS: usize = 5;
+
+        let device = Device::system_default().expect("no Metal device");
+        let queue = device.new_command_queue();
+        let source = [SHADER_SOURCE, ABSORB_AB_KERNELS].concat();
+        let library = autoreleasepool(|| {
+            device
+                .new_library_with_source(&source, &CompileOptions::new())
+                .unwrap_or_else(|error| panic!("absorb A/B shader failed: {error}"))
+        });
+        let make_pipeline = |name: &str| {
+            let function = library
+                .get_function(name, None)
+                .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+        };
+        let arms = [
+            ("base", make_pipeline("leaves_cm_base")),
+            ("fixed8", make_pipeline("poseidon2_hash_leaves_colmajor")),
+        ];
+
+        let mut parameter_values: Vec<u64> = Vec::with_capacity(130);
+        parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+        parameter_values.extend(INTERNAL_CONSTANTS);
+        parameter_values.extend(MATRIX_DIAG_12_U64);
+        let parameters = device.new_buffer_with_data(
+            parameter_values.as_ptr().cast::<c_void>(),
+            size_of_val(parameter_values.as_slice()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        for log_leaf_count in [17u32, 19u32] {
+            let leaf_count = 1usize << log_leaf_count;
+            let columns = device.new_buffer(
+                (LEAF_WIDTH * leaf_count * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            {
+                let cells = unsafe {
+                    slice::from_raw_parts_mut(
+                        columns.contents().cast::<u64>(),
+                        LEAF_WIDTH * leaf_count,
+                    )
+                };
+                let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+                for cell in cells.iter_mut() {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    *cell = x % 0xffff_ffff_0000_0001;
+                }
+            }
+            let digests = device.new_buffer(
+                (leaf_count * 4 * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let run = |state: &ComputePipelineState| -> f64 {
+                let start = Instant::now();
+                let command_buffer = autoreleasepool(|| {
+                    let command_buffer = queue.new_command_buffer();
+                    let encoder = command_buffer.new_compute_command_encoder();
+                    encoder.set_compute_pipeline_state(state);
+                    encoder.set_buffer(0, Some(&columns), 0);
+                    encoder.set_buffer(1, Some(&digests), 0);
+                    encoder.set_buffer(2, Some(&parameters), 0);
+                    set_u32(encoder, 3, LEAF_WIDTH as u32);
+                    set_u32(encoder, 4, leaf_count as u32);
+                    set_u32(encoder, 5, log_leaf_count);
+                    // Buffer 6 is `canonicalize_in_place`; clear it so the two
+                    // arms do the same stores and the timing stays comparable.
+                    set_u32(encoder, 6, 0);
+                    dispatch(encoder, state, leaf_count);
+                    encoder.end_encoding();
+                    command_buffer.commit();
+                    command_buffer.to_owned()
+                });
+                command_buffer.wait_until_completed();
+                assert_eq!(
+                    command_buffer.status(),
+                    MTLCommandBufferStatus::Completed,
+                    "leaf command failed"
+                );
+                gpu_seconds(&command_buffer, start.elapsed())
+            };
+            let snapshot = || -> Vec<u64> {
+                unsafe {
+                    slice::from_raw_parts(digests.contents().cast::<u64>(), leaf_count * 4)
+                }
+                .to_vec()
+            };
+
+            let mut reference: Option<Vec<u64>> = None;
+            for (name, state) in &arms {
+                run(state);
+                let observed = snapshot();
+                match &reference {
+                    None => reference = Some(observed),
+                    Some(expected) => assert!(
+                        *expected == observed,
+                        "{name} digests differ from base: the peel is not value-exact"
+                    ),
+                }
+            }
+
+            let mut totals = vec![Vec::<f64>::new(); arms.len()];
+            for _ in 0..ROUNDS {
+                for (index, (_, state)) in arms.iter().enumerate() {
+                    totals[index].push(run(state));
+                }
+            }
+            for (index, (name, _)) in arms.iter().enumerate() {
+                let mut samples = totals[index].clone();
+                samples.sort_by(f64::total_cmp);
+                let median = samples[samples.len() / 2];
+                println!(
+                    "leaves_cm n=2^{log_leaf_count} {name}: median {:.3} ms, samples {:?}",
+                    median * 1e3,
+                    samples
+                        .iter()
+                        .map(|value| (value * 1e6).round() / 1e3)
+                        .collect::<Vec<_>>()
+                );
+            }
         }
     }
 }
