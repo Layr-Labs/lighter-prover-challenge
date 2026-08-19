@@ -37,8 +37,6 @@ pub fn spine_backlog_add(_delta: isize) {}
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
 pub fn prewarm_large_column_store(_bytes: u64) {}
 
-/// No-op fallback for the streamed-sponge buffer prewarm on platforms without
-/// the Metal backend.
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
 pub fn prewarm_streamed_buffers(_leaf_count: usize) {}
 

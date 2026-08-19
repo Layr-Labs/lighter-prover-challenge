@@ -199,4 +199,3 @@ mod tests {
         assert_eq!(out, expected);
     }
 }
-
