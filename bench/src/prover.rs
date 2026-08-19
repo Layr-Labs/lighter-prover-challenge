@@ -134,6 +134,36 @@ fn light_tx_proof_window() -> usize {
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
+/// Number of ordered light transaction proofs to retire before the final block
+/// circuit starts building. Its preprocessing has no data dependency on the
+/// transaction paths, but starting it immediately puts a large Rayon workload
+/// beside the latency-critical first proof waves. The build has ample slack
+/// before the light chain finishes, so let those first waves own the machine.
+/// Zero restores the eager schedule for same-binary A/B measurements.
+fn final_build_after_light_proofs() -> usize {
+    std::env::var("LIGHTER_FINAL_BUILD_AFTER_LIGHT_PROOFS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(12)
+}
+
+fn retire_tx_proof_for_final_build(
+    gate: Option<(usize, &std::sync::mpsc::Sender<()>)>,
+    retired: &mut usize,
+    signaled: &mut bool,
+) {
+    let Some((threshold, sender)) = gate else {
+        return;
+    };
+    *retired += 1;
+    if !*signaled && *retired >= threshold {
+        sender
+            .send(())
+            .expect("final block build lane must still be waiting");
+        *signaled = true;
+    }
+}
+
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
@@ -580,6 +610,7 @@ fn prove_path(
     pre_output: &BlockPreExecWitness<F>,
     state_metadata_hash: HashOut<F>,
     active_paths: &AtomicUsize,
+    final_build_gate: Option<(usize, &std::sync::mpsc::Sender<()>)>,
 ) -> Proof {
     assert!(
         !chunks.is_empty(),
@@ -684,6 +715,8 @@ fn prove_path(
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
         let mut current_step = 0u64;
+        let mut retired_tx_proofs = 0usize;
+        let mut final_build_signaled = false;
 
         loop {
             if let Some((chain_step, tx_proof)) = pending_tx.take() {
@@ -772,6 +805,11 @@ fn prove_path(
                 let tx_proof = proof_handle
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                retire_tx_proof_for_final_build(
+                    final_build_gate,
+                    &mut retired_tx_proofs,
+                    &mut final_build_signaled,
+                );
                 pending_tx = Some((proof_step, tx_proof));
             }
             current_step += 1;
@@ -830,6 +868,11 @@ fn prove_path(
                     .join()
                     .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
             };
+            retire_tx_proof_for_final_build(
+                final_build_gate,
+                &mut retired_tx_proofs,
+                &mut final_build_signaled,
+            );
             // Claim the exclusive phase only once the window has flushed AND
             // the last chunk proof has retired (the join above): before this
             // point the exclusive routing's lower GPU cutoff and occupancy
@@ -872,6 +915,13 @@ fn prove_path(
         let chain_proof = chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof");
+        if let Some((_, sender)) = final_build_gate {
+            if !final_build_signaled {
+                sender
+                    .send(())
+                    .expect("final block build lane must still be waiting");
+            }
+        }
         if exclusive_drain {
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
         }
@@ -1021,7 +1071,13 @@ pub(crate) fn prove_block_after_pre(
         // block so the finished extensions can be released below.
         let circuits = &circuits;
         let active_paths = &active_paths;
+        let pre_output_ref = &pre_output;
+        let block_number = block.block_number;
+        let created_at = block.created_at;
+        let old_account_delta_tree_root = block.old_account_delta_tree_root;
         std::thread::scope(|scope| {
+            let final_build_after = final_build_after_light_proofs();
+            let (final_build_ready_tx, final_build_ready_rx) = std::sync::mpsc::channel();
             // The final block circuit depends only on already-built circuit data
             // and is not needed until the final proof, so it builds concurrently
             // with the entire transaction/chain proving pipeline.
@@ -1043,17 +1099,18 @@ pub(crate) fn prove_block_after_pre(
             let heavy_handle_outer = std::thread::Builder::new()
                 .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
+                .spawn_scoped(scope, move || {
                     prove_path(
                         TxPath::Heavy,
                         heavy_chunks,
                         circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
+                        block_number,
+                        created_at,
+                        old_account_delta_tree_root,
+                        pre_output_ref,
                         state_metadata_hash,
                         active_paths,
+                        None,
                     )
                 })
                 .expect("heavy transaction chain thread must start");
@@ -1071,6 +1128,14 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    if final_build_after != 0 {
+                        #[cfg(feature = "diagnostic_profile")]
+                        let _start_gate_wait =
+                            plonky2::util::profile::span("wait", "final_block_start_gate");
+                        final_build_ready_rx
+                            .recv()
+                            .expect("light path must signal final block build readiness");
+                    }
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -1139,18 +1204,20 @@ pub(crate) fn prove_block_after_pre(
             let light_handle = std::thread::Builder::new()
                 .name("light-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
+                .spawn_scoped(scope, move || {
                     mark_spine_thread_latency_critical();
                     prove_path(
                         TxPath::Light,
                         light_chunks,
                         circuits,
-                        block.block_number,
-                        block.created_at,
-                        block.old_account_delta_tree_root,
-                        &pre_output,
+                        block_number,
+                        created_at,
+                        old_account_delta_tree_root,
+                        pre_output_ref,
                         state_metadata_hash,
                         active_paths,
+                        (final_build_after != 0)
+                            .then_some((final_build_after, &final_build_ready_tx)),
                     )
                 })
                 .expect("light transaction chain thread must start");
