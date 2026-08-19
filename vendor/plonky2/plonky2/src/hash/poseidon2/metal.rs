@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "9404854d2c94959362532599ac6007f06d983f53a0b28c164c21a3254b50802e";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -2630,7 +2630,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            // This streamed absorb is the dominant serialized Metal hash pass;
+            // keep its occupancy independently tunable without changing leaf,
+            // parent, quotient, or arithmetic dispatch geometry.
+            dispatch_hash(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -4453,15 +4456,46 @@ fn dispatch2d(
     );
 }
 
+/// Threadgroup cap for the streamed Poseidon2 absorb pass. The override makes
+/// occupancy A/B tests possible with one binary; invalid values retain the
+/// production default rather than silently selecting an unsafe geometry.
+fn hash_threadgroup_cap() -> NSUInteger {
+    static CAP: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("LIGHTER_HASH_TG")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| (32..=1024).contains(&value) && value.is_power_of_two())
+            .unwrap_or(256)
+    });
+    *CAP as NSUInteger
+}
+
+fn dispatch_hash(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
+}
+
 fn dispatch(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
+}
+
+fn dispatch_with_group_cap(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    group_cap: NSUInteger,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(group_cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {

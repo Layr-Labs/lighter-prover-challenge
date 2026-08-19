@@ -2,6 +2,8 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use core::any::TypeId;
 use core::cmp::min;
 
 use anyhow::{ensure, Result};
@@ -726,10 +728,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let base_0 = wire_value + gamma_0;
+                                let base_1 = wire_value + gamma_1;
+                                numerator_0 *= base_0.multiply_accumulate(beta_k_is_0[j], x);
+                                numerator_1 *= base_1.multiply_accumulate(beta_k_is_1[j], x);
+                                denominator_0 *= base_0.multiply_accumulate(beta_0, sigma);
+                                denominator_1 *= base_1.multiply_accumulate(beta_1, sigma);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -859,8 +863,9 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let base = wire_value + gamma;
+                            numerator_product *= base.multiply_accumulate(beta_k_is[j], x);
+                            denominator_product *= base.multiply_accumulate(beta, s_sigmas[j]);
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -1603,9 +1608,56 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     low: &[F],
     odd: &[Vec<F>],
     filter_at: impl Fn(usize, usize) -> F,
-) {
+) -> bool {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
+    if TypeId::of::<F>() == TypeId::of::<crate::field::goldilocks_field::GoldilocksField>() {
+        use crate::field::extension::quadratic::NeonGoldilocksField;
+        use crate::field::goldilocks_field::GoldilocksField;
+
+        // SAFETY: the TypeId guard proves `F = GoldilocksField`; every cast
+        // keeps the original allocation, length, alignment and ownership.
+        let low = unsafe {
+            core::slice::from_raw_parts(low.as_ptr().cast::<GoldilocksField>(), low.len())
+        };
+        let acc = unsafe {
+            core::slice::from_raw_parts_mut(
+                chunk.as_mut_ptr().cast::<GoldilocksField>(),
+                chunk.len(),
+            )
+        };
+        for g in 0..num_gates {
+            let odd0 = unsafe {
+                core::slice::from_raw_parts(
+                    odd[g * 2].as_ptr().cast::<GoldilocksField>(),
+                    odd[g * 2].len(),
+                )
+            };
+            let odd1 = unsafe {
+                core::slice::from_raw_parts(
+                    odd[g * 2 + 1].as_ptr().cast::<GoldilocksField>(),
+                    odd[g * 2 + 1].len(),
+                )
+            };
+            let low_base = g * half_rows * 2;
+            for r in 0..rows {
+                let i = row0 + r;
+                let values = if i & 1 == 0 {
+                    let base = low_base + (i >> 1) * 2;
+                    NeonGoldilocksField([low[base], low[base + 1]])
+                } else {
+                    NeonGoldilocksField([odd0[i >> 1], odd1[i >> 1]])
+                };
+                let filter_f = filter_at(g, r);
+                let filter = unsafe { *(&filter_f as *const F).cast::<GoldilocksField>() };
+                let pair = NeonGoldilocksField([acc[2 * r], acc[2 * r + 1]]);
+                let updated = pair + values * filter;
+                acc[2 * r] = updated.0[0];
+                acc[2 * r + 1] = updated.0[1];
+            }
+        }
+        return true;
+    }
+
     for g in 0..num_gates {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
@@ -1619,11 +1671,11 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            chunk[2 * r] += filter * sv0;
+            chunk[2 * r + 1] += filter * sv1;
         }
     }
-    chunk.copy_from_slice(&acc);
+    false
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -1669,10 +1721,11 @@ fn combine_low_range_quotient<F: RichField>(
         })
         .map(|entry| entry.filters.as_slice());
 
-    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
-    // SAFETY: both disjoint parallel branches below write every output slot
-    // before the vector is returned, exactly as the pre-cache implementation.
-    unsafe { out.set_len(full_rows * 2) };
+    // Each chunk now accumulates directly into this initialized output. The
+    // previous helper allocated and zeroed a second chunk-sized `Vec`, then
+    // copied it over `out`; initializing once here deletes every per-chunk
+    // allocation and the full output copy without changing accumulation order.
+    let mut out = vec![F::ZERO; full_rows * 2];
     let num_gates = gates.len();
     if let Some(filters) = cached_filters {
         out.par_chunks_mut(2 * ROWS_PER_CHUNK)
@@ -3658,8 +3711,8 @@ mod quotient_layout_tests {
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
+        accumulate_low_range_quotient_chunk, combine_low_range_quotient,
+        gpu_poseidon_quotient_stats, LowDegreeRangeGate, COMPARE_GPU_QUOTIENT,
     };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64, PrimeField64};
@@ -3711,6 +3764,69 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn low_range_chunk_uses_paired_neon_and_preserves_raw_limbs() {
+        let rows = 19usize;
+        let half_rows = rows.div_ceil(2);
+        let num_gates = 3usize;
+        let edge = [
+            F::ZERO,
+            F::ONE,
+            F::from_noncanonical_u64(F::ORDER),
+            F::from_noncanonical_u64(F::ORDER + 1),
+            F::from_noncanonical_u64(u64::MAX),
+        ];
+        let value = |i: usize| edge[(i * 7 + 3) % edge.len()];
+        let low = (0..num_gates * half_rows * 2)
+            .map(value)
+            .collect::<Vec<_>>();
+        let odd = (0..num_gates * 2)
+            .map(|column| {
+                (0..half_rows)
+                    .map(|row| value(10_000 + column * half_rows + row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let filters = (0..num_gates * rows)
+            .map(|i| value(20_000 + i))
+            .collect::<Vec<_>>();
+
+        let mut expected = vec![F::ZERO; rows * 2];
+        for g in 0..num_gates {
+            for r in 0..rows {
+                let (sv0, sv1) = if r & 1 == 0 {
+                    let base = g * half_rows * 2 + (r >> 1) * 2;
+                    (low[base], low[base + 1])
+                } else {
+                    (odd[g * 2][r >> 1], odd[g * 2 + 1][r >> 1])
+                };
+                let filter = filters[g * rows + r];
+                expected[2 * r] += filter * sv0;
+                expected[2 * r + 1] += filter * sv1;
+            }
+        }
+
+        let mut actual = vec![F::ZERO; rows * 2];
+        let dispatched = accumulate_low_range_quotient_chunk(
+            &mut actual,
+            0,
+            half_rows,
+            num_gates,
+            &low,
+            &odd,
+            |g, r| filters[g * rows + r],
+        );
+        assert!(dispatched, "Goldilocks production path did not use paired NEON");
+        let raw = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(raw(&actual), raw(&expected));
     }
 
     /// Raw-limb differential and dispatch guard for the immutable low-range

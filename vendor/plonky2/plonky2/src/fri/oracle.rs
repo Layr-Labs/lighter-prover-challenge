@@ -624,34 +624,33 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        // `out` is per-worker scratch reused across the quotient batches, so it
-        // already has the right length for all but the last (short) batch. Every
-        // arm below writes all `n * w` cells before any is read:
-        //   - Columns/PolyMajor: `ci` covers `0..w`, `k` covers `0..n`, writing
-        //     each `ci * n + k` exactly once;
-        //   - Columns/PointMajor: the same loop nest writes each `k * w + ci`;
-        //   - Rows/PointMajor: each `k` copies a full `w`-element row into
-        //     `out[k * w..(k + 1) * w]`;
-        //   - Rows/PolyMajor: each `k` writes `ci * n + k` for every `ci` in
-        //     `0..w` (`row.len() == w`).
-        // So the zero-fill of a correctly sized buffer is a dead store: adjust
-        // the length only (`resize` is a no-op when it already matches, and
-        // still zero-initializes any newly created or grown scratch).
-        out.resize(n * w, F::ZERO);
+        // `out` is per-worker scratch reused across the quotient batches. Every
+        // arm below writes all `n * w` cells before any is read. Reserve enough
+        // storage but keep the old initialized length while filling through raw
+        // pointers; setting the length before initialization would violate
+        // `Vec::set_len`'s contract even for a `Copy` field type.
+        let output_len = n * w;
+        if output_len > out.capacity() {
+            out.reserve(output_len - out.len());
+        }
+        let output = out.as_mut_ptr();
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
                     let column = columns.col(c);
                     match layout {
                         BatchLayout::PolyMajor => {
-                            let destination = &mut out[ci * n..(ci + 1) * n];
                             for (k, &i) in indices.iter().enumerate() {
-                                destination[k] = column[i * step];
+                                // SAFETY: `ci < w`, `k < n`, and reservation
+                                // above covers `w * n`; each pair is disjoint.
+                                unsafe { output.add(ci * n + k).write(column[i * step]) };
                             }
                         }
                         BatchLayout::PointMajor => {
                             for (k, &i) in indices.iter().enumerate() {
-                                out[k * w + ci] = column[i * step];
+                                // SAFETY: `k < n`, `ci < w`, and each pair is
+                                // written exactly once within reserved storage.
+                                unsafe { output.add(k * w + ci).write(column[i * step]) };
                             }
                         }
                     }
@@ -662,17 +661,30 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     let row = &self.get_lde_values(i, step)[start..start + w];
                     match layout {
                         BatchLayout::PointMajor => {
-                            out[k * w..(k + 1) * w].copy_from_slice(row);
+                            // SAFETY: row has `w` elements and the destination
+                            // range `k * w..(k + 1) * w` is reserved and disjoint.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    row.as_ptr(),
+                                    output.add(k * w),
+                                    w,
+                                )
+                            };
                         }
                         BatchLayout::PolyMajor => {
                             for (ci, &value) in row.iter().enumerate() {
-                                out[ci * n + k] = value;
+                                // SAFETY: `ci < w`, `k < n`, and each pair is
+                                // written exactly once within reserved storage.
+                                unsafe { output.add(ci * n + k).write(value) };
                             }
                         }
                     }
                 }
             }
         }
+        // SAFETY: every one of the `output_len` slots was initialized exactly
+        // once by the exhaustive storage/layout arms above.
+        unsafe { out.set_len(output_len) };
     }
 
     /// Copies consecutive LDE points into a PolyMajor output buffer.
@@ -689,7 +701,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) {
         let start = col_range.start;
         let w = col_range.len();
-        out.resize(n * w, F::ZERO);
+        let output_len = n * w;
+        if output_len > out.capacity() {
+            out.reserve(output_len - out.len());
+        }
+        let output = out.as_mut_ptr();
 
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
@@ -697,19 +713,33 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     .checked_add(n)
                     .expect("contiguous LDE batch range overflow");
                 for (ci, c) in col_range.enumerate() {
-                    out[ci * n..(ci + 1) * n]
-                        .copy_from_slice(&columns.col(c)[index_start..index_end]);
+                    let source = &columns.col(c)[index_start..index_end];
+                    // SAFETY: `ci < w`, each source contains `n` initialized
+                    // elements, reserved output spans `w * n`, and scratch does
+                    // not alias the commitment's immutable column storage.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            source.as_ptr(),
+                            output.add(ci * n),
+                            n,
+                        )
+                    };
                 }
             }
             MerkleLeaves::Rows { .. } => {
                 for k in 0..n {
                     let row = &self.get_lde_values(index_start + k, 1)[start..start + w];
                     for (ci, &value) in row.iter().enumerate() {
-                        out[ci * n + k] = value;
+                        // SAFETY: `ci < w`, `k < n`, and every pair is written
+                        // exactly once within the reserved `w * n` slots.
+                        unsafe { output.add(ci * n + k).write(value) };
                     }
                 }
             }
         }
+        // SAFETY: every one of the `output_len` slots was initialized exactly
+        // once by either exhaustive storage arm above.
+        unsafe { out.set_len(output_len) };
     }
 
     /// Extracts the stride-`step` LDE values for a whole quotient domain of
@@ -1179,9 +1209,19 @@ fn dif_layer_neon_ext2(
 
     let half = 1usize << lg_half_m;
     let m = half << 1;
+    debug_assert_eq!(omega[0].0, GoldilocksField::ONE.0);
     for block in values.chunks_exact_mut(m) {
         let (low, high) = block.split_at_mut(half);
-        for j in 0..half {
+
+        // Every FFT root row starts with canonical ONE. Multiplication by it
+        // is raw-word-identical to the subtraction, so keep the representative
+        // and delete one paired reduction from every block in every layer.
+        let u = NeonGoldilocksField(low[0].0);
+        let v = NeonGoldilocksField(high[0].0);
+        low[0] = QuadraticExtension((u + v).0);
+        high[0] = QuadraticExtension((u - v).0);
+
+        for j in 1..half {
             let u = NeonGoldilocksField(low[j].0);
             let v = NeonGoldilocksField(high[j].0);
             low[j] = QuadraticExtension((u + v).0);
@@ -1585,6 +1625,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn dif_layer_neon_ext2_mul_one_reference(
+        values: &mut [QuadraticExtension<GoldilocksField>],
+        lg_half_m: usize,
+        omega: &[GoldilocksField],
+    ) {
+        use crate::field::extension::quadratic::NeonGoldilocksField;
+
+        let half = 1usize << lg_half_m;
+        let m = half << 1;
+        for block in values.chunks_exact_mut(m) {
+            let (low, high) = block.split_at_mut(half);
+            for j in 0..half {
+                let u = NeonGoldilocksField(low[j].0);
+                let v = NeonGoldilocksField(high[j].0);
+                low[j] = QuadraticExtension((u + v).0);
+                high[j] = QuadraticExtension(((u - v) * omega[j]).0);
+            }
+        }
+    }
+
+    /// The Apple-AArch64 layer's `j = 0` shortcut must reproduce the old
+    /// multiply-by-one path word for word, not only modulo the field. Exercise
+    /// every layer regime on arbitrary raw limbs, including representatives at
+    /// and above the modulus, and require every root row's first word to be the
+    /// canonical representation of one.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn dif_layer_neon_ext2_twiddle_one_matches_mul_raw_words() {
+        use crate::field::types::Field64;
+
+        const BLOCKS: usize = 5;
+        let p = GoldilocksField::ORDER;
+        let edges = [0, 1, 2, p - 1, p, p + 1, 0xffff_ffff, u64::MAX];
+        let mut compared_words = 0usize;
+        let mut last_expected = Vec::new();
+        let mut last_actual = Vec::new();
+
+        for lg_half_m in [0usize, 1, 2, 3, 5, 8, 12] {
+            let half = 1usize << lg_half_m;
+            let m = half << 1;
+            let roots = cached_fft_root_table::<GoldilocksField>(m);
+            let omega = &roots[lg_half_m][..half];
+            assert_eq!(
+                omega[0].0,
+                GoldilocksField::ONE.0,
+                "row {lg_half_m} does not start with canonical ONE",
+            );
+
+            let mut state = 0x243f_6a88_85a3_08d3u64 ^ lg_half_m as u64;
+            let mut next_raw = |word: usize| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                if word % 3 == 0 {
+                    edges[(word * 5 + lg_half_m) % edges.len()]
+                } else {
+                    state
+                }
+            };
+            let input = (0..m * BLOCKS)
+                .map(|i| {
+                    QuadraticExtension([
+                        GoldilocksField(next_raw(2 * i)),
+                        GoldilocksField(next_raw(2 * i + 1)),
+                    ])
+                })
+                .collect::<Vec<_>>();
+            let mut expected = input.clone();
+            let mut actual = input;
+            dif_layer_neon_ext2_mul_one_reference(
+                &mut expected,
+                lg_half_m,
+                omega,
+            );
+            dif_layer_neon_ext2(&mut actual, lg_half_m, omega);
+
+            let expected_words = expected
+                .iter()
+                .flat_map(|value| value.0.iter().map(|limb| limb.0))
+                .collect::<Vec<_>>();
+            let actual_words = actual
+                .iter()
+                .flat_map(|value| value.0.iter().map(|limb| limb.0))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_words, expected_words,
+                "raw layer mismatch at lg_half_m={lg_half_m}",
+            );
+            // Name the optimized positions explicitly so a future differential
+            // cannot accidentally compare only the still-multiplied columns.
+            for block in 0..BLOCKS {
+                let high_zero = block * m + half;
+                assert_eq!(
+                    actual[high_zero].0.map(|limb| limb.0),
+                    expected[high_zero].0.map(|limb| limb.0),
+                    "j=0 raw mismatch in block {block}, layer {lg_half_m}",
+                );
+            }
+            compared_words += expected_words.len();
+            last_expected = expected_words;
+            last_actual = actual_words;
+        }
+        assert!(compared_words >= 80_000, "raw differential was too small");
+
+        // Sabotage control: prove the raw-word oracle notices a one-bit error.
+        let sabotage_index = last_actual.len() / 2;
+        last_actual[sabotage_index] ^= 1;
+        assert_ne!(
+            last_actual, last_expected,
+            "sabotage control did not detect a flipped raw limb",
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn dif_block_neon_ext2_mul_one_reference(
+        values: &mut [QuadraticExtension<GoldilocksField>],
+        roots: &FftRootTable<GoldilocksField>,
+    ) {
+        const CACHE_LG: usize = 12;
+
+        let lg_n = log2_strict(values.len());
+        let local_lg = lg_n.min(CACHE_LG);
+        for lg_m in (local_lg + 1..=lg_n).rev() {
+            dif_layer_neon_ext2_mul_one_reference(values, lg_m - 1, &roots[lg_m - 1]);
+        }
+        let local_len = 1usize << local_lg;
+        for local in values.chunks_exact_mut(local_len) {
+            for lg_m in (1..=local_lg).rev() {
+                dif_layer_neon_ext2_mul_one_reference(local, lg_m - 1, &roots[lg_m - 1]);
+            }
+        }
+    }
+
+    /// Single-thread screen of exactly the eight 2^16-element DIF cores in a
+    /// recurring production 2^19 rate-8 transform. Run with:
+    /// `cargo test -p plonky2 --release --lib
+    /// dif_neon_ext2_twiddle_one_production_shape_benchmark -- --ignored --nocapture`
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "release-only production-shape microbenchmark"]
+    fn dif_neon_ext2_twiddle_one_production_shape_benchmark() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const LIVE: usize = 1 << 16;
+        const CORE_BLOCKS: usize = 8;
+        const LEN: usize = LIVE * CORE_BLOCKS;
+        const REPEATS: usize = 3;
+        const SAMPLES: usize = 31;
+
+        let seed = (0..LEN)
+            .map(|i| {
+                QuadraticExtension([
+                    GoldilocksField((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                    GoldilocksField(
+                        (i as u64)
+                            .wrapping_add(1)
+                            .wrapping_mul(0xd1b5_4a32_d192_ed03),
+                    ),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let roots = cached_fft_root_table::<GoldilocksField>(LEN);
+        let old_pass = |values: &mut [QuadraticExtension<GoldilocksField>]| {
+            values
+                .chunks_exact_mut(LIVE)
+                .for_each(|block| dif_block_neon_ext2_mul_one_reference(block, &roots));
+        };
+        let new_pass = |values: &mut [QuadraticExtension<GoldilocksField>]| {
+            values
+                .chunks_exact_mut(LIVE)
+                .for_each(|block| dif_block_neon_ext2(block, &roots));
+        };
+
+        let mut expected = seed.clone();
+        let mut actual = seed.clone();
+        old_pass(&mut expected);
+        new_pass(&mut actual);
+        assert_eq!(
+            actual
+                .iter()
+                .flat_map(|value| value.0.iter().map(|limb| limb.0))
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .flat_map(|value| value.0.iter().map(|limb| limb.0))
+                .collect::<Vec<_>>(),
+        );
+
+        let measure = |pass: &dyn Fn(&mut [QuadraticExtension<GoldilocksField>])| {
+            let mut values = seed.clone();
+            let start = Instant::now();
+            for _ in 0..REPEATS {
+                pass(black_box(&mut values));
+            }
+            black_box(values);
+            start.elapsed()
+        };
+        for _ in 0..3 {
+            black_box(measure(&old_pass));
+            black_box(measure(&new_pass));
+        }
+        let mut old_samples = Vec::with_capacity(SAMPLES);
+        let mut new_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            let (old_elapsed, new_elapsed) = if sample % 2 == 0 {
+                (measure(&old_pass), measure(&new_pass))
+            } else {
+                let new_elapsed = measure(&new_pass);
+                let old_elapsed = measure(&old_pass);
+                (old_elapsed, new_elapsed)
+            };
+            old_samples.push(old_elapsed);
+            new_samples.push(new_elapsed);
+        }
+        old_samples.sort_unstable();
+        new_samples.sort_unstable();
+        let old_median: Duration = old_samples[SAMPLES / 2];
+        let new_median: Duration = new_samples[SAMPLES / 2];
+        eprintln!(
+            "mul_one={old_median:?} j0_sub={new_median:?} speedup={:.4}x",
+            old_median.as_secs_f64() / new_median.as_secs_f64(),
+        );
     }
 
     /// Filling retained column storage must preserve the exact raw field-word
@@ -2137,6 +2403,9 @@ mod tests {
                     .collect::<Vec<_>>()
             };
 
+            // Seed and reuse one scratch allocation across small, short, and
+            // growing batches so the overwrite path cannot rely on fresh zeros.
+            let mut uncached = vec![GoldilocksField(u64::MAX); 7];
             for batch_size in [1usize, 3, 8, 32] {
                 let num_batches = domain.div_ceil(batch_size);
                 for batch_i in 0..num_batches {
@@ -2149,7 +2418,6 @@ mod tests {
                         (sigmas_range.clone(), num_constants),
                     ] {
                         let w = range.len();
-                        let mut uncached = Vec::new();
                         batch.fill_lde_batch(
                             &indices,
                             step,
@@ -2168,6 +2436,82 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_lde_batch_reused_uninit_scratch_matches_point_oracle_raw_words() {
+        use crate::field::types::{Field64, PrimeField64};
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let degree = 32usize;
+        let width = 5usize;
+        let values = (0..width)
+            .map(|column| {
+                PolynomialValues::new(
+                    (0..degree)
+                        .map(|row| {
+                            F::from_noncanonical_u64(
+                                F::ORDER
+                                    .wrapping_add((column * degree + row + 1) as u64),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for blinding in [false, true] {
+            let batch = PolynomialBatch::<F, C, D>::from_values(
+                values.clone(),
+                2,
+                blinding,
+                1,
+                &mut TimingTree::default(),
+                None,
+            );
+            let mut out = vec![F::from_noncanonical_u64(u64::MAX); 3];
+            for (indices, step, range) in [
+                (vec![0usize, 1, 2, 3, 4, 5], 1usize, 0usize..5usize),
+                (vec![1usize, 3, 7, 11], 1usize, 1usize..4usize),
+                (vec![0usize, 2, 5, 9], 2usize, 0usize..2usize),
+                (vec![3usize], 1usize, 2usize..5usize),
+            ] {
+                for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                    batch.fill_lde_batch(&indices, step, range.clone(), layout, &mut out);
+                    let value_at = |index: usize, column: usize| match &batch.merkle_tree.leaves {
+                        MerkleLeaves::Columns { columns, .. } => columns.col(column)[index * step],
+                        MerkleLeaves::Rows { .. } => batch.get_lde_values(index, step)[column],
+                    };
+                    let mut expected = Vec::with_capacity(indices.len() * range.len());
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            for &index in &indices {
+                                expected.extend(range.clone().map(|column| value_at(index, column)));
+                            }
+                        }
+                        BatchLayout::PolyMajor => {
+                            for column in range.clone() {
+                                expected.extend(indices.iter().map(|&index| value_at(index, column)));
+                            }
+                        }
+                    }
+                    assert_eq!(out.len(), expected.len());
+                    assert_eq!(
+                        out.iter()
+                            .map(PrimeField64::to_noncanonical_u64)
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(PrimeField64::to_noncanonical_u64)
+                            .collect::<Vec<_>>(),
+                        "blinding={blinding} step={step} range={range:?} layout={layout:?}",
+                    );
                 }
             }
         }
