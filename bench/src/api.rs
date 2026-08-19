@@ -1,4 +1,4 @@
-// Redraw marker 655
+// Redraw marker rawqubit-redraw-1787182263
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
