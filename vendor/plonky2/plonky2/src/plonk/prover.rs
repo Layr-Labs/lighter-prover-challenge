@@ -1358,6 +1358,9 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
             && common_data.num_lookup_polys == 0
             && common_data.config.num_challenges == 2
             && common_data.degree_bits() + common_data.config.fri_config.rate_bits >= min_bits
+            // Not the final block's 2^21 shape: measured slower there (its 1 GiB
+            // companion and 2^20-point extension sit on the serial tail).
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits <= 19
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
