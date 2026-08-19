@@ -22,7 +22,8 @@ use circuit::types::config::{C, D, F};
 use circuit::types::constants::TX_LIGHT;
 use plonky2::hash::hash_types::{HashOut, HashOutTarget};
 use plonky2::iop::generator::{
-    ParallelWitnessGuard, PartitionSeedLayout, PendingPartitionWitness, is_seed_layout_mismatch,
+    ParallelWitnessGuard, PartitionSeedLayout, PendingPartitionWitness,
+    is_generator_replay_mismatch, is_seed_layout_mismatch,
 };
 #[cfg(test)]
 use plonky2::iop::generator::generate_partial_witness;
@@ -471,6 +472,7 @@ fn generate_tx_witness<'a>(
     state_metadata_hash: HashOut<F>,
     old_jump: JumpState<F>,
     seed_layout: &mut Option<PartitionSeedLayout<'a, F, C, D>>,
+    generator_replay_enabled: &mut bool,
 ) -> (PartitionWitness<'a, F>, JumpState<F>) {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
@@ -496,12 +498,21 @@ fn generate_tx_witness<'a>(
     // watcher-CSR traversal collapse into one positional read and one sparse
     // aggregate pass.
     let pending = if let Some(layout) = seed_layout.as_ref() {
-        let replay = PendingPartitionWitness::start_seeded_with_layout(
-            &tx_data.prover_only,
-            &tx_data.common,
-            layout,
-            |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
-        );
+        let replay = if *generator_replay_enabled {
+            PendingPartitionWitness::start_seeded_with_layout(
+                &tx_data.prover_only,
+                &tx_data.common,
+                layout,
+                |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
+            )
+        } else {
+            PendingPartitionWitness::start_seeded_with_layout_without_generator_replay(
+                &tx_data.prover_only,
+                &tx_data.common,
+                layout,
+                |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
+            )
+        };
         // Only a typed layout-applicability mismatch may retry on the generic
         // lookup path; a writer failure or a generator/worklist failure keeps
         // its own type and propagates without rerunning the writer.
@@ -514,6 +525,20 @@ fn generate_tx_witness<'a>(
                 PendingPartitionWitness::start_seeded(
                     &tx_data.prover_only,
                     &tx_data.common,
+                    |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
+                )
+            }
+            Err(error) if is_generator_replay_mismatch(&error) => {
+                // A value-dependent generator schedule may legitimately drift
+                // while the writer target layout remains fixed. Disable only
+                // schedule replay for the rest of this path, discard the
+                // partial candidate witness, and rerun this chunk through the
+                // generic scheduler with the still-valid seed layout.
+                *generator_replay_enabled = false;
+                PendingPartitionWitness::start_seeded_with_layout_without_generator_replay(
+                    &tx_data.prover_only,
+                    &tx_data.common,
+                    layout,
                     |seeder| BlockTxCircuit::generate_witness_into(&block_tx, tx_target, seeder),
                 )
             }
@@ -656,6 +681,7 @@ fn prove_path(
     // Recorded on this path's first chunk and replayed for the rest; failing
     // closed and retiring itself if the writer's target sequence ever changes.
     let mut tx_seed_layout = None;
+    let mut tx_generator_replay_enabled = true;
     // Same discipline for the chain circuit's phase-1 writer, shared across the
     // chain-step threads this path spawns.
     let chain_seed_layout = ChainSeedLayout::new();
@@ -672,6 +698,7 @@ fn prove_path(
         state_metadata_hash,
         jump,
         &mut tx_seed_layout,
+        &mut tx_generator_replay_enabled,
     );
     jump = next_jump;
 
@@ -738,6 +765,7 @@ fn prove_path(
                     state_metadata_hash,
                     jump,
                     &mut tx_seed_layout,
+                    &mut tx_generator_replay_enabled,
                 );
                 jump = next_jump;
                 (chunk_index, witness)
@@ -1421,6 +1449,7 @@ mod tests {
             // Exercise the actual production helper for its
             // first-record/second-replay route.
             let mut production_layout = None;
+            let mut production_generator_replay_enabled = true;
             let (production_first, production_second_jump) = generate_tx_witness(
                 path,
                 0,
@@ -1431,6 +1460,7 @@ mod tests {
                 state_metadata_hash,
                 initial_jump,
                 &mut production_layout,
+                &mut production_generator_replay_enabled,
             );
             assert!(
                 production_layout.is_some(),
@@ -1446,6 +1476,7 @@ mod tests {
                 state_metadata_hash,
                 production_second_jump,
                 &mut production_layout,
+                &mut production_generator_replay_enabled,
             );
             for &public_target in &data.prover_only.public_inputs {
                 assert_eq!(
@@ -1471,6 +1502,7 @@ mod tests {
                 .expect("foreign recording for the fallback control")
                 .1,
             );
+            let mut doomed_generator_replay_enabled = true;
             let (_, fallback_jump) = generate_tx_witness(
                 path,
                 0,
@@ -1481,6 +1513,7 @@ mod tests {
                 state_metadata_hash,
                 initial_jump,
                 &mut doomed,
+                &mut doomed_generator_replay_enabled,
             );
             assert!(
                 doomed.is_none(),
@@ -1489,9 +1522,14 @@ mod tests {
             let _ = fallback_jump;
 
             println!(
-                "TX_SEED_LAYOUT_CENSUS path={path:?} target_writes={} changed_generators={} fixture_chunks={}",
+                "TX_SEED_LAYOUT_CENSUS path={path:?} target_writes={} changed_generators={} replay_steps={} replay_outputs={} replay_bytes={} fixture_chunks={}",
                 layout.target_write_count(),
                 layout.changed_generator_count(),
+                layout.generator_replay_step_count(),
+                layout.generator_replay_output_count(),
+                layout.generator_replay_step_count()
+                    * core::mem::size_of::<(u32, u32)>()
+                    + layout.generator_replay_output_count() * core::mem::size_of::<(u32, u32)>(),
                 block
                     .tx_chunks
                     .iter()
@@ -1687,6 +1725,7 @@ mod tests {
         let jump = JumpState::initial(new_state_root, old_delta_root);
 
         let light_chunk = vec![Arc::new(empty_tx); LIGHT_TX_PER_PROOF];
+        let mut generator_replay_enabled = true;
         let (witness, _) = generate_tx_witness(
             TxPath::Light,
             0,
@@ -1697,6 +1736,7 @@ mod tests {
             state_metadata_hash,
             jump,
             &mut None,
+            &mut generator_replay_enabled,
         );
         let tx_prove_start = Instant::now();
         let mut tx_timing = TimingTree::new("tx-chunk-prove", log::Level::Debug);

@@ -249,7 +249,10 @@ fn run_generator_worklist<
     remaining_generators: &mut usize,
     mut pending_generator_indices: Vec<usize>,
     parallel_threshold: usize,
+    mut replay_recorder: Option<&mut GeneratorReplayRecorder<'_>>,
 ) -> Result<()> {
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_span = crate::util::profile::span("witness", "generator_worklist");
     let generators = &prover_data.generators;
     let generator_indices_by_watches = readiness.watchers;
     // When every generator defers until ready, it enters a worklist only after its unresolved
@@ -296,8 +299,8 @@ fn run_generator_worklist<
             let round_generator_is_expired: &[bool] = generator_is_expired;
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
-                Vec<(usize, bool, usize)>,
-                Vec<(Target, F, usize, Option<&[u32]>)>,
+                Vec<(usize, bool, bool, usize)>,
+                Vec<(Target, F, u32, usize, Option<&[u32]>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -320,11 +323,15 @@ fn run_generator_worklist<
                             &mut round_buffer,
                             ready,
                         );
-                        entries.push((generator_idx, finished, round_buffer.target_values.len()));
+                        entries.push((
+                            generator_idx,
+                            ready,
+                            finished,
+                            round_buffer.target_values.len(),
+                        ));
                         for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
+                            let target_index = round_witness.target_index(t);
+                            let rep_index = round_witness.representative_map[target_index] as usize;
                             let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
                                 generator_indices_by_watches.get(&rep_index)
                             } else {
@@ -332,7 +339,13 @@ fn run_generator_worklist<
                                 // cannot newly populate it and never needs watchers.
                                 None
                             };
-                            annotated_values.push((t, v, rep_index, watchers));
+                            annotated_values.push((
+                                t,
+                                v,
+                                u32::try_from(target_index).expect("target index exceeds u32"),
+                                rep_index,
+                                watchers,
+                            ));
                         }
                     }
                     (entries, annotated_values)
@@ -343,13 +356,25 @@ fn run_generator_worklist<
             // sequential loop's per-generator merge.
             for (entries, annotated_values) in round_outputs {
                 let mut annotated_values = annotated_values.into_iter();
-                for (generator_idx, finished, value_count) in entries {
+                for (generator_idx, ready, finished, value_count) in entries {
+                    let replay_output_start = replay_recorder
+                        .as_ref()
+                        .map_or(0, |recorder| recorder.outputs.len());
                     if finished {
                         generator_is_expired[generator_idx] = true;
                         *remaining_generators -= 1;
                     }
 
-                    for (t, v, rep_index, watchers) in annotated_values.by_ref().take(value_count) {
+                    for (t, v, target_index, rep_index, watchers) in
+                        annotated_values.by_ref().take(value_count)
+                    {
+                        if let Some(recorder) = replay_recorder.as_mut() {
+                            recorder.outputs.push(GeneratorReplayOutput {
+                                target_index,
+                                representative: u32::try_from(rep_index)
+                                    .map_err(|_| anyhow!("representative index exceeds u32"))?,
+                            });
+                        }
                         // Reuse the representative the run phase already gathered
                         // instead of gathering it again. `round_witness` above is an
                         // immutable reborrow of this very `witness`, and
@@ -379,6 +404,9 @@ fn run_generator_worklist<
                             );
                         }
                     }
+                    if let Some(recorder) = replay_recorder.as_mut() {
+                        recorder.push_step(generator_idx, ready, finished, replay_output_start)?;
+                    }
                 }
             }
 
@@ -402,6 +430,9 @@ fn run_generator_worklist<
                 generators[generator_idx]
                     .0
                     .run_with_ready_hint(witness, &mut buffer, ready);
+            let replay_output_start = replay_recorder
+                .as_ref()
+                .map_or(0, |recorder| recorder.outputs.len());
             if finished {
                 generator_is_expired[generator_idx] = true;
                 *remaining_generators -= 1;
@@ -415,6 +446,15 @@ fn run_generator_worklist<
             // rep Vec while preserving both the `set_target_returning_rep` call order and the
             // pending-queue push order exactly.
             for (t, v) in buffer.target_values.drain(..) {
+                if let Some(recorder) = replay_recorder.as_mut() {
+                    let target_index = witness.target_index(t);
+                    let representative = witness.representative_map[target_index];
+                    recorder.outputs.push(GeneratorReplayOutput {
+                        target_index: u32::try_from(target_index)
+                            .map_err(|_| anyhow!("target index exceeds u32"))?,
+                        representative,
+                    });
+                }
                 if let Some(representative) = witness.set_target_returning_rep(t, v)? {
                     readiness.populate_representative(
                         representative,
@@ -424,6 +464,9 @@ fn run_generator_worklist<
                     );
                 }
             }
+            if let Some(recorder) = replay_recorder.as_mut() {
+                recorder.push_step(generator_idx, ready, finished, replay_output_start)?;
+            }
         }
 
         core::mem::swap(
@@ -432,6 +475,95 @@ fn run_generator_worklist<
         );
     }
 
+    Ok(())
+}
+
+/// Re-executes a topology-bound schedule while checking every dynamic
+/// observation that could make it value-dependent. Values are always freshly
+/// generated from `witness`; the plan contains structure only.
+fn replay_generator_schedule<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &mut PartitionWitness<F>,
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    steps: &[GeneratorReplayStep],
+    outputs: &[GeneratorReplayOutput],
+    complete: bool,
+) -> Result<()> {
+    if !complete {
+        return Err(generator_replay_mismatch(
+            "recorded generator schedule did not reach a complete witness",
+        ));
+    }
+
+    #[cfg(feature = "diagnostic_profile")]
+    let _profile_span = crate::util::profile::span("witness", "generator_schedule_replay");
+    let mut buffer = GeneratedValues::empty();
+    let mut output_cursor = 0usize;
+    if steps.len() != prover_data.generators.len() {
+        return Err(generator_replay_mismatch(
+            "generator schedule length does not match the circuit generator count",
+        ));
+    }
+
+    for (step_index, step) in steps.iter().enumerate() {
+        let generator_index = step.generator as usize;
+        let generator = prover_data.generators.get(generator_index).ok_or_else(|| {
+            generator_replay_mismatch(format!(
+                "generator schedule step {step_index} names missing generator {generator_index}"
+            ))
+        })?;
+        let finished = generator.0.run_with_ready_hint(witness, &mut buffer, true);
+        if !finished {
+            return Err(generator_replay_mismatch(format!(
+                "generator schedule step {step_index} finish result drifted"
+            )));
+        }
+
+        let output_end = step.output_end as usize;
+        if output_end < output_cursor || output_end > outputs.len() {
+            return Err(generator_replay_mismatch(format!(
+                "generator schedule step {step_index} output range is invalid"
+            )));
+        }
+        let expected_output_count = output_end - output_cursor;
+        if buffer.target_values.len() != expected_output_count {
+            return Err(generator_replay_mismatch(format!(
+                "generator schedule step {step_index} output count drifted from {} to {}",
+                expected_output_count,
+                buffer.target_values.len(),
+            )));
+        }
+        for ((target, value), expected) in buffer
+            .target_values
+            .drain(..)
+            .zip(&outputs[output_cursor..output_end])
+        {
+            let target_index = witness.target_index(target);
+            let checked_target_index =
+                u32::try_from(target_index).map_err(|_| anyhow!("target index exceeds u32"))?;
+            if checked_target_index != expected.target_index {
+                return Err(generator_replay_mismatch(format!(
+                    "generator schedule step {step_index} output target drifted"
+                )));
+            }
+            // The layout holds an immutable borrow of this exact prover
+            // topology, and the checked target index is identical to the one
+            // recorded from it. Reuse its recorded representative directly;
+            // gathering the same scattered map entry millions of times is the
+            // scheduler cost this replay removes.
+            witness.set_rep_index_returning_new(expected.representative as usize, target, value)?;
+        }
+        output_cursor = output_end;
+    }
+
+    if output_cursor != outputs.len() {
+        return Err(generator_replay_mismatch(
+            "generator schedule has trailing output targets",
+        ));
+    }
     Ok(())
 }
 
@@ -504,6 +636,72 @@ pub fn is_seed_layout_mismatch(error: &anyhow::Error) -> bool {
     error.downcast_ref::<SeedLayoutMismatch>().is_some()
 }
 
+/// A recorded generator schedule is not applicable to the current witness.
+///
+/// Only this structural mismatch may be retried through the generic scheduler.
+/// Generator errors and witness contradictions retain their original types and
+/// propagate without a retry.
+#[derive(Debug)]
+pub struct GeneratorReplayMismatch(String);
+
+impl core::fmt::Display for GeneratorReplayMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl core::error::Error for GeneratorReplayMismatch {}
+
+fn generator_replay_mismatch(message: impl Into<String>) -> anyhow::Error {
+    GeneratorReplayMismatch(message.into()).into()
+}
+
+/// Whether an error denotes only generator-schedule applicability, allowing a
+/// fresh witness to retry through the generic scheduler.
+pub fn is_generator_replay_mismatch(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<GeneratorReplayMismatch>().is_some()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GeneratorReplayStep {
+    generator: u32,
+    output_end: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GeneratorReplayOutput {
+    target_index: u32,
+    representative: u32,
+}
+
+struct GeneratorReplayRecorder<'a> {
+    steps: &'a mut Vec<GeneratorReplayStep>,
+    outputs: &'a mut Vec<GeneratorReplayOutput>,
+    direct_replayable: &'a mut bool,
+}
+
+impl GeneratorReplayRecorder<'_> {
+    fn push_step(
+        &mut self,
+        generator: usize,
+        ready: bool,
+        finished: bool,
+        output_start: usize,
+    ) -> Result<()> {
+        if !ready || !finished {
+            *self.direct_replayable = false;
+        }
+        debug_assert!(self.outputs.len() >= output_start);
+        self.steps.push(GeneratorReplayStep {
+            generator: u32::try_from(generator)
+                .map_err(|_| anyhow!("generator index exceeds u32"))?,
+            output_end: u32::try_from(self.outputs.len())
+                .map_err(|_| anyhow!("generator replay output index exceeds u32"))?,
+        });
+        Ok(())
+    }
+}
+
 /// Order-sensitive 64-bit fold of the target sequence a writer produces.
 ///
 /// The recorded layout stores one bare `u32` representative per write rather
@@ -538,6 +736,9 @@ pub struct PartitionSeedLayout<
     /// value or order cannot reproduce it.
     target_checksum: u64,
     seeded_watch_decrements: Vec<(u32, u32)>,
+    generator_replay_steps: Vec<GeneratorReplayStep>,
+    generator_replay_outputs: Vec<GeneratorReplayOutput>,
+    generator_replay_complete: bool,
     /// Lifetime brand for the exact immutable prover topology used while
     /// recording. Holding the whole owner borrowed prevents drop, mutation and
     /// allocator-address reuse (ABA), while pointer equality binds the
@@ -557,6 +758,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
                 "changed_generator_count",
                 &self.seeded_watch_decrements.len(),
             )
+            .field("generator_replay_steps", &self.generator_replay_steps.len())
+            .field(
+                "generator_replay_outputs",
+                &self.generator_replay_outputs.len(),
+            )
+            .field("generator_replay_complete", &self.generator_replay_complete)
             .finish_non_exhaustive()
     }
 }
@@ -575,6 +782,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     /// input target.
     pub fn changed_generator_count(&self) -> usize {
         self.seeded_watch_decrements.len()
+    }
+
+    pub fn generator_replay_step_count(&self) -> usize {
+        self.generator_replay_steps.len()
+    }
+
+    pub fn generator_replay_output_count(&self) -> usize {
+        self.generator_replay_outputs.len()
     }
 }
 
@@ -779,6 +994,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut remaining_generators,
             initial_pending,
             parallel_threshold,
+            None,
         )?;
 
         Ok(Self {
@@ -830,6 +1046,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut remaining_generators,
             initial_pending,
             PARALLEL_WORKLIST_THRESHOLD,
+            None,
         )?;
 
         Ok(Self {
@@ -896,6 +1113,14 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
         let initial_pending = readiness.initial_worklist(prover_data.generators_defer_until_ready);
+        let mut generator_replay_steps = Vec::new();
+        let mut generator_replay_outputs = Vec::new();
+        let mut generator_replay_direct = true;
+        let mut replay_recorder = GeneratorReplayRecorder {
+            steps: &mut generator_replay_steps,
+            outputs: &mut generator_replay_outputs,
+            direct_replayable: &mut generator_replay_direct,
+        };
         run_generator_worklist(
             &mut witness,
             prover_data,
@@ -904,7 +1129,11 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut remaining_generators,
             initial_pending,
             PARALLEL_WORKLIST_THRESHOLD,
+            Some(&mut replay_recorder),
         )?;
+        let generator_replay_complete = remaining_generators == 0
+            && generator_replay_direct
+            && generator_replay_steps.len() == generators.len();
         Ok((
             Self {
                 witness,
@@ -918,6 +1147,9 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 representatives,
                 target_checksum,
                 seeded_watch_decrements,
+                generator_replay_steps,
+                generator_replay_outputs,
+                generator_replay_complete,
                 prover_data,
                 common_data,
             },
@@ -934,6 +1166,29 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
         layout: &PartitionSeedLayout<'a, F, C, D>,
         seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
     ) -> Result<Self> {
+        Self::start_seeded_with_layout_mode(prover_data, common_data, layout, true, seed)
+    }
+
+    /// Applies only the recorded input layout and runs the generic generator
+    /// scheduler. This is the stable fallback after a value-dependent
+    /// generator schedule rejects direct replay; it preserves seed-layout
+    /// speedups without retrying a known-inapplicable schedule.
+    pub fn start_seeded_with_layout_without_generator_replay(
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &'a CommonCircuitData<F, D>,
+        layout: &PartitionSeedLayout<'a, F, C, D>,
+        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<Self> {
+        Self::start_seeded_with_layout_mode(prover_data, common_data, layout, false, seed)
+    }
+
+    fn start_seeded_with_layout_mode(
+        prover_data: &'a ProverOnlyCircuitData<F, C, D>,
+        common_data: &'a CommonCircuitData<F, D>,
+        layout: &PartitionSeedLayout<'a, F, C, D>,
+        replay_generators: bool,
+        seed: impl FnOnce(&mut PartitionSeeder<'a, '_, F>) -> Result<()>,
+    ) -> Result<Self> {
         let generators = &prover_data.generators;
         if !core::ptr::eq(layout.prover_data, prover_data)
             || !core::ptr::eq(layout.common_data, common_data)
@@ -942,16 +1197,26 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 "seed layout belongs to a different immutable circuit topology instance",
             ));
         }
-        let mut witness = PartitionWitness::new(
-            common_data.config.num_wires,
-            common_data.degree(),
-            &prover_data.representative_map,
-        );
-        let mut readiness = TargetReadiness::new(
-            &prover_data.generator_watch_counts,
-            &prover_data.generator_indices_by_watches,
-        );
+        let mut witness = {
+            #[cfg(feature = "diagnostic_profile")]
+            let _profile_span = crate::util::profile::span("witness", "partition_witness_init");
+            PartitionWitness::new(
+                common_data.config.num_wires,
+                common_data.degree(),
+                &prover_data.representative_map,
+            )
+        };
+        let mut readiness = {
+            #[cfg(feature = "diagnostic_profile")]
+            let _profile_span = crate::util::profile::span("witness", "readiness_init");
+            TargetReadiness::new(
+                &prover_data.generator_watch_counts,
+                &prover_data.generator_indices_by_watches,
+            )
+        };
         let (cursor, checksum) = {
+            #[cfg(feature = "diagnostic_profile")]
+            let _profile_span = crate::util::profile::span("witness", "seed_layout_replay");
             let mut seeder = PartitionSeeder {
                 witness: &mut witness,
                 readiness: &mut readiness,
@@ -984,16 +1249,37 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 "seed layout target sequence checksum mismatch",
             ));
         }
-        for &(generator, decrement) in &layout.seeded_watch_decrements {
-            let count = &mut readiness.unresolved[generator as usize];
-            if *count < decrement {
-                return Err(seed_layout_mismatch(
-                    "seed layout watcher decrement underflow",
-                ));
+        {
+            #[cfg(feature = "diagnostic_profile")]
+            let _profile_span = crate::util::profile::span("witness", "seed_watch_decrements");
+            for &(generator, decrement) in &layout.seeded_watch_decrements {
+                let count = &mut readiness.unresolved[generator as usize];
+                if *count < decrement {
+                    return Err(seed_layout_mismatch(
+                        "seed layout watcher decrement underflow",
+                    ));
+                }
+                *count -= decrement;
             }
-            *count -= decrement;
         }
 
+        if replay_generators && layout.generator_replay_complete {
+            replay_generator_schedule(
+                &mut witness,
+                prover_data,
+                &layout.generator_replay_steps,
+                &layout.generator_replay_outputs,
+                layout.generator_replay_complete,
+            )?;
+            return Ok(Self {
+                witness,
+                readiness,
+                generator_is_expired: vec![true; generators.len()],
+                remaining_generators: 0,
+                prover_data,
+                parallel_threshold: PARALLEL_WORKLIST_THRESHOLD,
+            });
+        }
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
         let initial_pending = readiness.initial_worklist(prover_data.generators_defer_until_ready);
@@ -1005,6 +1291,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut remaining_generators,
             initial_pending,
             PARALLEL_WORKLIST_THRESHOLD,
+            None,
         )?;
         Ok(Self {
             witness,
@@ -1040,6 +1327,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut self.remaining_generators,
             pending_generator_indices,
             self.parallel_threshold,
+            None,
         )
     }
 
@@ -1069,6 +1357,7 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             &mut self.remaining_generators,
             pending_generator_indices,
             self.parallel_threshold,
+            None,
         )
     }
 
@@ -1731,24 +2020,7 @@ mod tests {
         )?;
         circuit.verify(recorded_proof.clone())?;
         circuit.verify(replayed_proof.clone())?;
-        // A BITWISE proof comparison is not a valid assertion in this tree, and
-        // the original form of this test (`assert_eq!(recorded_proof,
-        // replayed_proof)`) fails 3/3 under rayon while passing with
-        // RAYON_NUM_THREADS=1. Two independent proving runs of the SAME witness
-        // differ for two reasons, neither of them a record/replay defect:
-        // `fri_proof_of_work` searches the nonce space with `find_any`, so the
-        // PoW witness is whichever nonce a racing thread reaches first; and the
-        // two paths leave different residue in the UNSET (unconstrained) wire
-        // positions, which the commitment absorbs into the caps. Normalising the
-        // nonce alone is therefore not enough.
-        //
-        // What the record/replay contract actually claims is asserted in full
-        // above -- identical set bitmap and identical value at every SET
-        // representative -- plus the two `circuit.verify` calls here. The public
-        // inputs are the deterministic, contractual part of the proof, and
-        // public-input equality is the same oracle this campaign already uses for
-        // the chain-step replay harness (`chain_step_two_phase_timing`).
-        assert_eq!(recorded_proof.public_inputs, replayed_proof.public_inputs);
+        assert_eq!(recorded_proof, replayed_proof);
         Ok(())
     }
 
@@ -1940,6 +2212,67 @@ mod tests {
             raw(&reference),
             "replayed seed diverges raw"
         );
+        assert!(
+            layout.generator_replay_step_count() > 0,
+            "the recording path must retain a generator schedule"
+        );
+        assert!(
+            layout.generator_replay_output_count() > 0,
+            "the recording path must retain generator output targets"
+        );
+
+        // Sabotage the recorded generator index. The replay must identify a
+        // typed schedule-applicability mismatch so its caller can discard the
+        // partial witness and retry through the generic scheduler.
+        let mut wrong_generator = PendingPartitionWitness::start_seeded_recording(
+            prover_data,
+            common_data,
+            write(&all_inputs),
+        )?
+        .1;
+        wrong_generator.generator_replay_steps[0].generator = u32::MAX;
+        let error = PendingPartitionWitness::start_seeded_with_layout(
+            prover_data,
+            common_data,
+            &wrong_generator,
+            write(&all_inputs),
+        )
+        .err()
+        .expect("a drifted generator schedule must be rejected");
+        assert!(is_generator_replay_mismatch(&error), "{error:?}");
+        let bypassed = PendingPartitionWitness::start_seeded_with_layout_without_generator_replay(
+            prover_data,
+            common_data,
+            &wrong_generator,
+            write(&all_inputs),
+        )
+        .and_then(PendingPartitionWitness::finish)?;
+        assert_eq!(bypassed.set_bitmap, reference.set_bitmap);
+        assert_eq!(
+            raw(&bypassed),
+            raw(&reference),
+            "generic schedule bypass diverges raw"
+        );
+
+        // Sabotage the first recorded output target independently of its
+        // representative. A replay may never route a fresh value according to
+        // stale structure.
+        let mut wrong_output = PendingPartitionWitness::start_seeded_recording(
+            prover_data,
+            common_data,
+            write(&all_inputs),
+        )?
+        .1;
+        wrong_output.generator_replay_outputs[0].target_index = u32::MAX;
+        let error = PendingPartitionWitness::start_seeded_with_layout(
+            prover_data,
+            common_data,
+            &wrong_output,
+            write(&all_inputs),
+        )
+        .err()
+        .expect("a drifted generator output sequence must be rejected");
+        assert!(is_generator_replay_mismatch(&error), "{error:?}");
 
         // Sabotage 1: a truncated layout. Replay must reject, not seed a
         // partial witness.

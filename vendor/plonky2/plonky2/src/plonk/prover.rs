@@ -1299,6 +1299,36 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeQuotientAdmission {
+    WholeOrSplit,
+    SplitOnly,
+}
+
+/// Metadata for the production 67-bit exponentiation gate. This family is
+/// admitted only by the low-degree split: the previously accepted whole-domain
+/// ablation remains the fail-closed fallback when that split cannot launch.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn exponentiation_split_quotient_spec<F: RichField + Extendable<D>, const D: usize>(
+    gate: &crate::gates::exponentiation::ExponentiationGate<F, D>,
+) -> Option<(
+    crate::hash::poseidon2::metal::U32QuotientKind,
+    usize,
+    usize,
+    usize,
+    NativeQuotientAdmission,
+)> {
+    let num_power_bits = gate.num_power_bits;
+    Some((
+        crate::hash::poseidon2::metal::U32QuotientKind::Exponentiation,
+        num_power_bits,
+        num_power_bits.checked_mul(2)?.checked_add(2)?,
+        num_power_bits.checked_add(1)?,
+        NativeQuotientAdmission::SplitOnly,
+    ))
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 /// One gate whose alpha-combined constraint sum `S_g(x)` (no selector filter)
 /// was evaluated by the GPU on the half-size quotient sub-domain (every other
 /// LDE row). `S_g` has degree at most `4 * (n - 1)` for a gate of degree at
@@ -1335,6 +1365,15 @@ pub(crate) enum RangeQuotientJobs<F: RichField> {
 fn range_quotient_split_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT").is_some_and(|v| v == "0"))
+}
+
+/// `LIGHTER_QSPLIT_PRESCALED=0` keeps the submitted parent's two-multiply
+/// IFFT normalization/postscale pass; default folds both factors together.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn range_quotient_prescaled_ifft_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT_PRESCALED").is_some_and(|v| v == "0"))
 }
 
 /// Whether the wires commitment should retain its compact even-row companion
@@ -1398,18 +1437,20 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
 ) -> Vec<F> {
     debug_assert_eq!(full_rows, half_rows * 2);
     debug_assert_eq!(low.len(), gates.len() * half_rows * 2);
+    let lde_bits = log2_strict(full_rows);
     // `points[i] = omega^i` on the full domain, so the even rows are the coset
     // `shift * <omega^2>` and the odd rows are `(shift * omega) * <omega^2>`.
     // Even rows are the coset `shift * <omega^2>`; the odd rows are
     // `(shift * omega) * <omega^2>`. Interpolating on the first coset scales
     // coefficient `i` by `shift^-i`, re-evaluating on the second by
     // `(shift * omega)^i`; the net per-coefficient factor is `omega^i`, fused
-    // into the IFFT's normalization pass.
-    // Fold the half-size IFFT's `1/n` normalization into the cached omega
-    // powers. Every reconstructed gate/challenge column then pays one field
-    // multiply per coefficient instead of two; the table is circuit-shape
-    // fixed and shared by every proof in the process.
-    let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
+    // into the IFFT's normalization pass (`coset_ifft_with_powers`).
+    let omega = F::primitive_root_of_unity(lde_bits);
+    let prescaled = range_quotient_prescaled_ifft_enabled();
+    let omega_powers =
+        (!prescaled).then(|| precomputed::shift_powers::<F>(omega, half_rows));
+    let scaled_omega_powers =
+        prescaled.then(|| precomputed::scaled_shift_powers::<F>(omega, half_rows));
     let odd: Vec<Vec<F>> = (0..gates.len() * 2)
         .into_par_iter()
         .map(|t| {
@@ -1417,10 +1458,13 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let c = t % 2;
             let base = g * half_rows * 2;
             let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
+            let coefficients = if let Some(powers) = &scaled_omega_powers {
+                PolynomialValues::new(values).coset_ifft_with_prescaled_powers(powers)
+            } else {
+                PolynomialValues::new(values)
+                    .coset_ifft_with_powers(omega_powers.as_ref().expect("control powers"))
+            };
+            coefficients.fft().values
         })
         .collect();
     #[cfg(feature = "diagnostic_profile")]
@@ -1521,132 +1565,6 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     out
 }
 
-/// Standalone timing harness for the range/u32 quotient kernel variants on a
-/// quiet GPU (no proofs in flight): builds a random wires commitment of the
-/// circuit's shape through the production path (with even-row companion) and
-/// prints per-variant minimum wall times. Diagnostics only; never used by the
-/// prover.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-pub fn range_quotient_microbench<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    prover_data: &ProverOnlyCircuitData<F, C, D>,
-    reps: usize,
-) {
-    use crate::gates::gate::U32QuotientGate;
-    let degree = 1usize << common_data.degree_bits();
-    let rate_bits = common_data.config.fri_config.rate_bits;
-    let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
-    let step = 1 << (rate_bits - quotient_degree_bits);
-    let lde_size = degree << rate_bits;
-    let quotient_rows = lde_size / step;
-    let num_wires = common_data.config.num_wires;
-    let mut timing = TimingTree::default();
-    let mk_wires = || {
-        (0..num_wires)
-            .map(|_| PolynomialCoeffs::new(F::rand_vec(degree)))
-            .collect::<Vec<_>>()
-    };
-    // Companion fill cost.
-    let t = std::time::Instant::now();
-    let _plain = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
-        mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_deref(), false);
-    let plain_ms = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
-    let wires_commitment = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
-        mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_deref(), true);
-    let comp_ms = t.elapsed().as_secs_f64() * 1e3;
-    eprintln!("[qmb] degree_bits={} lde={} wires commit: plain {plain_ms:.1} ms, with companion {comp_ms:.1} ms, companion present={}",
-        common_data.degree_bits(), lde_size, wires_commitment.even_columns.get().is_some());
-    let alphas = vec![F::rand(), F::rand()];
-    // Reuse the production spec builder through the split-disabled and
-    // split-enabled entry points; time by finishing each job.
-    let time = |name: &str, f: &dyn Fn() -> Option<f64>| {
-        let mut best = f64::MAX;
-        for _ in 0..reps {
-            if let Some(v) = f() { best = best.min(v); }
-        }
-        eprintln!("[qmb]   {name}: {best:.2} ms");
-    };
-    // Whole (as production without split): call start_gpu_... with split disabled is env-based;
-    // instead build the jobs directly.
-    let wires = wires_commitment.merkle_tree.shared_columns().expect("metal wires");
-    let even = wires_commitment.even_columns.get();
-    let constants = prover_data.constants_sigmas_commitment.merkle_tree.shared_columns().expect("metal constants");
-    // Build specs exactly as start_gpu_range_check_gate_quotient does, by calling it (split may be on).
-    let Some((_gates, jobs)) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas) else {
-        eprintln!("[qmb] range job declined"); return;
-    };
-    drop(jobs);
-    // Extract specs by re-running the spec collection: simplest is to re-implement minimal
-    // collection here via the same helper closure used in production. To avoid duplication we
-    // just time via the public entry points with the env switch:
-    let _ = U32QuotientGate::Arithmetic { num_ops: 0 };
-    let run_whole = |q: usize, st: usize| -> Option<f64> {
-        let t = std::time::Instant::now();
-        // Whole job = production path with split disabled: emulate by calling metal directly
-        // through start_gpu_range_check_gate_quotient with LIGHTER_QSPLIT=0 semantics is not
-        // possible per-call; so we rely on the caller running this harness twice (QSPLIT=0/1).
-        let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, q, st, &alphas)?;
-        match &jobs {
-            RangeQuotientJobs::Whole(job) => { job.finish().ok()?; }
-            RangeQuotientJobs::Split { low, high, .. } => { low.finish().ok()?; if let Some(h) = high { h.finish().ok()?; } }
-        }
-        Some(t.elapsed().as_secs_f64() * 1e3)
-    };
-    time(&format!("production range job (split={}) full rows", range_quotient_split_enabled()), &|| run_whole(quotient_rows, step));
-    // Split pieces individually + CPU extension.
-    if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high })) =
-        start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)
-    {
-        let _ = (wires, even);
-        low.finish().ok();
-        if let Some(h) = &high { h.finish().ok(); }
-        time("  low job only (re-dispatched)", &|| {
-            let t = std::time::Instant::now();
-            let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)?;
-            if let RangeQuotientJobs::Split { low, .. } = &jobs { low.finish().ok()?; }
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        let low_values = low.finish().unwrap();
-        time("  CPU extension FFTs only (30 tasks)", &|| {
-            let t = std::time::Instant::now();
-            let half = low_rows;
-            let omega = F::primitive_root_of_unity(log2_strict(lde_size));
-            let omega_powers = precomputed::shift_powers::<F>(omega, half);
-            let odd: Vec<Vec<F>> = (0..low_gates.len() * 2).into_par_iter().map(|tt| {
-                let g = tt / 2; let c = tt % 2; let base = g * half * 2;
-                let values: Vec<F> = (0..half).map(|k| low_values[base + k * 2 + c]).collect();
-                PolynomialValues::new(values).coset_ifft_with_powers(&omega_powers).fft().values
-            }).collect();
-            core::hint::black_box(&odd);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        time("  single IFFT+FFT 2^18 (1 thread)", &|| {
-            let half = low_rows;
-            let omega = F::primitive_root_of_unity(log2_strict(lde_size));
-            let omega_powers = precomputed::shift_powers::<F>(omega, half);
-            let values: Vec<F> = (0..half).map(|k| low_values[k * 2]).collect();
-            let t = std::time::Instant::now();
-            let v = PolynomialValues::new(values).coset_ifft_with_powers(&omega_powers).fft().values;
-            core::hint::black_box(&v);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        time("  CPU extend+combine", &|| {
-            let t = std::time::Instant::now();
-            let out = extend_and_combine_low_range_quotient(low_values, &low_gates, low_rows, lde_size, constants);
-            core::hint::black_box(&out);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        eprintln!("[qmb]   low gates={} high={}", low_gates.len(), high.is_some());
-    }
-}
-
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -1702,6 +1620,8 @@ fn start_gpu_range_check_gate_quotient<
     let mut u32_specs = Vec::new();
     let mut spec_degrees = Vec::new();
     let mut u32_spec_degrees = Vec::new();
+    let mut split_only_u32_specs = Vec::new();
+    let mut split_only_gate_indices = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
@@ -1964,15 +1884,15 @@ fn start_gpu_range_check_gate_quotient<
         // the production circuits and are pure arithmetic, so they are matched
         // by type here instead of through the downstream-crate trait hooks
         // (those hooks exist only to avoid a `plonky2` -> circuit-crate dep).
-        let native = if gate.0.as_any().is::<ExponentiationGate<F, D>>() {
-            // The transaction circuits' 67-bit exponentiation loop is the
-            // most divergent native branch in the shared Range/U32 command.
-            // Leave this one family on the existing CPU quotient evaluator:
-            // it stays out of `gate_indices`, so it is not CPU-excluded and
-            // its selector/alpha contribution remains byte-for-byte the
-            // ordinary generic path. This trades a small parallel CPU span
-            // for a shorter process-shared Metal queue tail.
-            None
+        let native = if let Some(exponentiation) =
+            gate.0.as_any().downcast_ref::<ExponentiationGate<F, D>>()
+        {
+            // Whole-domain offload of this divergent 67-bit loop was removed
+            // by an accepted ablation. QSplit changes that tradeoff: evaluate
+            // exactly half the rows on Metal and reconstruct the degree-four
+            // polynomial on CPU. Mark it SplitOnly so a declined split leaves
+            // the gate on the accepted generic CPU path.
+            exponentiation_split_quotient_spec(exponentiation)
         } else if let Some(equality) = gate.0.as_any().downcast_ref::<EqualityGate>() {
             // The gate reads its single constant (the "one" value) as local
             // constant 0, i.e. the column immediately after the selector
@@ -1983,6 +1903,7 @@ fn start_gpu_range_check_gate_quotient<
                 equality.num_ops,
                 equality.num_ops.checked_mul(6)?,
                 equality.num_ops.checked_mul(4)?,
+                NativeQuotientAdmission::WholeOrSplit,
             ))
         } else if let Some(reducing) = gate.0.as_any().downcast_ref::<ReducingGate<D>>() {
             // The kernel's extension arithmetic is specialised to the
@@ -1997,6 +1918,7 @@ fn start_gpu_range_check_gate_quotient<
                     reducing.num_coeffs,
                     reducing.num_coeffs.checked_mul(3)?.checked_add(4)?,
                     reducing.num_coeffs.checked_mul(2)?,
+                    NativeQuotientAdmission::WholeOrSplit,
                 ))
             }
         } else if let Some(reducing) =
@@ -2012,12 +1934,13 @@ fn start_gpu_range_check_gate_quotient<
                     reducing.num_coeffs,
                     reducing.num_coeffs.checked_mul(4)?.checked_add(4)?,
                     reducing.num_coeffs.checked_mul(2)?,
+                    NativeQuotientAdmission::WholeOrSplit,
                 ))
             }
         } else {
             None
         };
-        if let Some((kind, num_ops, expected_wires, expected_constraints)) = native {
+        if let Some((kind, num_ops, expected_wires, expected_constraints, admission)) = native {
             if range.is_some() || u32_gate.is_some() {
                 if gpu_poseidon_quotient_diagnostics_enabled() {
                     eprintln!(
@@ -2042,19 +1965,29 @@ fn start_gpu_range_check_gate_quotient<
                 return None;
             }
             let selector_column = common_data.selectors_info.selector_indices[gate_index];
-            u32_specs.push(U32QuotientSpec {
+            let spec = U32QuotientSpec {
                 selector_column,
                 gate_index,
                 group: common_data.selectors_info.groups[selector_column].clone(),
                 include_unused_selector,
                 num_ops,
                 kind,
-            });
-            u32_spec_degrees.push(gate.0.degree());
-            gate_indices.push(gate_index);
+            };
+            match admission {
+                NativeQuotientAdmission::WholeOrSplit => {
+                    u32_specs.push(spec);
+                    u32_spec_degrees.push(gate.0.degree());
+                    gate_indices.push(gate_index);
+                }
+                NativeQuotientAdmission::SplitOnly => {
+                    debug_assert!(gate.0.degree() <= 4);
+                    split_only_u32_specs.push(spec);
+                    split_only_gate_indices.push(gate_index);
+                }
+            }
         }
     }
-    if specs.is_empty() && u32_specs.is_empty() {
+    if specs.is_empty() && u32_specs.is_empty() && split_only_u32_specs.is_empty() {
         if gpu_poseidon_quotient_diagnostics_enabled() {
             eprintln!("[gpu-range-quotient] no advertised RangeCheck/U32 gates");
         }
@@ -2086,19 +2019,18 @@ fn start_gpu_range_check_gate_quotient<
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
+    // Circuit-fixed constants/sigmas live in a deserialized Metal store
+    // with no companion. One even-row copy lets constant-reading deg<=4
+    // gates join the half-domain job: the shader strides both buffers by
+    // `wires.rows`, so the compact constants must match the compact wires.
+    let even_constants = prover_data
+        .constants_sigmas_commitment
+        .even_columns
+        .get_or_fill_even_rows(constants);
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
-        // Circuit-fixed constants/sigmas live in a deserialized Metal store
-        // with no companion. Fill their compact even rows only after the
-        // wires/shape admission succeeds; all other paths have no consumer
-        // for this cache. The shader strides both buffers by `wires.rows`, so
-        // admitted constant readers still receive matching compact columns.
-        let even_constants = prover_data
-            .constants_sigmas_commitment
-            .even_columns
-            .get_or_fill_even_rows(constants);
         // Without a constants companion, kinds that read gate constants
         // stay on the full-domain dispatch (the kernel would otherwise
         // index `col * half_rows + k` into a full-stride store).
@@ -2146,6 +2078,18 @@ fn start_gpu_range_check_gate_quotient<
             } else {
                 high_u32_specs.push(spec.clone());
             }
+        }
+        for spec in &split_only_u32_specs {
+            let mut alone = spec.clone();
+            alone.group = spec.gate_index..spec.gate_index + 1;
+            alone.include_unused_selector = false;
+            low_groups.push((Vec::new(), vec![alone]));
+            low_gates.push(LowDegreeRangeGate {
+                gate_index: spec.gate_index,
+                selector_column: spec.selector_column,
+                group: spec.group.clone(),
+                include_unused_selector: spec.include_unused_selector,
+            });
         }
         if !low_groups.is_empty() {
             if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
@@ -2208,6 +2152,9 @@ fn start_gpu_range_check_gate_quotient<
         }
         return None;
     };
+    if matches!(&job, RangeQuotientJobs::Split { .. }) {
+        gate_indices.extend(split_only_gate_indices);
+    }
     gate_indices.extend(random_access_gate_indices);
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
@@ -2971,10 +2918,14 @@ fn compute_quotient_polys<
                 debug_assert_eq!(values.len(), quotient_values.len());
                 Some(values)
             }
-            RangeQuotientJobs::Split { low, high, .. } => {
+            RangeQuotientJobs::Split {
+                low: _low_job,
+                high,
+                ..
+            } => {
                 match low_extension_result {
                     Ok(values) => gpu_range_low_values = values,
-                    Err(error) => range_fallback!(low, error),
+                    Err(error) => range_fallback!(_low_job, error),
                 }
                 GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 match high {
@@ -3165,14 +3116,17 @@ pub(crate) mod precomputed {
         /// itself, of which the FRI folding schedule uses only a handful
         /// (`g`, then `g^arity` per reduction round) for a given circuit.
         type ShiftTables<F> = RwLock<Vec<(F, Arc<Vec<F>>)>>;
+        /// Prescaling includes `1/len`, so unlike [`ShiftTables`] a table for
+        /// one length is not a prefix-compatible table for another length.
+        type ScaledShiftTables<F> = RwLock<Vec<(F, usize, Arc<Vec<F>>)>>;
         type ShiftMap = RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>;
 
         static SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
-        static ODD_COSET_IFFT_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
         static SHIFT_POWERS: OnceLock<ShiftMap> = OnceLock::new();
+        static SCALED_SHIFT_POWERS: OnceLock<ShiftMap> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -3263,6 +3217,62 @@ pub(crate) mod precomputed {
             }
         }
 
+        /// Cached `n_inv * shift.powers().take(len)` for an arbitrary shift.
+        /// Entries are keyed by exact `(shift, len)` because `n_inv` changes
+        /// with the transform length. The table lets an IFFT fold its
+        /// normalization and caller postscale into one multiply per slot.
+        pub(crate) fn scaled_shift_powers<F: Field>(shift: F, len: usize) -> Arc<Vec<F>> {
+            let map = SCALED_SHIFT_POWERS.get_or_init(|| RwLock::new(HashMap::new()));
+            let key = TypeId::of::<F>();
+            let existing = map.read().unwrap().get(&key).map(Arc::clone);
+            let erased = match existing {
+                Some(entry) => entry,
+                None => {
+                    let mut map = map.write().unwrap();
+                    Arc::clone(map.entry(key).or_insert_with(|| {
+                        Arc::new(ScaledShiftTables::<F>::new(Vec::new()))
+                            as Arc<dyn Any + Send + Sync>
+                    }))
+                }
+            };
+            let tables = erased
+                .downcast::<ScaledShiftTables<F>>()
+                .ok()
+                .expect("type-keyed cache entry has the keyed type");
+            if let Some(hit) = tables
+                .read()
+                .unwrap()
+                .iter()
+                .find(|(cached_shift, cached_len, _)| {
+                    *cached_shift == shift && *cached_len == len
+                })
+                .map(|(_, _, table)| Arc::clone(table))
+            {
+                return hit;
+            }
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(len));
+            let computed: Arc<Vec<F>> = Arc::new(
+                shift
+                    .powers()
+                    .take(len)
+                    .map(|power| n_inv * power)
+                    .collect(),
+            );
+            let mut tables = tables.write().unwrap();
+            if let Some(hit) = tables
+                .iter()
+                .find(|(cached_shift, cached_len, _)| {
+                    *cached_shift == shift && *cached_len == len
+                })
+                .map(|(_, _, table)| Arc::clone(table))
+            {
+                hit
+            } else {
+                tables.push((shift, len, Arc::clone(&computed)));
+                computed
+            }
+        }
+
         /// Cached `x * F::coset_shift()` over the whole two-adic subgroup of
         /// size `1 << n_log`. The quotient evaluator needs the shifted point
         /// for every domain element of every proof, and the domain depends
@@ -3292,21 +3302,6 @@ pub(crate) mod precomputed {
                     .collect()
             })
         }
-
-        /// Cached `n^-1 * omega^i` table for reconstructing the odd rows of a
-        /// `2n`-point domain from its even `n` rows. `omega` is the primitive
-        /// `2n`-th root, so the table depends only on `n` and the field type.
-        pub(crate) fn odd_coset_ifft_powers_scaled<F: Field>(n: usize) -> Arc<Vec<F>> {
-            get_or_compute(&ODD_COSET_IFFT_POWERS_SCALED, n, || {
-                let n_bits = plonky2_util::log2_strict(n);
-                let n_inv = F::inverse_2exp(n_bits);
-                F::primitive_root_of_unity(n_bits + 1)
-                    .powers()
-                    .take(n)
-                    .map(|power| n_inv * power)
-                    .collect()
-            })
-        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -3330,6 +3325,17 @@ pub(crate) mod precomputed {
             Arc::new(shift.powers().take(len).collect::<Vec<F>>())
         }
 
+        pub(crate) fn scaled_shift_powers<F: Field>(shift: F, len: usize) -> Arc<Vec<F>> {
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(len));
+            Arc::new(
+                shift
+                    .powers()
+                    .take(len)
+                    .map(|power| n_inv * power)
+                    .collect::<Vec<F>>(),
+            )
+        }
+
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             let shift = F::coset_shift();
             Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
@@ -3346,22 +3352,10 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
-
-        pub(crate) fn odd_coset_ifft_powers_scaled<F: Field>(n: usize) -> Arc<Vec<F>> {
-            let n_bits = plonky2_util::log2_strict(n);
-            let n_inv = F::inverse_2exp(n_bits);
-            Arc::new(
-                F::primitive_root_of_unity(n_bits + 1)
-                    .powers()
-                    .take(n)
-                    .map(|power| n_inv * power)
-                    .collect::<Vec<F>>(),
-            )
-        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers_scaled, odd_coset_ifft_powers_scaled,
+        coset_shift_powers, inverse_coset_shift_powers_scaled, scaled_shift_powers,
         shift_powers, shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
@@ -3375,8 +3369,14 @@ mod quotient_layout_tests {
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
+    use super::{
+        exponentiation_split_quotient_spec, extend_and_combine_low_range_quotient,
+        gpu_poseidon_quotient_stats, LowDegreeRangeGate, NativeQuotientAdmission,
+        COMPARE_GPU_QUOTIENT,
+    };
     use crate::field::goldilocks_field::GoldilocksField;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use crate::field::polynomial::PolynomialCoeffs;
     use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
@@ -3424,6 +3424,98 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    #[test]
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn half_domain_extension_and_selector_combine_matches_full_domain() {
+        const FULL_ROWS: usize = 32;
+        const HALF_ROWS: usize = FULL_ROWS / 2;
+        const GATES: usize = 2;
+        const CHALLENGES: usize = 2;
+
+        let mut constants = crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
+            1,
+            FULL_ROWS,
+        )
+        .expect("Metal test allocation");
+        let selector = constants
+            .columns_mut()
+            .expect("shared selector columns")
+            .into_iter()
+            .next()
+            .expect("selector column");
+        for (row, value) in selector.iter_mut().enumerate() {
+            *value = F::from_canonical_usize(row % 3);
+        }
+
+        let gates = (0..GATES)
+            .map(|gate_index| LowDegreeRangeGate {
+                gate_index,
+                selector_column: 0,
+                group: 0..GATES,
+                include_unused_selector: false,
+            })
+            .collect::<Vec<_>>();
+        let mut low = vec![F::ZERO; GATES * HALF_ROWS * CHALLENGES];
+        let mut full = vec![vec![vec![F::ZERO; FULL_ROWS]; CHALLENGES]; GATES];
+        for gate in 0..GATES {
+            for challenge in 0..CHALLENGES {
+                let mut coeffs = vec![F::ZERO; FULL_ROWS];
+                for (degree, coefficient) in coeffs.iter_mut().take(8).enumerate() {
+                    *coefficient = F::from_canonical_usize(
+                        1 + gate * 31 + challenge * 17 + degree * 7,
+                    );
+                }
+                let values = PolynomialCoeffs::new(coeffs)
+                    .coset_fft(F::coset_shift())
+                    .values;
+                full[gate][challenge].copy_from_slice(&values);
+                let base = gate * HALF_ROWS * CHALLENGES;
+                for row in 0..HALF_ROWS {
+                    low[base + row * CHALLENGES + challenge] = values[2 * row];
+                }
+            }
+        }
+
+        let actual = extend_and_combine_low_range_quotient(
+            &low,
+            &gates,
+            HALF_ROWS,
+            FULL_ROWS,
+            &constants,
+        );
+        let selector = constants.col(0);
+        let mut expected = vec![F::ZERO; FULL_ROWS * CHALLENGES];
+        for row in 0..FULL_ROWS {
+            for challenge in 0..CHALLENGES {
+                for gate in 0..GATES {
+                    let other_gate = 1 - gate;
+                    let filter = F::from_canonical_usize(other_gate) - selector[row];
+                    expected[row * CHALLENGES + challenge] +=
+                        filter * full[gate][challenge][row];
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn exponentiation_native_quotient_is_split_only() {
+        use crate::gates::exponentiation::ExponentiationGate;
+
+        let gate = ExponentiationGate::<F, D>::new(67);
+        let (kind, num_ops, expected_wires, expected_constraints, admission) =
+            exponentiation_split_quotient_spec(&gate).expect("valid exponentiation metadata");
+        assert!(matches!(
+            kind,
+            crate::hash::poseidon2::metal::U32QuotientKind::Exponentiation
+        ));
+        assert_eq!(num_ops, 67);
+        assert_eq!(expected_wires, 136);
+        assert_eq!(expected_constraints, 68);
+        assert_eq!(admission, NativeQuotientAdmission::SplitOnly);
     }
 
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
@@ -3750,6 +3842,31 @@ mod quotient_layout_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn scaled_shift_powers_cache_matches_normalized_chain() {
+        let shift = F::primitive_root_of_unity(12);
+        for len in [8usize, 8, 4, 128, 16, 128, 256] {
+            let cached = precomputed::scaled_shift_powers::<F>(shift, len);
+            let n_inv = F::inverse_2exp(plonky2_util::log2_strict(len));
+            let direct = shift
+                .powers()
+                .take(len)
+                .map(|power| n_inv * power)
+                .collect::<Vec<_>>();
+            assert_eq!(cached.len(), len);
+            for (index, (&actual, &expected)) in cached.iter().zip(&direct).enumerate() {
+                assert_eq!(
+                    actual,
+                    expected,
+                    "scaled shift power differs at {index} for len {len}"
+                );
+            }
+        }
+        let first = precomputed::scaled_shift_powers::<F>(shift, 64);
+        let hit = precomputed::scaled_shift_powers::<F>(shift, 64);
+        assert!(std::sync::Arc::ptr_eq(&first, &hit));
     }
 
     /// Sabotage control for the differential above: the classic off-by-one

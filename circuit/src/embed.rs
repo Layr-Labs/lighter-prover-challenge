@@ -42,7 +42,7 @@ use plonky2::plonk::circuit_data::{
     empty_watched, mark_watched, CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData,
     VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{Forest, WirePartition};
+use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest, WirePartition};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -311,31 +311,6 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     Ok(out)
 }
 
-/// Walks a column-major routed-position stream while reporting the matching
-/// row-major index. `index` is always
-/// `(i % degree) * num_routed_wires + i / degree` for the `i`-th advance, held
-/// as two adds and a compare instead of a division per position
-/// (`row_major_cursor_matches_closed_form` checks the two forms agree).
-#[derive(Default)]
-struct RowMajorCursor {
-    row: usize,
-    column: usize,
-    index: usize,
-}
-
-impl RowMajorCursor {
-    #[inline(always)]
-    fn advance(&mut self, degree: usize, num_routed_wires: usize) {
-        self.row += 1;
-        self.index += num_routed_wires;
-        if self.row == degree {
-            self.row = 0;
-            self.column += 1;
-            self.index = self.column;
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Read side (runtime)
 // ---------------------------------------------------------------------------
@@ -545,30 +520,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         "embedded sigma permutation has {sigma_len} entries, expected {expected_sigma_len}"
     );
     let mut sigma_indices = Vec::with_capacity(sigma_len);
-    // The routed-position singleton mask is exactly the set of sigma fixed
-    // points: `wire_partition` cycles only the routed members of a copy
-    // class, so a class with one routed member maps it to itself and a class
-    // with two or more has no fixed point at all. Both
-    // `fixed_routed_mask_is_exactly_sigma_identity_with_aliases` and
-    // `folded_mask_matches_two_pass_derivation` assert that identity, the
-    // latter over a 135/80/2^12 production shape. A fixed point is exactly a
-    // zero delta, which this loop has already decoded, so the mask falls out
-    // of the pass that is running anyway: no second walk of the
-    // representative map, no random cardinality lookup per routed position,
-    // and no `representative_map.len() / 4` scratch array.
-    //
-    // `sigma` is column-major and the mask is row-major, so the destination
-    // bit index is carried as a cursor rather than divided out per position.
-    let num_routed_wires = common.config.num_routed_wires;
-    let mut fixed_routed_wires = vec![0u8; sigma_len.div_ceil(8)];
-    let mut cursor = RowMajorCursor::default();
     for index in 0..sigma_len {
         let delta = unzigzag(read_uvarint(&section, &mut vpos)?);
-        if delta == 0 {
-            let bit = cursor.index;
-            fixed_routed_wires[bit >> 3] |= 1 << (bit & 7);
-        }
-        cursor.advance(degree, num_routed_wires);
         let successor = index as i64 + delta;
         let successor = u32::try_from(successor)
             .context("embedded sigma permutation entry out of range")?;
@@ -588,6 +541,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let degree_bits = common.degree_bits();
     let rate_bits = common.config.fri_config.rate_bits;
     let cap_height = common.config.fri_config.cap_height;
+    let num_wires = common.config.num_wires;
+    let num_routed = common.config.num_routed_wires;
 
     // The embedded loads run concurrently and several circuits share a degree
     // or FFT-domain size, so route these deterministic derivations through the
@@ -607,6 +562,9 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // the frozen partition itself no longer gets re-derived at runtime.
     let wire_partition = WirePartition::from_sigma_indices(sigma_indices);
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
+    let fixed_routed_wires =
+        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
+            .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
@@ -760,30 +718,6 @@ mod tests {
         assert_eq!(zigzag(0), 0);
         assert_eq!(zigzag(-1), 1);
         assert_eq!(zigzag(1), 2);
-    }
-
-    /// The decode loop's incremental transpose must agree with the closed
-    /// form it replaces at every position, including the last of each column.
-    #[test]
-    fn row_major_cursor_matches_closed_form() {
-        for (degree, num_routed_wires) in [
-            (1usize << 17, 80usize),
-            (1 << 16, 80),
-            (1 << 12, 135),
-            (4, 3),
-            (1, 5),
-            (64, 1),
-        ] {
-            let mut cursor = RowMajorCursor::default();
-            for i in 0..degree * num_routed_wires {
-                assert_eq!(
-                    cursor.index,
-                    (i % degree) * num_routed_wires + i / degree,
-                    "cursor diverged at {i} for {degree}x{num_routed_wires}"
-                );
-                cursor.advance(degree, num_routed_wires);
-            }
-        }
     }
 
     #[test]
