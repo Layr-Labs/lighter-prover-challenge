@@ -213,8 +213,83 @@ pub(crate) enum PermutationBatch<'a, F> {
         /// Z columns only (`zs_range`), gathered at the "next" indices.
         zs_next_cols: &'a [F],
         /// Sigma columns (`sigmas_range` of the constants-sigmas commitment).
-        s_sigmas_cols: &'a [F],
+        ///
+        /// Unlike the proof-local Z buffers, these may remain in the
+        /// circuit-wide quotient cache. `ColumnBatch` keeps the batch window
+        /// as a borrowed strided view, so each proof reads the cached columns
+        /// directly instead of copying every routed-wire sigma into a worker
+        /// scratch buffer first.
+        s_sigmas_cols: ColumnBatch<'a, F>,
     },
+}
+
+/// A point window over column-major values without repacking the columns.
+///
+/// Column `c` occupies `data[c * column_stride + offset..][..batch_len]`.
+/// The ordinary proof-local gather uses `column_stride == batch_len` and
+/// `offset == 0`; a circuit-wide cache uses the full quotient-domain stride
+/// and a per-batch offset. Both expose the same contiguous per-column slice to
+/// the permutation evaluator.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnBatch<'a, F> {
+    data: &'a [F],
+    columns: usize,
+    column_stride: usize,
+    offset: usize,
+    batch_len: usize,
+}
+
+impl<'a, F> ColumnBatch<'a, F> {
+    pub(crate) fn new(
+        data: &'a [F],
+        columns: usize,
+        column_stride: usize,
+        offset: usize,
+        batch_len: usize,
+    ) -> Self {
+        if columns == 0 {
+            assert!(data.is_empty());
+        } else {
+            assert!(offset + batch_len <= column_stride);
+            assert!(
+                (columns - 1) * column_stride + offset + batch_len <= data.len(),
+                "column batch exceeds its backing store"
+            );
+        }
+        Self {
+            data,
+            columns,
+            column_stride,
+            offset,
+            batch_len,
+        }
+    }
+
+    pub(crate) fn contiguous(data: &'a [F], columns: usize, batch_len: usize) -> Self {
+        assert_eq!(data.len(), columns * batch_len);
+        Self::new(data, columns, batch_len, 0, batch_len)
+    }
+
+    pub(crate) fn empty(batch_len: usize) -> Self {
+        Self {
+            data: &[],
+            columns: 0,
+            column_stride: 0,
+            offset: 0,
+            batch_len,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.columns * self.batch_len
+    }
+
+    #[inline]
+    fn col(&self, column: usize) -> &'a [F] {
+        assert!(column < self.columns);
+        let start = column * self.column_stride + self.offset;
+        &self.data[start..start + self.batch_len]
+    }
 }
 
 const INTERLEAVE_PAIR_WIRES: usize = 136;
@@ -297,7 +372,7 @@ fn fill_interleave_gate_filter<F: RichField + Extendable<D>, const D: usize>(
     let batch_size = vars_batch.len();
     debug_assert_eq!(output.len(), batch_size);
     let selector_index = common_data.selectors_info.selector_indices[gate_index];
-    let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
+    let selector_col = vars_batch.local_constants_col(selector_index);
     let mut factors = common_data.selectors_info.groups[selector_index]
         .clone()
         .filter(|&index| index != gate_index)
@@ -509,14 +584,6 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
     }
 }
 
-/// Reduces the per-row constraint terms into `res_out`.
-///
-/// `clear_as_consumed` zeroes each term as it is read. Every element is read
-/// exactly once here, so a caller that owns the buffer as reusable scratch gets
-/// it back all-zero and can skip re-zeroing it before the next batch. Doing it
-/// on this walk rather than in a separate pass is what makes it nearly free:
-/// the line is already resident and dirty from the read. Callers that do not
-/// own the buffer, or that want to inspect it afterwards, pass `false`.
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &mut [F],
     batch_size: usize,
@@ -834,7 +901,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 den_prod_second.clear();
                 {
                     let wire_col = &wires[j_start * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                    let sigma_col = s_sigmas_cols.col(j_start);
                     let beta_k_0 = beta_k_is[j_start];
                     let beta_k_1 = beta_k_is[num_routed_wires + j_start];
                     for k in 0..n {
@@ -849,7 +916,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                 }
                 for j in j_start + 1..j_end {
                     let wire_col = &wires[j * n..][..n];
-                    let sigma_col = &s_sigmas_cols[j * n..][..n];
+                    let sigma_col = s_sigmas_cols.col(j);
                     let beta_k_0 = beta_k_is[j];
                     let beta_k_1 = beta_k_is[num_routed_wires + j];
                     for k in 0..n {
@@ -893,7 +960,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     den_prod.clear();
                     {
                         let wire_col = &wires[j_start * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j_start * n..][..n];
+                        let sigma_col = s_sigmas_cols.col(j_start);
                         let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                         for k in 0..n {
                             num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
@@ -902,7 +969,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                     }
                     for j in j_start + 1..j_end {
                         let wire_col = &wires[j * n..][..n];
-                        let sigma_col = &s_sigmas_cols[j * n..][..n];
+                        let sigma_col = s_sigmas_cols.col(j);
                         let beta_k_i = beta_k_is[i * num_routed_wires + j];
                         for k in 0..n {
                             num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
@@ -1554,16 +1621,6 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     interleave_pair: Option<&InterleavePairPlan>,
 ) {
     debug_assert!(num_constraint_rows <= common_data.num_gate_constraints);
-    // The gates below accumulate, so this buffer must start at zero — but it
-    // does not need re-zeroing here. `reduce_gate_constraints_base_batch` is
-    // the sole consumer, it runs immediately after this function on every
-    // batch, it reads every element exactly once, and it is called with
-    // `clear_as_consumed`, so it hands the buffer back all-zero. Only a change
-    // of length (a different circuit shape reaching this worker's scratch)
-    // needs the full fill. That removes a `num_constraint_rows * batch`
-    // element memset from every batch — 136 * 32 elements on the block shape,
-    // ~16k batches per proof — and pays for it with stores to lines the
-    // reduction has already pulled in and dirtied.
     let required = num_constraint_rows * vars_batch.len();
     if constraints_batch.len() != required {
         constraints_batch.clear();
@@ -1576,16 +1633,6 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     for &i in cpu_gate_indices {
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
-                // Size the buffer without re-zeroing it. `clear()` then
-                // `resize()` memset all three sub-slices on every batch, but
-                // each is fully assigned before it is read: the two
-                // `fill_interleave_gate_filter` calls below write every point of
-                // `interleave_filter` and `uninterleave_filter`, and the loop
-                // writes every point of `summed_filter`. `filters` is scratch
-                // reused across batches, so after the first batch of a worker
-                // thread this resize is a no-op and the memset is gone
-                // entirely — 3 * batch * 8 B per batch, ~12 MiB per d16 tx
-                // proof. Value-exact: no slot's read can observe the difference.
                 if filters.len() != 3 * vars_batch.len() {
                     filters.resize(3 * vars_batch.len(), F::ZERO);
                 }
@@ -1892,7 +1939,14 @@ mod tests {
             }
 
             let mut actual = initial;
-            reduce_gate_constraints_base_batch(&mut terms, batch_size, &alphas, &mut actual, false, false);
+            reduce_gate_constraints_base_batch(
+                &mut terms,
+                batch_size,
+                &alphas,
+                &mut actual,
+                false,
+                false,
+            );
             assert_eq!(actual, expected, "batch size {batch_size}");
         }
     }
