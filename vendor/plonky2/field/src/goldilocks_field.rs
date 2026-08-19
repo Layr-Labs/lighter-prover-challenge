@@ -504,6 +504,13 @@ fn mul_acc_reduce(acc: u64, a: u64, b: u64) -> u64 {
     result
 }
 
+/// The nine-instruction Goldilocks multiply-reduce kernel, re-exported so
+/// consumers outside this crate (the Poseidon2 S-box in `plonky2`) can reach the
+/// same kernel the packed field and `multiply_accumulate` already use, instead of
+/// keeping a second, slower copy of the same reduction.
+#[cfg(target_arch = "aarch64")]
+pub use crate::arch::aarch64::neon_goldilocks_field::mul_reduce_pair;
+
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
 #[inline]
