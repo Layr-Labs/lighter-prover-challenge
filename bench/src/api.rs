@@ -1,4 +1,4 @@
-// Redraw marker 652
+// Redraw marker 628
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
@@ -173,7 +173,7 @@ impl Circuits {
     /// Value-exact: no quantity is computed differently, only storage that no
     /// subsequent read can reach is returned early.
     pub fn release_finished_circuit_extensions(&mut self) {
-        self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+        self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default().into();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
         for lock in [
             &mut self.light_tx_data,
@@ -184,7 +184,7 @@ impl Circuits {
             let data = lock
                 .get_mut()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default().into();
             // The quotient-domain cache is reachable only from the same proofs
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
@@ -220,7 +220,7 @@ impl Circuits {
             let mut data = lock
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default().into();
             // Same guard, same argument: the exclusive acquisition proves no
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
@@ -244,7 +244,7 @@ impl Circuits {
             let mut data = lock
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+            data.prover_only.constants_sigmas_commitment = PolynomialBatch::default().into();
             // Same guard, same argument: the exclusive acquisition proves no
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.

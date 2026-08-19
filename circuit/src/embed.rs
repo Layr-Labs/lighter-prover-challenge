@@ -28,21 +28,25 @@
 //! * every bulky section is independently zstd-compressed, keeping parallel
 //!   load memory bounded without a second whole-blob decompression pass.
 //!
-//! Everything recomputed is validated at load: the recomputed commitment cap
-//! must equal the embedded verifier data's cap, which transitively pins the
-//! circuit digest. On any mismatch the loader errors and callers fall back to
-//! building circuits from scratch.
+//! Everything recomputed is validated: the recomputed commitment cap must
+//! equal the embedded verifier data's cap, which transitively pins the
+//! circuit digest. Parse-time failures (absent or truncated sections, version
+//! mismatches) error out of the loader and callers fall back to building
+//! circuits from scratch. The commitment recompute itself is *deferred* into
+//! a [`plonky2::fri::oracle::LazyPolynomialBatch`] that materializes on the
+//! rayon pool underneath later startup work, so its cap check runs at
+//! materialization and panics on mismatch — reachable only from a binary
+//! whose compiled-in blob disagrees with its own verifier data.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use plonky2::field::fft::{cached_fft_root_table, cached_two_adic_subgroup};
 use plonky2::field::polynomial::PolynomialValues;
 use plonky2::field::types::Field;
-use plonky2::fri::oracle::PolynomialBatch;
+use plonky2::fri::oracle::{LazyPolynomialBatch, PolynomialBatch};
 use plonky2::plonk::circuit_data::{
-    empty_watched, mark_watched, CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData,
-    VerifierOnlyCircuitData,
+    CircuitData, GeneratorWatchIndex, ProverOnlyCircuitData, VerifierOnlyCircuitData,
 };
-use plonky2::plonk::permutation_argument::{Forest, WirePartition};
+use plonky2::plonk::permutation_argument::{fixed_routed_wire_mask, Forest};
 use plonky2::util::serialization::{Buffer, Read as _, Write as _};
 use plonky2::util::timing::TimingTree;
 use plonky2::util::{log2_ceil, transpose_poly_values_ref};
@@ -67,7 +71,7 @@ fn embed_generator_serializer() -> EmbedGeneratorSerializer {
 }
 
 const EMBED_MAGIC: u32 = 0x4C45_4331; // "LEC1"
-const EMBED_VERSION: u32 = 2;
+const EMBED_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Primitive encoding helpers
@@ -287,53 +291,7 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     }
     write_compressed_section(&mut out, &buf);
 
-    // Routed-wire permutation successors. They are a pure function of the
-    // frozen representative map, but rebuilding them at runtime walks that
-    // multi-million-entry map and mutates every copy-class root once per
-    // worker. Derive them here in the untimed build job and delta-code against
-    // the identity permutation; singleton wires encode as zero and dominate
-    // these circuits, so the extra blob section stays compact.
-    let mut forest = Forest::from_parents(
-        prover.representative_map.clone(),
-        common.config.num_wires,
-        common.config.num_routed_wires,
-        degree,
-    );
-    let wire_partition = forest.wire_partition();
-    let sigma_indices = wire_partition.sigma_indices();
-    let mut buf = Vec::with_capacity(2 * sigma_indices.len() + 8);
-    write_uvarint(&mut buf, sigma_indices.len() as u64);
-    for (index, &successor) in sigma_indices.iter().enumerate() {
-        write_uvarint(&mut buf, zigzag(i64::from(successor) - index as i64));
-    }
-    write_compressed_section(&mut out, &buf);
-
     Ok(out)
-}
-
-/// Walks a column-major routed-position stream while reporting the matching
-/// row-major index. `index` is always
-/// `(i % degree) * num_routed_wires + i / degree` for the `i`-th advance, held
-/// as two adds and a compare instead of a division per position
-/// (`row_major_cursor_matches_closed_form` checks the two forms agree).
-#[derive(Default)]
-struct RowMajorCursor {
-    row: usize,
-    column: usize,
-    index: usize,
-}
-
-impl RowMajorCursor {
-    #[inline(always)]
-    fn advance(&mut self, degree: usize, num_routed_wires: usize) {
-        self.row += 1;
-        self.index += num_routed_wires;
-        if self.row == degree {
-            self.row = 0;
-            self.column += 1;
-            self.index = self.column;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,22 +409,9 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let mut vpos = 0usize;
     let offsets_len = read_uvarint(&section, &mut vpos)? as usize;
     let mut offsets = Vec::with_capacity(offsets_len);
-    // A representative is watched exactly when its offset differs from the next one, i.e.
-    // exactly when the delta decoded for the following index is non-zero -- a bit this loop
-    // already holds. Deriving the presence bitmap and the entry count here rather than in
-    // `GeneratorWatchIndex::from_parts` deletes that constructor's second full pass over the
-    // finished table, which is 36 MB per transaction circuit and far too large to be
-    // cache-resident, so it is a genuine DRAM re-read.
-    let mut watched = empty_watched(offsets_len);
-    let mut watch_entries = 0usize;
     let mut running = 0u64;
-    for index in 0..offsets_len {
-        let delta = read_uvarint(&section, &mut vpos)?;
-        if index > 0 && delta != 0 {
-            mark_watched(&mut watched, index - 1);
-            watch_entries += 1;
-        }
-        running += delta;
+    for _ in 0..offsets_len {
+        running += read_uvarint(&section, &mut vpos)?;
         offsets.push(u32::try_from(running).context("watch index offset exceeds u32")?);
     }
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -477,21 +422,18 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         "watch index watcher section length mismatch"
     );
     let mut watchers = Vec::with_capacity(watchers_len);
-    // Watch counts are a pure function of the (deduplicated) watcher lists;
-    // this mirrors `read_prover_only_circuit_data`'s reconstruction. Counting inside the
-    // decode loop -- which already reads and range-checks every watcher -- deletes a second
-    // streaming pass over the freshly built watcher vector (2.3 M entries per transaction
-    // circuit). The increments are order-independent and each still follows its bound check,
-    // so both vectors come out element-for-element identical.
-    let mut generator_watch_counts = vec![0usize; generator_count];
     for chunk in section[vpos..].chunks_exact(4) {
         let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
         ensure!((watcher as usize) < generator_count, "watcher index out of range");
-        generator_watch_counts[watcher as usize] += 1;
         watchers.push(watcher);
     }
-    let generator_indices_by_watches =
-        GeneratorWatchIndex::from_parts_with_presence(offsets, watchers, watch_entries, watched);
+    // Watch counts are a pure function of the (deduplicated) watcher lists;
+    // this mirrors `read_prover_only_circuit_data`'s reconstruction.
+    let mut generator_watch_counts = vec![0usize; generator_count];
+    for &watcher in &watchers {
+        generator_watch_counts[watcher as usize] += 1;
+    }
+    let generator_indices_by_watches = GeneratorWatchIndex::from_parts(offsets, watchers);
 
     // constant polynomial values
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -530,64 +472,14 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         representative_map
             .push(u32::try_from(parent).context("representative map entry out of range")?);
     }
-
-    // Routed-wire permutation successors, pre-derived by the build job from
-    // the representative map above. Decoding is a single linear pass over a
-    // compact varint stream; no union-find reconstruction is needed here.
-    let section = read_compressed_section(bytes, &mut pos)?;
-    let mut vpos = 0usize;
-    let sigma_len = read_uvarint(&section, &mut vpos)? as usize;
-    let expected_sigma_len = degree
-        .checked_mul(common.config.num_routed_wires)
-        .context("embedded sigma permutation length overflow")?;
-    ensure!(
-        sigma_len == expected_sigma_len,
-        "embedded sigma permutation has {sigma_len} entries, expected {expected_sigma_len}"
-    );
-    let mut sigma_indices = Vec::with_capacity(sigma_len);
-    // The routed-position singleton mask is exactly the set of sigma fixed
-    // points: `wire_partition` cycles only the routed members of a copy
-    // class, so a class with one routed member maps it to itself and a class
-    // with two or more has no fixed point at all. Both
-    // `fixed_routed_mask_is_exactly_sigma_identity_with_aliases` and
-    // `folded_mask_matches_two_pass_derivation` assert that identity, the
-    // latter over a 135/80/2^12 production shape. A fixed point is exactly a
-    // zero delta, which this loop has already decoded, so the mask falls out
-    // of the pass that is running anyway: no second walk of the
-    // representative map, no random cardinality lookup per routed position,
-    // and no `representative_map.len() / 4` scratch array.
-    //
-    // `sigma` is column-major and the mask is row-major, so the destination
-    // bit index is carried as a cursor rather than divided out per position.
-    let num_routed_wires = common.config.num_routed_wires;
-    let mut fixed_routed_wires = vec![0u8; sigma_len.div_ceil(8)];
-    let mut cursor = RowMajorCursor::default();
-    for index in 0..sigma_len {
-        let delta = unzigzag(read_uvarint(&section, &mut vpos)?);
-        if delta == 0 {
-            let bit = cursor.index;
-            fixed_routed_wires[bit >> 3] |= 1 << (bit & 7);
-        }
-        cursor.advance(degree, num_routed_wires);
-        let successor = index as i64 + delta;
-        let successor = u32::try_from(successor)
-            .context("embedded sigma permutation entry out of range")?;
-        ensure!(
-            (successor as usize) < sigma_len,
-            "embedded sigma permutation successor exceeds its domain"
-        );
-        sigma_indices.push(successor);
-    }
-    ensure!(
-        vpos == section.len(),
-        "trailing bytes in embedded sigma permutation section"
-    );
     ensure!(pos == bytes.len(), "trailing bytes in embedded circuit blob");
 
     // ---- recompute the derived prover-only components ----
     let degree_bits = common.degree_bits();
     let rate_bits = common.config.fri_config.rate_bits;
     let cap_height = common.config.fri_config.cap_height;
+    let num_wires = common.config.num_wires;
+    let num_routed = common.config.num_routed_wires;
 
     // The embedded loads run concurrently and several circuits share a degree
     // or FFT-domain size, so route these deterministic derivations through the
@@ -602,11 +494,15 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         1usize << (degree_bits + rate_bits.max(log2_ceil(common.quotient_degree_factor)));
     let root_table = cached_fft_root_table::<F>(max_fft_points);
 
-    // Sigma values from the compile-time-derived permutation successors. This
-    // is the same `WirePartition::get_sigma_polys` path as the builder, only
-    // the frozen partition itself no longer gets re-derived at runtime.
-    let wire_partition = WirePartition::from_sigma_indices(sigma_indices);
+    // Sigma values from the representative map, through the builder's own
+    // forest partition code (`sigma_vecs` post-`compress_paths` state).
+    let mut forest = Forest::from_parents(representative_map, num_wires, num_routed, degree);
+    let wire_partition = forest.wire_partition();
     let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
+    let representative_map = forest.into_parents();
+    let fixed_routed_wires =
+        fixed_routed_wire_mask(&representative_map, num_wires, num_routed, degree)
+            .context("embedded circuit has an invalid compressed representative map")?;
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
@@ -618,22 +514,51 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 
     // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
     // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
+    //
+    // DEFERRED, not skipped: the commitment's inputs (constant values + sigma
+    // values) exist right here, but its first consumer — the quotient
+    // evaluation, then the FRI openings, of a proof of THIS circuit — runs
+    // hundreds of milliseconds after the load join that this function sits
+    // under. Packing the recompute into a `LazyPolynomialBatch` and starting
+    // it on the rayon pool lets the loader return without it, pulling the
+    // startup joins in `bin/prove.rs` forward; the materialization overlaps
+    // the pre-execution proof tail and the first witness generations instead
+    // of blocking them. Value-exact: the closure runs the identical
+    // `from_values` call on the identical inputs, only later.
+    //
+    // The commitment-cap validation moves with the computation, and it is NOT
+    // weakened: the recomputed cap must still equal the embedded verifier
+    // data's cap, which transitively pins the circuit digest. What changes is
+    // the failure mode — a mismatch now panics at materialization (aborting
+    // the worker) instead of erroring out of this loader into the
+    // build-from-scratch fallback. That fallback remains reachable for every
+    // failure a healthy binary can hit (absent/stub blobs, truncated or
+    // version-mismatched sections all still error above, before this point);
+    // the cap check can only fire if the compiled-in blob is internally
+    // inconsistent with its own verifier data, i.e. a corrupt binary.
     let mut constants_sigmas_vecs = constant_values;
     constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
-    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
-        bail!(
+    let expected_cap = verifier_only.constants_sigmas_cap.clone();
+    let constants_sigmas_commitment = LazyPolynomialBatch::deferred(move || {
+        // Cache hit (the eager path above already populated it for this
+        // size); value-identical to the table captured by `prover_only`.
+        let root_table = cached_fft_root_table::<F>(max_fft_points);
+        let commitment = PolynomialBatch::<F, C, D>::from_values(
+            constants_sigmas_vecs,
+            rate_bits,
+            false,
+            cap_height,
+            &mut TimingTree::default(),
+            Some(&root_table),
+        );
+        assert!(
+            commitment.merkle_tree.cap == expected_cap,
             "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
              (stale or corrupt embedded circuit blob)"
         );
-    }
+        commitment
+    });
+    constants_sigmas_commitment.spawn_prefetch();
 
     let circuit_digest = verifier_only.circuit_digest;
 
@@ -760,30 +685,6 @@ mod tests {
         assert_eq!(zigzag(0), 0);
         assert_eq!(zigzag(-1), 1);
         assert_eq!(zigzag(1), 2);
-    }
-
-    /// The decode loop's incremental transpose must agree with the closed
-    /// form it replaces at every position, including the last of each column.
-    #[test]
-    fn row_major_cursor_matches_closed_form() {
-        for (degree, num_routed_wires) in [
-            (1usize << 17, 80usize),
-            (1 << 16, 80),
-            (1 << 12, 135),
-            (4, 3),
-            (1, 5),
-            (64, 1),
-        ] {
-            let mut cursor = RowMajorCursor::default();
-            for i in 0..degree * num_routed_wires {
-                assert_eq!(
-                    cursor.index,
-                    (i % degree) * num_routed_wires + i / degree,
-                    "cursor diverged at {i} for {degree}x{num_routed_wires}"
-                );
-                cursor.advance(degree, num_routed_wires);
-            }
-        }
     }
 
     #[test]
