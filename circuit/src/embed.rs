@@ -340,6 +340,109 @@ impl RowMajorCursor {
 // Read side (runtime)
 // ---------------------------------------------------------------------------
 
+/// Constant/sigma *values* produced by CPU-only blob parse, ready for the
+/// builder's [`PolynomialBatch::from_values`] path. The remaining four startup
+/// circuits do not need their Merkle trees until after the pre-execution SNARK
+/// joins; deferring `from_values` keeps Metal exclusive to that SNARK.
+pub struct DeferredConstantsSigmas {
+    constant_values: Vec<PolynomialValues<F>>,
+    sigma_vecs: Vec<PolynomialValues<F>>,
+}
+
+fn commit_constants_sigmas(
+    common: &plonky2::plonk::circuit_data::CommonCircuitData<F, D>,
+    verifier_only: &VerifierOnlyCircuitData<C, D>,
+    root_table: &plonky2::field::fft::FftRootTable<F>,
+    constant_values: Vec<PolynomialValues<F>>,
+    sigma_vecs: Vec<PolynomialValues<F>>,
+) -> Result<(
+    PolynomialBatch<F, C, D>,
+    Option<Vec<F>>,
+    usize,
+    usize,
+)> {
+    let rate_bits = common.config.fri_config.rate_bits;
+    let cap_height = common.config.fri_config.cap_height;
+    let mut constants_sigmas_vecs = constant_values;
+    constants_sigmas_vecs.extend(sigma_vecs);
+    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
+        constants_sigmas_vecs,
+        rate_bits,
+        false,
+        cap_height,
+        &mut TimingTree::default(),
+        Some(root_table),
+    );
+    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
+        bail!(
+            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
+             (stale or corrupt embedded circuit blob)"
+        );
+    }
+
+    let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
+    let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
+        let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
+        let domain = 1 << (common.degree_bits() + quotient_degree_bits);
+        let cols = common.constants_range().len() + common.sigmas_range().len();
+        if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
+            match (
+                constants_sigmas_commitment.extract_lde_batch_columns(
+                    step,
+                    common.constants_range(),
+                    domain,
+                ),
+                constants_sigmas_commitment.extract_lde_batch_columns(
+                    step,
+                    common.sigmas_range(),
+                    domain,
+                ),
+            ) {
+                (Some(constants), Some(sigmas_cache)) => {
+                    let mut cache: Vec<F> = constants;
+                    cache.extend(sigmas_cache);
+                    (Some(cache), step, domain)
+                }
+                _ => (None, step, domain),
+            }
+        } else {
+            (None, step, domain)
+        }
+    };
+    Ok((
+        constants_sigmas_commitment,
+        constants_sigmas_quotient_cache,
+        constants_sigmas_quotient_step,
+        constants_sigmas_quotient_domain,
+    ))
+}
+
+/// Runs the builder's constants/sigmas commitment path on values produced by
+/// [`deserialize_embedded_cpu`]. Cap-checked against the embedded verifier
+/// data, so a deferred load is value-identical to [`deserialize_embedded`].
+pub fn finish_deferred_constants_sigmas(
+    data: &mut CircuitData<F, C, D>,
+    deferred: DeferredConstantsSigmas,
+) -> Result<()> {
+    let root_table = data
+        .prover_only
+        .fft_root_table
+        .as_ref()
+        .context("deferred embed is missing the FFT root table")?;
+    let (commitment, cache, step, domain) = commit_constants_sigmas(
+        &data.common,
+        &data.verifier_only,
+        root_table,
+        deferred.constant_values,
+        deferred.sigma_vecs,
+    )?;
+    data.prover_only.constants_sigmas_commitment = commitment;
+    data.prover_only.constants_sigmas_quotient_cache = cache;
+    data.prover_only.constants_sigmas_quotient_step = step;
+    data.prover_only.constants_sigmas_quotient_domain = domain;
+    Ok(())
+}
+
 /// Reconstructs the target struct and the full [`CircuitData`] from a blob
 /// produced by [`serialize_embedded`].
 ///
@@ -350,6 +453,29 @@ impl RowMajorCursor {
 /// itself runs, from the same inputs. The recomputed commitment cap is checked
 /// against the embedded verifier data before returning.
 pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, CircuitData<F, C, D>)> {
+    let (target, data, deferred) = deserialize_embedded_inner(bytes, true)?;
+    debug_assert!(deferred.is_none());
+    Ok((target, data))
+}
+
+/// CPU-only reconstruction: every derived prover field except the constants/
+/// sigmas Merkle tree and its quotient-domain cache. Pair with
+/// [`finish_deferred_constants_sigmas`] before proving with the circuit.
+pub fn deserialize_embedded_cpu<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, CircuitData<F, C, D>, DeferredConstantsSigmas)> {
+    let (target, data, deferred) = deserialize_embedded_inner(bytes, false)?;
+    Ok((
+        target,
+        data,
+        deferred.context("cpu deserialize must return deferred constants/sigmas")?,
+    ))
+}
+
+fn deserialize_embedded_inner<T: DeserializeOwned>(
+    bytes: &[u8],
+    commit_gpu: bool,
+) -> Result<(T, CircuitData<F, C, D>, Option<DeferredConstantsSigmas>)> {
     let gate_serializer = BlockGateSerializer;
     let generator_serializer = embed_generator_serializer();
 
@@ -587,7 +713,6 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // ---- recompute the derived prover-only components ----
     let degree_bits = common.degree_bits();
     let rate_bits = common.config.fri_config.rate_bits;
-    let cap_height = common.config.fri_config.cap_height;
 
     // The embedded loads run concurrently and several circuits share a degree
     // or FFT-domain size, so route these deterministic derivations through the
@@ -616,72 +741,38 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // of two independent reads changes — no quantity is computed differently.
     let sigmas = transpose_poly_values_ref(&sigma_vecs);
 
-    // The builder's commitment path: values in, IFFT inside, LDE + Merkle.
-    // `PlonkOracle::CONSTANTS_SIGMAS.blinding` is `false` (non-ZK circuits).
-    let mut constants_sigmas_vecs = constant_values;
-    constants_sigmas_vecs.extend(sigma_vecs);
-    let constants_sigmas_commitment = PolynomialBatch::<F, C, D>::from_values(
-        constants_sigmas_vecs,
-        rate_bits,
-        false,
-        cap_height,
-        &mut TimingTree::default(),
-        Some(&root_table),
-    );
-    if constants_sigmas_commitment.merkle_tree.cap != verifier_only.constants_sigmas_cap {
-        bail!(
-            "recomputed constants/sigmas commitment cap diverges from the embedded verifier data \
-             (stale or corrupt embedded circuit blob)"
-        );
-    }
-
     let circuit_digest = verifier_only.circuit_digest;
 
-    // Mirror the builder's quotient-domain constants/sigmas cache (added by the
-    // Metal quotient-gate union frontier). It is a pure derivation from the
-    // freshly recomputed column-backed commitment — the same extraction the
-    // builder performs — and the documented `None` fallback keeps the quotient
-    // path correct if extraction declines.
-    // Skipped entirely at `step == 1`, where the cache cannot pay for itself:
-    // it exists to turn a strided gather into a contiguous copy, and at stride
-    // one the gather is *already* contiguous. Concretely,
-    // `extract_lde_batch_columns(1, range, domain)` memcpys
-    // `columns.col(c)[..domain]` per column, while the uncached quotient path
-    // reaches `fill_lde_batch` with `BatchLayout::PolyMajor`, `step == 1` and
-    // consecutive indices — which routes to `fill_lde_batch_contiguous` and
-    // copies `columns.col(c)[start..end]`. Same bytes out of the same buffer,
-    // one `copy_from_slice` per column either way. So the cache is a bit-exact
-    // duplicate of storage the commitment already retains, and building it
-    // costs one extra full-LDE allocation plus copy per circuit and holds that
-    // duplicate resident for the rest of the process.
-    let quotient_degree_bits = plonky2::util::log2_ceil(common.quotient_degree_factor);
-    let (constants_sigmas_quotient_cache, constants_sigmas_quotient_step, constants_sigmas_quotient_domain) = {
-        let step = 1 << (common.config.fri_config.rate_bits - quotient_degree_bits);
-        let domain = 1 << (common.degree_bits() + quotient_degree_bits);
-        let cols = common.constants_range().len() + common.sigmas_range().len();
-        if step != 1 && cols.saturating_mul(domain) * core::mem::size_of::<F>() <= 1 << 30 {
-            match (
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.constants_range(),
-                    domain,
-                ),
-                constants_sigmas_commitment.extract_lde_batch_columns(
-                    step,
-                    common.sigmas_range(),
-                    domain,
-                ),
-            ) {
-                (Some(constants), Some(sigmas_cache)) => {
-                    let mut cache: Vec<F> = constants;
-                    cache.extend(sigmas_cache);
-                    (Some(cache), step, domain)
-                }
-                _ => (None, step, domain),
-            }
-        } else {
-            (None, step, domain)
-        }
+    let (
+        constants_sigmas_commitment,
+        constants_sigmas_quotient_cache,
+        constants_sigmas_quotient_step,
+        constants_sigmas_quotient_domain,
+        deferred,
+    ) = if commit_gpu {
+        let (commitment, cache, step, domain) = commit_constants_sigmas(
+            &common,
+            &verifier_only,
+            &root_table,
+            constant_values,
+            sigma_vecs,
+        )?;
+        (commitment, cache, step, domain, None)
+    } else {
+        // Placeholder batch: unused until `finish_deferred_constants_sigmas`.
+        let step = 1 << (common.config.fri_config.rate_bits
+            - plonky2::util::log2_ceil(common.quotient_degree_factor));
+        let domain = 1 << (common.degree_bits() + plonky2::util::log2_ceil(common.quotient_degree_factor));
+        (
+            PolynomialBatch::default(),
+            None,
+            step,
+            domain,
+            Some(DeferredConstantsSigmas {
+                constant_values,
+                sigma_vecs,
+            }),
+        )
     };
 
     // Runtime-only, like `generator_watch_counts`: a pure function of `generators`. Every
@@ -721,6 +812,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
             verifier_only,
             common,
         },
+        deferred,
     ))
 }
 
