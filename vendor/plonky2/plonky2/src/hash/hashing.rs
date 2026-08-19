@@ -24,7 +24,15 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
         &mut self,
         inputs: Vec<Target>,
     ) -> HashOutTarget {
-        HashOutTarget::from_vec(self.hash_n_to_m_no_pad::<H>(inputs, NUM_HASH_OUT_ELTS))
+        let zero = self.zero();
+        let mut state = H::AlgebraicPermutation::new(core::iter::repeat(zero));
+        for input_chunk in inputs.chunks(H::AlgebraicPermutation::RATE) {
+            state.set_from_slice(input_chunk, 0);
+            state = self.permute::<H>(state);
+        }
+        HashOutTarget {
+            elements: state.squeeze()[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+        }
     }
 
     pub fn hash_n_to_m_no_pad<H: AlgebraicHasher<F>>(
@@ -138,7 +146,7 @@ pub fn hash_n_to_m_no_pad<F: RichField, P: PlonkyPermutation<F>>(
     }
 
     // Squeeze until we have the desired number of outputs.
-    let mut outputs = Vec::new();
+    let mut outputs = Vec::with_capacity(num_outputs);
     loop {
         for &item in perm.squeeze() {
             outputs.push(item);
@@ -151,5 +159,12 @@ pub fn hash_n_to_m_no_pad<F: RichField, P: PlonkyPermutation<F>>(
 }
 
 pub fn hash_n_to_hash_no_pad<F: RichField, P: PlonkyPermutation<F>>(inputs: &[F]) -> HashOut<F> {
-    HashOut::from_vec(hash_n_to_m_no_pad::<F, P>(inputs, NUM_HASH_OUT_ELTS))
+    let mut perm = P::new(core::iter::repeat(F::ZERO));
+    for input_chunk in inputs.chunks(P::RATE) {
+        perm.set_from_slice(input_chunk, 0);
+        perm.permute();
+    }
+    HashOut {
+        elements: perm.squeeze()[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    }
 }
