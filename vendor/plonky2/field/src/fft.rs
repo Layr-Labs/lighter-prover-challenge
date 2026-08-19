@@ -2787,6 +2787,98 @@ mod tests {
     };
     use crate::goldilocks_field::GoldilocksField;
 
+    #[test]
+    fn fft_root_table_row_starts_at_canonical_one() {
+        use crate::types::{Field, PrimeField64};
+        for lg_n in 1..=18 {
+            let n = 1 << lg_n;
+            let table = fft_root_table::<GoldilocksField>(n);
+            for (lg_m, row) in table.iter().enumerate() {
+                assert_eq!(
+                    row[0].to_noncanonical_u64(),
+                    GoldilocksField::ONE.to_noncanonical_u64(),
+                    "lg_n={lg_n} row={}",
+                    lg_m + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn goldilocks_mul_one_preserves_raw_limb() {
+        use crate::types::{Field, Field64};
+        let edges = [
+            0u64,
+            1,
+            2,
+            GoldilocksField::ORDER - 1,
+            GoldilocksField::ORDER,
+            GoldilocksField::ORDER + 1,
+            u32::MAX as u64,
+            1 << 32,
+            u64::MAX,
+        ];
+        for &raw in &edges {
+            let x = GoldilocksField(raw);
+            assert_eq!(
+                (x * GoldilocksField::ONE).0,
+                raw,
+                "x={raw:#x} * ONE changed the raw limb"
+            );
+        }
+    }
+
+    #[test]
+    fn dif_layer_skip_identity_twiddle_matches_multiply() {
+        use crate::extension::FieldExtension;
+        use crate::types::{Field, Sample};
+
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        for lg_half in 0..=10 {
+            let half = 1usize << lg_half;
+            let m = half << 1;
+            let omega = fft_root_table::<F>(m.max(2))[lg_half].clone();
+            assert_eq!(omega[0], F::ONE);
+            let src = FE::rand_vec(m);
+
+            let mut multiplied = src.clone();
+            {
+                let (low, high) = multiplied.split_at_mut(half);
+                for j in 0..half {
+                    let u = low[j];
+                    let v = high[j];
+                    low[j] = u + v;
+                    high[j] = FieldExtension::<2>::scalar_mul(&(u - v), omega[j]);
+                }
+            }
+
+            let mut skipped = src;
+            {
+                let (low, high) = skipped.split_at_mut(half);
+                let u = low[0];
+                let v = high[0];
+                low[0] = u + v;
+                high[0] = u - v;
+                for j in 1..half {
+                    let u = low[j];
+                    let v = high[j];
+                    low[j] = u + v;
+                    high[j] = FieldExtension::<2>::scalar_mul(&(u - v), omega[j]);
+                }
+            }
+
+            for i in 0..m {
+                assert_eq!(
+                    [skipped[i].0[0].0, skipped[i].0[1].0],
+                    [multiplied[i].0[0].0, multiplied[i].0[1].0],
+                    "raw-limb mismatch lg_half={lg_half} i={i}"
+                );
+            }
+        }
+    }
+
     /// Portable copy of the general extension-butterfly product used by the
     /// NEON path: `(a0 + a1*u) * (b0 + b1*u)` with `u^2 = 7`, reduced
     /// component-wise exactly like the generic `QuadraticExtension` mul.

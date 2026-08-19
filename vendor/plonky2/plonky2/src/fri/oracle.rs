@@ -1128,13 +1128,7 @@ fn fft_dif_bitrev_base_twiddles<F: Extendable<D>, const D: usize>(
         let half = m >> 1;
         let omega = &roots[lg_m - 1][..half];
         values.par_chunks_mut(m).for_each(|block| {
-            let (low, high) = block.split_at_mut(half);
-            for j in 0..half {
-                let u = low[j];
-                let v = high[j];
-                low[j] = u + v;
-                high[j] = <F::Extension as FieldExtension<D>>::scalar_mul(&(u - v), omega[j]);
-            }
+            dif_layer_skip_identity_twiddle::<F, D>(block, omega);
         });
     }
     #[cfg(feature = "diagnostic_profile")]
@@ -1146,14 +1140,32 @@ fn fft_dif_bitrev_base_twiddles<F: Extendable<D>, const D: usize>(
         let half = m >> 1;
         let omega = &roots[lg_m - 1][..half];
         values.par_chunks_mut(m).for_each(|block| {
-            let (low, high) = block.split_at_mut(half);
-            for j in 0..half {
-                let u = low[j];
-                let v = high[j];
-                low[j] = u + v;
-                high[j] = <F::Extension as FieldExtension<D>>::scalar_mul(&(u - v), omega[j]);
-            }
+            dif_layer_skip_identity_twiddle::<F, D>(block, omega);
         });
+    }
+}
+
+
+/// One DIF layer. `omega` is a `fft_root_table` row prefix, so `omega[0]` is
+/// `base.powers()`'s first term - canonical `F::ONE`. Goldilocks `x * 1`
+/// preserves the raw `u64` limb (`reduce128(x as u128)` with `x_hi = 0`), so
+/// the j=0 twiddle multiply is an identity and is skipped.
+fn dif_layer_skip_identity_twiddle<F: Extendable<D>, const D: usize>(
+    block: &mut [F::Extension],
+    omega: &[F],
+) {
+    let half = omega.len();
+    debug_assert_eq!(block.len(), half << 1);
+    let (low, high) = block.split_at_mut(half);
+    let u = low[0];
+    let v = high[0];
+    low[0] = u + v;
+    high[0] = u - v;
+    for j in 1..half {
+        let u = low[j];
+        let v = high[j];
+        low[j] = u + v;
+        high[j] = <F::Extension as FieldExtension<D>>::scalar_mul(&(u - v), omega[j]);
     }
 }
 
@@ -1179,9 +1191,15 @@ fn dif_layer_neon_ext2(
 
     let half = 1usize << lg_half_m;
     let m = half << 1;
+    debug_assert!(omega.len() >= half);
     for block in values.chunks_exact_mut(m) {
         let (low, high) = block.split_at_mut(half);
-        for j in 0..half {
+        // `omega[0] == ONE`; `mul_reduce_pair(x, 1)` is bit-identical to `x`.
+        let u = NeonGoldilocksField(low[0].0);
+        let v = NeonGoldilocksField(high[0].0);
+        low[0] = QuadraticExtension((u + v).0);
+        high[0] = QuadraticExtension((u - v).0);
+        for j in 1..half {
             let u = NeonGoldilocksField(low[j].0);
             let v = NeonGoldilocksField(high[j].0);
             low[j] = QuadraticExtension((u + v).0);
@@ -1219,7 +1237,16 @@ fn dif_expand_block_neon_ext2(
 ) {
     assert_eq!(source.len(), destination.len());
     assert_eq!(source.len(), twiddles.len());
-    for ((destination, &source), &twiddle) in destination.iter_mut().zip(source).zip(twiddles) {
+    if source.is_empty() {
+        return;
+    }
+    // `twiddles[0]` is a root-table row head, hence canonical ONE.
+    destination[0] = source[0];
+    for ((destination, &source), &twiddle) in destination[1..]
+        .iter_mut()
+        .zip(&source[1..])
+        .zip(&twiddles[1..])
+    {
         *destination = dif_mul_base_ext2(source, twiddle);
     }
 }
@@ -1282,6 +1309,18 @@ fn fft_dif_rate8_neon_ext2(
         // tail slot was initialized by the caller's first-touch fill, and
         // block 0 is read-only here.
         unsafe {
+            if j == 0 {
+                // w1[0]=w2[0]=w3[0]=ONE, so the seven products are copies of b0.
+                let b0 = shared.read(0);
+                shared.write(live, b0);
+                shared.write(2 * live, b0);
+                shared.write(3 * live, b0);
+                shared.write(4 * live, b0);
+                shared.write(5 * live, b0);
+                shared.write(6 * live, b0);
+                shared.write(7 * live, b0);
+                return;
+            }
             let b0 = shared.read(j);
             let b4 = dif_mul_base_ext2(b0, w1[j]);
             let b2 = dif_mul_base_ext2(b0, w2[j]);
