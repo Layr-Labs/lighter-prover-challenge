@@ -120,13 +120,8 @@ struct TargetReadiness<'a> {
 }
 
 impl<'a> TargetReadiness<'a> {
-    fn new(generator_watch_counts: &[usize], watchers: &'a GeneratorWatchIndex) -> Self {
-        let unresolved = generator_watch_counts
-            .iter()
-            .map(|&count| {
-                u32::try_from(count).expect("generator watch count exceeds the CSR u32 edge index")
-            })
-            .collect();
+    fn new(generator_watch_counts: &[u32], watchers: &'a GeneratorWatchIndex) -> Self {
+        let unresolved = generator_watch_counts.to_vec();
         Self {
             unresolved,
             watchers,
@@ -451,7 +446,7 @@ fn run_generator_worklist<
 fn seed_inputs_and_readiness<'a, F: Field>(
     witness: &mut PartitionWitness<F>,
     inputs: PartialWitness<F>,
-    generator_watch_counts: &[usize],
+    generator_watch_counts: &[u32],
     generator_indices_by_watches: &'a GeneratorWatchIndex,
 ) -> Result<TargetReadiness<'a>> {
     let mut readiness = TargetReadiness::new(generator_watch_counts, generator_indices_by_watches);
@@ -880,8 +875,6 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             .zip(&readiness.unresolved)
             .enumerate()
             .filter_map(|(generator, (&total, &unresolved))| {
-                let total = u32::try_from(total)
-                    .expect("generator watch count exceeds the CSR u32 edge index");
                 let decrement = total - unresolved;
                 (decrement != 0).then(|| {
                     Ok((
@@ -1648,6 +1641,15 @@ mod tests {
     }
 
     #[test]
+    fn readiness_clones_cached_u32_watch_counts() {
+        let watch_index = GeneratorWatchIndex::from_map(Default::default());
+        let cached = vec![0u32, 3, 1, 0];
+        let readiness = TargetReadiness::new(&cached, &watch_index);
+
+        assert_eq!(readiness.unresolved, cached);
+    }
+
+    #[test]
     fn dense_target_readiness_preserves_alias_duplicates_and_layout_replay() -> Result<()> {
         let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
         let seed = builder.add_virtual_target();
@@ -2101,7 +2103,7 @@ mod tests {
 
         // The builder-derived counts must equal the number of watcher-list occurrences of each
         // generator across the whole map (the "no representative is populated yet" case).
-        let mut occurrences = vec![0usize; prover_data.generators.len()];
+        let mut occurrences = vec![0u32; prover_data.generators.len()];
         for (_, watchers) in prover_data.generator_indices_by_watches.iter() {
             for &generator_idx in watchers {
                 occurrences[generator_idx as usize] += 1;

@@ -483,11 +483,13 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // streaming pass over the freshly built watcher vector (2.3 M entries per transaction
     // circuit). The increments are order-independent and each still follows its bound check,
     // so both vectors come out element-for-element identical.
-    let mut generator_watch_counts = vec![0usize; generator_count];
+    let mut generator_watch_counts = vec![0u32; generator_count];
     for chunk in section[vpos..].chunks_exact(4) {
         let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
         ensure!((watcher as usize) < generator_count, "watcher index out of range");
-        generator_watch_counts[watcher as usize] += 1;
+        generator_watch_counts[watcher as usize] = generator_watch_counts[watcher as usize]
+            .checked_add(1)
+            .context("generator watch count exceeds u32")?;
         watchers.push(watcher);
     }
     let generator_indices_by_watches =

@@ -462,15 +462,19 @@ impl GeneratorWatchIndex {
     /// flat avoids a tree node and a separately allocated `Vec` for every watched representative.
     pub(crate) fn from_sorted_generator_representatives(
         representatives: &[u32],
-        generator_watch_counts: &[usize],
+        generator_watch_counts: &[u32],
     ) -> Self {
         debug_assert_eq!(
-            generator_watch_counts.iter().sum::<usize>(),
+            generator_watch_counts
+                .iter()
+                .map(|&count| count as usize)
+                .sum::<usize>(),
             representatives.len()
         );
         debug_assert!({
             let mut end = 0usize;
             generator_watch_counts.iter().all(|&count| {
+                let count = count as usize;
                 let start = end;
                 end += count;
                 representatives[start..end]
@@ -523,6 +527,7 @@ impl GeneratorWatchIndex {
         let mut watchers = vec![0u32; representatives.len()];
         let mut group_end = representatives.len();
         for (generator, &count) in generator_watch_counts.iter().enumerate().rev() {
+            let count = count as usize;
             let group_start = group_end - count;
             for &representative in &representatives[group_start..group_end] {
                 let cursor = &mut offsets[representative as usize + 1];
@@ -683,7 +688,7 @@ pub struct ProverOnlyCircuitData<
     /// decrementing on first population, instead of traversing the entire watcher map at the
     /// start of every proof. Runtime-only: it is a pure function of `generator_indices_by_watches`
     /// and is reconstructed on deserialization, so the serialized format is unchanged.
-    pub generator_watch_counts: Vec<usize>,
+    pub generator_watch_counts: Vec<u32>,
     /// Whether every generator in [`Self::generators`] reports
     /// [`WitnessGenerator::defers_until_ready`].
     ///
@@ -1150,12 +1155,12 @@ mod generator_watch_index_tests {
             }
             let max_generator = *per_generator.keys().max().unwrap();
             let mut representatives: Vec<u32> = Vec::new();
-            let mut counts: Vec<usize> = vec![0usize; max_generator + 1];
+            let mut counts: Vec<u32> = vec![0u32; max_generator + 1];
             for generator in 0..=max_generator {
                 let mut group = per_generator.get(&generator).cloned().unwrap_or_default();
                 group.sort_unstable();
                 group.dedup();
-                counts[generator] = group.len();
+                counts[generator] = u32::try_from(group.len()).unwrap();
                 representatives.extend(group);
             }
             let from_groups = GeneratorWatchIndex::from_sorted_generator_representatives(
