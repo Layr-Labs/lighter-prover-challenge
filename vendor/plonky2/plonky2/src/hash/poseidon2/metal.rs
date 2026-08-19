@@ -16,7 +16,7 @@ use objc::Message;
 use metal::{
     BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
     ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
+    MTLPipelineOption, MTLResourceOptions, MTLSize, NSRange, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -856,6 +856,35 @@ fn allocate_page_walked(device: &Device, bytes: u64) -> Option<Buffer> {
     Some(buffer)
 }
 
+/// Allocates GPU-private storage and commits a blit fill so allocation and
+/// first-touch costs are paid before the streamed proof path needs the buffer.
+/// The sponge state is never accessed by the CPU, so private storage avoids
+/// shared-buffer cache-coherence traffic during every absorb pass.
+fn allocate_private_prewarmed(device: &Device, queue: &CommandQueue, bytes: u64) -> Option<Buffer> {
+    if bytes == 0 || bytes > NSUInteger::MAX as u64 {
+        return None;
+    }
+    let buffer =
+        autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModePrivate));
+    let completed = autoreleasepool(|| {
+        let command_buffer = queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.fill_buffer(
+            &buffer,
+            NSRange {
+                location: 0,
+                length: bytes as NSUInteger,
+            },
+            0,
+        );
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        command_buffer.status() == MTLCommandBufferStatus::Completed
+    });
+    completed.then_some(buffer)
+}
+
 pub fn prewarm_streamed_buffers(leaf_count: usize) {
     let Some(context) = shared_context() else {
         return;
@@ -878,7 +907,9 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
     };
     let (state_bytes, output_bytes) = (state_bytes as u64, output_bytes as u64);
 
-    let Some(state) = allocate_page_walked(&context.device, state_bytes) else {
+    let Some(state) =
+        allocate_private_prewarmed(&context.device, &context.queue, state_bytes)
+    else {
         return;
     };
     let Some(output) = allocate_page_walked(&context.device, output_bytes) else {
@@ -2574,7 +2605,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             (
                 context.device.new_buffer(
                     state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
+                    MTLResourceOptions::StorageModePrivate,
                 ),
                 context.device.new_buffer(
                     output_bytes as u64,
