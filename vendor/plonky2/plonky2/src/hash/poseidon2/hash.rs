@@ -900,20 +900,6 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
     }
 
-    fn hash_or_noop(input: &[F]) -> Self::Hash {
-        if input.len() <= NUM_HASH_OUT_ELTS {
-            HashOut {
-                elements: core::array::from_fn(|i| {
-                    input
-                        .get(i)
-                        .map_or(F::ZERO, |x| F::from_canonical_u64(x.to_canonical_u64()))
-                }),
-            }
-        } else {
-            Self::hash_no_pad(input)
-        }
-    }
-
     fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
         debug_assert_eq!(input_a.len(), input_b.len());
         if input_a.len() * 8 <= <Self as Hasher<F>>::HASH_SIZE {

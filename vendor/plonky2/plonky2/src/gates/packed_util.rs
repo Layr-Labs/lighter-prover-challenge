@@ -100,9 +100,14 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
                 vars_packed,
                 StridedConstraintConsumer::new(scratch, width, 0),
             );
-            let filter = *<F as Packable>::Packing::from_slice(
-                &filters[offset..offset + width],
-            );
+            // Load packed lanes directly. The previous form zero-initialized each
+            // packed value and then immediately overwrote every lane, so the
+            // `ZEROS` store was dead. Alignment-safe by construction: the packed
+            // type is `#[repr(transparent)]` over `[GoldilocksField; WIDTH]` and
+            // documents that it "deliberately retains the scalar field's
+            // eight-byte alignment so that a scalar slice can be reinterpreted as
+            // packed values"; `from_slice` also asserts len == WIDTH.
+            let filter = *<F as Packable>::Packing::from_slice(&filters[offset..offset + width]);
             for j in 0..num_constraints {
                 let combined = &mut combined_gate_constraints[j * n + offset..][..width];
                 let acc = *<F as Packable>::Packing::from_slice(combined);

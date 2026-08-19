@@ -1,6 +1,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
 
+use hashbrown::HashSet;
+
 use super::circuit_builder::NUM_COINS_LOOKUP;
 use crate::field::extension::Extendable;
 use crate::field::polynomial::PolynomialCoeffs;
@@ -197,13 +199,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 },
             ..
         } = challenges;
-        let reduction_depths = common_data.fri_params.reduction_arity_bits.len();
-        let num_queries = fri_query_indices.len();
-        let mut fri_inferred_elements = Vec::with_capacity(num_queries * reduction_depths);
+        let mut fri_inferred_elements = Vec::new();
         // Holds the indices that have already been seen at each reduction depth.
-        let mut seen_indices_by_depth = (0..reduction_depths)
-            .map(|_| Vec::with_capacity(num_queries))
-            .collect::<Vec<_>>();
+        let mut seen_indices_by_depth =
+            vec![HashSet::new(); common_data.fri_params.reduction_arity_bits.len()];
         let precomputed_reduced_evals = PrecomputedReducedOpenings::from_os_and_alpha(
             &self.proof.openings.to_fri_openings(),
             *fri_alpha,
@@ -233,20 +232,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 .enumerate()
             {
                 let coset_index = x_index >> arity_bits;
-                if seen_indices_by_depth[i].contains(&coset_index) {
+                if !seen_indices_by_depth[i].insert(coset_index) {
                     // If this index has already been seen, we can skip the rest of the reductions.
                     break;
                 }
-                seen_indices_by_depth[i].push(coset_index);
                 fri_inferred_elements.push(old_eval);
                 let arity = 1 << arity_bits;
+                let mut evals = self.proof.opening_proof.query_round_proofs.steps[i][&coset_index]
+                    .evals
+                    .clone();
                 let x_index_within_coset = x_index & (arity - 1);
-                let source_evals =
-                    &self.proof.opening_proof.query_round_proofs.steps[i][&coset_index].evals;
-                let mut evals = Vec::with_capacity(source_evals.len() + 1);
-                evals.extend_from_slice(&source_evals[..x_index_within_coset]);
-                evals.push(old_eval);
-                evals.extend_from_slice(&source_evals[x_index_within_coset..]);
+                evals.insert(x_index_within_coset, old_eval);
                 old_eval = compute_evaluation(
                     subgroup_x,
                     x_index_within_coset,
