@@ -1357,7 +1357,7 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
         range_quotient_split_enabled()
             && common_data.num_lookup_polys == 0
             && common_data.config.num_challenges == 2
-            && common_data.degree_bits() + common_data.config.fri_config.rate_bits >= min_bits
+            && (min_bits..=19).contains(&(common_data.degree_bits() + common_data.config.fri_config.rate_bits))
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
@@ -2065,18 +2065,17 @@ fn start_gpu_range_check_gate_quotient<
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
-    // Circuit-fixed constants/sigmas live in a deserialized Metal store
-    // with no companion. One even-row copy lets constant-reading deg<=4
-    // gates join the half-domain job: the shader strides both buffers by
-    // `wires.rows`, so the compact constants must match the compact wires.
-    let even_constants = prover_data
-        .constants_sigmas_commitment
-        .even_columns
-        .get_or_fill_even_rows(constants);
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
+        // Circuit-fixed constants/sigmas live in a deserialized Metal store
+        // with no companion. Derive their even rows only after a matching
+        // wires companion proves that this shape can execute the split.
+        let even_constants = prover_data
+            .constants_sigmas_commitment
+            .even_columns
+            .get_or_fill_even_rows(constants);
         // Without a constants companion, kinds that read gate constants
         // stay on the full-domain dispatch (the kernel would otherwise
         // index `col * half_rows + k` into a full-stride store).
