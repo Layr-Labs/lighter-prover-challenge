@@ -1047,9 +1047,11 @@ fn fft_classic_simd_single_layer_neon_ext(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    // Root rows contain `base.powers().take(half.max(2))`; row 1 is
+    // therefore the generator. All of its powers lie in the base subfield
+    // exactly when the generator does, so scanning the whole row is redundant.
+    debug_assert!(omega_row.len() >= 2);
+    let base_subfield = omega_row[1].0[1].0 == 0;
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
@@ -2830,6 +2832,29 @@ mod tests {
                 [expected_s[0].0, expected_s[1].0],
                 "base-subfield twiddle product diverges"
             );
+        }
+    }
+
+    #[test]
+    fn extension_root_generator_decides_base_subfield_row() {
+        type FE = QuadraticExtension<GoldilocksField>;
+
+        let bases: [FE; 2] = [
+            QuadraticExtension([GoldilocksField(3), GoldilocksField::ZERO]),
+            QuadraticExtension([GoldilocksField(3), GoldilocksField(5)]),
+        ];
+        for base in bases {
+            let row: Vec<_> = base.powers().take(64).collect();
+            let scanned = row.iter().all(|value| value.0[1].0 == 0);
+            assert_eq!(scanned, row[1].0[1].0 == 0);
+        }
+
+        for lg_n in 1..=12 {
+            for row in fft_root_table::<FE>(1 << lg_n) {
+                assert!(row.len() >= 2);
+                let scanned = row.iter().all(|value| value.0[1].0 == 0);
+                assert_eq!(scanned, row[1].0[1].0 == 0);
+            }
         }
     }
     use crate::packable::Packable;

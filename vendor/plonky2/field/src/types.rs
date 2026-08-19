@@ -531,6 +531,16 @@ pub trait Field:
         // Default implementation.
         *self + x * y
     }
+
+    /// Two independent [`Self::multiply_accumulate`] operations. Targets with
+    /// paired widening arithmetic may interleave their reductions.
+    #[inline]
+    fn multiply_accumulate_pair(acc: [Self; 2], x: [Self; 2], y: [Self; 2]) -> [Self; 2] {
+        [
+            acc[0].multiply_accumulate(x[0], y[0]),
+            acc[1].multiply_accumulate(x[1], y[1]),
+        ]
+    }
 }
 
 pub trait PrimeField: Field {

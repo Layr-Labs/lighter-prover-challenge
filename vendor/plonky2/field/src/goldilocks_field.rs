@@ -233,6 +233,25 @@ impl Field for GoldilocksField {
             reduce128((self.0 as u128) + (x.0 as u128) * (y.0 as u128))
         }
     }
+
+    #[inline]
+    fn multiply_accumulate_pair(acc: [Self; 2], x: [Self; 2], y: [Self; 2]) -> [Self; 2] {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let (lane_0, lane_1) =
+                crate::arch::aarch64::neon_goldilocks_field::mul_acc_reduce_pair(
+                    acc[0].0, x[0].0, y[0].0, acc[1].0, x[1].0, y[1].0,
+                );
+            [Self(lane_0), Self(lane_1)]
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            [
+                acc[0].multiply_accumulate(x[0], y[0]),
+                acc[1].multiply_accumulate(x[1], y[1]),
+            ]
+        }
+    }
 }
 
 impl PrimeField for GoldilocksField {
@@ -734,6 +753,32 @@ mod tests {
                     check(next(), next(), e);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn multiply_accumulate_pair_matches_two_singles_raw() {
+        use crate::goldilocks_field::GoldilocksField;
+        use crate::types::Field;
+
+        let mut state = 0xA076_1D64_78BD_642Fu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200_000 {
+            let acc = [GoldilocksField(next()), GoldilocksField(next())];
+            let x = [GoldilocksField(next()), GoldilocksField(next())];
+            let y = [GoldilocksField(next()), GoldilocksField(next())];
+            let actual = GoldilocksField::multiply_accumulate_pair(acc, x, y);
+            let expected = [
+                acc[0].multiply_accumulate(x[0], y[0]),
+                acc[1].multiply_accumulate(x[1], y[1]),
+            ];
+            assert_eq!(actual[0].0, expected[0].0);
+            assert_eq!(actual[1].0, expected[1].0);
         }
     }
 
