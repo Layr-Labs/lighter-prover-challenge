@@ -1366,6 +1366,16 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn range_selector_constants<F: Field, const N: usize>(start: usize, len: usize) -> [F; N] {
+    debug_assert!(len <= N);
+    let mut constants = [F::ZERO; N];
+    for (offset, constant) in constants[..len].iter_mut().enumerate() {
+        *constant = F::from_canonical_usize(start + offset);
+    }
+    constants
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1438,10 +1448,16 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             }),
         }
     }
-    let selector_cols: Vec<&[F]> = plans.iter().map(|p| constants.col(p.selector_column)).collect();
     const ROWS_PER_CHUNK: usize = 512;
     const MAX_GROUP: usize = 16;
     assert!(plans.iter().all(|p| p.group_len <= MAX_GROUP));
+    let selector_cols: Vec<&[F]> = plans.iter().map(|p| constants.col(p.selector_column)).collect();
+    let selector_factors: Vec<[F; MAX_GROUP]> = plans
+        .iter()
+        .map(|plan| {
+            range_selector_constants::<F, MAX_GROUP>(plan.group_start, plan.group_len)
+        })
+        .collect();
     let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
     // SAFETY: every slot is written exactly once by the disjoint parallel
     // pass below before any read.
@@ -1457,12 +1473,14 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let mut factors = [F::ZERO; MAX_GROUP];
             let mut prefix = [F::ONE; MAX_GROUP + 1];
             let mut suffix = [F::ONE; MAX_GROUP + 1];
-            for (plan, selector_col) in plans.iter().zip(&selector_cols) {
+            for ((plan, selector_col), factor_constants) in
+                plans.iter().zip(&selector_cols).zip(&selector_factors)
+            {
                 let n = plan.group_len;
                 for r in 0..rows {
                     let s_val = selector_col[row0 + r];
                     for k in 0..n {
-                        factors[k] = F::from_canonical_usize(plan.group_start + k) - s_val;
+                        factors[k] = factor_constants[k] - s_val;
                     }
                     prefix[0] = if plan.include_unused_selector { unused - s_val } else { F::ONE };
                     for k in 0..n {
@@ -3375,6 +3393,15 @@ mod quotient_layout_tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn range_selector_constants_are_precomputed_once() {
+        let constants = super::range_selector_constants::<F, 4>(7, 3);
+        assert_eq!(constants[0], F::from_canonical_usize(7));
+        assert_eq!(constants[1], F::from_canonical_usize(8));
+        assert_eq!(constants[2], F::from_canonical_usize(9));
+        assert_eq!(constants[3], F::ZERO);
+    }
 
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
