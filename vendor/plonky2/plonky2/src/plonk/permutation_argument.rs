@@ -337,6 +337,19 @@ pub struct WirePartition {
 }
 
 impl WirePartition {
+    /// Reconstructs the routed-wire permutation from its compact successor
+    /// indices. Embedded circuits serialize these indices at compile time so
+    /// startup does not have to rebuild the same partition from the frozen
+    /// representative map in every worker.
+    pub fn from_sigma_indices(sigma: Vec<u32>) -> Self {
+        Self { sigma }
+    }
+
+    /// Returns the column-major routed-wire successor indices.
+    pub fn sigma_indices(&self) -> &[u32] {
+        &self.sigma
+    }
+
     pub fn get_sigma_polys<F: Field>(
         &self,
         degree_log: usize,
