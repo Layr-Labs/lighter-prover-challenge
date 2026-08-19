@@ -146,6 +146,60 @@ pub trait Poseidon2: PrimeField64 {
         }
     }
 
+    /// Eight-state variant of `poseidon2_x4`; same bit-identity guarantee.
+    /// The partial rounds route through `internal_linear_layer_x4`, so the
+    /// Goldilocks delayed-reduction lane fold applies here unchanged.
+    #[inline]
+    fn poseidon2_x8(inputs: [[Self; WIDTH]; 8]) -> [[Self; WIDTH]; 8] {
+        let mut s = inputs;
+        for state in s.iter_mut() {
+            Self::external_linear_layer(state);
+        }
+        Self::full_rounds_x8(&mut s, 0);
+        Self::partial_rounds_x8(&mut s);
+        Self::full_rounds_x8(&mut s, ROUNDS_F_HALF);
+        s
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn full_rounds_x8(s: &mut [[Self; WIDTH]; 8], start: usize) {
+        for r in start..(start + ROUNDS_F_HALF) {
+            for i in 0..8 {
+                Self::add_rc(&mut s[i], r);
+            }
+            for i in 0..8 {
+                Self::sbox(&mut s[i]);
+            }
+            for i in 0..8 {
+                Self::external_linear_layer(&mut s[i]);
+            }
+        }
+    }
+
+    #[inline]
+    #[unroll::unroll_for_loops]
+    fn partial_rounds_x8(s: &mut [[Self; WIDTH]; 8]) {
+        for r in 0..ROUNDS_P {
+            let rc = Self::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            for i in 0..8 {
+                s[i][0] += rc;
+            }
+            for i in 0..8 {
+                s[i][0] = Self::sbox_p(&s[i][0]);
+            }
+            let (lo, hi) = s.split_at_mut(4);
+            let (a, rest) = lo.split_at_mut(1);
+            let (b, rest) = rest.split_at_mut(1);
+            let (c, d) = rest.split_at_mut(1);
+            Self::internal_linear_layer_x4(&mut a[0], &mut b[0], &mut c[0], &mut d[0]);
+            let (e, rest) = hi.split_at_mut(1);
+            let (f, rest) = rest.split_at_mut(1);
+            let (g, h) = rest.split_at_mut(1);
+            Self::internal_linear_layer_x4(&mut e[0], &mut f[0], &mut g[0], &mut h[0]);
+        }
+    }
+
     #[inline]
     #[unroll::unroll_for_loops]
     fn full_rounds(state: &mut [Self; WIDTH], start: usize) {
@@ -483,64 +537,88 @@ fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
     }
 }
 
+/// One internal-layer lane with the row sum still in its raw 128-bit form:
+/// `reduce128(state * diag + raw_sum)`, a single reduction where the
+/// multiply-then-add spelling paid one reduction for the product and a
+/// canonicalizing field add on top.
+///
+/// Fits 128 bits for every diagonal: the largest diagonal constant is
+/// `0xf3faac6faee378ae < 0.954 * 2^64`, so the product is below
+/// `0.954 * 2^128`, and the raw row sum of twelve u64 limbs is below
+/// `12 * 2^64 < 2^68` (`internal_lane_accumulator_fits_128_bits` asserts the
+/// exact worst case for all twelve diagonals). Pure Rust on purpose: a
+/// hand-asm variant of this fold measured 4x worse by blocking LLVM's
+/// pipelining of the twelve independent lanes.
+#[inline(always)]
+fn internal_lane(raw_sum: u128, lane: F, diag: u64) -> F {
+    F::from_noncanonical_u128((lane.0 as u128) * (diag as u128) + raw_sum)
+}
+
 impl Poseidon2 for F {
     #[inline]
     fn internal_linear_layer(state: &mut [Self; WIDTH]) {
         // AArch64 NEON has no native widening 64x64 multiply. The packed
         // Goldilocks path therefore expands each four-lane product, while the
         // scalar backend lowers each fixed product directly to `mul`/`umulh`.
-        // Keep the exact historical multiply-then-add order in every lane.
-        let sum = sum_12(state);
-        state[0] = sum + state[0] * F(0xc3b6c08e23ba9300);
-        state[1] = sum + state[1] * F(0xd84b5de94a324fb6);
-        state[2] = sum + state[2] * F(0x0d0c371c5b35b84f);
-        state[3] = sum + state[3] * F(0x7964f570e7188037);
-        state[4] = sum + state[4] * F(0x5daf18bbd996604b);
-        state[5] = sum + state[5] * F(0x6743bc47b9595257);
-        state[6] = sum + state[6] * F(0x5528b9362c59bb70);
-        state[7] = sum + state[7] * F(0xac45e25b7127b68b);
-        state[8] = sum + state[8] * F(0xa2077d7dfbb606b5);
-        state[9] = sum + state[9] * F(0xf3faac6faee378ae);
-        state[10] = sum + state[10] * F(0x0c6388b51545e883);
-        state[11] = sum + state[11] * F(0xd27dbb6944917b60);
+        // The row sum stays in its raw 128-bit accumulator and each lane
+        // folds it into its own widened product ahead of one reduction:
+        // 12 reductions per round instead of 13 plus 12 canonicalizing adds.
+        // Bit-identical to the multiply-then-add order, including across the
+        // near-boundary row residues where a field element has two u64
+        // representatives (`internal_layer_matches_multiply_then_add`).
+        let sum = sum_12_u128(state);
+        state[0] = internal_lane(sum, state[0], 0xc3b6c08e23ba9300);
+        state[1] = internal_lane(sum, state[1], 0xd84b5de94a324fb6);
+        state[2] = internal_lane(sum, state[2], 0x0d0c371c5b35b84f);
+        state[3] = internal_lane(sum, state[3], 0x7964f570e7188037);
+        state[4] = internal_lane(sum, state[4], 0x5daf18bbd996604b);
+        state[5] = internal_lane(sum, state[5], 0x6743bc47b9595257);
+        state[6] = internal_lane(sum, state[6], 0x5528b9362c59bb70);
+        state[7] = internal_lane(sum, state[7], 0xac45e25b7127b68b);
+        state[8] = internal_lane(sum, state[8], 0xa2077d7dfbb606b5);
+        state[9] = internal_lane(sum, state[9], 0xf3faac6faee378ae);
+        state[10] = internal_lane(sum, state[10], 0x0c6388b51545e883);
+        state[11] = internal_lane(sum, state[11], 0xd27dbb6944917b60);
     }
 
     /// Grouped x2 internal layer: sum both states first, then interleave the
     /// 24 independent lane expressions so the twelve diagonal immediates are
-    /// shared and the two dependency chains overlap. Bit-identical to two
-    /// sequential `internal_linear_layer` calls.
+    /// shared and the two dependency chains overlap. Uses the same raw-sum
+    /// delayed-reduction lane fold; bit-identical to two sequential
+    /// `internal_linear_layer` calls.
     #[inline]
     fn internal_linear_layer_x2(a: &mut [Self; WIDTH], b: &mut [Self; WIDTH]) {
-        let sum_a = sum_12(a);
-        let sum_b = sum_12(b);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
+        let sum_a = sum_12_u128(a);
+        let sum_b = sum_12_u128(b);
+        a[0] = internal_lane(sum_a, a[0], 0xc3b6c08e23ba9300);
+        b[0] = internal_lane(sum_b, b[0], 0xc3b6c08e23ba9300);
+        a[1] = internal_lane(sum_a, a[1], 0xd84b5de94a324fb6);
+        b[1] = internal_lane(sum_b, b[1], 0xd84b5de94a324fb6);
+        a[2] = internal_lane(sum_a, a[2], 0x0d0c371c5b35b84f);
+        b[2] = internal_lane(sum_b, b[2], 0x0d0c371c5b35b84f);
+        a[3] = internal_lane(sum_a, a[3], 0x7964f570e7188037);
+        b[3] = internal_lane(sum_b, b[3], 0x7964f570e7188037);
+        a[4] = internal_lane(sum_a, a[4], 0x5daf18bbd996604b);
+        b[4] = internal_lane(sum_b, b[4], 0x5daf18bbd996604b);
+        a[5] = internal_lane(sum_a, a[5], 0x6743bc47b9595257);
+        b[5] = internal_lane(sum_b, b[5], 0x6743bc47b9595257);
+        a[6] = internal_lane(sum_a, a[6], 0x5528b9362c59bb70);
+        b[6] = internal_lane(sum_b, b[6], 0x5528b9362c59bb70);
+        a[7] = internal_lane(sum_a, a[7], 0xac45e25b7127b68b);
+        b[7] = internal_lane(sum_b, b[7], 0xac45e25b7127b68b);
+        a[8] = internal_lane(sum_a, a[8], 0xa2077d7dfbb606b5);
+        b[8] = internal_lane(sum_b, b[8], 0xa2077d7dfbb606b5);
+        a[9] = internal_lane(sum_a, a[9], 0xf3faac6faee378ae);
+        b[9] = internal_lane(sum_b, b[9], 0xf3faac6faee378ae);
+        a[10] = internal_lane(sum_a, a[10], 0x0c6388b51545e883);
+        b[10] = internal_lane(sum_b, b[10], 0x0c6388b51545e883);
+        a[11] = internal_lane(sum_a, a[11], 0xd27dbb6944917b60);
+        b[11] = internal_lane(sum_b, b[11], 0xd27dbb6944917b60);
     }
 
     /// Grouped x4 internal layer: four independent sums first, then interleaved
-    /// lane updates across the four states. Bit-identical to four sequential
+    /// lane updates across the four states. Uses the same raw-sum
+    /// delayed-reduction lane fold; bit-identical to four sequential
     /// `internal_linear_layer` calls.
     #[inline]
     fn internal_linear_layer_x4(
@@ -549,58 +627,58 @@ impl Poseidon2 for F {
         c: &mut [Self; WIDTH],
         d: &mut [Self; WIDTH],
     ) {
-        let sum_a = sum_12(a);
-        let sum_b = sum_12(b);
-        let sum_c = sum_12(c);
-        let sum_d = sum_12(d);
-        a[0] = sum_a + a[0] * F(0xc3b6c08e23ba9300);
-        b[0] = sum_b + b[0] * F(0xc3b6c08e23ba9300);
-        c[0] = sum_c + c[0] * F(0xc3b6c08e23ba9300);
-        d[0] = sum_d + d[0] * F(0xc3b6c08e23ba9300);
-        a[1] = sum_a + a[1] * F(0xd84b5de94a324fb6);
-        b[1] = sum_b + b[1] * F(0xd84b5de94a324fb6);
-        c[1] = sum_c + c[1] * F(0xd84b5de94a324fb6);
-        d[1] = sum_d + d[1] * F(0xd84b5de94a324fb6);
-        a[2] = sum_a + a[2] * F(0x0d0c371c5b35b84f);
-        b[2] = sum_b + b[2] * F(0x0d0c371c5b35b84f);
-        c[2] = sum_c + c[2] * F(0x0d0c371c5b35b84f);
-        d[2] = sum_d + d[2] * F(0x0d0c371c5b35b84f);
-        a[3] = sum_a + a[3] * F(0x7964f570e7188037);
-        b[3] = sum_b + b[3] * F(0x7964f570e7188037);
-        c[3] = sum_c + c[3] * F(0x7964f570e7188037);
-        d[3] = sum_d + d[3] * F(0x7964f570e7188037);
-        a[4] = sum_a + a[4] * F(0x5daf18bbd996604b);
-        b[4] = sum_b + b[4] * F(0x5daf18bbd996604b);
-        c[4] = sum_c + c[4] * F(0x5daf18bbd996604b);
-        d[4] = sum_d + d[4] * F(0x5daf18bbd996604b);
-        a[5] = sum_a + a[5] * F(0x6743bc47b9595257);
-        b[5] = sum_b + b[5] * F(0x6743bc47b9595257);
-        c[5] = sum_c + c[5] * F(0x6743bc47b9595257);
-        d[5] = sum_d + d[5] * F(0x6743bc47b9595257);
-        a[6] = sum_a + a[6] * F(0x5528b9362c59bb70);
-        b[6] = sum_b + b[6] * F(0x5528b9362c59bb70);
-        c[6] = sum_c + c[6] * F(0x5528b9362c59bb70);
-        d[6] = sum_d + d[6] * F(0x5528b9362c59bb70);
-        a[7] = sum_a + a[7] * F(0xac45e25b7127b68b);
-        b[7] = sum_b + b[7] * F(0xac45e25b7127b68b);
-        c[7] = sum_c + c[7] * F(0xac45e25b7127b68b);
-        d[7] = sum_d + d[7] * F(0xac45e25b7127b68b);
-        a[8] = sum_a + a[8] * F(0xa2077d7dfbb606b5);
-        b[8] = sum_b + b[8] * F(0xa2077d7dfbb606b5);
-        c[8] = sum_c + c[8] * F(0xa2077d7dfbb606b5);
-        d[8] = sum_d + d[8] * F(0xa2077d7dfbb606b5);
-        a[9] = sum_a + a[9] * F(0xf3faac6faee378ae);
-        b[9] = sum_b + b[9] * F(0xf3faac6faee378ae);
-        c[9] = sum_c + c[9] * F(0xf3faac6faee378ae);
-        d[9] = sum_d + d[9] * F(0xf3faac6faee378ae);
-        a[10] = sum_a + a[10] * F(0x0c6388b51545e883);
-        b[10] = sum_b + b[10] * F(0x0c6388b51545e883);
-        c[10] = sum_c + c[10] * F(0x0c6388b51545e883);
-        d[10] = sum_d + d[10] * F(0x0c6388b51545e883);
-        a[11] = sum_a + a[11] * F(0xd27dbb6944917b60);
-        b[11] = sum_b + b[11] * F(0xd27dbb6944917b60);
-        c[11] = sum_c + c[11] * F(0xd27dbb6944917b60);
-        d[11] = sum_d + d[11] * F(0xd27dbb6944917b60);
+        let sum_a = sum_12_u128(a);
+        let sum_b = sum_12_u128(b);
+        let sum_c = sum_12_u128(c);
+        let sum_d = sum_12_u128(d);
+        a[0] = internal_lane(sum_a, a[0], 0xc3b6c08e23ba9300);
+        b[0] = internal_lane(sum_b, b[0], 0xc3b6c08e23ba9300);
+        c[0] = internal_lane(sum_c, c[0], 0xc3b6c08e23ba9300);
+        d[0] = internal_lane(sum_d, d[0], 0xc3b6c08e23ba9300);
+        a[1] = internal_lane(sum_a, a[1], 0xd84b5de94a324fb6);
+        b[1] = internal_lane(sum_b, b[1], 0xd84b5de94a324fb6);
+        c[1] = internal_lane(sum_c, c[1], 0xd84b5de94a324fb6);
+        d[1] = internal_lane(sum_d, d[1], 0xd84b5de94a324fb6);
+        a[2] = internal_lane(sum_a, a[2], 0x0d0c371c5b35b84f);
+        b[2] = internal_lane(sum_b, b[2], 0x0d0c371c5b35b84f);
+        c[2] = internal_lane(sum_c, c[2], 0x0d0c371c5b35b84f);
+        d[2] = internal_lane(sum_d, d[2], 0x0d0c371c5b35b84f);
+        a[3] = internal_lane(sum_a, a[3], 0x7964f570e7188037);
+        b[3] = internal_lane(sum_b, b[3], 0x7964f570e7188037);
+        c[3] = internal_lane(sum_c, c[3], 0x7964f570e7188037);
+        d[3] = internal_lane(sum_d, d[3], 0x7964f570e7188037);
+        a[4] = internal_lane(sum_a, a[4], 0x5daf18bbd996604b);
+        b[4] = internal_lane(sum_b, b[4], 0x5daf18bbd996604b);
+        c[4] = internal_lane(sum_c, c[4], 0x5daf18bbd996604b);
+        d[4] = internal_lane(sum_d, d[4], 0x5daf18bbd996604b);
+        a[5] = internal_lane(sum_a, a[5], 0x6743bc47b9595257);
+        b[5] = internal_lane(sum_b, b[5], 0x6743bc47b9595257);
+        c[5] = internal_lane(sum_c, c[5], 0x6743bc47b9595257);
+        d[5] = internal_lane(sum_d, d[5], 0x6743bc47b9595257);
+        a[6] = internal_lane(sum_a, a[6], 0x5528b9362c59bb70);
+        b[6] = internal_lane(sum_b, b[6], 0x5528b9362c59bb70);
+        c[6] = internal_lane(sum_c, c[6], 0x5528b9362c59bb70);
+        d[6] = internal_lane(sum_d, d[6], 0x5528b9362c59bb70);
+        a[7] = internal_lane(sum_a, a[7], 0xac45e25b7127b68b);
+        b[7] = internal_lane(sum_b, b[7], 0xac45e25b7127b68b);
+        c[7] = internal_lane(sum_c, c[7], 0xac45e25b7127b68b);
+        d[7] = internal_lane(sum_d, d[7], 0xac45e25b7127b68b);
+        a[8] = internal_lane(sum_a, a[8], 0xa2077d7dfbb606b5);
+        b[8] = internal_lane(sum_b, b[8], 0xa2077d7dfbb606b5);
+        c[8] = internal_lane(sum_c, c[8], 0xa2077d7dfbb606b5);
+        d[8] = internal_lane(sum_d, d[8], 0xa2077d7dfbb606b5);
+        a[9] = internal_lane(sum_a, a[9], 0xf3faac6faee378ae);
+        b[9] = internal_lane(sum_b, b[9], 0xf3faac6faee378ae);
+        c[9] = internal_lane(sum_c, c[9], 0xf3faac6faee378ae);
+        d[9] = internal_lane(sum_d, d[9], 0xf3faac6faee378ae);
+        a[10] = internal_lane(sum_a, a[10], 0x0c6388b51545e883);
+        b[10] = internal_lane(sum_b, b[10], 0x0c6388b51545e883);
+        c[10] = internal_lane(sum_c, c[10], 0x0c6388b51545e883);
+        d[10] = internal_lane(sum_d, d[10], 0x0c6388b51545e883);
+        a[11] = internal_lane(sum_a, a[11], 0xd27dbb6944917b60);
+        b[11] = internal_lane(sum_b, b[11], 0xd27dbb6944917b60);
+        c[11] = internal_lane(sum_c, c[11], 0xd27dbb6944917b60);
+        d[11] = internal_lane(sum_d, d[11], 0xd27dbb6944917b60);
     }
 
     #[inline]
@@ -754,6 +832,25 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
     }
 }
 
+/// Raw 128-bit row sum of twelve u64 limb representatives: at most
+/// `12 * (2^64 - 1) < 2^68`, left unreduced so each internal-layer lane can
+/// fold it into its own widened product before the lane's one reduction.
+#[inline(always)]
+fn sum_12_u128<F: PrimeField64>(inputs: &[F; WIDTH]) -> u128 {
+    inputs[0].to_noncanonical_u64() as u128
+        + inputs[1].to_noncanonical_u64() as u128
+        + inputs[2].to_noncanonical_u64() as u128
+        + inputs[3].to_noncanonical_u64() as u128
+        + inputs[4].to_noncanonical_u64() as u128
+        + inputs[5].to_noncanonical_u64() as u128
+        + inputs[6].to_noncanonical_u64() as u128
+        + inputs[7].to_noncanonical_u64() as u128
+        + inputs[8].to_noncanonical_u64() as u128
+        + inputs[9].to_noncanonical_u64() as u128
+        + inputs[10].to_noncanonical_u64() as u128
+        + inputs[11].to_noncanonical_u64() as u128
+}
+
 #[inline]
 /// Sum of 12 elements to u128; unrolled for performance.
 fn sum_12<F: PrimeField64>(inputs: &[F]) -> F {
@@ -838,6 +935,26 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
     (out(&state_a), out(&state_b), out(&state_c), out(&state_d))
 }
 
+/// Eight-input variant of `hash_quad_no_pad`, permuted via `poseidon2_x8`.
+/// Each output is bit-identical to `hash_n_to_hash_no_pad` on that input.
+pub(crate) fn hash_oct_no_pad<F: RichField + Poseidon2>(inputs: [&[F]; 8]) -> [HashOut<F>; 8] {
+    let len = inputs[0].len();
+    debug_assert!(inputs.iter().all(|i| i.len() == len));
+    let mut states = [[F::ZERO; WIDTH]; 8];
+    let mut off = 0;
+    while off < len {
+        let n = RATE.min(len - off);
+        for (state, input) in states.iter_mut().zip(inputs.iter()) {
+            state[..n].copy_from_slice(&input[off..off + n]);
+        }
+        states = F::poseidon2_x8(states);
+        off += RATE;
+    }
+    core::array::from_fn(|i| HashOut {
+        elements: states[i][..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    })
+}
+
 /// Two independent `compress` calls with their permutations interleaved via
 /// `poseidon2_x2`. Each output is bit-identical to `compress` on that pair.
 pub(crate) fn compress_pair<F: RichField + Poseidon2>(
@@ -886,6 +1003,23 @@ pub(crate) fn compress_quad<F: RichField + Poseidon2>(
         elements: state[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
     };
     [out(a), out(b), out(c), out(d)]
+}
+
+/// Eight independent `compress` calls with their permutations interleaved via
+/// `poseidon2_x8`. Each output is bit-identical to `compress` on that pair.
+pub(crate) fn compress_oct<F: RichField + Poseidon2>(
+    inputs: [(HashOut<F>, HashOut<F>); 8],
+) -> [HashOut<F>; 8] {
+    let load = |(x, y): (HashOut<F>, HashOut<F>)| {
+        let mut state = [F::ZERO; WIDTH];
+        state[..NUM_HASH_OUT_ELTS].copy_from_slice(&x.elements);
+        state[NUM_HASH_OUT_ELTS..2 * NUM_HASH_OUT_ELTS].copy_from_slice(&y.elements);
+        state
+    };
+    let states = F::poseidon2_x8(core::array::from_fn(|i| load(inputs[i])));
+    core::array::from_fn(|i| HashOut {
+        elements: states[i][..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    })
 }
 
 /// Poseidon2 hash function.
@@ -948,6 +1082,19 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     fn two_to_one_quad(inputs: [(Self::Hash, Self::Hash); 4]) -> [Self::Hash; 4] {
         compress_quad::<F>(inputs)
+    }
+
+    fn hash_or_noop_oct(inputs: [&[F]; 8]) -> [Self::Hash; 8] {
+        debug_assert!(inputs.iter().all(|i| i.len() == inputs[0].len()));
+        if inputs[0].len() * 8 <= <Self as Hasher<F>>::HASH_SIZE {
+            core::array::from_fn(|i| <Self as Hasher<F>>::hash_or_noop(inputs[i]))
+        } else {
+            hash_oct_no_pad::<F>(inputs)
+        }
+    }
+
+    fn two_to_one_oct(inputs: [(Self::Hash, Self::Hash); 8]) -> [Self::Hash; 8] {
+        compress_oct::<F>(inputs)
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -1288,6 +1435,77 @@ mod pair_hash_tests {
         }
     }
 
+    /// The eight-wide leaf sponge must reproduce `hash_or_noop` on every one
+    /// of its eight inputs, at every width the Merkle builds present -- both
+    /// sides of the `hash_or_noop` no-op boundary, non-multiples of the rate,
+    /// and the two production leaf widths (16 and 20) and FRI width (32).
+    /// Compared on raw `to_noncanonical_u64` limbs, because `HashOut`'s
+    /// `PartialEq` canonicalises and would hide a changed representative.
+    #[test]
+    fn oct_hash_matches_individual_across_widths() {
+        use plonky2_field::types::PrimeField64;
+        for width in [1, 2, 3, 4, 5, 7, 8, 9, 12, 16, 17, 20, 24, 32, 33, 87, 135, 136] {
+            let inputs: Vec<Vec<F>> = (0..8)
+                .map(|_| (0..width).map(|_| F::rand()).collect())
+                .collect();
+            let borrowed: [&[F]; 8] = core::array::from_fn(|i| inputs[i].as_slice());
+            let got = Poseidon2Hash::hash_or_noop_oct(borrowed);
+            for i in 0..8 {
+                let want = <Poseidon2Hash as Hasher<F>>::hash_or_noop(&inputs[i]);
+                assert_eq!(
+                    got[i].elements.map(|e| e.to_noncanonical_u64()),
+                    want.elements.map(|e| e.to_noncanonical_u64()),
+                    "width {width} input {i}"
+                );
+            }
+        }
+    }
+
+    /// The eight-wide compression must reproduce `two_to_one` on every one of
+    /// its eight pairs, on raw limbs.
+    #[test]
+    fn oct_compress_matches_individual() {
+        use plonky2_field::types::PrimeField64;
+        for _ in 0..64 {
+            let pairs: [(HashOut<F>, HashOut<F>); 8] = core::array::from_fn(|_| {
+                (
+                    HashOut::from_vec(F::rand_vec(NUM_HASH_OUT_ELTS)),
+                    HashOut::from_vec(F::rand_vec(NUM_HASH_OUT_ELTS)),
+                )
+            });
+            let got = Poseidon2Hash::two_to_one_oct(pairs);
+            for i in 0..8 {
+                let want = <Poseidon2Hash as Hasher<F>>::two_to_one(pairs[i].0, pairs[i].1);
+                assert_eq!(
+                    got[i].elements.map(|e| e.to_noncanonical_u64()),
+                    want.elements.map(|e| e.to_noncanonical_u64()),
+                    "pair {i}"
+                );
+            }
+        }
+    }
+
+    /// `poseidon2_x8` must reproduce `poseidon2` on each of its eight states.
+    #[test]
+    fn poseidon2_x8_matches_scalar() {
+        use plonky2_field::types::PrimeField64;
+        for _ in 0..64 {
+            let states: [[F; WIDTH]; 8] =
+                core::array::from_fn(|_| core::array::from_fn(|_| F::rand()));
+            let got = <F as Poseidon2>::poseidon2_x8(states);
+            for i in 0..8 {
+                let want = <F as Poseidon2>::poseidon2(states[i]);
+                for j in 0..WIDTH {
+                    assert_eq!(
+                        got[i][j].to_noncanonical_u64(),
+                        want[j].to_noncanonical_u64(),
+                        "state {i} lane {j}"
+                    );
+                }
+            }
+        }
+    }
+
     // Not a correctness test: times sequential sibling-leaf hashing against the
     // interleaved pair sponge. Run with --nocapture.
     #[test]
@@ -1324,5 +1542,155 @@ mod pair_hash_tests {
             new_time,
             old_time.as_secs_f64() / new_time.as_secs_f64()
         );
+    }
+
+    /// The exact worst-case internal-layer lane accumulator —
+    /// `(2^64 - 1) * diag + 12 * (2^64 - 1)` — must fit u128 for every
+    /// diagonal constant (the largest is `0xf3faac6faee378ae ≈ 0.954 * 2^64`).
+    #[test]
+    fn internal_lane_accumulator_fits_128_bits() {
+        let max = u64::MAX as u128;
+        for &diag in MATRIX_DIAG_12_U64.iter() {
+            let worst = max
+                .checked_mul(diag as u128)
+                .and_then(|x| x.checked_add(12 * max));
+            assert!(worst.is_some(), "lane accumulator overflows for diagonal {diag:#x}");
+        }
+    }
+
+    /// Historical multiply-then-add spelling of the internal layer: reduce
+    /// the row sum, reduce each product, then a canonicalizing field add.
+    fn internal_linear_layer_reference(state: &mut [F; WIDTH]) {
+        let tmp: u128 = state
+            .iter()
+            .map(|x| x.to_noncanonical_u64() as u128)
+            .sum();
+        let sum = F::from_noncanonical_u128_with_96_bits(tmp);
+        for i in 0..WIDTH {
+            state[i] = sum + state[i] * F(MATRIX_DIAG_12_U64[i]);
+        }
+    }
+
+    fn assert_internal_layer_bit_identical(case: [F; WIDTH]) {
+        let mut fused = case;
+        F::internal_linear_layer(&mut fused);
+        let mut reference = case;
+        internal_linear_layer_reference(&mut reference);
+        for i in 0..WIDTH {
+            assert_eq!(
+                fused[i].to_noncanonical_u64(),
+                reference[i].to_noncanonical_u64(),
+                "lane {i} raw limbs diverge for state {:?}",
+                case.map(|x| x.to_noncanonical_u64()),
+            );
+        }
+    }
+
+    /// The raw-sum delayed-reduction internal layer must be *bit-identical*
+    /// (raw limbs, not just canonical values) to the multiply-then-add
+    /// order. Random states alone prove nothing here: the interesting event
+    /// — a row residue in `[0, 2 * EPSILON)`, where a field element has two
+    /// u64 representatives — has probability ~2^-32 per round, so this test
+    /// constructs those states explicitly for every multiple of `p` a
+    /// twelve-limb raw sum can reach, alongside biased random sweeps.
+    #[test]
+    fn internal_layer_matches_multiply_then_add() {
+        const P: u64 = 0xFFFF_FFFF_0000_0001;
+        const EPSILON: u64 = 0xFFFF_FFFF;
+
+        // Constructed near-boundary row residues: raw sum = k * p + t with
+        // t swept densely around 0, EPSILON and 2 * EPSILON.
+        let mut targets: Vec<u64> = Vec::new();
+        for base in [0u64, EPSILON, 2 * EPSILON] {
+            for delta in 0..512u64 {
+                targets.push(base.saturating_sub(delta));
+                targets.push(base + delta);
+            }
+        }
+        for k in 0..12usize {
+            for &t in &targets {
+                let mut limbs = [0u64; WIDTH];
+                for limb in limbs.iter_mut().take(k) {
+                    *limb = P; // noncanonical representative of zero
+                }
+                limbs[k] = t;
+                assert_internal_layer_bit_identical(limbs.map(F));
+                // The same residue with a boundary product operand in the
+                // last lane (and the residue budget adjusted through lane
+                // k, keeping the raw sum's relation to k * p + t exact).
+                for w in [1u64, EPSILON, P - 1, P, u64::MAX] {
+                    let mut with_product = limbs;
+                    with_product[11] = w;
+                    assert_internal_layer_bit_identical(with_product.map(F));
+                }
+            }
+        }
+
+        // Biased random sweep: every fifth limb forced into `[p, 2^64)`.
+        let mut seed = 0xC0FFEE0DDBA11u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        for round in 0..200_000u32 {
+            let limbs: [u64; WIDTH] = core::array::from_fn(|i| {
+                let v = next();
+                if (round as usize + i) % 5 == 0 {
+                    P.wrapping_add(v % ((1u64 << 32) - 2))
+                } else {
+                    v
+                }
+            });
+            assert_internal_layer_bit_identical(limbs.map(F));
+        }
+    }
+
+    /// The grouped x2/x4 internal layers must stay bit-identical to
+    /// repeated scalar applications now that all three share the raw-sum
+    /// lane fold.
+    #[test]
+    fn internal_layer_x2_x4_match_scalar_bitwise() {
+        const P: u64 = 0xFFFF_FFFF_0000_0001;
+        let mut seed = 0xFEEDF00D5EEDu64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        for round in 0..20_000u32 {
+            let mut mk = |offset: usize| -> [F; WIDTH] {
+                core::array::from_fn(|i| {
+                    let v = next();
+                    F(if (round as usize + i + offset) % 5 == 0 {
+                        P.wrapping_add(v % ((1u64 << 32) - 2))
+                    } else {
+                        v
+                    })
+                })
+            };
+            let (a, b, c, d) = (mk(0), mk(1), mk(2), mk(3));
+            let (mut sa, mut sb, mut sc, mut sd) = (a, b, c, d);
+            F::internal_linear_layer(&mut sa);
+            F::internal_linear_layer(&mut sb);
+            F::internal_linear_layer(&mut sc);
+            F::internal_linear_layer(&mut sd);
+
+            let (mut xa, mut xb) = (a, b);
+            F::internal_linear_layer_x2(&mut xa, &mut xb);
+            let (mut qa, mut qb, mut qc, mut qd) = (a, b, c, d);
+            F::internal_linear_layer_x4(&mut qa, &mut qb, &mut qc, &mut qd);
+
+            for i in 0..WIDTH {
+                assert_eq!(xa[i].to_noncanonical_u64(), sa[i].to_noncanonical_u64());
+                assert_eq!(xb[i].to_noncanonical_u64(), sb[i].to_noncanonical_u64());
+                assert_eq!(qa[i].to_noncanonical_u64(), sa[i].to_noncanonical_u64());
+                assert_eq!(qb[i].to_noncanonical_u64(), sb[i].to_noncanonical_u64());
+                assert_eq!(qc[i].to_noncanonical_u64(), sc[i].to_noncanonical_u64());
+                assert_eq!(qd[i].to_noncanonical_u64(), sd[i].to_noncanonical_u64());
+            }
+        }
     }
 }

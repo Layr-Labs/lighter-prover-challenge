@@ -2481,6 +2481,22 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
+    // Materialize the constants/sigmas commitment before the parallel region
+    // below rather than from inside it. The batch is deferred
+    // (`LazyPolynomialBatch`), the `fill_lde_batch` gathers further down are
+    // its first consumer, and a deferred batch forced from a rayon body blocks
+    // every other worker on whichever thread is initializing it. Forcing it on
+    // this thread leaves the pool free while it materializes; the load-time
+    // prefetch normally means the value is already resident and this is a
+    // plain acquire load. Belt and braces over the materialization pool that
+    // makes the deadlock structurally impossible.
+    //
+    // The GPU range job setup above already derefs the commitment on this
+    // base (shared_columns / companion fill), but only when its admission
+    // gates pass, so it closes this window for some shapes and not others.
+    // This does it always.
+    let _ = &*prover_data.constants_sigmas_commitment;
+
     let points_batches = points.par_chunks(BATCH_SIZE);
     let num_batches = points.len().div_ceil(BATCH_SIZE);
 

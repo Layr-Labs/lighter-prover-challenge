@@ -49,6 +49,150 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // only syscall batching, never the serialized bytes.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
 
+/// Return the same top-level JSON object with the transaction array replaced by an empty one.
+///
+/// The pre-execution witness does not read transactions, but deserializing the full ranked
+/// transaction array currently delays that proof. This byte scanner only identifies the
+/// top-level `txs` value; it still leaves both parses to serde, so the unchanged full parse is the
+/// authority for every transaction and all input validation. Strings and nested arrays are
+/// skipped exactly, including escaped quotes and brackets inside strings.
+fn without_top_level_txs(json: &[u8]) -> Vec<u8> {
+    let mut i = 0;
+    let mut object_depth = 0usize;
+    let mut array_depth = 0usize;
+
+    while i < json.len() {
+        match json[i] {
+            b'"' => {
+                let string_start = i;
+                i += 1;
+                while i < json.len() {
+                    match json[i] {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                assert!(i <= json.len(), "unterminated string in prover fixture");
+
+                if object_depth == 1
+                    && array_depth == 0
+                    && &json[string_start + 1..i - 1] == b"txs"
+                {
+                    let mut value_start = i;
+                    while json.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                        value_start += 1;
+                    }
+                    assert_eq!(json.get(value_start), Some(&b':'), "txs must be an object key");
+                    value_start += 1;
+                    while json.get(value_start).is_some_and(u8::is_ascii_whitespace) {
+                        value_start += 1;
+                    }
+                    assert_eq!(json.get(value_start), Some(&b'['), "txs must be a JSON array");
+
+                    let mut value_end = value_start;
+                    let mut tx_array_depth = 0usize;
+                    while value_end < json.len() {
+                        match json[value_end] {
+                            b'"' => {
+                                value_end += 1;
+                                while value_end < json.len() {
+                                    match json[value_end] {
+                                        b'\\' => value_end += 2,
+                                        b'"' => {
+                                            value_end += 1;
+                                            break;
+                                        }
+                                        _ => value_end += 1,
+                                    }
+                                }
+                            }
+                            b'[' => {
+                                tx_array_depth += 1;
+                                value_end += 1;
+                            }
+                            b']' => {
+                                tx_array_depth -= 1;
+                                value_end += 1;
+                                if tx_array_depth == 0 {
+                                    let mut envelope = Vec::with_capacity(
+                                        json.len() - (value_end - value_start) + 2,
+                                    );
+                                    envelope.extend_from_slice(&json[..value_start]);
+                                    envelope.extend_from_slice(b"[]");
+                                    envelope.extend_from_slice(&json[value_end..]);
+                                    return envelope;
+                                }
+                            }
+                            _ => value_end += 1,
+                        }
+                    }
+                    panic!("unterminated txs array in prover fixture");
+                }
+            }
+            b'{' => {
+                object_depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                object_depth -= 1;
+                i += 1;
+            }
+            b'[' => {
+                array_depth += 1;
+                i += 1;
+            }
+            b']' => {
+                array_depth -= 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    panic!("prover fixture is missing its top-level txs array");
+}
+
+/// Number of performance ("P") cores, or `None` on hardware without a
+/// heterogeneous topology. `hw.perflevel0` is the fastest performance level;
+/// the sysctl is absent on homogeneous machines, where the call fails and the
+/// pool keeps rayon's default sizing.
+///
+/// Read through `sysctlbyname` rather than the `sysctl` binary: the ranked
+/// Seatbelt profile denies child processes. Declared as raw FFI for the same
+/// reason `pthread_set_qos_class_self_np` is in `prover.rs` — this crate links
+/// no libc crate.
+#[cfg(target_os = "macos")]
+fn performance_core_count() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const core::ffi::c_char,
+            oldp: *mut core::ffi::c_void,
+            oldlenp: *mut usize,
+            newp: *const core::ffi::c_void,
+            newlen: usize,
+        ) -> core::ffi::c_int;
+    }
+    let mut value: u32 = 0;
+    let mut len = core::mem::size_of::<u32>();
+    let rc = unsafe {
+        sysctlbyname(
+            c"hw.perflevel0.logicalcpu".as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            core::ptr::null(),
+            0,
+        )
+    };
+    // A single-thread pool would silently change behavior rather than just
+    // timing: `iop/generator.rs` gates its parallel path on
+    // `current_num_threads() > 1`. Two P-cores is the floor that keeps the
+    // same code path as the default pool.
+    (rc == 0 && value >= 2).then_some(value as usize)
+}
+
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
@@ -84,9 +228,55 @@ fn main() {
     // `log` is statically disabled in release builds: the ranked worker has no
     // log consumer, and diagnostics remain available in debug/test builds.
     // Do not link and initialize an unused logger in every scored process.
-    rayon::ThreadPoolBuilder::new()
+    // Rayon's default spawn handler starts worker threads at default QoS,
+    // which leaves every bulk proving thread eligible for efficiency-core
+    // placement and schedules it behind any QoS-classed thread in the
+    // process. The dedicated threads already opt in: the chain-fold spine
+    // runs USER_INTERACTIVE (0x21) and the tx-proof/GPU-holder threads
+    // USER_INITIATED (0x19, relative 0). Spawning the pool workers at
+    // USER_INITIATED relative -1 keeps the bulk work on performance cores
+    // in the same class, while staying strictly below both the spine and
+    // the buffer-set holders — a pool worker must never preempt the thread
+    // holding the single GPU buffer set (the inversion those helpers exist
+    // to prevent). Scheduling only: thread count, stack size, and all
+    // computed values are unchanged, so proof bytes are untouched.
+    //
+    // Sizing the pool to the performance cores alone, rather than every
+    // logical CPU, is the same idea one step further. QoS asks the scheduler
+    // to prefer P-cores but does not stop it from placing a worker on an
+    // efficiency core, and the tree work is split into a fixed count, not
+    // work-stolen down to nothing: `merkle_tree.rs` walks exactly
+    // `1 << cap_height` = 16 independent subtrees with `par_chunks_exact_mut`
+    // (both at build and at the gather), and `cap_height` is frozen at 4. With
+    // a thread per logical CPU those 16 tasks land in two uneven rounds whose
+    // makespan is set by whichever chunks drew an efficiency core; with one
+    // thread per P-core they divide exactly, two rounds of equal-speed cores.
+    // The harness runs scored workers strictly sequentially, so the cores this
+    // gives up are idle rather than serving a concurrent worker, and the pool
+    // never drops below two threads — `iop/generator.rs` selects a different
+    // code path at one.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut pool = rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
-        .build_global()
+        .spawn_handler(|thread| {
+            let mut builder = std::thread::Builder::new();
+            if let Some(name) = thread.name() {
+                builder = builder.name(name.to_owned());
+            }
+            if let Some(stack_size) = thread.stack_size() {
+                builder = builder.stack_size(stack_size);
+            }
+            builder.spawn(|| {
+                prover::mark_thread_user_initiated_below();
+                thread.run()
+            })?;
+            Ok(())
+        });
+    #[cfg(target_os = "macos")]
+    if let Some(p_cores) = performance_core_count() {
+        pool = pool.num_threads(p_cores);
+    }
+    pool.build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
     plonky2::util::profile::counter(
@@ -95,12 +285,27 @@ fn main() {
         rayon::current_num_threads() as u64,
     );
 
-    // Fixture parse overlaps the pre-execution circuit load; both are fast.
-    let (block, pre_circuits) = rayon::join(
-        || {
+    let json = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span = plonky2::util::profile::span("startup", "fixture_read");
+        fs::read(&fixture).expect("cannot read prover fixture")
+    };
+    let pre_json = {
+        #[cfg(feature = "diagnostic_profile")]
+        let _span = plonky2::util::profile::span("startup", "fixture_split_transactions");
+        without_top_level_txs(&json)
+    };
+    // The unchanged authoritative parse starts immediately on its own thread. In
+    // parallel, serde parses the much smaller transaction-free envelope needed by
+    // the pre-execution proof while the pre circuit loads, so the pre-execution
+    // witness starts without waiting for the full transaction parse; the
+    // transaction pipeline joins the authoritative `Block` before consuming it.
+    let block_handle = std::thread::Builder::new()
+        .name("fixture-full-parse".into())
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .spawn(move || {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "fixture_read_parse");
-            let json = fs::read(&fixture).expect("cannot read prover fixture");
             Block::<F>::from_json_with_empty_txs(
                 &json,
                 HEAVY_TX_PER_PROOF,
@@ -109,6 +314,14 @@ fn main() {
                 PUBLIC_LIGHT_TX_COUNT,
             )
             .expect("invalid prover fixture")
+        })
+        .expect("cannot start full fixture parse");
+    // Envelope parse overlaps the pre-execution circuit load; both are fast.
+    let (pre_block, pre_circuits) = rayon::join(
+        || {
+            #[cfg(feature = "diagnostic_profile")]
+            let _span = plonky2::util::profile::span("startup", "fixture_envelope_parse");
+            serde_json::from_slice::<Block<F>>(&pre_json).expect("invalid prover fixture envelope")
         },
         || {
             #[cfg(feature = "diagnostic_profile")]
@@ -143,8 +356,13 @@ fn main() {
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = plonky2::util::profile::span("startup", "pre_execution_native_witness");
-            circuit::block_pre_execution::BlockPreExec::from_block(&block)
+            circuit::block_pre_execution::BlockPreExec::from_block(&pre_block)
         };
+        // The native pre witness owns everything the startup proof needs. Do not
+        // retain the transaction-free parse beside the authoritative full block
+        // for the rest of the worker.
+        drop(pre_block);
+        drop(pre_json);
         let pre_handle = std::thread::Builder::new()
             .name("pre-exec-startup".into())
             .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -172,7 +390,7 @@ fn main() {
                 // contend for the machine's memory. Value-exact and free: no
                 // quantity is computed differently and no work is added — storage
                 // that no subsequent read can reach is returned earlier.
-                pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+                pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default().into();
                 (pre_target, pre_data, pre_proof)
             })
             .expect("pre-execution startup thread must start");
@@ -191,6 +409,13 @@ fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _pre_wait = plonky2::util::profile::span("wait", "pre_execution_join");
     let (pre_target, pre_data, pre_proof) = pre_handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    // Join the authoritative full-block parse now that the pre-execution proof is
+    // running (or done); the transaction pipeline cannot consume the block before
+    // this join, which keeps the tx-free envelope and the full parse bit-identical
+    // to the single parse master produced.
+    let block = block_handle
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     #[cfg(feature = "diagnostic_profile")]

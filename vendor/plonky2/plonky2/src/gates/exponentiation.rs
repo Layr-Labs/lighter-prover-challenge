@@ -5,11 +5,14 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::any::TypeId;
 use core::marker::PhantomData;
 
 use anyhow::Result;
 
 use crate::field::extension::Extendable;
+use crate::field::goldilocks_extensions::base_constraint_mul2_accumulate;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::ops::Square;
 use crate::field::packed::PackedField;
 use crate::field::types::Field;
@@ -138,12 +141,53 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
         self.eval_unfiltered_base_batch_packed(vars_base)
     }
 
+    /// For the production Goldilocks configuration the filtered transition
+    /// `filter * (prev * mul_by - interm)` is folded into a 160-bit
+    /// accumulator with one `reduce160` per constraint
+    /// (`base_constraint_mul2_accumulate`); every other configuration takes
+    /// the packed path.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() {
+            let n = vars_base.len();
+            assert_eq!(filters.len(), n);
+            assert!(
+                combined_gate_constraints.len()
+                    >= <Self as Gate<F, D>>::num_constraints(self) * n
+            );
+            // SAFETY (all casts below): the `TypeId` comparison proves `F` is
+            // exactly `GoldilocksField`; only the generic spelling differs,
+            // so the pointer reinterpretations preserve layout, length and
+            // alignment exactly.
+            let wires = unsafe {
+                core::slice::from_raw_parts(
+                    vars_base.local_wires.as_ptr().cast::<GoldilocksField>(),
+                    vars_base.local_wires.len(),
+                )
+            };
+            let filters = unsafe {
+                core::slice::from_raw_parts(filters.as_ptr().cast::<GoldilocksField>(), n)
+            };
+            let combined = unsafe {
+                core::slice::from_raw_parts_mut(
+                    combined_gate_constraints
+                        .as_mut_ptr()
+                        .cast::<GoldilocksField>(),
+                    combined_gate_constraints.len(),
+                )
+            };
+            return exponentiation_accumulate_goldilocks(
+                self.num_power_bits,
+                n,
+                wires,
+                filters,
+                combined,
+            );
+        }
         self.eval_unfiltered_base_batch_accumulate_packed(
             vars_base,
             filters,
@@ -214,6 +258,97 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for Exponentiation
 
     fn num_constraints(&self) -> usize {
         self.num_power_bits + 1
+    }
+}
+
+/// Goldilocks fast path for `ExponentiationGate`'s filtered batch
+/// accumulate. Constraint `i` is the transition
+/// `prev_i * mul_by_i - interm_i` with `prev_i = interm_{i-1}^2` (`1` for
+/// `i == 0`) and `mul_by_i = 1 + bit * (base - 1)` — the same rewrite the
+/// packed path uses. Filtered and folded as
+/// `acc + (filter * prev) * mul_by + (-filter) * interm`, one `reduce160`
+/// per constraint via `base_constraint_mul2_accumulate`; the final
+/// constraint `filter * (output - interm_last)` is the same two-product
+/// shape. Value-identical (canonically) to the packed
+/// evaluate-then-multiply-add path; raw representatives may differ, which
+/// every consumer tolerates.
+fn exponentiation_accumulate_goldilocks(
+    num_power_bits: usize,
+    n: usize,
+    wires: &[GoldilocksField],
+    filters: &[GoldilocksField],
+    combined_gate_constraints: &mut [GoldilocksField],
+) {
+    let nb = num_power_bits;
+    // Wire layout (see the `wire_*` accessors): base at column 0, power bits
+    // at `1..1 + nb` (little-endian), output at `1 + nb`, intermediates at
+    // `2 + nb..2 + 2 * nb`.
+    let base_col = &wires[..n];
+    let out_col = &wires[(1 + nb) * n..][..n];
+    let interm0 = 2 + nb;
+
+    // Per-point `-(filter)` and `base - 1`, shared across all constraints.
+    // Batches are 32 points; keep the small buffers on the stack when they
+    // fit.
+    const STACK_POINTS: usize = 128;
+    let mut scratch_stack = [GoldilocksField(0); 2 * STACK_POINTS];
+    let mut scratch_heap;
+    let scratch: &mut [GoldilocksField] = if n <= STACK_POINTS {
+        &mut scratch_stack[..2 * n]
+    } else {
+        scratch_heap = vec![GoldilocksField(0); 2 * n];
+        &mut scratch_heap
+    };
+    let (neg_f, base_minus_one) = scratch.split_at_mut(n);
+    for p in 0..n {
+        neg_f[p] = -filters[p];
+        base_minus_one[p] = base_col[p] - GoldilocksField(1);
+    }
+
+    for i in 0..nb {
+        // power_bits is in LE order, but the transitions accumulate in BE
+        // order.
+        let bit_col = &wires[(1 + nb - i - 1) * n..][..n];
+        let interm_col = &wires[(interm0 + i) * n..][..n];
+        let combined = &mut combined_gate_constraints[i * n..][..n];
+        if i == 0 {
+            for p in 0..n {
+                let mul_by = Field::multiply_accumulate(&GoldilocksField(1), bit_col[p], base_minus_one[p]);
+                // prev == 1, so filter * prev is just the filter.
+                combined[p] = base_constraint_mul2_accumulate(
+                    combined[p],
+                    filters[p],
+                    mul_by,
+                    neg_f[p],
+                    interm_col[p],
+                );
+            }
+        } else {
+            let prev_col = &wires[(interm0 + i - 1) * n..][..n];
+            for p in 0..n {
+                let prev = prev_col[p] * prev_col[p];
+                let mul_by = Field::multiply_accumulate(&GoldilocksField(1), bit_col[p], base_minus_one[p]);
+                combined[p] = base_constraint_mul2_accumulate(
+                    combined[p],
+                    filters[p] * prev,
+                    mul_by,
+                    neg_f[p],
+                    interm_col[p],
+                );
+            }
+        }
+    }
+
+    let last_col = &wires[(interm0 + nb - 1) * n..][..n];
+    let combined = &mut combined_gate_constraints[nb * n..][..n];
+    for p in 0..n {
+        combined[p] = base_constraint_mul2_accumulate(
+            combined[p],
+            filters[p],
+            out_col[p],
+            neg_f[p],
+            last_col[p],
+        );
     }
 }
 
@@ -539,4 +674,62 @@ mod tests {
         );
     }
 
+    /// The Goldilocks delayed-reduction accumulate must agree canonically
+    /// with the packed evaluate-then-multiply-add path over ragged batch
+    /// sizes, random filters and initial buffer contents, and deliberately
+    /// noncanonical (`>= p`) wire representatives.
+    #[test]
+    fn accumulate_fast_path_matches_packed() {
+        use crate::field::types::{Field64, PrimeField64};
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = ExponentiationGate::<F, D>::new_from_config(
+            &crate::plonk::circuit_data::CircuitConfig::standard_recursion_config(),
+        );
+        let num_wires = <ExponentiationGate<F, D> as Gate<F, D>>::num_wires(&gate);
+        let num_constraints = <ExponentiationGate<F, D> as Gate<F, D>>::num_constraints(&gate);
+
+        let mut seed = 0xB16B00B5CAFEF00Du64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        // Every fifth raw limb is forced into `[p, 2^64)`, the noncanonical
+        // band the quotient wire columns legitimately contain.
+        let mut raw = |k: usize| {
+            let v = next();
+            if k % 5 == 0 {
+                GoldilocksField(F::ORDER.wrapping_add(v % ((1u64 << 32) - 2)))
+            } else {
+                GoldilocksField(v)
+            }
+        };
+
+        let pih = HashOut::<F>::ZERO;
+        for &n in &[1usize, 3, 4, 5, 7, 31, 32, 33] {
+            let wires: Vec<F> = (0..num_wires * n).map(&mut raw).collect();
+            let constants: Vec<F> = Vec::new();
+            let filters: Vec<F> = (0..n).map(|p| raw(3 * p + 1)).collect();
+            let initial: Vec<F> = (0..num_constraints * n).map(&mut raw).collect();
+
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &pih);
+            let mut fast = initial.clone();
+            <ExponentiationGate<F, D> as Gate<F, D>>::eval_unfiltered_base_batch_accumulate(
+                &gate, vars, &filters, &mut fast,
+            );
+            let mut packed = initial;
+            gate.eval_unfiltered_base_batch_accumulate_packed(vars, &filters, &mut packed);
+
+            for (i, (a, b)) in fast.iter().zip(&packed).enumerate() {
+                assert_eq!(
+                    a.to_canonical_u64(),
+                    b.to_canonical_u64(),
+                    "n = {n}, slot {i}"
+                );
+            }
+        }
+    }
 }

@@ -906,7 +906,7 @@ pub trait Read {
         let generator_indices_by_watches =
             GeneratorWatchIndex::from_map(generator_indices_by_watches);
 
-        let constants_sigmas_commitment = self.read_polynomial_batch()?;
+        let constants_sigmas_commitment = self.read_polynomial_batch()?.into();
         let sigmas_len = self.read_usize()?;
         let mut sigmas = Vec::with_capacity(sigmas_len);
         for _ in 0..sigmas_len {

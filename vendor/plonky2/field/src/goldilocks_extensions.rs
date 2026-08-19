@@ -572,6 +572,118 @@ pub fn ext2_mul_add(
     QuadraticExtension([c0, c1])
 }
 
+/// Fused filtered gate-constraint multiply-accumulate for the Goldilocks
+/// quadratic extension: folds one filtered `output - scale * m0 * m1`
+/// constraint term into an already-accumulated constraint value with a
+/// single `reduce160` per extension limb.
+///
+/// The caller pre-reduces `filter` and pre-negates the filtered scale
+/// (`neg_scale = -(filter * scale)`), so per limb `d` this computes the
+/// exact 160-bit integer
+///
+/// ```text
+/// acc[d] + filter * output[d] + neg_scale * product[d]
+/// ```
+///
+/// where `product = m0 * m1` is the delayed-reduction `ext2_mul` of the raw
+/// wire limbs. As field values this equals
+/// `acc + filter * (output - scale * m0 * m1)`, the term the generic
+/// evaluate-then-`batch_multiply_add_inplace` path adds; the raw
+/// representative may differ (both are sub-2^64 and every consumer is
+/// congruence-preserving).
+///
+/// Overflow bound: `acc[d]` is a raw limb below `2^64`; `filter` and
+/// `neg_scale` are reduced (below `2^64`) and the wire/product limbs are
+/// arbitrary raw representatives below `2^64`, so each of the two products
+/// is below `(2^64 - 1)^2 < 2^128` and the accumulator stays below
+///
+/// ```text
+/// 2^64 + 2 * 2^128 < 2^130 << 2^160 - 2^128 + 2^96,
+/// ```
+///
+/// far inside `reduce160`'s precondition (`u160_bounds_for_constraint_
+/// accumulators` asserts this, including the three-product mul-add form).
+#[inline(always)]
+pub fn ext2_constraint_mul_accumulate(
+    acc: [GoldilocksField; 2],
+    filter: GoldilocksField,
+    output: [GoldilocksField; 2],
+    neg_scale: GoldilocksField,
+    m0: [GoldilocksField; 2],
+    m1: [GoldilocksField; 2],
+) -> [GoldilocksField; 2] {
+    let product = ext2_mul([m0[0].0, m0[1].0], [m1[0].0, m1[1].0]);
+    let mut res = [GoldilocksField::ZERO; 2];
+    for d in 0..2 {
+        let (mut lo, mut hi) = (acc[d].0 as u128, 0u32);
+        u160_add_product(&mut lo, &mut hi, filter.0, output[d].0);
+        u160_add_product(&mut lo, &mut hi, neg_scale.0, product[d].0);
+        // SAFETY: the bound documented above (< 2^130) is far below
+        // reduce160's `2^160 - 2^128 + 2^96` precondition.
+        res[d] = unsafe { reduce160(lo, hi) };
+    }
+    res
+}
+
+/// [`ext2_constraint_mul_accumulate`] plus one scaled addend term — the
+/// `ArithmeticExtensionGate` constraint shape
+/// `output - scale0 * m0 * m1 - scale1 * addend`, filtered. Exactly one
+/// extra `u160_add_product` per limb over the mul-only form, and still one
+/// `reduce160` per limb.
+///
+/// Overflow bound: three products instead of two, so the accumulator stays
+/// below `2^64 + 3 * 2^128 < 2^130`, far inside `reduce160`'s
+/// `2^160 - 2^128 + 2^96` precondition.
+#[inline(always)]
+pub fn ext2_constraint_mul_add_accumulate(
+    acc: [GoldilocksField; 2],
+    filter: GoldilocksField,
+    output: [GoldilocksField; 2],
+    neg_scale0: GoldilocksField,
+    m0: [GoldilocksField; 2],
+    m1: [GoldilocksField; 2],
+    neg_scale1: GoldilocksField,
+    addend: [GoldilocksField; 2],
+) -> [GoldilocksField; 2] {
+    let product = ext2_mul([m0[0].0, m0[1].0], [m1[0].0, m1[1].0]);
+    let mut res = [GoldilocksField::ZERO; 2];
+    for d in 0..2 {
+        let (mut lo, mut hi) = (acc[d].0 as u128, 0u32);
+        u160_add_product(&mut lo, &mut hi, filter.0, output[d].0);
+        u160_add_product(&mut lo, &mut hi, neg_scale0.0, product[d].0);
+        u160_add_product(&mut lo, &mut hi, neg_scale1.0, addend[d].0);
+        // SAFETY: the bound documented above (< 2^130) is far below
+        // reduce160's `2^160 - 2^128 + 2^96` precondition.
+        res[d] = unsafe { reduce160(lo, hi) };
+    }
+    res
+}
+
+/// Base-field sibling of the constraint accumulators:
+/// `reduce160(acc + a * b + c * d)` — two widened products folded into a
+/// raw accumulator limb with one reduction. The exponentiation gate's
+/// filtered transition `acc + (filter * prev) * mul_by + (-filter) * interm`
+/// is this shape.
+///
+/// Overflow bound: `acc < 2^64` plus two products below `(2^64 - 1)^2`
+/// keeps the total below `2^64 + 2 * 2^128 < 2^130`, far inside
+/// `reduce160`'s `2^160 - 2^128 + 2^96` precondition.
+#[inline(always)]
+pub fn base_constraint_mul2_accumulate(
+    acc: GoldilocksField,
+    a: GoldilocksField,
+    b: GoldilocksField,
+    c: GoldilocksField,
+    d: GoldilocksField,
+) -> GoldilocksField {
+    let (mut lo, mut hi) = (acc.0 as u128, 0u32);
+    u160_add_product(&mut lo, &mut hi, a.0, b.0);
+    u160_add_product(&mut lo, &mut hi, c.0, d.0);
+    // SAFETY: the bound documented above (< 2^130) is far below reduce160's
+    // `2^160 - 2^128 + 2^96` precondition.
+    unsafe { reduce160(lo, hi) }
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///
@@ -1190,6 +1302,194 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
     let c3 = ext5_add_prods3(&a, &b);
     let c4 = ext5_add_prods4(&a, &b);
     [c0, c1, c2, c3, c4]
+}
+
+#[cfg(test)]
+mod constraint_accumulate_tests {
+    use super::*;
+    use crate::extension::quadratic::QuadraticExtension as Q2;
+    use crate::extension::FieldExtension;
+    use crate::goldilocks_field::GoldilocksField as GF;
+    use crate::types::{Field64, PrimeField64, Sample};
+
+    /// The exact worst-case accumulator integers of the constraint
+    /// accumulators, checked against `reduce160`'s precondition. The largest
+    /// form (`ext2_constraint_mul_add_accumulate`) is one raw limb plus
+    /// three full products:
+    /// `(2^64 - 1) + 3 * (2^64 - 1)^2 < 2^64 + 3 * 2^128 < 2^130`.
+    #[test]
+    fn u160_bounds_for_constraint_accumulators() {
+        // 160-bit arithmetic via (u128 lo, u32 hi) pairs, mirroring the
+        // accumulator representation itself.
+        let max_limb = (u64::MAX as u128) * (u64::MAX as u128);
+        let (mut lo, mut hi) = (u64::MAX as u128, 0u32);
+        for _ in 0..3 {
+            let (sum, carry) = lo.overflowing_add(max_limb);
+            lo = sum;
+            hi += carry as u32;
+        }
+        // < 2^130 means hi < 4.
+        assert!(hi < 4, "worst-case accumulator reached 2^130");
+        // reduce160 precondition: x < 2^160 - 2^128 + 2^96, i.e.
+        // hi < 2^32 - 1, or hi == 2^32 - 1 with lo < 2^96. hi < 4 is far
+        // below.
+        assert!((hi as u64) < (u32::MAX as u64));
+    }
+
+    fn naive_filtered_mul_add(
+        acc: [GF; 2],
+        filter: GF,
+        output: [GF; 2],
+        scale0: GF,
+        m0: [GF; 2],
+        m1: [GF; 2],
+        scale1: GF,
+        addend: [GF; 2],
+    ) -> [GF; 2] {
+        let acc = Q2(acc);
+        let output = Q2(output);
+        let m0 = Q2(m0);
+        let m1 = Q2(m1);
+        let addend = Q2(addend);
+        let constraint = output
+            - FieldExtension::<2>::scalar_mul(&(m0 * m1), scale0)
+            - FieldExtension::<2>::scalar_mul(&addend, scale1);
+        let Q2(res) = acc + FieldExtension::<2>::scalar_mul(&constraint, filter);
+        res
+    }
+
+    fn assert_canonical_eq(a: [GF; 2], b: [GF; 2]) {
+        assert_eq!(a[0].to_canonical_u64(), b[0].to_canonical_u64());
+        assert_eq!(a[1].to_canonical_u64(), b[1].to_canonical_u64());
+    }
+
+    /// Representatives that exercise both canonical values and raw limbs in
+    /// `[p, 2^64)`, which the quotient wire columns legitimately contain.
+    fn interesting_raw() -> Vec<u64> {
+        let p = GF::ORDER;
+        vec![0, 1, 2, p - 1, p, p + 1, u64::MAX - 1, u64::MAX, 0xFFFF_FFFF, p - 2]
+    }
+
+    #[test]
+    fn mul_accumulate_matches_naive_on_boundary_representatives() {
+        let raws = interesting_raw();
+        for (i, &a) in raws.iter().enumerate() {
+            for (j, &b) in raws.iter().enumerate() {
+                let acc = [GF(a), GF(b)];
+                let filter = GF(raws[(i + j) % raws.len()]);
+                let output = [GF(b), GF(a)];
+                let m0 = [GF(a), GF(a)];
+                let m1 = [GF(b), GF(b)];
+                let scale = GF(raws[(i * 3 + j) % raws.len()]);
+                // The gate fast path feeds a *reduced* filter and a reduced,
+                // negated filtered scale; reproduce that contract here.
+                let filter = GF::from_noncanonical_u64(filter.0);
+                let neg_scale = -(filter * GF::from_noncanonical_u64(scale.0));
+                let fast =
+                    ext2_constraint_mul_accumulate(acc, filter, output, neg_scale, m0, m1);
+                let naive = naive_filtered_mul_add(
+                    acc,
+                    filter,
+                    output,
+                    GF::from_noncanonical_u64(scale.0),
+                    m0,
+                    m1,
+                    GF::ZERO,
+                    [GF::ZERO; 2],
+                );
+                assert_canonical_eq(fast, naive);
+            }
+        }
+    }
+
+    #[test]
+    fn mul_add_accumulate_matches_naive_on_random_and_boundary() {
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed
+        };
+        // Random raw representatives, full u64 range.
+        for _ in 0..20_000 {
+            let acc = [GF(next()), GF(next())];
+            let filter = GF::from_noncanonical_u64(next());
+            let output = [GF(next()), GF(next())];
+            let m0 = [GF(next()), GF(next())];
+            let m1 = [GF(next()), GF(next())];
+            let addend = [GF(next()), GF(next())];
+            let scale0 = GF::from_noncanonical_u64(next());
+            let scale1 = GF::from_noncanonical_u64(next());
+            let fast = ext2_constraint_mul_add_accumulate(
+                acc,
+                filter,
+                output,
+                -(filter * scale0),
+                m0,
+                m1,
+                -(filter * scale1),
+                addend,
+            );
+            let naive =
+                naive_filtered_mul_add(acc, filter, output, scale0, m0, m1, scale1, addend);
+            assert_canonical_eq(fast, naive);
+        }
+        // Boundary sweep.
+        let raws = interesting_raw();
+        for &a in &raws {
+            for &b in &raws {
+                let acc = [GF(a), GF(b)];
+                let filter = GF::from_noncanonical_u64(b);
+                let output = [GF(a), GF(a)];
+                let m0 = [GF(b), GF(a)];
+                let m1 = [GF(a), GF(b)];
+                let addend = [GF(b), GF(b)];
+                let scale0 = GF::from_noncanonical_u64(a);
+                let scale1 = GF::from_noncanonical_u64(b);
+                let fast = ext2_constraint_mul_add_accumulate(
+                    acc,
+                    filter,
+                    output,
+                    -(filter * scale0),
+                    m0,
+                    m1,
+                    -(filter * scale1),
+                    addend,
+                );
+                let naive =
+                    naive_filtered_mul_add(acc, filter, output, scale0, m0, m1, scale1, addend);
+                assert_canonical_eq(fast, naive);
+            }
+        }
+    }
+
+    #[test]
+    fn base_mul2_accumulate_matches_naive() {
+        let raws = interesting_raw();
+        for &a in &raws {
+            for &b in &raws {
+                for &c in &raws {
+                    let acc = GF(c);
+                    let x = GF::from_noncanonical_u64(a);
+                    let y = GF(b);
+                    let z = GF::from_noncanonical_u64(b);
+                    let w = GF(a);
+                    let fast = base_constraint_mul2_accumulate(acc, x, y, z, w);
+                    let naive = acc + x * y + z * w;
+                    assert_eq!(fast.to_canonical_u64(), naive.to_canonical_u64());
+                }
+            }
+        }
+        for _ in 0..10_000 {
+            let acc = GF(GF::rand().0);
+            let x = GF::rand();
+            let y = GF(u64::MAX - GF::rand().0 % 1024);
+            let z = GF::rand();
+            let w = GF(GF::ORDER.wrapping_add(GF::rand().0 % 1024));
+            let fast = base_constraint_mul2_accumulate(acc, x, y, z, w);
+            let naive = acc + x * y + z * w;
+            assert_eq!(fast.to_canonical_u64(), naive.to_canonical_u64());
+        }
+    }
 }
 
 #[cfg(test)]

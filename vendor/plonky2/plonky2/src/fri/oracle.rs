@@ -40,6 +40,267 @@ pub const SALT_SIZE: usize = 4;
 /// trees (`new_columns`) remain on.
 const GPU_NTT_COMMITMENTS: bool = false;
 
+/// A [`PolynomialBatch`] whose materialization (IFFT + LDE + Merkle tree) may
+/// be deferred off the thread that constructs it and overlapped with unrelated
+/// work, without changing any computed value.
+///
+/// Motivation: the embedded-circuit loader recomputes each circuit's
+/// constants/sigmas commitment at startup, and that recompute sits on the
+/// worker's critical path (the loads are joined before proving begins) while
+/// its first *consumer* — the quotient evaluation, then the FRI openings — runs
+/// hundreds of milliseconds later. Wrapping the commitment lets the loader
+/// return as soon as the commitment's *inputs* exist and materialize it on the
+/// global pool underneath the witness phase instead.
+///
+/// Semantics: a `ready` batch behaves exactly like a plain [`PolynomialBatch`].
+/// A `deferred` batch holds the closure that produces it; the first access
+/// (any deref) runs the closure to completion — under [`std::sync::OnceLock`],
+/// so exactly one thread computes it and concurrent accessors block until the
+/// value exists, then read it forever after through a lock-free acquire load.
+/// [`Self::spawn_prefetch`] starts that materialization in the background.
+///
+/// Deadlock freedom rests entirely on [`materialize`] running the closure on a
+/// pool of its own. `get_or_init` blocks *every* accessor but the first, and
+/// the closure is itself heavily parallel, so if it ran on the global pool the
+/// two facts compose into a cycle: an off-pool thread wins the cell, its
+/// closure injects work into the global pool and waits for a worker, and every
+/// worker meanwhile parks on the cell that thread holds. Nothing can then run.
+/// That is not hypothetical — it is the hang this indirection exists to
+/// prevent; see [`materialize`].
+///
+/// Value-exactness: the closure is the same computation the eager path ran,
+/// moved in time only. Nothing about the produced batch differs.
+pub struct LazyPolynomialBatch<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+> {
+    state: std::sync::Arc<LazyBatchState<F, C, D>>,
+}
+
+type LazyBatchJob<F, C, const D: usize> =
+    Box<dyn FnOnce() -> PolynomialBatch<F, C, D> + Send>;
+
+struct LazyBatchState<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> {
+    cell: std::sync::OnceLock<PolynomialBatch<F, C, D>>,
+    /// The pending materialization, if any. Taken (exactly once) inside the
+    /// `cell` initialization closure, so the lock is touched only before the
+    /// value exists — never on the steady-state read path.
+    job: std::sync::Mutex<Option<LazyBatchJob<F, C, D>>>,
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    LazyBatchState<F, C, D>
+{
+    fn force(&self) -> &PolynomialBatch<F, C, D> {
+        self.cell.get_or_init(|| {
+            let job = self
+                .job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .expect("lazy polynomial batch constructed without a value or a job");
+            materialize(job)
+        })
+    }
+}
+
+/// Threads that materialize deferred batches, kept out of the global pool.
+///
+/// The closure runs while its `OnceLock` is held, and every other accessor
+/// blocks on that lock. Running it on the global pool therefore makes the
+/// initializer's progress depend on global-pool capacity that its own waiters
+/// have consumed — an off-pool initializer (`Registry::in_worker_cold` injects
+/// and waits) plus enough waiting workers is a permanent deadlock at 0% CPU.
+/// Observed: every pool worker parked in `once::queue::wait` under
+/// `fill_lde_batch`, while the off-pool thread proving the pre-execution
+/// circuit held the cell and waited for a worker that could never come.
+///
+/// Its own pool breaks the cycle structurally: these threads never touch a
+/// deferred batch, so they are always free to finish the closure no matter
+/// what the global pool is doing.
+///
+/// Deliberately small. The materialization is one IFFT + LDE + Merkle tree
+/// that has hundreds of milliseconds of slack before its first consumer, and
+/// it overlaps the witness phase, which wants the global pool for the scored
+/// critical path; a narrow pool bounds the oversubscription rather than
+/// doubling the machine's runnable threads. Built on first use, so a process
+/// that never defers a batch never creates it.
+#[cfg(feature = "parallel")]
+const MATERIALIZE_THREADS: usize = 4;
+
+/// Runs `job` off the global rayon pool. See [`MATERIALIZE_THREADS`].
+///
+/// A build failure falls back to running the closure inline: strictly the old
+/// behaviour, which is correct whenever the caller is not in the deadlock
+/// shape, and there is nothing better to do with a pool that will not start.
+///
+/// At most one job may occupy the pool at a time (the admission lock below).
+/// The jobs stream their LDE through the process-global Metal
+/// `STREAMED_BUFFERS` mutex, which `from_coeffs` HOLDS across its parallel
+/// column fill; a rayon worker that blocks in `join` while holding it will
+/// steal whatever else sits in its registry's queue. With two materialize
+/// jobs admitted at once, the stolen work is the second job, whose first act
+/// is to lock the same non-reentrant mutex — the thread deadlocks on itself
+/// at 0% CPU (observed: `lazy-batch-1` nested prefetch job #2 inside job
+/// #1's `join_context` wait, parked in `pthread_mutex_lock` on the
+/// `STREAMED_BUFFERS` lock its own outer frame held). Admission is taken by
+/// the *calling* thread — never a pool worker, see [`spawn_prefetch`] — so
+/// the pool's queue holds at most one materialize job and a join-waiting
+/// worker can only ever steal lock-free fragments of the job it is already
+/// running.
+#[cfg(feature = "parallel")]
+fn materialize<T: Send>(job: impl FnOnce() -> T + Send) -> T {
+    static ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    match materialize_pool() {
+        Some(pool) => {
+            let _admitted = ADMISSION
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pool.install(job)
+        }
+        None => job(),
+    }
+}
+
+#[cfg(not(feature = "parallel"))]
+fn materialize<T>(job: impl FnOnce() -> T) -> T {
+    job()
+}
+
+#[cfg(feature = "parallel")]
+fn materialize_pool() -> Option<&'static plonky2_maybe_rayon::rayon::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<plonky2_maybe_rayon::rayon::ThreadPool>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+            .num_threads(MATERIALIZE_THREADS)
+            .thread_name(|index| format!("lazy-batch-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    LazyPolynomialBatch<F, C, D>
+{
+    /// Wraps an already-materialized batch; every access is a plain read.
+    pub fn ready(batch: PolynomialBatch<F, C, D>) -> Self {
+        let state = LazyBatchState {
+            cell: std::sync::OnceLock::from(batch),
+            job: std::sync::Mutex::new(None),
+        };
+        Self {
+            state: std::sync::Arc::new(state),
+        }
+    }
+
+    /// Wraps a pending materialization. `job` runs at most once — on the first
+    /// deref or when a [`Self::spawn_prefetch`] task gets scheduled, whichever
+    /// happens first.
+    pub fn deferred(job: impl FnOnce() -> PolynomialBatch<F, C, D> + Send + 'static) -> Self {
+        let state = LazyBatchState {
+            cell: std::sync::OnceLock::new(),
+            job: std::sync::Mutex::new(Some(Box::new(job) as LazyBatchJob<F, C, D>)),
+        };
+        Self {
+            state: std::sync::Arc::new(state),
+        }
+    }
+
+    /// Starts materialization in the background (without `parallel`,
+    /// materializes inline). Idempotent; a consumer that derefs first simply
+    /// does the work itself and the prefetch thread finds the cell populated.
+    ///
+    /// Spawned as a dedicated OS thread rather than a task on any rayon pool,
+    /// so a prefetch never occupies a pool worker and — critically — is never
+    /// *stealable* by one; see the body and [`materialize`] for the
+    /// work-stealing self-deadlock this rules out.
+    pub fn spawn_prefetch(&self)
+    where
+        F: 'static,
+        C: 'static,
+    {
+        #[cfg(feature = "parallel")]
+        {
+            // A plain OS thread, deliberately NOT a task on any rayon pool.
+            // The force path takes the materialize admission lock and then
+            // blocks in `install`; queued as a pool task instead, it becomes
+            // stealable — a materialize-pool worker that blocks in `join`
+            // mid-job (holding the Metal `STREAMED_BUFFERS` mutex) would
+            // steal the queued force and re-lock that mutex on its own
+            // stack. That nesting is the 0%-CPU self-deadlock this thread
+            // exists to make impossible: an OS thread never steals. One
+            // short-lived thread per deferred batch (a handful per process,
+            // at load time); it exits as soon as the cell is filled.
+            let state = std::sync::Arc::clone(&self.state);
+            let spawned = std::thread::Builder::new()
+                .name("lazy-batch-prefetch".to_string())
+                .spawn(move || {
+                    state.force();
+                });
+            // Thread spawn failure: no prefetch — the first consumer
+            // materializes inline, exactly the pre-prefetch behaviour.
+            let _ = spawned;
+        }
+        #[cfg(not(feature = "parallel"))]
+        self.state.force();
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    core::ops::Deref for LazyPolynomialBatch<F, C, D>
+{
+    type Target = PolynomialBatch<F, C, D>;
+
+    fn deref(&self) -> &Self::Target {
+        self.state.force()
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
+    From<PolynomialBatch<F, C, D>> for LazyPolynomialBatch<F, C, D>
+{
+    fn from(batch: PolynomialBatch<F, C, D>) -> Self {
+        Self::ready(batch)
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn default() -> Self {
+        Self::ready(PolynomialBatch::default())
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> core::fmt::Debug
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.state.cell.get() {
+            Some(batch) => f.debug_tuple("LazyPolynomialBatch").field(batch).finish(),
+            None => f.write_str("LazyPolynomialBatch(<pending>)"),
+        }
+    }
+}
+
+/// Comparison materializes both sides: equality is a property of the batch
+/// *values*, which deferral does not change.
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> PartialEq
+    for LazyPolynomialBatch<F, C, D>
+{
+    fn eq(&self, other: &Self) -> bool {
+        *self.state.force() == *other.state.force()
+    }
+}
+
+impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Eq
+    for LazyPolynomialBatch<F, C, D>
+{
+}
+
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BatchLayout {

@@ -210,7 +210,7 @@ fn mark_spine_thread_latency_critical() {}
 /// preempted while every other tree build queues behind it — a classic
 /// priority inversion at the pipeline's one serialized station. Best-effort.
 #[cfg(target_os = "macos")]
-fn mark_thread_user_initiated() {
+pub(crate) fn mark_thread_user_initiated() {
     #[allow(non_camel_case_types)]
     type qos_class_t = u32;
     unsafe extern "C" {
@@ -222,7 +222,27 @@ fn mark_thread_user_initiated() {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn mark_thread_user_initiated() {}
+pub(crate) fn mark_thread_user_initiated() {}
+
+/// Marks the calling thread `QOS_CLASS_USER_INITIATED` with relative
+/// priority -1: same class as the tx-proof buffer-set holders above (P-core
+/// preference, ranked above default QoS) but strictly below their relative 0,
+/// so a pool worker can never preempt the thread holding the single GPU
+/// buffer set. Used for the global rayon pool workers. Best-effort.
+#[cfg(target_os = "macos")]
+pub(crate) fn mark_thread_user_initiated_below() {
+    #[allow(non_camel_case_types)]
+    type qos_class_t = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: qos_class_t, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x19, -1);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn mark_thread_user_initiated_below() {}
 
 /// Marks the calling thread `QOS_CLASS_UTILITY` (0x11) so background page
 /// walks prefer E-cores instead of competing with the light pipeline's
