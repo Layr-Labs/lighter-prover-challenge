@@ -9,16 +9,16 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use block::ConcreteBlock;
 #[cfg(feature = "diagnostic_profile")]
 use metal::CommandBufferRef;
-#[cfg(feature = "diagnostic_profile")]
-use objc::runtime::Sel;
-#[cfg(feature = "diagnostic_profile")]
-use objc::Message;
 use metal::{
     BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
     ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
     MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
+#[cfg(feature = "diagnostic_profile")]
+use objc::Message;
 use objc::rc::autoreleasepool;
+#[cfg(feature = "diagnostic_profile")]
+use objc::runtime::Sel;
 use plonky2_maybe_rayon::*;
 
 use crate::field::types::{Field, PrimeField64};
@@ -31,11 +31,7 @@ static PROFILE_COMMAND_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(feature = "diagnostic_profile")]
-fn profile_command_buffer(
-    command_buffer: &CommandBufferRef,
-    name: &'static str,
-    work_items: u64,
-) {
+fn profile_command_buffer(command_buffer: &CommandBufferRef, name: &'static str, work_items: u64) {
     use std::sync::atomic::Ordering;
 
     let sequence = PROFILE_COMMAND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -463,8 +459,8 @@ pub(crate) struct ForceRangeQuotientFinishFailureGuard {
 }
 
 #[cfg(test)]
-pub(crate) fn force_range_quotient_finish_failure_for_tests(
-) -> ForceRangeQuotientFinishFailureGuard {
+pub(crate) fn force_range_quotient_finish_failure_for_tests() -> ForceRangeQuotientFinishFailureGuard
+{
     let observer = Arc::new(RangeQuotientFailureObserver::default());
     FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
         let mut fault = fault.borrow_mut();
@@ -1017,9 +1013,7 @@ impl<F: RichField> MetalColumns<F> {
         // SAFETY: the buffer holds `rows * cols` Goldilocks elements (8-byte,
         // any-bit-pattern-valid via `F`'s u64 wrapper) written before this
         // handle was returned and never mutated afterwards.
-        unsafe {
-            slice::from_raw_parts((self.base as *const F).add(j * self.rows), self.rows)
-        }
+        unsafe { slice::from_raw_parts((self.base as *const F).add(j * self.rows), self.rows) }
     }
 
     pub(crate) fn columns_mut(&mut self) -> Option<Vec<&mut [F]>> {
@@ -1030,9 +1024,8 @@ impl<F: RichField> MetalColumns<F> {
         // which every u64 bit pattern is valid. The uniqueness token and
         // exclusive access to the handle guarantee that no cloned handle, CPU
         // reader, or GPU reader can observe the buffer during initialization.
-        let values = unsafe {
-            slice::from_raw_parts_mut(self.base as *mut F, self.rows * self.cols)
-        };
+        let values =
+            unsafe { slice::from_raw_parts_mut(self.base as *mut F, self.rows * self.cols) };
         Some(values.chunks_exact_mut(self.rows).collect())
     }
 }
@@ -1537,8 +1530,7 @@ static PROBE_BUILD_SPENT: core::sync::atomic::AtomicBool =
 /// exists to avoid. Reading this atomic touches no lock and no lazy cell, so a
 /// thread that asks "is the GPU context up yet?" can never be parked behind the
 /// shader compile it is asking about. Monotonic false -> true, set once.
-static CONTEXT_READY: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static CONTEXT_READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Forces [`CONTEXT`] (blocking, exactly as before) and publishes readiness.
 ///
@@ -1967,9 +1959,7 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
         || num_partial_products > u32::MAX as usize
         || chunk_size > u32::MAX as usize
         || alpha_stride.checked_mul(2 * size_of::<u64>())? > MAX_INLINE_BYTES
-        || (4usize.checked_add(beta_k_is.len())?)
-            .checked_mul(size_of::<u64>())?
-            > MAX_INLINE_BYTES
+        || (4usize.checked_add(beta_k_is.len())?).checked_mul(size_of::<u64>())? > MAX_INLINE_BYTES
     {
         return None;
     }
@@ -2060,7 +2050,12 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
         return None;
     }
     let args = build_range_quotient_dispatch_args(
-        wires, constants, specs, u32_specs, alphas, alpha_offset,
+        wires,
+        constants,
+        specs,
+        u32_specs,
+        alphas,
+        alpha_offset,
     )?;
     let context = shared_context()?;
     match context.start_range_check_gate_quotient(
@@ -2120,7 +2115,12 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
     let mut dispatches = Vec::with_capacity(groups.len());
     for (specs, u32_specs) in groups {
         let args = build_range_quotient_dispatch_args(
-            wires, constants, specs, u32_specs, alphas, alpha_offset,
+            wires,
+            constants,
+            specs,
+            u32_specs,
+            alphas,
+            alpha_offset,
         )?;
         dispatches.push((args, specs.len(), u32_specs.len()));
     }
@@ -2299,7 +2299,14 @@ fn build_range_quotient_dispatch_args<F: RichField>(
                     if constant_base.checked_add(num_extra_constants)? > constants.cols {
                         return None;
                     }
-                    (6usize, bits, num_extra_constants, constant_base, wire_count, num_constraints)
+                    (
+                        6usize,
+                        bits,
+                        num_extra_constants,
+                        constant_base,
+                        wire_count,
+                        num_constraints,
+                    )
                 }
                 // Wire 0 is the base, wires 1..=n the power bits, wire 1+n the
                 // output and wires 2+n..2+2n the running intermediate values.
@@ -2572,14 +2579,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     if needs_new {
         *buffers = Some(autoreleasepool(|| {
             (
-                context.device.new_buffer(
-                    state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                context.device.new_buffer(
-                    output_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
-                ),
+                context
+                    .device
+                    .new_buffer(state_bytes as u64, MTLResourceOptions::StorageModeShared),
+                context
+                    .device
+                    .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared),
             )
         }));
     }
@@ -2630,7 +2635,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            let next_pass_full = group + 1 == groups || leaf_width - (col_start + chunk) >= 8;
+            set_u32(encoder, 10, next_pass_full as u32);
+            // The absorb kernel carries twelve live field lanes plus the
+            // Poseidon2 round state. Use two SIMD groups per threadgroup to
+            // increase occupancy; quotient and tree-parent kernels retain the
+            // generic 128-thread dispatcher.
+            dispatch_absorb(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -3351,8 +3362,8 @@ impl MetalShared {
         alpha_stride: usize,
         challenges: &[u64],
     ) -> Result<PermutationQuotientJob<F>, String> {
-        let pipeline = permutation_quotient_pipeline()
-            .ok_or("permutation quotient pipeline unavailable")?;
+        let pipeline =
+            permutation_quotient_pipeline().ok_or("permutation quotient pipeline unavailable")?;
         let num_chunks = num_partial_products + 1;
         if alpha_powers.len() != alpha_stride * 2
             || alpha_stride != 2 * (1 + num_chunks)
@@ -3721,10 +3732,9 @@ impl MetalShared {
         let (roots_buffer, roots_offsets) = self.roots_for(log_lde)?;
         let shift_buffer = self.shift_powers_for(degree)?;
         let ones_buffer = self.ones_for(degree)?;
-        let n_inv = crate::field::goldilocks_field::GoldilocksField::inverse_2exp(
-            degree.ilog2() as usize,
-        )
-        .to_canonical_u64();
+        let n_inv =
+            crate::field::goldilocks_field::GoldilocksField::inverse_2exp(degree.ilog2() as usize)
+                .to_canonical_u64();
 
         let column_buffer = take_or_new_column_buffer(&self.device, column_bytes as u64);
         // Coefficients need their own buffer: the LDE prepare reads them while
@@ -3755,9 +3765,8 @@ impl MetalShared {
                     .par_chunks_mut(degree)
                     .zip(value_columns.par_iter())
                     .for_each(|(destination, column)| {
-                        let source = unsafe {
-                            slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree)
-                        };
+                        let source =
+                            unsafe { slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree) };
                         destination.copy_from_slice(source);
                     });
             }
@@ -3917,22 +3926,15 @@ impl MetalShared {
                 ));
             }
 
-            self.completed_tree_readback(
-                &mut set,
-                output_len,
-                level_offsets,
-                lde_size,
-                cap_height,
-            )
+            self.completed_tree_readback(&mut set, output_len, level_offsets, lde_size, cap_height)
         })();
         self.release_set(set);
         drop(job);
         let (digests, cap) = result?.finish();
 
         // Copy the coefficients out for the oracle's `polynomials` field.
-        let coeff_source = unsafe {
-            slice::from_raw_parts(coeffs_buffer.contents().cast::<F>(), value_len)
-        };
+        let coeff_source =
+            unsafe { slice::from_raw_parts(coeffs_buffer.contents().cast::<F>(), value_len) };
         let coeff_columns: Vec<Vec<F>> = coeff_source
             .par_chunks(degree)
             .map(|chunk| chunk.to_vec())
@@ -4062,9 +4064,8 @@ impl MetalShared {
                 .par_chunks_mut(degree)
                 .zip(coeff_columns.par_iter())
                 .for_each(|(destination, column)| {
-                    let source = unsafe {
-                        slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree)
-                    };
+                    let source =
+                        unsafe { slice::from_raw_parts(column.as_ptr().cast::<u64>(), degree) };
                     destination.copy_from_slice(source);
                 });
         }
@@ -4113,11 +4114,7 @@ impl MetalShared {
                 );
                 set_u32(stage_encoder, 2, lde_size_u32);
                 set_u32(stage_encoder, 3, stage);
-                set_u32(
-                    stage_encoder,
-                    4,
-                    u32::from(stage == log_lde - 1),
-                );
+                set_u32(stage_encoder, 4, u32::from(stage == log_lde - 1));
                 dispatch2d(stage_encoder, &self.ntt_stage_pipeline, lde_size / 2, cols);
                 stage_encoder.end_encoding();
             }
@@ -4164,11 +4161,7 @@ impl MetalShared {
             }
 
             #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(
-                command_buffer,
-                "coeff_ntt_merkle",
-                (lde_size * cols) as u64,
-            );
+            profile_command_buffer(command_buffer, "coeff_ntt_merkle", (lde_size * cols) as u64);
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -4181,13 +4174,7 @@ impl MetalShared {
             ));
         }
 
-        self.completed_tree_readback(
-            set,
-            output_len,
-            level_offsets,
-            lde_size,
-            cap_height,
-        )
+        self.completed_tree_readback(set, output_len, level_offsets, lde_size, cap_height)
     }
 
     fn build<F: RichField>(
@@ -4273,9 +4260,8 @@ impl MetalShared {
             };
             match &source {
                 LeafSource::Rows(leaves) => {
-                    let source = unsafe {
-                        slice::from_raw_parts(leaves.as_ptr().cast::<u64>(), input_len)
-                    };
+                    let source =
+                        unsafe { slice::from_raw_parts(leaves.as_ptr().cast::<u64>(), input_len) };
                     destination
                         .par_chunks_mut(STAGING_CHUNK)
                         .zip(source.par_chunks(STAGING_CHUNK))
@@ -4289,10 +4275,7 @@ impl MetalShared {
                         .zip(columns.par_iter())
                         .for_each(|(destination, column)| {
                             let source = unsafe {
-                                slice::from_raw_parts(
-                                    column.as_ptr().cast::<u64>(),
-                                    leaf_count,
-                                )
+                                slice::from_raw_parts(column.as_ptr().cast::<u64>(), leaf_count)
                             };
                             destination.copy_from_slice(source);
                         });
@@ -4410,13 +4393,7 @@ impl MetalShared {
             ));
         }
 
-        self.completed_tree_readback(
-            set,
-            output_len,
-            level_offsets,
-            leaf_count,
-            cap_height,
-        )
+        self.completed_tree_readback(set, output_len, level_offsets, leaf_count, cap_height)
     }
 }
 
@@ -4443,6 +4420,30 @@ fn dispatch2d(
         MTLSize {
             width: width as NSUInteger,
             height: height as NSUInteger,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+fn dispatch_absorb(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    let execution_width = pipeline.thread_execution_width();
+    let group_width = pipeline
+        .max_total_threads_per_threadgroup()
+        .min(64)
+        .max(execution_width);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
             depth: 1,
         },
         MTLSize {
@@ -4557,8 +4558,8 @@ mod tests {
     use core::mem::MaybeUninit;
     use std::time::{Duration, Instant};
 
-    use objc::runtime::Sel;
     use objc::Message;
+    use objc::runtime::Sel;
     use rand::rngs::StdRng;
     use rand::{RngCore, SeedableRng};
 
@@ -4660,14 +4661,20 @@ mod tests {
                 "permutation_quotient",
                 &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             ),
-            ("range_check_gate_quotient", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            (
+                "range_check_gate_quotient",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
             ("poseidon2_hash_leaves", &[0, 1, 2, 3, 4]),
             ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
             ("ntt_stage", &[0, 1, 2, 3, 4]),
             ("ifft_finalize", &[0, 1, 2, 3]),
             ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5]),
             ("poseidon2_hash_parents", &[0, 1, 2, 3]),
-            ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            (
+                "poseidon2_absorb_pass",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            ),
         ];
         let observed: Vec<(&str, &[u32])> = kernels
             .iter()
@@ -4737,7 +4744,10 @@ mod tests {
             .expect("shasum must be available to verify the metallib is current");
         assert!(output.status.success(), "shasum failed");
         let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
-        let digest = digest.split_whitespace().next().expect("empty shasum output");
+        let digest = digest
+            .split_whitespace()
+            .next()
+            .expect("empty shasum output");
         assert_eq!(
             digest, SHADER_SOURCE_SHA256,
             "poseidon2.metal changed but poseidon2.metallib was not regenerated. Run:\n  \
@@ -4882,9 +4892,7 @@ mod tests {
             return;
         };
         let buffer = |bytes| {
-            autoreleasepool(|| {
-                device.new_buffer(bytes, MTLResourceOptions::StorageModeShared)
-            })
+            autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
         };
         let mib = 1024 * 1024;
         let mut pool = QuotientOutputPool::default();
@@ -4893,7 +4901,11 @@ mod tests {
         pool.recycle(buffer(8 * mib));
         pool.recycle(buffer(4 * mib));
         assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
-        let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
+        let mut lengths = pool
+            .free
+            .iter()
+            .map(|buffer| buffer.length())
+            .collect::<Vec<_>>();
         lengths.sort_unstable();
         assert_eq!(lengths, vec![4 * mib, 8 * mib]);
 
@@ -4915,9 +4927,8 @@ mod tests {
         };
         let queue = device.new_command_queue();
         let pool = Arc::new(Mutex::new(QuotientOutputPool::default()));
-        let output = || {
-            autoreleasepool(|| device.new_buffer(64, MTLResourceOptions::StorageModeShared))
-        };
+        let output =
+            || autoreleasepool(|| device.new_buffer(64, MTLResourceOptions::StorageModeShared));
 
         let not_enqueued = queue.new_command_buffer().to_owned();
         drop(PoseidonGateQuotientJob::<F> {
@@ -5150,9 +5161,7 @@ mod tests {
 
             let mut gathered_wires = Vec::with_capacity(WIRE_COLUMNS * QUOTIENT_ROWS);
             for column in 0..WIRE_COLUMNS {
-                gathered_wires.extend(
-                    (0..QUOTIENT_ROWS).map(|row| wires.col(column)[row * step]),
-                );
+                gathered_wires.extend((0..QUOTIENT_ROWS).map(|row| wires.col(column)[row * step]));
             }
             let filters = (0..QUOTIENT_ROWS)
                 .map(|row| {
@@ -5166,18 +5175,10 @@ mod tests {
                         })
                 })
                 .collect::<Vec<_>>();
-            let vars = EvaluationVarsBaseBatch::new(
-                QUOTIENT_ROWS,
-                &[],
-                &gathered_wires,
-                &HashOut::ZERO,
-            );
+            let vars =
+                EvaluationVarsBaseBatch::new(QUOTIENT_ROWS, &[], &gathered_wires, &HashOut::ZERO);
             let mut filtered_constraints = vec![F::ZERO; CONSTRAINTS * QUOTIENT_ROWS];
-            gate.eval_unfiltered_base_batch_accumulate(
-                vars,
-                &filters,
-                &mut filtered_constraints,
-            );
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut filtered_constraints);
             let mut expected = vec![F::ZERO; 2 * QUOTIENT_ROWS];
             for row in 0..QUOTIENT_ROWS {
                 for (challenge, &alpha) in alphas.iter().enumerate() {
@@ -5275,10 +5276,9 @@ mod tests {
                                 beta_k_is[permutation_challenge * ROUTED + j],
                                 shifted_points[row],
                             ) + gamma;
-                            let denominator = wire.multiply_accumulate(
-                                beta,
-                                constants.col(SIGMA_START + j)[source],
-                            ) + gamma;
+                            let denominator = wire
+                                .multiply_accumulate(beta, constants.col(SIGMA_START + j)[source])
+                                + gamma;
                             (numerator, denominator)
                         };
                         let (mut numerator, mut denominator) = factor(start);
@@ -5473,7 +5473,9 @@ mod tests {
                 ALPHA_OFFSET,
             )
             .expect("Metal RangeCheck quotient job must start");
-            let actual = job.finish().expect("Metal RangeCheck quotient job must finish");
+            let actual = job
+                .finish()
+                .expect("Metal RangeCheck quotient job must finish");
             assert_eq!(actual.len(), expected.len());
             for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
@@ -5735,17 +5737,14 @@ mod tests {
                             for op in 0..spec.num_ops {
                                 let routed = routed_per_op * op;
                                 let carry = wires.col(routed + num_addends)[source_row];
-                                let output_result =
-                                    wires.col(routed + num_addends + 1)[source_row];
-                                let output_carry =
-                                    wires.col(routed + num_addends + 2)[source_row];
+                                let output_result = wires.col(routed + num_addends + 1)[source_row];
+                                let output_carry = wires.col(routed + num_addends + 2)[source_row];
                                 let mut computed = carry;
                                 for j in 0..num_addends {
                                     computed += wires.col(routed + j)[source_row];
                                 }
-                                constraints.push(
-                                    output_carry * word_base + output_result - computed,
-                                );
+                                constraints
+                                    .push(output_carry * word_base + output_result - computed);
                                 let limb_base = routed_per_op * spec.num_ops + total_limbs * op;
                                 let mut combined_result = F::ZERO;
                                 let mut combined_carry = F::ZERO;
@@ -5931,8 +5930,7 @@ mod tests {
                 constant_column: equality_constant_column,
             }),
         ));
-        for (bits, num_ops, num_extra_constants) in
-            [(3usize, 8usize, 0usize), (4, 4, 2), (6, 1, 2)]
+        for (bits, num_ops, num_extra_constants) in [(3usize, 8usize, 0usize), (4, 4, 2), (6, 1, 2)]
         {
             shapes.push((
                 num_ops,
@@ -5952,16 +5950,14 @@ mod tests {
             let gate_index = 3 * spec_index + 2;
             let group = 3 * spec_index + 1..3 * spec_index + 4;
             match shape {
-                UnionShape::RangeCheck { bit_size } => {
-                    range_specs.push(RangeCheckQuotientSpec {
-                        selector_column,
-                        gate_index,
-                        group,
-                        include_unused_selector: true,
-                        num_ops,
-                        bit_size,
-                    })
-                }
+                UnionShape::RangeCheck { bit_size } => range_specs.push(RangeCheckQuotientSpec {
+                    selector_column,
+                    gate_index,
+                    group,
+                    include_unused_selector: true,
+                    num_ops,
+                    bit_size,
+                }),
                 UnionShape::U32(kind) => u32_specs.push(U32QuotientSpec {
                     selector_column,
                     gate_index,
@@ -6069,17 +6065,16 @@ mod tests {
             for row in 0..QUOTIENT_ROWS {
                 let source_row = row * step;
                 let wire = |column: usize| wires.col(column)[source_row];
-                let filter_for = |selector_column: usize,
-                                  gate_index: usize,
-                                  group: core::ops::Range<usize>| {
-                    let selector = constants.col(selector_column)[source_row];
-                    group
-                        .filter(|&gate| gate != gate_index)
-                        .chain(core::iter::once(UNUSED_SELECTOR))
-                        .fold(F::ONE, |filter, gate| {
-                            filter * (F::from_canonical_usize(gate) - selector)
-                        })
-                };
+                let filter_for =
+                    |selector_column: usize, gate_index: usize, group: core::ops::Range<usize>| {
+                        let selector = constants.col(selector_column)[source_row];
+                        group
+                            .filter(|&gate| gate != gate_index)
+                            .chain(core::iter::once(UNUSED_SELECTOR))
+                            .fold(F::ONE, |filter, gate| {
+                                filter * (F::from_canonical_usize(gate) - selector)
+                            })
+                    };
 
                 for spec in &range_specs {
                     let filter =
@@ -6121,17 +6116,15 @@ mod tests {
                     let mut constraints = Vec::new();
                     match spec.kind {
                         U32QuotientKind::Subtraction { result_limbs } => {
-                            let base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
+                            let base = F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
                             for op in 0..spec.num_ops {
                                 let routed = 5 * op;
                                 let output_result = wire(routed + 3);
                                 let output_borrow = wire(routed + 4);
                                 let result_initial =
                                     wire(routed) - wire(routed + 1) - wire(routed + 2);
-                                constraints.push(
-                                    output_result - (result_initial + base * output_borrow),
-                                );
+                                constraints
+                                    .push(output_result - (result_initial + base * output_borrow));
                                 let limb_base = 5 * spec.num_ops + result_limbs * op;
                                 let mut recomposed = F::ZERO;
                                 for j in (0..result_limbs).rev() {
@@ -6150,8 +6143,7 @@ mod tests {
                             result_limbs,
                             num_carry_limbs,
                         } => {
-                            let base =
-                                F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
+                            let base = F::from_canonical_u64(1u64 << (2 * result_limbs as u64));
                             let total_limbs = result_limbs + num_carry_limbs;
                             let routed_per_op = num_addends + 3;
                             for op in 0..spec.num_ops {
@@ -6162,10 +6154,8 @@ mod tests {
                                 }
                                 let output_result = wire(routed + num_addends + 1);
                                 let output_carry = wire(routed + num_addends + 2);
-                                constraints
-                                    .push(output_carry * base + output_result - computed);
-                                let limb_base =
-                                    routed_per_op * spec.num_ops + total_limbs * op;
+                                constraints.push(output_carry * base + output_result - computed);
+                                let limb_base = routed_per_op * spec.num_ops + total_limbs * op;
                                 let mut combined_result = F::ZERO;
                                 let mut combined_carry = F::ZERO;
                                 for j in (0..total_limbs).rev() {
@@ -6187,8 +6177,7 @@ mod tests {
                             let routed_per_op = 1 + num_limbs;
                             for op in 0..spec.num_ops {
                                 let routed = routed_per_op * op;
-                                let aux_base =
-                                    routed_per_op * spec.num_ops + 4 * num_limbs * op;
+                                let aux_base = routed_per_op * spec.num_ops + 4 * num_limbs * op;
                                 for j in 0..4 * num_limbs {
                                     let x = wire(aux_base + j);
                                     let y = x * (x - three);
@@ -6208,17 +6197,13 @@ mod tests {
                                 }
                                 constraints.push(acc - wire(routed));
                             }
-                            assert_eq!(
-                                constraints.len(),
-                                spec.num_ops * (1 + 5 * num_limbs)
-                            );
+                            assert_eq!(constraints.len(), spec.num_ops * (1 + 5 * num_limbs));
                         }
                         U32QuotientKind::QuinticMultiplication => {
                             for op in 0..spec.num_ops {
                                 let routed = 15 * op;
                                 let a: [F; 5] = core::array::from_fn(|j| wire(routed + j));
-                                let b: [F; 5] =
-                                    core::array::from_fn(|j| wire(routed + 5 + j));
+                                let b: [F; 5] = core::array::from_fn(|j| wire(routed + 5 + j));
                                 let mut d = [F::ZERO; 9];
                                 for j in 0..5 {
                                     for k in 0..5 {
@@ -6237,10 +6222,8 @@ mod tests {
                                 let routed = 10 * op;
                                 let temp = 10 * spec.num_ops + 10 * op;
                                 let a: [F; 5] = core::array::from_fn(|j| wire(routed + j));
-                                let c: [F; 5] =
-                                    core::array::from_fn(|j| wire(routed + 5 + j));
-                                let extra: [F; 10] =
-                                    core::array::from_fn(|j| wire(temp + j));
+                                let c: [F; 5] = core::array::from_fn(|j| wire(routed + 5 + j));
+                                let extra: [F; 10] = core::array::from_fn(|j| wire(temp + j));
                                 constraints.push(a[0] * a[0] - extra[0]);
                                 constraints.push((six * a[1] * a[4] + extra[0]) - extra[1]);
                                 constraints.push((six * a[2] * a[3] + extra[1]) - c[0]);
@@ -6272,14 +6255,12 @@ mod tests {
                                 let current_bit = wire(1 + (num_power_bits - i - 1));
                                 constraints.push(
                                     previous
-                                        * (current_bit * exponent_base
-                                            + (F::ONE - current_bit))
+                                        * (current_bit * exponent_base + (F::ONE - current_bit))
                                         - wire(2 + num_power_bits + i),
                                 );
                             }
-                            constraints.push(
-                                wire(1 + num_power_bits) - wire(1 + 2 * num_power_bits),
-                            );
+                            constraints
+                                .push(wire(1 + num_power_bits) - wire(1 + 2 * num_power_bits));
                             assert_eq!(constraints.len(), num_power_bits + 1);
                         }
                         U32QuotientKind::Equality { constant_column } => {
@@ -6289,8 +6270,7 @@ mod tests {
                                 let difference = wire(temporary);
                                 let product = wire(temporary + 2);
                                 constraints.push((wire(3 * op) - wire(3 * op + 1)) - difference);
-                                constraints
-                                    .push(difference * wire(temporary + 1) - product);
+                                constraints.push(difference * wire(temporary + 1) - product);
                                 constraints.push(product * difference - difference);
                                 constraints.push((const_0 - product) - wire(3 * op + 2));
                             }
@@ -6326,9 +6306,8 @@ mod tests {
                                 } else {
                                     F::ZERO
                                 };
-                                constraints.push(
-                                    acc_0 * alpha_0 + w * acc_1 * alpha_1 + coeff_0 - next_0,
-                                );
+                                constraints
+                                    .push(acc_0 * alpha_0 + w * acc_1 * alpha_1 + coeff_0 - next_0);
                                 constraints
                                     .push(acc_0 * alpha_1 + acc_1 * alpha_0 + coeff_1 - next_1);
                                 acc_0 = next_0;
@@ -6392,8 +6371,9 @@ mod tests {
                                 }
                                 constraints.push(reconstructed_index - wire(copy_base));
 
-                                let mut items =
-                                    (0..vec_size).map(|i| wire(copy_base + 2 + i)).collect::<Vec<_>>();
+                                let mut items = (0..vec_size)
+                                    .map(|i| wire(copy_base + 2 + i))
+                                    .collect::<Vec<_>>();
                                 let mut level_size = vec_size;
                                 for i in 0..bits {
                                     let b = wire(bit_base + copy * bits + i);
@@ -6634,7 +6614,9 @@ kernel void goldilocks_mul_bench_native(
                     let options = CompileOptions::new();
                     let library = device
                         .new_library_with_source(source, &options)
-                        .unwrap_or_else(|error| panic!("Poseidon2 benchmark shader failed: {error}"));
+                        .unwrap_or_else(|error| {
+                            panic!("Poseidon2 benchmark shader failed: {error}")
+                        });
                     let pipeline = |name| {
                         let function = library
                             .get_function(name, None)
@@ -6648,8 +6630,11 @@ kernel void goldilocks_mul_bench_native(
                         pipeline("poseidon2_hash_parents"),
                     )
                 };
-                let native_source =
-                    ["#define POSEIDON2_NATIVE_ARITHMETIC_REFERENCE 1\n", SHADER_SOURCE].concat();
+                let native_source = [
+                    "#define POSEIDON2_NATIVE_ARITHMETIC_REFERENCE 1\n",
+                    SHADER_SOURCE,
+                ]
+                .concat();
                 let (limb_leaf, limb) = pipelines(SHADER_SOURCE);
                 let (native_leaf, native) = pipelines(&native_source);
 
@@ -6813,8 +6798,7 @@ kernel void goldilocks_mul_bench_native(
             )
         });
         harness.run(&harness.differential, &input, &output, count);
-        let actual =
-            unsafe { slice::from_raw_parts(output.contents().cast::<u64>(), count * 6) };
+        let actual = unsafe { slice::from_raw_parts(output.contents().cast::<u64>(), count * 6) };
         for (index, (input, output)) in pairs
             .chunks_exact(2)
             .zip(actual.chunks_exact(6))
@@ -6835,10 +6819,16 @@ kernel void goldilocks_mul_bench_native(
             );
             let expected_add = ((a + b) % P) as u64;
             assert_eq!(output[2], expected_add, "limb add mismatch at pair {index}");
-            assert_eq!(output[3], expected_add, "native add mismatch at pair {index}");
+            assert_eq!(
+                output[3], expected_add,
+                "native add mismatch at pair {index}"
+            );
             let expected_sub = ((a + P - b) % P) as u64;
             assert_eq!(output[4], expected_sub, "limb sub mismatch at pair {index}");
-            assert_eq!(output[5], expected_sub, "native sub mismatch at pair {index}");
+            assert_eq!(
+                output[5], expected_sub,
+                "native sub mismatch at pair {index}"
+            );
         }
     }
 
@@ -6920,16 +6910,14 @@ kernel void goldilocks_mul_bench_native(
         });
         let output_bytes = count * 4 * size_of::<u64>();
         let limb_output = autoreleasepool(|| {
-            harness.device.new_buffer(
-                output_bytes as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+            harness
+                .device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
         let native_output = autoreleasepool(|| {
-            harness.device.new_buffer(
-                output_bytes as u64,
-                MTLResourceOptions::StorageModeShared,
-            )
+            harness
+                .device
+                .new_buffer(output_bytes as u64, MTLResourceOptions::StorageModeShared)
         });
         harness.run(&harness.limb, &input, &limb_output, count);
         harness.run(&harness.native, &input, &native_output, count);
@@ -7092,11 +7080,8 @@ kernel void goldilocks_mul_bench_native(
                 })
                 .collect();
 
-            let context = CONTEXT
-                .as_ref()
-                .unwrap_or_else(|error| panic!("{error}"));
-            let coeff_refs: Vec<&[GoldilocksField]> =
-                coeffs.iter().map(|c| c.as_slice()).collect();
+            let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+            let coeff_refs: Vec<&[GoldilocksField]> = coeffs.iter().map(|c| c.as_slice()).collect();
             for cap_height in [0, 3] {
                 let (gpu_columns, gpu_digests, gpu_cap) = context
                     .build_from_coeffs(&coeff_refs, degree, rate_bits, cap_height)
@@ -7115,10 +7100,8 @@ kernel void goldilocks_mul_bench_native(
 
                 // Tree must match the CPU tree over the bit-reversed transpose.
                 let flat = transpose_to_bitrev_flat(&cpu_columns);
-                let rows: Vec<Vec<GoldilocksField>> = flat
-                    .chunks(cols)
-                    .map(|row| row.to_vec())
-                    .collect();
+                let rows: Vec<Vec<GoldilocksField>> =
+                    flat.chunks(cols).map(|row| row.to_vec()).collect();
                 let cpu = cpu_tree(&rows, cap_height);
                 let gpu = (gpu_digests, gpu_cap);
                 assert_tree_eq(&gpu, &cpu, cols, cap_height);
@@ -7162,11 +7145,8 @@ kernel void goldilocks_mul_bench_native(
                 })
                 .collect();
 
-            let context = CONTEXT
-                .as_ref()
-                .unwrap_or_else(|error| panic!("{error}"));
-            let value_refs: Vec<&[GoldilocksField]> =
-                values.iter().map(|v| v.as_slice()).collect();
+            let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+            let value_refs: Vec<&[GoldilocksField]> = values.iter().map(|v| v.as_slice()).collect();
             let cap_height = 3;
             let (gpu_columns, gpu_digests, gpu_cap, gpu_coeffs) = context
                 .build_from_values(&value_refs, degree, rate_bits, cap_height)
@@ -7370,16 +7350,13 @@ kernel void goldilocks_mul_bench_native(
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
         assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
-        let streamed = build_merkle_tree_shared_streamed(
-            &columns,
-            cap_height,
-            &|group, destinations| {
+        let streamed =
+            build_merkle_tree_shared_streamed(&columns, cap_height, &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
                     destination.fill(F::from_canonical_usize(group * 8 + index + 1));
                 }
-            },
-        )
-        .expect("streamed tree");
+            })
+            .expect("streamed tree");
         assert!(streamed.0.nodes.is_shared());
 
         let classic = context
@@ -7410,8 +7387,10 @@ kernel void goldilocks_mul_bench_native(
                         .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>();
-            let flat: Vec<GoldilocksField> =
-                leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
+            let flat: Vec<GoldilocksField> = leaves
+                .iter()
+                .flat_map(|leaf| leaf.iter().copied())
+                .collect();
 
             let log_rows = leaves.len().ilog2() as usize;
             let columns: Vec<Vec<GoldilocksField>> = (0..width)
@@ -7427,16 +7406,9 @@ kernel void goldilocks_mul_bench_native(
                 .collect();
 
             for cap_height in [0, 3, 6] {
-                let context = CONTEXT
-                    .as_ref()
-                    .unwrap_or_else(|error| panic!("{error}"));
+                let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
                 let gpu = context
-                    .build(
-                        LeafSource::Rows(&flat),
-                        width,
-                        leaves.len(),
-                        cap_height,
-                    )
+                    .build(LeafSource::Rows(&flat), width, leaves.len(), cap_height)
                     .unwrap();
                 let cpu = cpu_tree(&leaves, cap_height);
                 assert!(
@@ -7482,12 +7454,12 @@ kernel void goldilocks_mul_bench_native(
                     .collect()
             })
             .collect();
-        let flat: Vec<GoldilocksField> =
-            leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
+        let flat: Vec<GoldilocksField> = leaves
+            .iter()
+            .flat_map(|leaf| leaf.iter().copied())
+            .collect();
 
-        let context = CONTEXT
-            .as_ref()
-            .unwrap_or_else(|error| panic!("{error}"));
+        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
         let gpu = context
             .build(LeafSource::Rows(&flat), WIDTH, leaf_count, cap_height)
             .unwrap();

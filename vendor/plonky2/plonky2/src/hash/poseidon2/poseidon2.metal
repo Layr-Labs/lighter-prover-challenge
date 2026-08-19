@@ -1847,6 +1847,7 @@ kernel void poseidon2_absorb_pass(
     constant uint& chunk_size [[buffer(7)]],
     constant uint& first_pass [[buffer(8)]],
     constant uint& final_pass [[buffer(9)]],
+    constant uint& next_pass_full [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
@@ -1869,7 +1870,15 @@ kernel void poseidon2_absorb_pass(
         for (uint i = 0; i < 4; ++i) {
             output[i] = gl_canonicalize(st[i]);
         }
+    } else if (next_pass_full != 0u) {
+        // A full next pass overwrites all eight rate lanes before permuting.
+        // Persist only the four capacity lanes that cross that boundary.
+        for (uint i = 8; i < 12; ++i) {
+            state[(ulong)i * leaf_count + gid] = st[i];
+        }
     } else {
+        // A short final pass leaves some rate lanes untouched, so it needs the
+        // complete preceding state.
         for (uint i = 0; i < 12; ++i) {
             state[(ulong)i * leaf_count + gid] = st[i];
         }

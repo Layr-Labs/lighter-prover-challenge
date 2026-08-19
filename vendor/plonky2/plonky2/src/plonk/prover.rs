@@ -26,10 +26,6 @@ use crate::iop::target::Target;
 use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-use crate::plonk::circuit_data::{
-    LowRangeSelectorFilterCache, LowRangeSelectorFilterCacheEntry,
-};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
@@ -1358,387 +1354,18 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(19)
         });
-        // Upper bound as well as a lower one. The split pays for itself only
-        // where its companion fill and extension can hide behind other work.
-        // On the final block's 2^21 shape it cannot: that proof runs alone on
-        // the serial tail, and the companion it needs there is 136 columns of
-        // 2^20 rows -- a gigabyte -- filled unconditionally by
-        // `from_coeffs_with_even_companion`, before we know whether the block
-        // circuit even has the low-degree gates the split would use.
-        //
-        // Kept env-overridable in step with the floor so that raising
-        // LIGHTER_QSPLIT_MIN_LDE_BITS cannot silently close the window.
-        static MAX_BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let max_bits = *MAX_BITS.get_or_init(|| {
-            std::env::var("LIGHTER_QSPLIT_MAX_LDE_BITS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(19)
-        });
-        let lde_bits = common_data.degree_bits() + common_data.config.fri_config.rate_bits;
         range_quotient_split_enabled()
             && common_data.num_lookup_polys == 0
             && common_data.config.num_challenges == 2
-            && lde_bits >= min_bits
-            && lde_bits <= max_bits
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits >= min_bits
+            // Not the final block's 2^21 shape: measured slower there (its 1 GiB
+            // companion and 2^20-point extension sit on the serial tail).
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits <= 19
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
         let _ = common_data;
         false
-    }
-}
-
-/// Process-wide retained payload limit for immutable low-range selector filters.
-/// The budget is deliberately well below one recurring proof's live working set
-/// and is shared by every circuit loaded in the worker. Oversized and late
-/// caches stay on the unchanged chunk-local path.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-const MAX_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 96 * 1024 * 1024;
-
-/// Reject a single table above the recurring light transaction shape. On the
-/// ranked circuits this admits the 64 MiB / 49-proof light table but rejects
-/// the 76 MiB / 3-proof heavy table and the one-off final block even if they
-/// happen to reach the quotient lane first.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-const MAX_SINGLE_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 68 * 1024 * 1024;
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-static LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// `LIGHTER_LOW_SELECTOR_FILTER_CACHE=0` keeps the exact chunk-local baseline;
-/// default on. The switch is process-local so one compiled binary supports A/B.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn low_range_selector_filter_cache_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var_os("LIGHTER_LOW_SELECTOR_FILTER_CACHE").is_some_and(|v| v == "0")
-    })
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn reserve_low_range_selector_filter_cache(bytes: usize) -> bool {
-    use core::sync::atomic::Ordering;
-
-    let mut current = LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = current.checked_add(bytes) else {
-            return false;
-        };
-        if next > MAX_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES {
-            return false;
-        }
-        match LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-struct LowRangeSelectorGroupPlan {
-    selector_column: usize,
-    group_start: usize,
-    group_len: usize,
-    include_unused_selector: bool,
-    /// (gate slot in `gates`, position of the gate inside the group)
-    members: Vec<(usize, usize)>,
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn low_range_selector_group_plans(
-    gates: &[LowDegreeRangeGate],
-) -> Vec<LowRangeSelectorGroupPlan> {
-    let mut plans: Vec<LowRangeSelectorGroupPlan> = Vec::new();
-    for (slot, gate) in gates.iter().enumerate() {
-        let position = gate.gate_index - gate.group.start;
-        match plans.iter_mut().find(|p| {
-            p.selector_column == gate.selector_column
-                && p.group_start == gate.group.start
-                && p.group_len == gate.group.len()
-                && p.include_unused_selector == gate.include_unused_selector
-        }) {
-            Some(plan) => plan.members.push((slot, position)),
-            None => plans.push(LowRangeSelectorGroupPlan {
-                selector_column: gate.selector_column,
-                group_start: gate.group.start,
-                group_len: gate.group.len(),
-                include_unused_selector: gate.include_unused_selector,
-                members: vec![(slot, position)],
-            }),
-        }
-    }
-    plans
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn low_range_gate_signature(
-    gates: &[LowDegreeRangeGate],
-) -> Vec<(usize, usize, usize, usize, bool)> {
-    gates
-        .iter()
-        .map(|gate| {
-            (
-                gate.gate_index,
-                gate.selector_column,
-                gate.group.start,
-                gate.group.end,
-                gate.include_unused_selector,
-            )
-        })
-        .collect()
-}
-
-/// Builds one exact gate-major filter column per low gate. Each selector group
-/// retains the baseline prefix/suffix multiplication order. Groups build in
-/// parallel without unsafe disjoint writes or a second full-size transpose.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn build_low_range_selector_filter_cache<F: RichField>(
-    gates: &[LowDegreeRangeGate],
-    plans: &[LowRangeSelectorGroupPlan],
-    selector_cols: &[&[F]],
-    full_rows: usize,
-    gate_signature: Vec<(usize, usize, usize, usize, bool)>,
-) -> Option<LowRangeSelectorFilterCacheEntry<F>> {
-    const MAX_GROUP: usize = 16;
-    if gates.is_empty()
-        || plans.len() != selector_cols.len()
-        || plans.iter().any(|plan| plan.group_len > MAX_GROUP)
-        || selector_cols.iter().any(|col| col.len() < full_rows)
-    {
-        return None;
-    }
-
-    // Account for all retained heap allocations, not just field payloads. The
-    // reservation is intentionally never returned: circuits live for the
-    // worker lifetime, and retaining a stale reservation after an unusual drop
-    // is conservative rather than allowing the hard process cap to be crossed.
-    let entries = gates.len().checked_mul(full_rows)?;
-    let bytes = entries
-        .checked_mul(core::mem::size_of::<F>())?
-        .checked_add(gates.len().checked_mul(core::mem::size_of::<Vec<F>>())?)?
-        .checked_add(
-            gates
-                .len()
-                .checked_mul(core::mem::size_of::<(usize, usize, usize, usize, bool)>())?,
-        )?;
-    if bytes > MAX_SINGLE_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES
-        || !reserve_low_range_selector_filter_cache(bytes)
-    {
-        return None;
-    }
-
-    let unused = F::from_canonical_u64(u32::MAX as u64);
-    let by_group: Vec<Vec<(usize, Vec<F>)>> = plans
-        .par_iter()
-        .zip(selector_cols.par_iter())
-        .map(|(plan, &selector_col)| {
-            let n = plan.group_len;
-            let mut member_filters = plan
-                .members
-                .iter()
-                .map(|_| vec![F::ONE; full_rows])
-                .collect::<Vec<_>>();
-            let mut factors = [F::ZERO; MAX_GROUP];
-            let mut prefix = [F::ONE; MAX_GROUP + 1];
-            let mut suffix = [F::ONE; MAX_GROUP + 1];
-            for row in 0..full_rows {
-                let s_val = selector_col[row];
-                for (k, factor) in factors[..n].iter_mut().enumerate() {
-                    *factor = F::from_canonical_usize(plan.group_start + k) - s_val;
-                }
-                prefix[0] = if plan.include_unused_selector {
-                    unused - s_val
-                } else {
-                    F::ONE
-                };
-                for k in 0..n {
-                    prefix[k + 1] = prefix[k] * factors[k];
-                }
-                suffix[n] = F::ONE;
-                for k in (0..n).rev() {
-                    suffix[k] = suffix[k + 1] * factors[k];
-                }
-                for (member_i, &(_, position)) in plan.members.iter().enumerate() {
-                    member_filters[member_i][row] = prefix[position] * suffix[position + 1];
-                }
-            }
-            plan.members
-                .iter()
-                .map(|&(slot, _)| slot)
-                .zip(member_filters)
-                .collect()
-        })
-        .collect();
-
-    let mut by_gate = (0..gates.len()).map(|_| None).collect::<Vec<_>>();
-    for group in by_group {
-        for (slot, filters) in group {
-            if slot >= by_gate.len() || by_gate[slot].replace(filters).is_some() {
-                return None;
-            }
-        }
-    }
-    let filters = by_gate.into_iter().collect::<Option<Vec<_>>>()?;
-    Some(LowRangeSelectorFilterCacheEntry {
-        full_rows,
-        gate_signature,
-        filters,
-    })
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-#[inline(always)]
-fn accumulate_low_range_quotient_chunk<F: RichField>(
-    chunk: &mut [F],
-    row0: usize,
-    half_rows: usize,
-    num_gates: usize,
-    low: &[F],
-    odd: &[Vec<F>],
-    filter_at: impl Fn(usize, usize) -> F,
-) {
-    let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
-    for g in 0..num_gates {
-        let odd0 = &odd[g * 2];
-        let odd1 = &odd[g * 2 + 1];
-        let low_base = g * half_rows * 2;
-        for r in 0..rows {
-            let i = row0 + r;
-            let (sv0, sv1) = if i & 1 == 0 {
-                let base = low_base + (i >> 1) * 2;
-                (low[base], low[base + 1])
-            } else {
-                (odd0[i >> 1], odd1[i >> 1])
-            };
-            let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
-        }
-    }
-    chunk.copy_from_slice(&acc);
-}
-
-/// Applies selector filters and combines already-extended low-gate values.
-/// The boolean reports whether the immutable cache dispatched; tests use it to
-/// distinguish raw equality from accidentally comparing the fallback twice.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn combine_low_range_quotient<F: RichField>(
-    low: &[F],
-    odd: &[Vec<F>],
-    gates: &[LowDegreeRangeGate],
-    half_rows: usize,
-    full_rows: usize,
-    constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    filter_cache: Option<&LowRangeSelectorFilterCache<F>>,
-) -> (Vec<F>, bool) {
-    const ROWS_PER_CHUNK: usize = 512;
-    const MAX_GROUP: usize = 16;
-
-    let plans = low_range_selector_group_plans(gates);
-    assert!(plans.iter().all(|plan| plan.group_len <= MAX_GROUP));
-    let selector_cols = plans
-        .iter()
-        .map(|plan| constants.col(plan.selector_column))
-        .collect::<Vec<_>>();
-    let signature = low_range_gate_signature(gates);
-    let cached_filters = filter_cache
-        .and_then(|cache| {
-            cache.get_or_init(|| {
-                build_low_range_selector_filter_cache(
-                    gates,
-                    &plans,
-                    &selector_cols,
-                    full_rows,
-                    signature.clone(),
-                )
-            })
-        })
-        .filter(|entry| {
-            entry.full_rows == full_rows
-                && entry.gate_signature == signature
-                && entry.filters.len() == gates.len()
-                && entry.filters.iter().all(|filter| filter.len() == full_rows)
-        })
-        .map(|entry| entry.filters.as_slice());
-
-    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
-    // SAFETY: both disjoint parallel branches below write every output slot
-    // before the vector is returned, exactly as the pre-cache implementation.
-    unsafe { out.set_len(full_rows * 2) };
-    let num_gates = gates.len();
-    if let Some(filters) = cached_filters {
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
-            .enumerate()
-            .for_each(|(chunk_i, chunk)| {
-                let row0 = chunk_i * ROWS_PER_CHUNK;
-                accumulate_low_range_quotient_chunk(
-                    chunk,
-                    row0,
-                    half_rows,
-                    num_gates,
-                    low,
-                    odd,
-                    |g, r| filters[g][row0 + r],
-                );
-            });
-        (out, true)
-    } else {
-        let unused = F::from_canonical_u64(u32::MAX as u64);
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
-            .enumerate()
-            .for_each(|(chunk_i, chunk)| {
-                let row0 = chunk_i * ROWS_PER_CHUNK;
-                let rows = chunk.len() / 2;
-                // Exact pre-cache baseline: chunk-local, gate-major filters.
-                let mut filters = vec![F::ONE; num_gates * ROWS_PER_CHUNK];
-                let mut factors = [F::ZERO; MAX_GROUP];
-                let mut prefix = [F::ONE; MAX_GROUP + 1];
-                let mut suffix = [F::ONE; MAX_GROUP + 1];
-                for (plan, selector_col) in plans.iter().zip(&selector_cols) {
-                    let n = plan.group_len;
-                    for r in 0..rows {
-                        let s_val = selector_col[row0 + r];
-                        for k in 0..n {
-                            factors[k] =
-                                F::from_canonical_usize(plan.group_start + k) - s_val;
-                        }
-                        prefix[0] = if plan.include_unused_selector {
-                            unused - s_val
-                        } else {
-                            F::ONE
-                        };
-                        for k in 0..n {
-                            prefix[k + 1] = prefix[k] * factors[k];
-                        }
-                        suffix[n] = F::ONE;
-                        for k in (0..n).rev() {
-                            suffix[k] = suffix[k + 1] * factors[k];
-                        }
-                        for &(g, position) in &plan.members {
-                            filters[g * ROWS_PER_CHUNK + r] =
-                                prefix[position] * suffix[position + 1];
-                        }
-                    }
-                }
-                accumulate_low_range_quotient_chunk(
-                    chunk,
-                    row0,
-                    half_rows,
-                    num_gates,
-                    low,
-                    odd,
-                    |g, r| filters[g * ROWS_PER_CHUNK + r],
-                );
-            });
-        (out, false)
     }
 }
 
@@ -1752,7 +1379,6 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     half_rows: usize,
     full_rows: usize,
     constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    filter_cache: &LowRangeSelectorFilterCache<F>,
 ) -> Vec<F> {
     debug_assert_eq!(full_rows, half_rows * 2);
     debug_assert_eq!(low.len(), gates.len() * half_rows * 2);
@@ -1783,16 +1409,100 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
         .collect();
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
-    combine_low_range_quotient(
-        low,
-        &odd,
-        gates,
-        half_rows,
-        full_rows,
-        constants,
-        low_range_selector_filter_cache_enabled().then_some(filter_cache),
-    )
-    .0
+    let unused = F::from_canonical_u64(u32::MAX as u64);
+    // Gates sharing a selector column share `s(x)` and the factors `(j - s)`;
+    // group them so each row computes every group's factors once and derives
+    // each gate's filter by prefix/suffix products (`prod_{j != g}` without
+    // division). Order within `gates` is preserved through `slot`.
+    struct GroupPlan {
+        selector_column: usize,
+        group_start: usize,
+        group_len: usize,
+        include_unused_selector: bool,
+        /// (gate slot in `gates`, position of the gate inside the group)
+        members: Vec<(usize, usize)>,
+    }
+    let mut plans: Vec<GroupPlan> = Vec::new();
+    for (slot, gate) in gates.iter().enumerate() {
+        let position = gate.gate_index - gate.group.start;
+        match plans.iter_mut().find(|p| {
+            p.selector_column == gate.selector_column
+                && p.group_start == gate.group.start
+                && p.group_len == gate.group.len()
+                && p.include_unused_selector == gate.include_unused_selector
+        }) {
+            Some(plan) => plan.members.push((slot, position)),
+            None => plans.push(GroupPlan {
+                selector_column: gate.selector_column,
+                group_start: gate.group.start,
+                group_len: gate.group.len(),
+                include_unused_selector: gate.include_unused_selector,
+                members: vec![(slot, position)],
+            }),
+        }
+    }
+    let selector_cols: Vec<&[F]> = plans.iter().map(|p| constants.col(p.selector_column)).collect();
+    const ROWS_PER_CHUNK: usize = 512;
+    const MAX_GROUP: usize = 16;
+    assert!(plans.iter().all(|p| p.group_len <= MAX_GROUP));
+    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
+    // SAFETY: every slot is written exactly once by the disjoint parallel
+    // pass below before any read.
+    unsafe { out.set_len(full_rows * 2) };
+    let num_gates = gates.len();
+    out.par_chunks_mut(2 * ROWS_PER_CHUNK)
+        .enumerate()
+        .for_each(|(chunk_i, chunk)| {
+            let row0 = chunk_i * ROWS_PER_CHUNK;
+            let rows = chunk.len() / 2;
+            // Filters for this chunk, gate-major: filters[g * ROWS_PER_CHUNK + r].
+            let mut filters = vec![F::ONE; num_gates * ROWS_PER_CHUNK];
+            let mut factors = [F::ZERO; MAX_GROUP];
+            let mut prefix = [F::ONE; MAX_GROUP + 1];
+            let mut suffix = [F::ONE; MAX_GROUP + 1];
+            for (plan, selector_col) in plans.iter().zip(&selector_cols) {
+                let n = plan.group_len;
+                for r in 0..rows {
+                    let s_val = selector_col[row0 + r];
+                    for k in 0..n {
+                        factors[k] = F::from_canonical_usize(plan.group_start + k) - s_val;
+                    }
+                    prefix[0] = if plan.include_unused_selector { unused - s_val } else { F::ONE };
+                    for k in 0..n {
+                        prefix[k + 1] = prefix[k] * factors[k];
+                    }
+                    suffix[n] = F::ONE;
+                    for k in (0..n).rev() {
+                        suffix[k] = suffix[k + 1] * factors[k];
+                    }
+                    for &(g, position) in &plan.members {
+                        filters[g * ROWS_PER_CHUNK + r] = prefix[position] * suffix[position + 1];
+                    }
+                }
+            }
+            // Accumulate gate-major so each pass streams one source array.
+            let mut acc = vec![F::ZERO; 2 * ROWS_PER_CHUNK];
+            for g in 0..num_gates {
+                let f = &filters[g * ROWS_PER_CHUNK..g * ROWS_PER_CHUNK + rows];
+                let odd0 = &odd[g * 2];
+                let odd1 = &odd[g * 2 + 1];
+                let low_base = g * half_rows * 2;
+                for r in 0..rows {
+                    let i = row0 + r;
+                    let (sv0, sv1) = if i & 1 == 0 {
+                        let base = low_base + (i >> 1) * 2;
+                        (low[base], low[base + 1])
+                    } else {
+                        (odd0[i >> 1], odd1[i >> 1])
+                    };
+                    let filter = f[r];
+                    acc[2 * r] += filter * sv0;
+                    acc[2 * r + 1] += filter * sv1;
+                }
+            }
+            chunk.copy_from_slice(&acc[..2 * rows]);
+        });
+    out
 }
 
 /// Standalone timing harness for the range/u32 quotient kernel variants on a
@@ -1913,14 +1623,7 @@ pub fn range_quotient_microbench<
         });
         time("  CPU extend+combine", &|| {
             let t = std::time::Instant::now();
-            let out = extend_and_combine_low_range_quotient(
-                low_values,
-                &low_gates,
-                low_rows,
-                lde_size,
-                constants,
-                &prover_data.low_range_selector_filter_cache,
-            );
+            let out = extend_and_combine_low_range_quotient(low_values, &low_gates, low_rows, lde_size, constants);
             core::hint::black_box(&out);
             Some(t.elapsed().as_secs_f64() * 1e3)
         });
@@ -2873,7 +2576,6 @@ fn compute_quotient_polys<
                 *low_rows,
                 points.len(),
                 constants,
-                &prover_data.low_range_selector_filter_cache,
             )))
         } else {
             Ok(None)
@@ -3657,12 +3359,9 @@ mod quotient_layout_tests {
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
-    };
+    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -3672,8 +3371,6 @@ mod quotient_layout_tests {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use crate::plonk::circuit_data::LowRangeSelectorFilterCache;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
@@ -3711,154 +3408,6 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
-    }
-
-    /// Raw-limb differential and dispatch guard for the immutable low-range
-    /// selector cache. This exercises multiple selector groups, UNUSED, a
-    /// short final chunk, the first fill, a cache hit, and signature mismatch.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    #[test]
-    fn low_range_selector_filter_cache_matches_chunked_raw_and_dispatches() {
-        let half_rows = 333usize;
-        let full_rows = half_rows * 2;
-        let Some(mut constants) =
-            crate::hash::poseidon2::metal::allocate_plain_columns::<F>(2, full_rows)
-        else {
-            return;
-        };
-        for (column_i, column) in constants
-            .columns_mut()
-            .expect("plain Metal columns are CPU writable")
-            .into_iter()
-            .enumerate()
-        {
-            for (row, value) in column.iter_mut().enumerate() {
-                let limb = ((column_i * 97 + row * 29) % 10_000 + 1) as u64;
-                *value = if (row + column_i) % 3 == 0 {
-                    F::from_noncanonical_u64(F::ORDER + limb)
-                } else {
-                    F::from_canonical_u64(limb)
-                };
-            }
-        }
-
-        let gates = vec![
-            LowDegreeRangeGate {
-                gate_index: 0,
-                selector_column: 0,
-                group: 0..4,
-                include_unused_selector: true,
-            },
-            LowDegreeRangeGate {
-                gate_index: 2,
-                selector_column: 0,
-                group: 0..4,
-                include_unused_selector: true,
-            },
-            LowDegreeRangeGate {
-                gate_index: 3,
-                selector_column: 0,
-                group: 0..4,
-                include_unused_selector: true,
-            },
-            LowDegreeRangeGate {
-                gate_index: 6,
-                selector_column: 1,
-                group: 6..9,
-                include_unused_selector: false,
-            },
-            LowDegreeRangeGate {
-                gate_index: 8,
-                selector_column: 1,
-                group: 6..9,
-                include_unused_selector: false,
-            },
-        ];
-        let field = |i: usize| {
-            let limb = ((i * 43 + 11) % 100_000 + 1) as u64;
-            if i % 5 == 0 {
-                F::from_noncanonical_u64(F::ORDER + limb)
-            } else {
-                F::from_canonical_u64(limb)
-            }
-        };
-        let low = (0..gates.len() * half_rows * 2)
-            .map(field)
-            .collect::<Vec<_>>();
-        let odd = (0..gates.len() * 2)
-            .map(|column| {
-                (0..half_rows)
-                    .map(|row| field(1_000_000 + column * half_rows + row))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let (chunked, chunked_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &gates,
-            half_rows,
-            full_rows,
-            &constants,
-            None,
-        );
-        assert!(!chunked_dispatched);
-
-        let cache = LowRangeSelectorFilterCache::default();
-        let (filled, fill_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &gates,
-            half_rows,
-            full_rows,
-            &constants,
-            Some(&cache),
-        );
-        assert!(fill_dispatched, "first eligible call did not fill/dispatch the cache");
-        let (hit, hit_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &gates,
-            half_rows,
-            full_rows,
-            &constants,
-            Some(&cache),
-        );
-        assert!(hit_dispatched, "second eligible call did not hit the cache");
-
-        let raw = |values: &[F]| {
-            values
-                .iter()
-                .map(PrimeField64::to_noncanonical_u64)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(raw(&filled), raw(&chunked), "cache fill changed raw limbs");
-        assert_eq!(raw(&hit), raw(&chunked), "cache hit changed raw limbs");
-
-        // The cache is owned by one exact circuit/shape. A different gate
-        // signature must reject the entry and use the value-identical fallback.
-        let mut changed_gates = gates;
-        changed_gates[0].include_unused_selector = false;
-        let (changed_reference, _) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &changed_gates,
-            half_rows,
-            full_rows,
-            &constants,
-            None,
-        );
-        let (changed_cached, changed_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &changed_gates,
-            half_rows,
-            full_rows,
-            &constants,
-            Some(&cache),
-        );
-        assert!(!changed_dispatched, "cache crossed its circuit signature guard");
-        assert_eq!(raw(&changed_cached), raw(&changed_reference));
     }
 
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
