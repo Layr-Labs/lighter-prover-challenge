@@ -1391,7 +1391,15 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // `(shift * omega)^i`; the net per-coefficient factor is `omega^i`, fused
     // into the IFFT's normalization pass (`coset_ifft_with_powers`).
     let omega = F::primitive_root_of_unity(lde_bits);
-    let omega_powers = precomputed::shift_powers::<F>(omega, half_rows);
+    // The IFFT normalization and the odd-coset coefficient shift are both
+    // deterministic per domain. Fold them into one cached scale table so the
+    // recurring split path performs one field multiplication per coefficient
+    // instead of first multiplying by `1 / half_rows` and then by `omega^i`.
+    let omega_powers = precomputed::scaled_shift_powers::<F>(
+        omega,
+        F::inverse_2exp(log2_strict(half_rows)),
+        half_rows,
+    );
     let odd: Vec<Vec<F>> = (0..gates.len() * 2)
         .into_par_iter()
         .map(|t| {
@@ -1400,7 +1408,7 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let base = g * half_rows * 2;
             let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
             PolynomialValues::new(values)
-                .coset_ifft_with_powers(&omega_powers)
+                .coset_ifft_with_prescaled_powers(&omega_powers)
                 .fft()
                 .values
         })
@@ -3119,6 +3127,7 @@ pub(crate) mod precomputed {
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
         static SHIFT_POWERS: OnceLock<ShiftMap> = OnceLock::new();
+        static SCALED_SHIFT_POWERS: OnceLock<ShiftMap> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
             cache: &'static OnceLock<Map>,
@@ -3209,6 +3218,61 @@ pub(crate) mod precomputed {
             }
         }
 
+        /// Cached `scale * shift^i` table. The pair participates in every
+        /// value, so both factors are part of the cache key.
+        pub(crate) fn scaled_shift_powers<F: Field>(
+            shift: F,
+            scale: F,
+            len: usize,
+        ) -> Arc<Vec<F>> {
+            type ScaledShiftTables<F> = RwLock<Vec<((F, F), Arc<Vec<F>>)>>;
+            let map = SCALED_SHIFT_POWERS.get_or_init(|| RwLock::new(HashMap::new()));
+            let key = TypeId::of::<F>();
+            let existing = map.read().unwrap().get(&key).map(Arc::clone);
+            let erased = match existing {
+                Some(entry) => entry,
+                None => {
+                    let mut map = map.write().unwrap();
+                    Arc::clone(map.entry(key).or_insert_with(|| {
+                        Arc::new(ScaledShiftTables::<F>::new(Vec::new()))
+                            as Arc<dyn Any + Send + Sync>
+                    }))
+                }
+            };
+            let tables = erased
+                .downcast::<ScaledShiftTables<F>>()
+                .ok()
+                .expect("type-keyed cache entry has the keyed type");
+            if let Some(hit) = tables
+                .read()
+                .unwrap()
+                .iter()
+                .find(|((cached_shift, cached_scale), table)| {
+                    *cached_shift == shift && *cached_scale == scale && table.len() >= len
+                })
+                .map(|(_, table)| Arc::clone(table))
+            {
+                return hit;
+            }
+            let computed: Arc<Vec<F>> =
+                Arc::new(shift.powers().take(len).map(|power| scale * power).collect());
+            let mut tables = tables.write().unwrap();
+            match tables.iter_mut().find(|((cached_shift, cached_scale), _)| {
+                *cached_shift == shift && *cached_scale == scale
+            }) {
+                Some(slot) => {
+                    if slot.1.len() < len {
+                        slot.1 = Arc::clone(&computed);
+                    }
+                    Arc::clone(&slot.1)
+                }
+                None => {
+                    tables.push(((shift, scale), Arc::clone(&computed)));
+                    computed
+                }
+            }
+        }
+
         /// Cached `x * F::coset_shift()` over the whole two-adic subgroup of
         /// size `1 << n_log`. The quotient evaluator needs the shifted point
         /// for every domain element of every proof, and the domain depends
@@ -3261,6 +3325,20 @@ pub(crate) mod precomputed {
             Arc::new(shift.powers().take(len).collect::<Vec<F>>())
         }
 
+        pub(crate) fn scaled_shift_powers<F: Field>(
+            shift: F,
+            scale: F,
+            len: usize,
+        ) -> Arc<Vec<F>> {
+            Arc::new(
+                shift
+                    .powers()
+                    .take(len)
+                    .map(|power| scale * power)
+                    .collect::<Vec<F>>(),
+            )
+        }
+
         pub(crate) fn shifted_two_adic_subgroup<F: Field>(n_log: usize) -> Arc<Vec<F>> {
             let shift = F::coset_shift();
             Arc::new(F::two_adic_subgroup(n_log).into_iter().map(|x| shift * x).collect::<Vec<F>>())
@@ -3280,7 +3358,7 @@ pub(crate) mod precomputed {
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers_scaled, shift_powers,
+        coset_shift_powers, inverse_coset_shift_powers_scaled, scaled_shift_powers, shift_powers,
         shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
