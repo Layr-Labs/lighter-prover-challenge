@@ -12,13 +12,13 @@ use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{unflatten, Extendable, FieldExtension};
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
-use crate::fri::oracle::{
-    coset_fft_zero_tail_base, coset_fft_zero_tail_base_dif_bitrev,
-};
+use crate::fri::oracle::{coset_fft_zero_tail_base, coset_fft_zero_tail_base_dif_bitrev};
 use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQueryStep};
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use crate::hash::merkle_tree::ColumnStore;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
@@ -173,8 +173,7 @@ fn flatten_bitrev_order<F: RichField + Extendable<D>, const D: usize>(
 ) -> Vec<F> {
     if D == 2
         && TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
-        && TypeId::of::<F::Extension>()
-            == TypeId::of::<QuadraticExtension<GoldilocksField>>()
+        && TypeId::of::<F::Extension>() == TypeId::of::<QuadraticExtension<GoldilocksField>>()
     {
         assert_eq!(size_of::<F::Extension>(), 2 * size_of::<F>());
         assert_eq!(align_of::<F::Extension>(), align_of::<F>());
@@ -188,11 +187,7 @@ fn flatten_bitrev_order<F: RichField + Extendable<D>, const D: usize>(
         // expressed in base-field elements. Ownership moves to the returned
         // Vec and the ManuallyDrop prevents a second free.
         return unsafe {
-            Vec::from_raw_parts(
-                values.as_mut_ptr().cast::<F>(),
-                len * 2,
-                capacity * 2,
-            )
+            Vec::from_raw_parts(values.as_mut_ptr().cast::<F>(), len * 2, capacity * 2)
         };
     }
 
@@ -242,14 +237,10 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
             let mut folded = vec![F::Extension::ZERO; terms.len() / 16];
             // SAFETY: TypeId equality proves all three element types exactly.
             let terms_ext2 = unsafe {
-                core::slice::from_raw_parts(
-                    terms.as_ptr().cast::<GoldilocksExt2>(),
-                    terms.len(),
-                )
+                core::slice::from_raw_parts(terms.as_ptr().cast::<GoldilocksExt2>(), terms.len())
             };
             let powers_ext2 = unsafe {
-                &*(beta_powers as *const [F::Extension; 16]
-                    as *const [GoldilocksExt2; 16])
+                &*(beta_powers as *const [F::Extension; 16] as *const [GoldilocksExt2; 16])
             };
             let folded_len = folded.len();
             let folded_ext2 = unsafe {
@@ -282,6 +273,111 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
         .collect()
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn try_fused_fri_fold_commitment<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    coeffs: &[F::Extension],
+    beta: F::Extension,
+    next_shift: F,
+    rate_bits: usize,
+    cap_height: usize,
+) -> Option<(Vec<F::Extension>, MerkleTree<F, C::Hasher>)> {
+    type ProductionExtension = QuadraticExtension<GoldilocksField>;
+    if D != 2
+        || TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<F::Extension>() != TypeId::of::<ProductionExtension>()
+        || !C::Hasher::SUPPORTS_GOLDILOCKS_POSEIDON2_METAL
+    {
+        return None;
+    }
+    debug_assert_eq!(size_of::<F::Extension>(), size_of::<ProductionExtension>());
+    debug_assert_eq!(
+        align_of::<F::Extension>(),
+        align_of::<ProductionExtension>()
+    );
+    let production_coeffs = unsafe {
+        // SAFETY: the field and extension TypeId checks above establish the
+        // benchmark's exact element types; the slice length is unchanged.
+        core::slice::from_raw_parts(coeffs.as_ptr().cast::<ProductionExtension>(), coeffs.len())
+    };
+    let production_beta = unsafe {
+        // SAFETY: the extension TypeId and layout checks above prove equality.
+        core::ptr::read((&beta as *const F::Extension).cast::<ProductionExtension>())
+    };
+    let production_shift = unsafe {
+        // SAFETY: the base-field TypeId check above proves equality.
+        core::ptr::read((&next_shift as *const F).cast::<GoldilocksField>())
+    };
+    let (_gpu_folded, columns, digests, cap) =
+        crate::hash::poseidon2::metal::build_fri_fold_commitment(
+            production_coeffs,
+            production_beta,
+            production_shift,
+            rate_bits,
+            cap_height,
+        )?;
+
+    let convert_hash = |hash: crate::hash::hash_types::HashOut<GoldilocksField>| {
+        C::Hasher::hash_from_goldilocks_poseidon2(hash.elements)
+            .expect("Poseidon2 Metal capability must convert its native digest")
+    };
+    let generic_digests = crate::hash::merkle_tree::LevelOrderDigests {
+        nodes: digests
+            .nodes
+            .iter()
+            .copied()
+            .map(convert_hash)
+            .collect::<Vec<_>>()
+            .into(),
+        level_offsets: digests.level_offsets,
+    };
+    let generic_cap = cap.into_iter().map(convert_hash).collect();
+    let columns = ManuallyDrop::new(columns);
+    let generic_columns = unsafe {
+        // SAFETY: the base-field TypeId check above proves `F` is exactly
+        // GoldilocksField. `MetalColumns` differs only in that element type.
+        core::ptr::read(
+            (&*columns
+                as *const crate::hash::poseidon2::metal::MetalColumns<GoldilocksField>)
+                .cast::<crate::hash::poseidon2::metal::MetalColumns<F>>(),
+        )
+    };
+    let generic_tree = MerkleTree::<F, C::Hasher>::from_column_store_with_digests(
+        ColumnStore::Shared(generic_columns),
+        generic_digests,
+        generic_cap,
+    );
+
+    // Keep the coefficient state raw-word-identical to the scalar baseline.
+    // The GPU fold feeds the fused NTT immediately, while this inexpensive
+    // live-prefix fold produces the CPU-owned coefficients consumed by later
+    // rounds and serialized as the final polynomial.
+    let mut beta_powers = [F::Extension::ONE; 16];
+    for i in 1..16 {
+        beta_powers[i] = beta_powers[i - 1] * beta;
+    }
+    let generic_folded = fri_fold_arity16_chunks::<F, D>(coeffs, beta, &beta_powers);
+    Some((generic_folded, generic_tree))
+}
+
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+fn try_fused_fri_fold_commitment<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    _coeffs: &[F::Extension],
+    _beta: F::Extension,
+    _next_shift: F,
+    _rate_bits: usize,
+    _cap_height: usize,
+) -> Option<(Vec<F::Extension>, MerkleTree<F, C::Hasher>)> {
+    None
+}
+
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
     values: PolynomialValues<F::Extension>,
@@ -293,6 +389,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
 ) -> FriCommitedTrees<F, C, D> {
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
     let mut values = Some(values);
+    let mut prefused_tree = None;
 
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
     let num_rounds = fri_params.reduction_arity_bits.len();
@@ -301,20 +398,25 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         #[cfg(feature = "diagnostic_profile")]
         let round_name = |names: [&'static str; 3]| names.get(round).copied().unwrap_or(names[2]);
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
+        let tree = if let Some(tree) = prefused_tree.take() {
+            tree
+        } else {
+            // Fused bit-reversal + flatten: one gather pass writes the flat
+            // leaf buffer directly. This remains both the first-round path and
+            // the complete fallback when the Metal fold/commit is unavailable.
         let flat_values = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = crate::util::profile::span(
                 "fri_commit",
-                round_name(["direct_flatten_r0", "direct_flatten_r1", "direct_flatten_r2"]),
+                    round_name([
+                        "direct_flatten_r0",
+                        "direct_flatten_r1",
+                        "direct_flatten_r2",
+                    ]),
             );
             let round_values = values
                 .take()
-                .expect("every FRI commit round has one codeword")
+                    .expect("every unfused FRI commit round has one codeword")
                 .values;
             if values_are_bitrev {
                 flatten_bitrev_order::<F, D>(round_values)
@@ -322,7 +424,6 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
                 bitrev_flatten::<F, D>(&round_values)
             }
         };
-        let tree = {
             #[cfg(feature = "diagnostic_profile")]
             let _span = crate::util::profile::span(
                 "fri_commit",
@@ -347,6 +448,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         let n_chunks = coeffs.coeffs.len() / arity;
         let support = coeffs.coeffs.len() >> fri_params.config.rate_bits;
         let live_chunks = support.div_ceil(arity).min(n_chunks);
+        let next_shift = shift.exp_u64(arity as u64);
         let beta_powers_16 = if arity == 16 {
             let mut powers = [F::Extension::ONE; 16];
             for i in 1..16 {
@@ -360,18 +462,40 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             #[cfg(feature = "diagnostic_profile")]
             let _span = crate::util::profile::span(
                 "fri_commit",
-                round_name(["coefficient_fold_r0", "coefficient_fold_r1", "coefficient_fold_r2"]),
+                round_name([
+                    "coefficient_fold_r0",
+                    "coefficient_fold_r1",
+                    "coefficient_fold_r2",
+                ]),
             );
-            match &beta_powers_16 {
-                Some(beta_powers) => fri_fold_arity16_chunks::<F, D>(
-                    &coeffs.coeffs[..live_chunks * arity],
-                    beta,
-                    beta_powers,
-                ),
-                None => coeffs.coeffs[..live_chunks * arity]
-                    .par_chunks_exact(arity)
-                    .map(|chunk| reduce_with_powers(chunk, beta))
-                    .collect::<Vec<_>>(),
+            let fused = (round + 1 < num_rounds
+                && *arity_bits == 4
+                && fri_params.reduction_arity_bits[round + 1] == 4)
+                .then(|| {
+                    try_fused_fri_fold_commitment::<F, C, D>(
+                        &coeffs.coeffs[..support],
+                        beta,
+                        next_shift,
+                        fri_params.config.rate_bits,
+                        fri_params.config.cap_height,
+                    )
+                })
+                .flatten();
+            if let Some((folded, tree)) = fused {
+                prefused_tree = Some(tree);
+                folded
+            } else {
+                match &beta_powers_16 {
+                    Some(beta_powers) => fri_fold_arity16_chunks::<F, D>(
+                        &coeffs.coeffs[..live_chunks * arity],
+                        beta,
+                        beta_powers,
+                    ),
+                    None => coeffs.coeffs[..live_chunks * arity]
+                        .par_chunks_exact(arity)
+                        .map(|chunk| reduce_with_powers(chunk, beta))
+                        .collect::<Vec<_>>(),
+                }
             }
         };
         // The historical `resize(n_chunks, ZERO)` zero-filled the whole dead
@@ -395,7 +519,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
             *value = F::Extension::ZERO;
         }
         coeffs = PolynomialCoeffs::new(folded);
-        shift = shift.exp_u64(arity as u64);
+        shift = next_shift;
         // Chunk-wise folding preserves the zero tail: the coefficient vector
         // keeps `1/2^rate_bits` support every round (asserted by the
         // truncation below), so the FFT's zero-run shortcut always applies.
@@ -403,11 +527,11 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         // above just wrote, and `shift^i * 0 == 0`, so the coset scaling is
         // dead work over that tail: scale only the folded prefix.
         //
-        // `values` is read by exactly one thing: the *next* round's leaf
-        // gather at the top of this loop. After the final round it is dropped
-        // unread — everything below this loop uses only `coeffs` — so the
-        // last round's transform is entirely dead work. Skip it.
-        if round + 1 < num_rounds {
+        // A successful fused transition already produced the next tree and
+        // retained its leaves, so no CPU codeword exists or is needed. The
+        // fallback computes exactly the historical codeword for the next
+        // round. The final round still skips its dead transform.
+        if round + 1 < num_rounds && prefused_tree.is_none() {
             values_are_bitrev = fri_params.config.rate_bits == 3;
             values = Some({
                 #[cfg(feature = "diagnostic_profile")]
@@ -416,11 +540,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
                     round_name(["coset_fft_r0", "coset_fft_r1", "coset_fft_r2"]),
                 );
                 if fri_params.config.rate_bits == 3 {
-                    coset_fft_zero_tail_base_dif_bitrev::<F, D>(
-                        &coeffs,
-                        shift,
-                        live_chunks,
-                    )
+                    coset_fft_zero_tail_base_dif_bitrev::<F, D>(&coeffs, shift, live_chunks)
                 } else {
                     coset_fft_zero_tail_base::<F, D>(
                         &coeffs,
@@ -431,6 +551,8 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
                     )
                 }
             });
+        } else {
+            values = None;
         }
     }
 
@@ -629,7 +751,8 @@ fn fri_prover_query_round<
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
-        let evals = unflatten(tree.get(x_index >> arity_bits));
+        let leaf = tree.get_cow(x_index >> arity_bits);
+        let evals = unflatten(&leaf);
         let merkle_proof = tree.prove(x_index >> arity_bits);
 
         query_steps.push(FriQueryStep {
@@ -655,6 +778,7 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::fri::reduction_strategies::FriReductionStrategy;
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
@@ -714,7 +838,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         let flat = flatten_bitrev_order::<F, 2>(values);
-        assert_eq!(flat.as_ptr(), input_ptr, "the allocation must be transferred");
+        assert_eq!(
+            flat.as_ptr(),
+            input_ptr,
+            "the allocation must be transferred"
+        );
         assert_eq!(flat.len(), expected.len());
         assert_eq!(flat.capacity(), input_capacity * 2);
         assert_eq!(
@@ -747,8 +875,10 @@ mod tests {
             let actual: [F; 2] = actual.to_basefield_array();
             let expected: [F; 2] = expected.to_basefield_array();
             for limb in 0..2 {
-                assert_eq!(actual[limb].0, expected[limb].0,
-                    "raw mismatch at row {row}, limb {limb}");
+                assert_eq!(
+                    actual[limb].0, expected[limb].0,
+                    "raw mismatch at row {row}, limb {limb}"
+                );
             }
         }
     }
@@ -783,20 +913,124 @@ mod tests {
     fn fri_fold_arity16_apple_batch_matches_scalar_noncanonical_raw_tails() {
         type F = GoldilocksField;
         type FE = <F as Extendable<2>>::Extension;
-        let raw = [0, 1, F::ORDER - 1, F::ORDER, F::ORDER + 1,
-            1 << 32, u64::MAX - 1, u64::MAX];
-        let beta = FE::from_basefield_array([
-            GoldilocksField(u64::MAX),
-            GoldilocksField(F::ORDER),
-        ]);
+        let raw = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            1 << 32,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let beta = FE::from_basefield_array([GoldilocksField(u64::MAX), GoldilocksField(F::ORDER)]);
         for rows in [1, 3, 7, 8, 9, 17] {
             let terms = (0..rows * 16)
-                .map(|i| FE::from_basefield_array([
+                .map(|i| {
+                    FE::from_basefield_array([
                     GoldilocksField(raw[i % raw.len()]),
                     GoldilocksField(raw[(i * 5 + 3) % raw.len()]),
-                ]))
+                    ])
+                })
                 .collect::<Vec<_>>();
             assert_arity16_batch_matches_scalar_raw(&terms, beta);
+        }
+    }
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn fused_fri_fold_commitment_matches_cpu_raw_tree_and_paths() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+        type H = crate::hash::poseidon2::hash::Poseidon2Hash;
+
+        assert!(
+            crate::hash::poseidon2::metal::wait_for_fri_fold_commit_pipelines(),
+            "FRI auxiliary pipelines"
+        );
+        let coeffs = (0..(1usize << 16))
+            .map(|i| {
+                let x = (i as u64)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add(0xd1b5_4a32_d192_ed03);
+                FE::from_basefield_array([
+                    F::from_canonical_u64(x % F::ORDER),
+                    F::from_canonical_u64(x.rotate_left(29) % F::ORDER),
+                ])
+            })
+            .collect::<Vec<_>>();
+        let beta = FE::from_basefield_array([
+            F::from_canonical_u64(0x1234_5678_9abc_def0),
+            F::from_canonical_u64(0x0fed_cba9_8765_4321),
+        ]);
+        let shift = F::MULTIPLICATIVE_GROUP_GENERATOR.exp_u64(16);
+        let (gpu_folded, columns, digests, cap) =
+            crate::hash::poseidon2::metal::build_fri_fold_commitment(&coeffs, beta, shift, 3, 4)
+                .expect("fused FRI fold/commit");
+
+        let mut powers = [FE::ONE; 16];
+        for i in 1..16 {
+            powers[i] = powers[i - 1] * beta;
+        }
+        let expected_folded = fri_fold_arity16_chunks::<F, 2>(&coeffs, beta, &powers);
+        assert_eq!(gpu_folded.len(), expected_folded.len());
+        for (i, (actual, expected)) in gpu_folded.iter().zip(&expected_folded).enumerate() {
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].to_canonical_u64(),
+                    expected.0[limb].to_canonical_u64(),
+                    "folded coefficient {i}, limb {limb}"
+                );
+            }
+        }
+
+        let mut padded = vec![FE::ZERO; 1 << 15];
+        padded[..expected_folded.len()].copy_from_slice(&expected_folded);
+        let polynomial = PolynomialCoeffs::new(padded);
+        let values =
+            coset_fft_zero_tail_base_dif_bitrev::<F, 2>(&polynomial, shift, expected_folded.len());
+        let flat = flatten_bitrev_order::<F, 2>(values.values);
+        let cpu_tree = MerkleTree::<F, H>::new_flat(flat, 32, 4);
+        let gpu_tree = MerkleTree::<F, H>::from_column_store_with_digests(
+            ColumnStore::Shared(columns),
+            digests,
+            cap,
+        );
+
+        let raw_hash = |hash: &HashOut<F>| hash.elements.map(|element| element.0);
+        assert_eq!(
+            gpu_tree.cap.0.iter().map(raw_hash).collect::<Vec<_>>(),
+            cpu_tree.cap.0.iter().map(raw_hash).collect::<Vec<_>>(),
+            "raw cap"
+        );
+        for leaf in 0..gpu_tree.num_leaves {
+            assert_eq!(
+                gpu_tree
+                    .get_cow(leaf)
+                    .iter()
+                    .map(|element| element.0)
+                    .collect::<Vec<_>>(),
+                cpu_tree
+                    .get_cow(leaf)
+                    .iter()
+                    .map(|element| element.0)
+                    .collect::<Vec<_>>(),
+                "raw leaf {leaf}"
+            );
+            assert_eq!(
+                gpu_tree
+                    .prove(leaf)
+                    .siblings
+                    .iter()
+                    .map(raw_hash)
+                    .collect::<Vec<_>>(),
+                cpu_tree
+                    .prove(leaf)
+                    .siblings
+                    .iter()
+                    .map(raw_hash)
+                    .collect::<Vec<_>>(),
+                "raw path {leaf}"
+            );
         }
     }
 

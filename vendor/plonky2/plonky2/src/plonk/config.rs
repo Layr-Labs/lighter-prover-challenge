@@ -51,6 +51,21 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// Permutation used in the sponge construction.
     type Permutation: PlonkyPermutation<F>;
 
+    /// Internal capability for the Apple-Silicon Goldilocks Poseidon2 backend.
+    #[doc(hidden)]
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    const SUPPORTS_GOLDILOCKS_POSEIDON2_METAL: bool = false;
+
+    /// Converts one canonical Metal Poseidon2 digest into this hasher's native
+    /// output. Only the exact Poseidon2 implementation may override it.
+    #[doc(hidden)]
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn hash_from_goldilocks_poseidon2(
+        _elements: [GoldilocksField; 4],
+    ) -> Option<Self::Hash> {
+        None
+    }
+
     /// Hash a message without any padding step. Note that this can enable length-extension attacks.
     /// However, it is still collision-resistant in cases where the input has a fixed length.
     fn hash_no_pad(input: &[F]) -> Self::Hash;

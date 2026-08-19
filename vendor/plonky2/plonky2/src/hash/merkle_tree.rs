@@ -1,5 +1,7 @@
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{borrow::Cow, vec::Vec};
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 use core::mem::MaybeUninit;
 use core::slice;
 
@@ -404,8 +406,7 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 
             let (h0, h1, h2, h3) = H::hash_or_noop_quad(leaf_0, leaf_1, leaf_2, leaf_3);
             let (h4, h5, h6, h7) = H::hash_or_noop_quad(leaf_4, leaf_5, leaf_6, leaf_7);
-            let [n01, n23, n45, n67] =
-                H::two_to_one_quad([(h0, h1), (h2, h3), (h4, h5), (h6, h7)]);
+            let [n01, n23, n45, n67] = H::two_to_one_quad([(h0, h1), (h2, h3), (h4, h5), (h6, h7)]);
 
             left_digests_buf[0].write(h0);
             left_digests_buf[1].write(h1);
@@ -583,9 +584,7 @@ pub(crate) fn fill_subtree_gather<F: RichField, H: Hasher<F>>(
     // tiny subtrees near the leaves.
     let (left_digest, right_digest) = if num_leaves > 64 {
         plonky2_maybe_rayon::join(
-            || {
-                fill_subtree_gather::<F, H>(left_digests_buf, columns, log_rows, start_leaf, half)
-            },
+            || fill_subtree_gather::<F, H>(left_digests_buf, columns, log_rows, start_leaf, half),
             || {
                 fill_subtree_gather::<F, H>(
                     right_digests_buf,
@@ -640,8 +639,7 @@ pub(crate) fn fill_digests_buf_gather<F: RichField, H: Hasher<F>>(
                     slot.write(unsafe { *column.get_unchecked(natural) });
                 }
                 // SAFETY: the first `width` slots were just written.
-                let leaf: &[F] =
-                    unsafe { slice::from_raw_parts(tile.as_ptr().cast::<F>(), width) };
+                let leaf: &[F] = unsafe { slice::from_raw_parts(tile.as_ptr().cast::<F>(), width) };
                 cap_buf.write(H::hash_or_noop(leaf));
             });
         return;
@@ -675,11 +673,10 @@ pub(crate) fn fill_digests_buf_flat<F: RichField, H: Hasher<F>>(
     // Special case of a tree that's all cap.
     if digests_buf.is_empty() {
         debug_assert_eq!(cap_buf.len(), num_leaves);
-        cap_buf
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(i, cap_buf)| {
-                cap_buf.write(H::hash_or_noop(&leaves[i * leaf_width..(i + 1) * leaf_width]));
+        cap_buf.par_iter_mut().enumerate().for_each(|(i, cap_buf)| {
+            cap_buf.write(H::hash_or_noop(
+                &leaves[i * leaf_width..(i + 1) * leaf_width],
+            ));
             });
         return;
     }
@@ -747,15 +744,56 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Returns the natural-order, column-major Metal leaf storage when this
     /// commitment retained its LDE in a shared GPU-visible buffer.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn shared_columns(
-        &self,
-    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
+    pub(crate) fn shared_columns(&self) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
         match &self.leaves {
             MerkleLeaves::Columns {
                 columns: ColumnStore::Shared(columns),
                 ..
             } => Some(columns),
             _ => None,
+        }
+    }
+
+    /// Borrows a row-major leaf or materializes one sparse column-major leaf.
+    /// GPU-backed commitments need the latter for query openings; the common
+    /// row-major path retains the original zero-copy behavior.
+    pub fn get_cow(&self, i: usize) -> Cow<'_, [F]> {
+        assert!(i < self.num_leaves);
+        match &self.leaves {
+            MerkleLeaves::Rows { data, width } => {
+                Cow::Borrowed(&data[i * width..(i + 1) * width])
+            }
+            MerkleLeaves::Columns { columns, log_rows } => {
+                let row = crate::util::reverse_bits(i, *log_rows);
+                Cow::Owned(
+                    (0..columns.num_cols())
+                        .map(|column| columns.col(column)[row])
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    /// Constructs a tree whose specialized backend already produced both the
+    /// retained natural-order columns and the exact level-order digest layout.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn from_column_store_with_digests(
+        columns: ColumnStore<F>,
+        level_digests: LevelOrderDigests<H::Hash>,
+        cap: Vec<H::Hash>,
+    ) -> Self {
+        let num_leaves = columns.num_rows();
+        debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - cap.len());
+        debug_assert!(cap.len().is_power_of_two());
+        Self {
+            leaves: MerkleLeaves::Columns {
+                columns,
+                log_rows: log2_strict(num_leaves),
+            },
+            num_leaves,
+            digests: Vec::new(),
+            level_digests: Some(level_digests),
+            cap: MerkleCap(cap),
         }
     }
 
@@ -802,7 +840,10 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         if let Some((level_digests, cap)) =
             H::try_build_merkle_tree_column_store(&columns, cap_height)
         {
-            debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - (1 << cap_height));
+            debug_assert_eq!(
+                level_digests.nodes.len(),
+                2 * num_leaves - (1 << cap_height)
+            );
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Columns { columns, log_rows },
@@ -857,8 +898,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 // unchanged.
                 let mut flat: Vec<F> = Vec::with_capacity(num_leaves * num_columns);
                 {
-                    let spare =
-                        &mut flat.spare_capacity_mut()[..num_leaves * num_columns];
+                    let spare = &mut flat.spare_capacity_mut()[..num_leaves * num_columns];
                     spare
                         .par_chunks_mut(num_columns)
                         .enumerate()
@@ -992,7 +1032,10 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         if let Some((level_digests, cap)) =
             H::try_build_merkle_tree(&leaves, leaf_width, num_leaves, cap_height)
         {
-            debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - (1 << cap_height));
+            debug_assert_eq!(
+                level_digests.nodes.len(),
+                2 * num_leaves - (1 << cap_height)
+            );
             debug_assert_eq!(cap.len(), 1 << cap_height);
             return Self {
                 leaves: MerkleLeaves::Rows {
@@ -1073,7 +1116,6 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 #[cfg(test)]
 pub(crate) mod tests {
     use anyhow::Result;
-
     use plonky2_field::types::{PrimeField64, Sample};
 
     use super::*;

@@ -896,6 +896,25 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     type Hash = HashOut<F>;
     type Permutation = Poseidon2Permutation<F>;
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    const SUPPORTS_GOLDILOCKS_POSEIDON2_METAL: bool = true;
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn hash_from_goldilocks_poseidon2(
+        elements: [crate::field::goldilocks_field::GoldilocksField; 4],
+    ) -> Option<Self::Hash> {
+        type GF = crate::field::goldilocks_field::GoldilocksField;
+        if core::any::TypeId::of::<F>() != core::any::TypeId::of::<GF>() {
+            return None;
+        }
+        let exact = HashOut { elements };
+        // SAFETY: the TypeId equality proves `F == GoldilocksField`, hence the
+        // two HashOut instantiations have identical element type and layout.
+        Some(unsafe {
+            core::ptr::read((&exact as *const HashOut<GF>).cast::<HashOut<F>>())
+        })
+    }
+
     fn hash_no_pad(input: &[F]) -> Self::Hash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
     }

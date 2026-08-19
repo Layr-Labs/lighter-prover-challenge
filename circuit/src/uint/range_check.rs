@@ -643,14 +643,13 @@ mod tests {
     };
     use rand::Rng;
 
+    use super::*;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::add_many_u32::U32AddManyGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::arithmetic_u32::U32ArithmeticGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::uint::u32::gates::subtraction_u32::U32SubtractionGate;
-
-    use super::*;
 
     #[test]
     fn direct_filtered_accumulation_matches_materialized_batch() {
@@ -741,7 +740,10 @@ mod tests {
         let (row, op) = builder.find_slot(add_many, &[F::from_canonical_usize(16)], &[]);
         for j in 0..16 {
             let input = builder.add_virtual_target();
-            builder.connect(input, Target::wire(row, add_many.wire_ith_op_jth_addend(op, j)));
+            builder.connect(
+                input,
+                Target::wire(row, add_many.wire_ith_op_jth_addend(op, j)),
+            );
             u32_inputs.push((input, 0x0102_0304 + j as u64));
         }
         let carry = builder.add_virtual_target();
