@@ -1647,6 +1647,52 @@ pub fn range_quotient_microbench<
     }
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn low_range_constants_prefix_cols(
+    specs: &[crate::hash::poseidon2::metal::RangeCheckQuotientSpec],
+    spec_degrees: &[usize],
+    u32_specs: &[crate::hash::poseidon2::metal::U32QuotientSpec],
+    u32_spec_degrees: &[usize],
+) -> Option<usize> {
+    use crate::hash::poseidon2::metal::U32QuotientKind;
+
+    if specs.len() != spec_degrees.len() || u32_specs.len() != u32_spec_degrees.len() {
+        return None;
+    }
+    // The full commitment appends all permutation sigma columns after the
+    // selectors and gate constants. The low-domain Range/U32 shader never
+    // addresses that suffix; retain exactly the selector/constant prefix its
+    // degree-at-most-four metadata can name.
+    let mut columns = 0usize;
+    for (spec, &degree) in specs.iter().zip(spec_degrees) {
+        if degree <= 4 {
+            columns = columns.max(spec.selector_column.checked_add(1)?);
+        }
+    }
+    for (spec, &degree) in u32_specs.iter().zip(u32_spec_degrees) {
+        if degree > 4 {
+            continue;
+        }
+        columns = columns.max(spec.selector_column.checked_add(1)?);
+        let constant_end = match spec.kind {
+            U32QuotientKind::RandomAccess {
+                num_extra_constants,
+                constant_base,
+                ..
+            } => constant_base.checked_add(num_extra_constants)?,
+            U32QuotientKind::Equality { constant_column } => {
+                constant_column.checked_add(1)?
+            }
+            U32QuotientKind::BaseAddition { constant_base } => {
+                constant_base.checked_add(2)?
+            }
+            _ => 0,
+        };
+        columns = columns.max(constant_end);
+    }
+    Some(columns)
+}
+
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -2091,14 +2137,21 @@ fn start_gpu_range_check_gate_quotient<
         even_wires,
     ) {
         // Circuit-fixed constants/sigmas live in a deserialized Metal store
-        // with no companion. Fill their compact even rows only after the
-        // wires/shape admission succeeds; all other paths have no consumer
-        // for this cache. The shader strides both buffers by `wires.rows`, so
-        // admitted constant readers still receive matching compact columns.
+        // with no companion. Fill only the selector/gate-constant prefix the
+        // low dispatch can address, and only after wires/shape admission; the
+        // permutation sigma suffix has no low-domain consumer. The shader
+        // strides both buffers by `wires.rows`, so admitted constant readers
+        // still receive matching compact columns.
+        let constants_prefix_cols = low_range_constants_prefix_cols(
+            &specs,
+            &spec_degrees,
+            &u32_specs,
+            &u32_spec_degrees,
+        )?;
         let even_constants = prover_data
             .constants_sigmas_commitment
             .even_columns
-            .get_or_fill_even_rows(constants);
+            .get_or_fill_even_rows(constants, constants_prefix_cols);
         // Without a constants companion, kinds that read gate constants
         // stay on the full-domain dispatch (the kernel would otherwise
         // index `col * half_rows + k` into a full-stride store).
@@ -3373,6 +3426,8 @@ mod quotient_layout_tests {
     use anyhow::Result;
 
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    use super::low_range_constants_prefix_cols;
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
@@ -3394,6 +3449,95 @@ mod quotient_layout_tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn low_range_constants_prefix_covers_only_addressable_columns() {
+        use crate::hash::poseidon2::metal::{
+            RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        };
+
+        let range_specs = vec![
+            RangeCheckQuotientSpec {
+                selector_column: 2,
+                gate_index: 3,
+                group: 1..5,
+                include_unused_selector: true,
+                num_ops: 4,
+                bit_size: 32,
+            },
+            RangeCheckQuotientSpec {
+                selector_column: 90,
+                gate_index: 6,
+                group: 6..7,
+                include_unused_selector: false,
+                num_ops: 1,
+                bit_size: 8,
+            },
+        ];
+        let u32_specs = vec![
+            U32QuotientSpec {
+                selector_column: 5,
+                gate_index: 7,
+                group: 7..8,
+                include_unused_selector: false,
+                num_ops: 20,
+                kind: U32QuotientKind::Selection,
+            },
+            U32QuotientSpec {
+                selector_column: 1,
+                gate_index: 8,
+                group: 8..9,
+                include_unused_selector: false,
+                num_ops: 4,
+                kind: U32QuotientKind::RandomAccess {
+                    bits: 4,
+                    num_extra_constants: 2,
+                    constant_base: 7,
+                },
+            },
+            U32QuotientSpec {
+                selector_column: 0,
+                gate_index: 9,
+                group: 9..10,
+                include_unused_selector: false,
+                num_ops: 1,
+                kind: U32QuotientKind::Equality {
+                    constant_column: 12,
+                },
+            },
+            U32QuotientSpec {
+                selector_column: 2,
+                gate_index: 10,
+                group: 10..11,
+                include_unused_selector: false,
+                num_ops: 1,
+                kind: U32QuotientKind::BaseAddition { constant_base: 16 },
+            },
+            U32QuotientSpec {
+                selector_column: 100,
+                gate_index: 11,
+                group: 11..12,
+                include_unused_selector: false,
+                num_ops: 1,
+                kind: U32QuotientKind::BaseAddition { constant_base: 110 },
+            },
+        ];
+
+        assert_eq!(
+            low_range_constants_prefix_cols(
+                &range_specs,
+                &[4, 5],
+                &u32_specs,
+                &[2, 3, 2, 2, 5],
+            ),
+            Some(18),
+        );
+        assert_eq!(
+            low_range_constants_prefix_cols(&[], &[], &u32_specs[4..], &[5]),
+            Some(0),
+        );
+    }
 
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();

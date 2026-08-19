@@ -108,24 +108,27 @@ impl<F> EvenColumns<F> {
         self.inner.get().and_then(Option::as_ref)
     }
 
-    /// Derive the even-row companion from a full-domain Metal column store.
+    /// Derive an even-row column prefix from a full-domain Metal column store.
     ///
     /// `companion[j][k] = full[j][2k]`. The kernel indexes both the wires
     /// companion and this buffer with stride `wires.rows`, so the compact
     /// constants must have the same row count as the compact wires. A
     /// degree-`< 4n` polynomial is determined by its `4n` even-coset
     /// samples; copying those samples does not change any value the
-    /// full-domain kernel would have read at those rows.
+    /// full-domain kernel would have read at those rows. `columns` is the
+    /// exclusive upper bound of every column the compact-domain consumer can
+    /// address, so suffix columns are intentionally omitted.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     pub(crate) fn get_or_fill_even_rows(
         &self,
         full: &crate::hash::poseidon2::metal::MetalColumns<F>,
+        columns: usize,
     ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>>
     where
         F: crate::hash::hash_types::RichField,
     {
         self.inner
-            .get_or_init(|| fill_even_companion_from_full(full))
+            .get_or_init(|| fill_even_companion_from_full(full, columns))
             .as_ref()
     }
 }
@@ -133,13 +136,18 @@ impl<F> EvenColumns<F> {
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
     full: &crate::hash::poseidon2::metal::MetalColumns<F>,
+    columns: usize,
 ) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
-    if full.rows() < 2 || full.rows() % 2 != 0 || full.cols() == 0 {
+    if full.rows() < 2
+        || full.rows() % 2 != 0
+        || columns == 0
+        || columns > full.cols()
+    {
         return None;
     }
     let half = full.rows() / 2;
     let mut companion =
-        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(full.cols(), half)?;
+        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(columns, half)?;
     let dests = companion.columns_mut()?;
     dests.into_par_iter().enumerate().for_each(|(j, dest)| {
         let src = full.col(j);
