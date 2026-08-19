@@ -2088,8 +2088,22 @@ fn start_gpu_range_check_gate_quotient<
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
         let mut high_u32_specs = Vec::new();
+        // Gates below this many constraints save little kernel time on the
+        // half domain but each costs a CPU IFFT/FFT pair; keep them on the
+        // full-domain job. `LIGHTER_QSPLIT_MIN_CONSTRAINTS` (default 60:
+        // measured 26.91 / 26.62 / 26.59 s for 0 / 30 / 60 and 27.30 s for
+        // 120 over 3 interleaved rounds; 60 keeps the wide U32/range families
+        // and drops BaseSum4, QuinticMul, Selection, RA-3).
+        static MIN_CONSTRAINTS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let min_constraints = *MIN_CONSTRAINTS.get_or_init(|| {
+            std::env::var("LIGHTER_QSPLIT_MIN_CONSTRAINTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60)
+        });
         for (spec, &degree) in specs.iter().zip(&spec_degrees) {
-            if degree <= 4 {
+            let n_constraints = common_data.gates[spec.gate_index].0.num_constraints();
+            if degree <= 4 && n_constraints >= min_constraints {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2105,7 +2119,8 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && !reads_constants(&spec.kind) {
+            let n_constraints = common_data.gates[spec.gate_index].0.num_constraints();
+            if degree <= 4 && !reads_constants(&spec.kind) && n_constraints >= min_constraints {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
