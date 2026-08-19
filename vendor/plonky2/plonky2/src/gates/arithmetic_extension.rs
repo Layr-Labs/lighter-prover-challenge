@@ -11,6 +11,8 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -113,11 +115,88 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         }
     }
 
-    /// Contiguous-column fused evaluation: reads each wire as a contiguous
-    /// `n`-point column and multiply-adds the filtered constraint rows
-    /// straight into the shared buffer, avoiding the per-point strided writes
-    /// of the default path.
+    /// Dispatcher: packed lanes for width-divisible D=2 batches, else the
+    /// scalar oracle verbatim.
     fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let width = <F as Packable>::Packing::WIDTH;
+        if D == 2 && vars_base.len() % width == 0 {
+            self.eval_accumulate_packed(vars_base, filters, combined_gate_constraints);
+        } else {
+            self.eval_accumulate_scalar(vars_base, filters, combined_gate_constraints);
+        }
+    }
+
+    fn eval_unfiltered_circuit(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        vars: EvaluationTargets<D>,
+    ) -> Vec<ExtensionTarget<D>> {
+        let const_0 = vars.local_constants[0];
+        let const_1 = vars.local_constants[1];
+
+        let mut constraints = Vec::with_capacity(self.num_ops * D);
+        for i in 0..self.num_ops {
+            let multiplicand_0 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_0(i));
+            let multiplicand_1 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_1(i));
+            let addend = vars.get_local_ext_algebra(Self::wires_ith_addend(i));
+            let output = vars.get_local_ext_algebra(Self::wires_ith_output(i));
+            let computed_output = {
+                let mul = builder.mul_ext_algebra(multiplicand_0, multiplicand_1);
+                let scaled_mul = builder.scalar_mul_ext_algebra(const_0, mul);
+                builder.scalar_mul_add_ext_algebra(const_1, addend, scaled_mul)
+            };
+
+            let diff = builder.sub_ext_algebra(output, computed_output);
+            constraints.extend(diff.to_ext_target_array());
+        }
+
+        constraints
+    }
+
+    fn generators(&self, row: usize, local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
+        (0..self.num_ops)
+            .map(|i| {
+                WitnessGeneratorRef::new(
+                    ArithmeticExtensionGenerator {
+                        row,
+                        const_0: local_constants[0],
+                        const_1: local_constants[1],
+                        i,
+                    }
+                    .adapter(),
+                )
+            })
+            .collect()
+    }
+
+    fn num_wires(&self) -> usize {
+        self.num_ops * 4 * D
+    }
+
+    fn num_constants(&self) -> usize {
+        2
+    }
+
+    fn degree(&self) -> usize {
+        3
+    }
+
+    fn num_constraints(&self) -> usize {
+        self.num_ops * D
+    }
+}
+
+impl<const D: usize> ArithmeticExtensionGate<D> {
+    /// Verbatim scalar accumulate body (the differential oracle for the
+    /// packed path). Every `eval_unfiltered_base_batch_accumulate` call that
+    /// is not width-divisible D=2 routes here, so the whole original
+    /// semantics are preserved for every non-packed shape.
+    fn eval_accumulate_scalar<F: RichField + Extendable<D> + Packable>(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
@@ -196,63 +275,66 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         }
     }
 
-    fn eval_unfiltered_circuit(
+    /// Packed-lane accumulate for the production D=2 shape.
+    ///
+    /// `(a0 + a1 u)(b0 + b1 u) = (a0 b0 + W a1 b1) + (a0 b1 + a1 b0) u` with
+    /// `W = <F as Extendable<D>>::W` (7 for Goldilocks), then `scalar_mul` by
+    /// `const_0`, plus `addend.scalar_mul(const_1)`, then the `output - computed`
+    /// difference, exactly like the scalar oracle. The packed field's per-lane
+    /// mul/add are the same field ops on that lane's operands; the filter tail
+    /// reuses `batch_multiply_add_inplace`, which is itself packed internally.
+    fn eval_accumulate_packed<F: RichField + Extendable<D> + Packable>(
         &self,
-        builder: &mut CircuitBuilder<F, D>,
-        vars: EvaluationTargets<D>,
-    ) -> Vec<ExtensionTarget<D>> {
-        let const_0 = vars.local_constants[0];
-        let const_1 = vars.local_constants[1];
-
-        let mut constraints = Vec::with_capacity(self.num_ops * D);
-        for i in 0..self.num_ops {
-            let multiplicand_0 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_0(i));
-            let multiplicand_1 = vars.get_local_ext_algebra(Self::wires_ith_multiplicand_1(i));
-            let addend = vars.get_local_ext_algebra(Self::wires_ith_addend(i));
-            let output = vars.get_local_ext_algebra(Self::wires_ith_output(i));
-            let computed_output = {
-                let mul = builder.mul_ext_algebra(multiplicand_0, multiplicand_1);
-                let scaled_mul = builder.scalar_mul_ext_algebra(const_0, mul);
-                builder.scalar_mul_add_ext_algebra(const_1, addend, scaled_mul)
-            };
-
-            let diff = builder.sub_ext_algebra(output, computed_output);
-            constraints.extend(diff.to_ext_target_array());
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        debug_assert_eq!(D, 2);
+        let n = vars_base.len();
+        let width = <F as Packable>::Packing::WIDTH;
+        debug_assert_eq!(n % width, 0);
+        let num_groups = n / width;
+        let wires = vars_base.local_wires;
+        let constants = vars_base.local_constants;
+        let const_0 = &constants[..n];
+        let const_1 = &constants[n..2 * n];
+        let w = <F as Extendable<D>>::W;
+        let packing = <F as Packable>::Packing::from_slice;
+        for group in 0..num_groups {
+            let offset = group * width;
+            let c0 = *packing(&const_0[offset..offset + width]);
+            let c1 = *packing(&const_1[offset..offset + width]);
+            for i in 0..self.num_ops {
+                let m0_start = Self::wires_ith_multiplicand_0(i).start;
+                let m1_start = Self::wires_ith_multiplicand_1(i).start;
+                let addend_start = Self::wires_ith_addend(i).start;
+                let output_start = Self::wires_ith_output(i).start;
+                let a0 = *packing(&wires[m0_start * n + offset..][..width]);
+                let a1 = *packing(&wires[(m0_start + 1) * n + offset..][..width]);
+                let b0 = *packing(&wires[m1_start * n + offset..][..width]);
+                let b1 = *packing(&wires[(m1_start + 1) * n + offset..][..width]);
+                let z0 = *packing(&wires[addend_start * n + offset..][..width]);
+                let z1 = *packing(&wires[(addend_start + 1) * n + offset..][..width]);
+                let o0 = *packing(&wires[output_start * n + offset..][..width]);
+                let o1 = *packing(&wires[(output_start + 1) * n + offset..][..width]);
+                let real = a0 * b0 + (a1 * b1) * w;
+                let imag = a0 * b1 + a1 * b0;
+                let computed0 = real * c0 + z0 * c1;
+                let computed1 = imag * c0 + z1 * c1;
+                let term0 = o0 - computed0;
+                let term1 = o1 - computed1;
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * D) * n + offset..][..width],
+                    term0.as_slice(),
+                    &filters[offset..offset + width],
+                );
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * D + 1) * n + offset..][..width],
+                    term1.as_slice(),
+                    &filters[offset..offset + width],
+                );
+            }
         }
-
-        constraints
-    }
-
-    fn generators(&self, row: usize, local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
-        (0..self.num_ops)
-            .map(|i| {
-                WitnessGeneratorRef::new(
-                    ArithmeticExtensionGenerator {
-                        row,
-                        const_0: local_constants[0],
-                        const_1: local_constants[1],
-                        i,
-                    }
-                    .adapter(),
-                )
-            })
-            .collect()
-    }
-
-    fn num_wires(&self) -> usize {
-        self.num_ops * 4 * D
-    }
-
-    fn num_constants(&self) -> usize {
-        2
-    }
-
-    fn degree(&self) -> usize {
-        3
-    }
-
-    fn num_constraints(&self) -> usize {
-        self.num_ops * D
     }
 }
 
@@ -335,9 +417,11 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 mod tests {
     use anyhow::Result;
 
+    use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::field::types::{Field, Field64, PrimeField64};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
@@ -356,5 +440,86 @@ mod tests {
         let gate =
             ArithmeticExtensionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn packed_accumulate_matches_scalar_across_batch_sizes() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = ArithmeticExtensionGate::<D>::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+        );
+
+        fn value(i: usize) -> F {
+            let small = ((i as u64).wrapping_mul(0x9e37_79b9) ^ 0x5a5a_a5a5) & 0xffff;
+            if i % 3 == 0 {
+                GoldilocksField(F::ORDER + small)
+            } else {
+                F::from_canonical_u64(small)
+            }
+        }
+
+        let packing_width = <<F as Packable>::Packing as PackedField>::WIDTH;
+        let mut batch_sizes = vec![
+            1,
+            3,
+            5,
+            7,
+            11,
+            31,
+            32,
+            33,
+            packing_width.saturating_sub(1).max(1),
+            packing_width,
+            packing_width + 1,
+            packing_width + 2,
+            2 * packing_width - 1,
+            2 * packing_width,
+            2 * packing_width + 1,
+            1 << 13,
+        ];
+        batch_sizes.extend((0..packing_width).map(|r| packing_width + r));
+        batch_sizes.extend((0..packing_width).map(|r| 2 * packing_width + r));
+        batch_sizes.sort_unstable();
+        batch_sizes.dedup();
+
+        for &n in &batch_sizes {
+            let num_wires = <ArithmeticExtensionGate<D> as Gate<F, D>>::num_wires(&gate);
+            let num_constants = <ArithmeticExtensionGate<D> as Gate<F, D>>::num_constants(&gate);
+            let num_constraints = <ArithmeticExtensionGate<D> as Gate<F, D>>::num_constraints(&gate);
+            let wires = (0..num_wires * n).map(|i| value(i + 1)).collect::<Vec<_>>();
+            let constants = (0..num_constants * n)
+                .map(|i| value(i + 10_001))
+                .collect::<Vec<_>>();
+            let filters = (0..n)
+                .map(|i| match i % 7 {
+                    0 => F::ZERO,
+                    1 => GoldilocksField(F::ORDER),
+                    _ => value(i + 20_001),
+                })
+                .collect::<Vec<_>>();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+            let initial = (0..num_constraints * n)
+                .map(|i| match i % 11 {
+                    0 => F::ZERO,
+                    1 => GoldilocksField(F::ORDER),
+                    _ => value(i + 30_001),
+                })
+                .collect::<Vec<_>>();
+            let mut expected = initial.clone();
+            gate.eval_accumulate_scalar(vars, &filters, &mut expected);
+            let mut actual = initial;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+
+            for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "n={n}, output={i}"
+                );
+            }
+        }
     }
 }

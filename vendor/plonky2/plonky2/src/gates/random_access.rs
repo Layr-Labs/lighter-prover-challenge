@@ -311,10 +311,136 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         res
     }
 
-    /// Same contiguous-column evaluation as `eval_unfiltered_base_batch`, but
-    /// multiply-adds each filtered constraint row straight into the shared
-    /// buffer instead of materializing the full constraint matrix first.
+    /// Dispatcher: width-divisible batches run the packed-lane
+    /// `PackedEvaluableBase` path (bit-identical per lane, NEON); every
+    /// other shape routes to the verbatim scalar body in
+    /// [`Self::eval_accumulate_scalar`].
     fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let width = <F as Packable>::Packing::WIDTH;
+        if vars_base.len() % width == 0 {
+            self.eval_unfiltered_base_batch_accumulate_packed(
+                vars_base,
+                filters,
+                combined_gate_constraints,
+            );
+        } else {
+            self.eval_accumulate_scalar(vars_base, filters, combined_gate_constraints);
+        }
+    }
+
+    fn eval_unfiltered_circuit(
+        &self,
+        builder: &mut CircuitBuilder<F, D>,
+        vars: EvaluationTargets<D>,
+    ) -> Vec<ExtensionTarget<D>> {
+        let zero = builder.zero_extension();
+        let two = builder.two_extension();
+        let mut constraints = Vec::with_capacity(self.num_constraints());
+
+        for copy in 0..self.num_copies {
+            let access_index = vars.local_wires[self.wire_access_index(copy)];
+            let mut list_items = (0..self.vec_size())
+                .map(|i| vars.local_wires[self.wire_list_item(i, copy)])
+                .collect::<Vec<_>>();
+            let claimed_element = vars.local_wires[self.wire_claimed_element(copy)];
+            let bits = (0..self.bits)
+                .map(|i| vars.local_wires[self.wire_bit(i, copy)])
+                .collect::<Vec<_>>();
+
+            // Assert that each bit wire value is indeed boolean.
+            for &b in &bits {
+                constraints.push(builder.mul_sub_extension(b, b, b));
+            }
+
+            // Assert that the binary decomposition was correct.
+            let reconstructed_index = bits
+                .iter()
+                .rev()
+                .fold(zero, |acc, &b| builder.mul_add_extension(acc, two, b));
+            constraints.push(builder.sub_extension(reconstructed_index, access_index));
+
+            // Repeatedly fold the list, selecting the left or right item from each pair based on
+            // the corresponding bit.
+            for b in bits {
+                list_items = list_items
+                    .iter()
+                    .tuples()
+                    .map(|(&x, &y)| builder.select_ext_generalized(b, y, x))
+                    .collect()
+            }
+
+            // Check that the one remaining element after the folding is the claimed element.
+            debug_assert_eq!(list_items.len(), 1);
+            constraints.push(builder.sub_extension(list_items[0], claimed_element));
+        }
+
+        // Check the constant values.
+        constraints.extend((0..self.num_extra_constants).map(|i| {
+            builder.sub_extension(
+                vars.local_constants[i],
+                vars.local_wires[self.wire_extra_constant(i)],
+            )
+        }));
+
+        constraints
+    }
+
+    fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
+        (0..self.num_copies)
+            .map(|copy| {
+                WitnessGeneratorRef::new(
+                    RandomAccessGenerator {
+                        row,
+                        gate: *self,
+                        copy,
+                    }
+                    .adapter(),
+                )
+            })
+            .collect()
+    }
+
+    fn num_wires(&self) -> usize {
+        self.num_routed_wires() + self.num_copies * self.bits
+    }
+
+    fn num_constants(&self) -> usize {
+        self.num_extra_constants
+    }
+
+    fn degree(&self) -> usize {
+        self.bits + 1
+    }
+
+    fn num_constraints(&self) -> usize {
+        let constraints_per_copy = self.bits + 2;
+        self.num_copies * constraints_per_copy + self.num_extra_constants
+    }
+
+    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
+        Some(U32QuotientGate::RandomAccess {
+            bits: self.bits,
+            num_ops: self.num_copies,
+            num_extra_constants: self.num_extra_constants,
+        })
+    }
+
+    fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
+        (0..self.num_extra_constants)
+            .map(|i| (i, self.wire_extra_constant(i)))
+            .collect()
+    }
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> RandomAccessGate<F, D> {
+    /// Verbatim scalar accumulate body (the differential oracle for the
+    /// packed path; see the `Gate` impl's dispatcher).
+    fn eval_accumulate_scalar(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
@@ -434,109 +560,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
             row += 1;
         }
         debug_assert_eq!(row, self.num_constraints());
-    }
-
-    fn eval_unfiltered_circuit(
-        &self,
-        builder: &mut CircuitBuilder<F, D>,
-        vars: EvaluationTargets<D>,
-    ) -> Vec<ExtensionTarget<D>> {
-        let zero = builder.zero_extension();
-        let two = builder.two_extension();
-        let mut constraints = Vec::with_capacity(self.num_constraints());
-
-        for copy in 0..self.num_copies {
-            let access_index = vars.local_wires[self.wire_access_index(copy)];
-            let mut list_items = (0..self.vec_size())
-                .map(|i| vars.local_wires[self.wire_list_item(i, copy)])
-                .collect::<Vec<_>>();
-            let claimed_element = vars.local_wires[self.wire_claimed_element(copy)];
-            let bits = (0..self.bits)
-                .map(|i| vars.local_wires[self.wire_bit(i, copy)])
-                .collect::<Vec<_>>();
-
-            // Assert that each bit wire value is indeed boolean.
-            for &b in &bits {
-                constraints.push(builder.mul_sub_extension(b, b, b));
-            }
-
-            // Assert that the binary decomposition was correct.
-            let reconstructed_index = bits
-                .iter()
-                .rev()
-                .fold(zero, |acc, &b| builder.mul_add_extension(acc, two, b));
-            constraints.push(builder.sub_extension(reconstructed_index, access_index));
-
-            // Repeatedly fold the list, selecting the left or right item from each pair based on
-            // the corresponding bit.
-            for b in bits {
-                list_items = list_items
-                    .iter()
-                    .tuples()
-                    .map(|(&x, &y)| builder.select_ext_generalized(b, y, x))
-                    .collect()
-            }
-
-            // Check that the one remaining element after the folding is the claimed element.
-            debug_assert_eq!(list_items.len(), 1);
-            constraints.push(builder.sub_extension(list_items[0], claimed_element));
-        }
-
-        // Check the constant values.
-        constraints.extend((0..self.num_extra_constants).map(|i| {
-            builder.sub_extension(
-                vars.local_constants[i],
-                vars.local_wires[self.wire_extra_constant(i)],
-            )
-        }));
-
-        constraints
-    }
-
-    fn generators(&self, row: usize, _local_constants: &[F]) -> Vec<WitnessGeneratorRef<F, D>> {
-        (0..self.num_copies)
-            .map(|copy| {
-                WitnessGeneratorRef::new(
-                    RandomAccessGenerator {
-                        row,
-                        gate: *self,
-                        copy,
-                    }
-                    .adapter(),
-                )
-            })
-            .collect()
-    }
-
-    fn num_wires(&self) -> usize {
-        self.num_routed_wires() + self.num_copies * self.bits
-    }
-
-    fn num_constants(&self) -> usize {
-        self.num_extra_constants
-    }
-
-    fn degree(&self) -> usize {
-        self.bits + 1
-    }
-
-    fn num_constraints(&self) -> usize {
-        let constraints_per_copy = self.bits + 2;
-        self.num_copies * constraints_per_copy + self.num_extra_constants
-    }
-
-    fn u32_quotient_gate(&self) -> Option<U32QuotientGate> {
-        Some(U32QuotientGate::RandomAccess {
-            bits: self.bits,
-            num_ops: self.num_copies,
-            num_extra_constants: self.num_extra_constants,
-        })
-    }
-
-    fn extra_constant_wires(&self) -> Vec<(usize, usize)> {
-        (0..self.num_extra_constants)
-            .map(|i| (i, self.wire_extra_constant(i)))
-            .collect()
     }
 }
 

@@ -11,6 +11,8 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -104,81 +106,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
         }
     }
 
-    /// Contiguous-column fused evaluation: reads each wire as a contiguous
-    /// `n`-point column and multiply-adds the filtered constraint rows
-    /// straight into the shared buffer, avoiding the per-point strided writes
-    /// of the default path.
+    /// Dispatcher: packed lanes for width-divisible D=2 batches, else the
+    /// scalar oracle verbatim.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
-        let n = vars_base.len();
-        assert_eq!(filters.len(), n);
-        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
-
-        let wires = vars_base.local_wires;
-        let const_0 = &vars_base.local_constants[..n];
-        let ext = |start: usize, p: usize| {
-            let mut arr = [F::ZERO; D];
-            for (d, a) in arr.iter_mut().enumerate() {
-                *a = wires[(start + d) * n + p];
-            }
-            F::Extension::from_basefield_array(arr)
-        };
-
-        // One `D x n` constraint block, reused across the `num_ops` operations.
-        // Every slot is assigned by the point loop below before the
-        // `batch_multiply_add_inplace` read: `to_basefield_array()` yields exactly
-        // `D` values and `p` covers `0..n`, so `(d, p)` sweeps the whole block —
-        // and the loop over operations already depends on that, since it never
-        // re-zeroes between iterations. The buffer therefore needed neither its
-        // zero-fill nor a heap allocation of its own. This accumulate impl runs
-        // once per 32-point quotient batch for a gate that stays on the CPU
-        // quotient path of every proof, i.e. `quotient_domain / 32` times per
-        // proof, and each call was paying a malloc, a free, and a `D * n` memset
-        // for a block it immediately overwrote.
-        const STACK_SCRATCH: usize = 128;
-        let scratch_len = D * n;
-        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
-        let mut scratch_heap;
-        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
-            // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`,
-            // and every element of `[..scratch_len]` is written by the point loop
-            // below before any is read. Same idiom as `RandomAccessGate`'s
-            // stack-or-heap scratch.
-            unsafe {
-                core::slice::from_raw_parts_mut(
-                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
-                    scratch_len,
-                )
-            }
+        let width = <F as Packable>::Packing::WIDTH;
+        if D == 2 && vars_base.len() % width == 0 {
+            self.eval_accumulate_packed(vars_base, filters, combined_gate_constraints);
         } else {
-            scratch_heap = vec![F::ZERO; scratch_len];
-            &mut scratch_heap
-        };
-        for i in 0..self.num_ops {
-            let m0_start = Self::wires_ith_multiplicand_0(i).start;
-            let m1_start = Self::wires_ith_multiplicand_1(i).start;
-            let output_start = Self::wires_ith_output(i).start;
-            for p in 0..n {
-                let multiplicand_0 = ext(m0_start, p);
-                let multiplicand_1 = ext(m1_start, p);
-                let output = ext(output_start, p);
-                let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p]);
-                let arr = (output - computed_output).to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
-                }
-            }
-            for d in 0..D {
-                batch_multiply_add_inplace(
-                    &mut combined_gate_constraints[(i * D + d) * n..][..n],
-                    &scratch[d * n..][..n],
-                    filters,
-                );
-            }
+            self.eval_accumulate_scalar(vars_base, filters, combined_gate_constraints);
         }
     }
 
@@ -235,6 +175,170 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
 
     fn num_constraints(&self) -> usize {
         self.num_ops * D
+    }
+}
+
+impl<const D: usize> MulExtensionGate<D> {
+    /// Verbatim scalar accumulate body (the differential oracle for the
+    /// packed path). Every `eval_unfiltered_base_batch_accumulate` call that
+    /// is not width-divisible D=2 routes here, so the whole original
+    /// semantics are preserved for every non-packed shape.
+    fn eval_accumulate_scalar<F: RichField + Extendable<D> + Packable>(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+
+        let wires = vars_base.local_wires;
+        let const_0 = &vars_base.local_constants[..n];
+        let ext = |start: usize, p: usize| {
+            let mut arr = [F::ZERO; D];
+            for (d, a) in arr.iter_mut().enumerate() {
+                *a = wires[(start + d) * n + p];
+            }
+            F::Extension::from_basefield_array(arr)
+        };
+
+        // One `D x n` constraint block, reused across the `num_ops` operations.
+        // Every slot is assigned by the point loop below before the
+        // `batch_multiply_add_inplace` read: `to_basefield_array()` yields exactly
+        // `D` values and `p` covers `0..n`, so `(d, p)` sweeps the whole block -
+        // and the loop over operations already depends on that, since it never
+        // re-zeroes between iterations. The buffer therefore needed neither its
+        // zero-fill nor a heap allocation of its own. This accumulate impl runs
+        // once per 32-point quotient batch for a gate that stays on the CPU
+        // quotient path of every proof, i.e. `quotient_domain / 32` times per
+        // proof, and each call was paying a malloc, a free, and a `D * n` memset
+        // for a block it immediately overwrote.
+        const STACK_SCRATCH: usize = 128;
+        let scratch_len = D * n;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
+            // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`,
+            // and every element of `[..scratch_len]` is written by the point loop
+            // below before any is read. Same idiom as `RandomAccessGate`'s
+            // stack-or-heap scratch.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
+                    scratch_len,
+                )
+            }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
+        for i in 0..self.num_ops {
+            let m0_start = Self::wires_ith_multiplicand_0(i).start;
+            let m1_start = Self::wires_ith_multiplicand_1(i).start;
+            let output_start = Self::wires_ith_output(i).start;
+            for p in 0..n {
+                let multiplicand_0 = ext(m0_start, p);
+                let multiplicand_1 = ext(m1_start, p);
+                let output = ext(output_start, p);
+                let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p]);
+                let arr = (output - computed_output).to_basefield_array();
+                for (d, a) in arr.iter().enumerate() {
+                    scratch[d * n + p] = *a;
+                }
+            }
+            for d in 0..D {
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * D + d) * n..][..n],
+                    &scratch[d * n..][..n],
+                    filters,
+                );
+            }
+        }
+    }
+
+    /// Packed-lane accumulate for the production D=2 shape.
+    ///
+    /// `(a0 + a1 u)(b0 + b1 u) = (a0 b0 + W a1 b1) + (a0 b1 + a1 b0) u` with
+    /// `W = <F as Extendable<D>>::W` (7 for Goldilocks), then `scalar_mul` by
+    /// `const_0` and the `output - computed` difference, exactly like the
+    /// scalar oracle. The packed field's per-lane mul/add are bit-identical
+    /// to the scalar field ops on the same operands, so each lane reproduces
+    /// the scalar body's value on that point; the filter tail reuses
+    /// `batch_multiply_add_inplace`, which is itself packed internally.
+    fn eval_accumulate_packed<F: RichField + Extendable<D> + Packable>(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        debug_assert_eq!(D, 2);
+        let n = vars_base.len();
+        let width = <F as Packable>::Packing::WIDTH;
+        debug_assert_eq!(n % width, 0);
+        let num_groups = n / width;
+        let wires = vars_base.local_wires;
+        let const_0 = &vars_base.local_constants[..n];
+        let w = <F as Extendable<D>>::W;
+        // One D x WIDTH constraint block per group, stack-resident for the
+        // production width. WIDTH is 4 on aarch64; the cap keeps every
+        // supported packing on the stack.
+        const STACK_SCRATCH: usize = 2 * 16;
+        let scratch_len = D * width;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
+            // SAFETY: every element of `[..scratch_len]` is written by the
+            // group loop below before any is read; `MaybeUninit<F>` has the
+            // same layout and alignment as `F`.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
+                    scratch_len,
+                )
+            }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
+        let packing = <F as Packable>::Packing::from_slice;
+        for group in 0..num_groups {
+            let offset = group * width;
+            let c0 = *packing(&const_0[offset..offset + width]);
+            let filter = *packing(&filters[offset..offset + width]);
+            for i in 0..self.num_ops {
+                let m0_start = Self::wires_ith_multiplicand_0(i).start;
+                let m1_start = Self::wires_ith_multiplicand_1(i).start;
+                let output_start = Self::wires_ith_output(i).start;
+                let a0 = *packing(&wires[(m0_start) * n + offset..][..width]);
+                let a1 = *packing(&wires[(m0_start + 1) * n + offset..][..width]);
+                let b0 = *packing(&wires[(m1_start) * n + offset..][..width]);
+                let b1 = *packing(&wires[(m1_start + 1) * n + offset..][..width]);
+                let o0 = *packing(&wires[(output_start) * n + offset..][..width]);
+                let o1 = *packing(&wires[(output_start + 1) * n + offset..][..width]);
+                // Extension product with the W = 7 conjugation, then the
+                // scalar_mul and the difference, in the same order as the
+                // scalar body.
+                let real = a0 * b0 + (a1 * b1) * w;
+                let imag = a0 * b1 + a1 * b0;
+                let computed0 = real * c0;
+                let computed1 = imag * c0;
+                let term0 = o0 - computed0;
+                let term1 = o1 - computed1;
+                scratch[..width].copy_from_slice(term0.as_slice());
+                scratch[width..2 * width].copy_from_slice(term1.as_slice());
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * D) * n + offset..][..width],
+                    &scratch[..width],
+                    &filters[offset..offset + width],
+                );
+                batch_multiply_add_inplace(
+                    &mut combined_gate_constraints[(i * D + 1) * n + offset..][..width],
+                    &scratch[width..2 * width],
+                    &filters[offset..offset + width],
+                );
+            }
+        }
     }
 }
 
@@ -302,7 +406,9 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, Field64, PrimeField64};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     #[test]
@@ -318,5 +424,78 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = MulExtensionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn packed_accumulate_matches_scalar_across_batch_sizes() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        let gate = MulExtensionGate::<D>::new_from_config(&CircuitConfig::standard_recursion_config());
+
+        // Noncanonical representatives included so a raw-limb regression in
+        // the packed path (e.g. a missing reduction) fails loudly.
+        fn value(i: usize) -> F {
+            let small = ((i as u64).wrapping_mul(0x9e37_79b9) ^ 0x5a5a_a5a5) & 0xffff;
+            if i % 3 == 0 {
+                GoldilocksField(F::ORDER + small)
+            } else {
+                F::from_canonical_u64(small)
+            }
+        }
+
+        let packing_width = <<F as Packable>::Packing as PackedField>::WIDTH;
+        let mut batch_sizes = vec![
+            1, 3, 5, 7, 11, 31, 32, 33, packing_width.saturating_sub(1).max(1),
+            packing_width, packing_width + 1, packing_width + 2, 2 * packing_width - 1,
+            2 * packing_width, 2 * packing_width + 1,
+        ];
+        batch_sizes.extend((0..packing_width).map(|r| packing_width + r));
+        batch_sizes.extend((0..packing_width).map(|r| 2 * packing_width + r));
+        batch_sizes.sort_unstable();
+        batch_sizes.dedup();
+
+        for &n in &batch_sizes {
+            let num_wires = <MulExtensionGate<D> as Gate<F, D>>::num_wires(&gate);
+            let num_constraints = <MulExtensionGate<D> as Gate<F, D>>::num_constraints(&gate);
+            let wires = (0..num_wires * n)
+                .map(|i| value(i + 1))
+                .collect::<Vec<_>>();
+            let constants = (0..1 * n)
+                .map(|i| value(i + 10_001))
+                .collect::<Vec<_>>();
+            let filters = (0..n)
+                .map(|i| match i % 7 {
+                    0 => F::ZERO,
+                    1 => GoldilocksField(F::ORDER), // noncanonical zero
+                    _ => value(i + 20_001),
+                })
+                .collect::<Vec<_>>();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+
+            let initial = (0..num_constraints * n)
+                .map(|i| match i % 11 {
+                    0 => F::ZERO,
+                    1 => GoldilocksField(F::ORDER), // noncanonical zero
+                    _ => value(i + 30_001),
+                })
+                .collect::<Vec<_>>();
+            //  is the dispatcher:
+            // width-divisible batches take the packed path, everything else
+            // falls back to the verbatim scalar body, so this exercises both
+            // sides and the routing seam.
+            let mut expected = initial.clone();
+            gate.eval_accumulate_scalar(vars, &filters, &mut expected);
+            let mut actual = initial;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+
+            for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "n={n}, output={i}"
+                );
+            }
+        }
     }
 }

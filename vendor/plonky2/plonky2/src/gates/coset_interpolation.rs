@@ -323,64 +323,86 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
         let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
 
-        for (p, vars) in vars_base.iter().enumerate() {
-            let shift = vars.local_wires[self.wire_shift()];
-            let evaluation_point = vars.get_local_ext(self.wires_evaluation_point());
-            let shifted_evaluation_point =
-                vars.get_local_ext(self.wires_shifted_evaluation_point());
-            let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
-                .to_basefield_array();
-            for (d, a) in arr.iter().enumerate() {
-                scratch[d * n + p] = *a;
-            }
+        // The point loop below writes every one of the `num_constraints * n`
+        // scratch slots before the `batch_multiply_add_inplace` reduction pass
+        // reads any of them: for each point `p` it stores the initial row
+        // (`0..D`), then `2 * D` limbs per intermediate, then the final row
+        // (`D` limbs) — i.e. `D + 2 * D * num_intermediates + D`
+        // = `2 * D * (1 + num_intermediates)` = `num_constraints` rows, each at
+        // stride `n`. So the previous `vec![F::ZERO; ..]` initializer was a
+        // dead full-buffer memset; reserve the space, write through the spare
+        // capacity, and publish the initialized length only after the full
+        // coverage loop completes.
+        let scratch_len = num_constraints * n;
+        let mut scratch: Vec<F> = Vec::with_capacity(scratch_len);
+        {
+            let scratch = scratch.spare_capacity_mut();
 
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = vars.get_local_ext(self.wires_value(i));
-            }
-
-            let (mut computed_eval, mut computed_prod) = partial_interpolate(
-                &domain[..self.degree()],
-                &values[..self.degree()],
-                &weights[..self.degree()],
-                shifted_evaluation_point,
-                F::Extension::ZERO,
-                F::Extension::ONE,
-            );
-
-            let mut row = D;
-            for i in 0..self.num_intermediates() {
-                let intermediate_eval = vars.get_local_ext(self.wires_intermediate_eval(i));
-                let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
-                let arr = (intermediate_eval - computed_eval).to_basefield_array();
+            for (p, vars) in vars_base.iter().enumerate() {
+                let shift = vars.local_wires[self.wire_shift()];
+                let evaluation_point = vars.get_local_ext(self.wires_evaluation_point());
+                let shifted_evaluation_point =
+                    vars.get_local_ext(self.wires_shifted_evaluation_point());
+                let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
+                    .to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
+                    scratch[d * n + p].write(*a);
                 }
-                row += D;
-                let arr = (intermediate_prod - computed_prod).to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
-                }
-                row += D;
 
-                let start_index = 1 + (self.degree() - 1) * (i + 1);
-                let end_index = (start_index + self.degree() - 1).min(self.num_points());
-                (computed_eval, computed_prod) = partial_interpolate(
-                    &domain[start_index..end_index],
-                    &values[start_index..end_index],
-                    &weights[start_index..end_index],
+                for (i, value) in values.iter_mut().enumerate() {
+                    *value = vars.get_local_ext(self.wires_value(i));
+                }
+
+                let (mut computed_eval, mut computed_prod) = partial_interpolate(
+                    &domain[..self.degree()],
+                    &values[..self.degree()],
+                    &weights[..self.degree()],
                     shifted_evaluation_point,
-                    intermediate_eval,
-                    intermediate_prod,
+                    F::Extension::ZERO,
+                    F::Extension::ONE,
                 );
-            }
 
-            let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
-            let arr = (evaluation_value - computed_eval).to_basefield_array();
-            for (d, a) in arr.iter().enumerate() {
-                scratch[(row + d) * n + p] = *a;
+                let mut row = D;
+                for i in 0..self.num_intermediates() {
+                    let intermediate_eval = vars.get_local_ext(self.wires_intermediate_eval(i));
+                    let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
+                    let arr = (intermediate_eval - computed_eval).to_basefield_array();
+                    for (d, a) in arr.iter().enumerate() {
+                        scratch[(row + d) * n + p].write(*a);
+                    }
+                    row += D;
+                    let arr = (intermediate_prod - computed_prod).to_basefield_array();
+                    for (d, a) in arr.iter().enumerate() {
+                        scratch[(row + d) * n + p].write(*a);
+                    }
+                    row += D;
+
+                    let start_index = 1 + (self.degree() - 1) * (i + 1);
+                    let end_index = (start_index + self.degree() - 1).min(self.num_points());
+                    (computed_eval, computed_prod) = partial_interpolate(
+                        &domain[start_index..end_index],
+                        &values[start_index..end_index],
+                        &weights[start_index..end_index],
+                        shifted_evaluation_point,
+                        intermediate_eval,
+                        intermediate_prod,
+                    );
+                }
+
+                let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
+                let arr = (evaluation_value - computed_eval).to_basefield_array();
+                debug_assert_eq!(row + D, num_constraints);
+                for (d, a) in arr.iter().enumerate() {
+                    scratch[(row + d) * n + p].write(*a);
+                }
             }
+        }
+        // SAFETY: capacity for `scratch_len` was reserved above, and every slot
+        // was initialized exactly once through `spare_capacity_mut` in the
+        // full-coverage loop before any read.
+        unsafe {
+            scratch.set_len(scratch_len);
         }
 
         for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
@@ -746,7 +768,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -786,6 +808,66 @@ mod tests {
             let mut actual = initial;
             gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
             assert_eq!(actual, expected, "max_degree {max_degree}");
+        }
+    }
+
+    /// Guards the `set_len` scratch (dead zero-fill deletion) in
+    /// `eval_unfiltered_base_batch_accumulate`: the fused override must remain
+    /// bit-identical to the per-point default across a range of batch sizes —
+    /// including `n = 1` and non-power-of-two `n` — and with a NONCANONICAL
+    /// pre-seeded `combined` buffer (values `>= F::ORDER`), which is what the
+    /// real quotient caller passes. If any scratch slot were read before being
+    /// written, the leftover capacity bytes would surface here.
+    #[test]
+    fn accumulate_matches_default_noncanonical_and_odd_batch() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        // A value that is a valid (noncanonical) Goldilocks representative:
+        // `ORDER + small` shares the field value of `small` but differs at the
+        // raw-limb level, so a `set_len`-exposed uninitialized slot would not
+        // silently match.
+        let noncanon = |i: usize| GoldilocksField(F::ORDER + ((i as u64 * 2_654_435_761) & 0xffff));
+
+        for max_degree in [2, 3, 6, 16] {
+            let gate = <CosetInterpolationGate<F, D>>::with_max_degree(4, max_degree);
+            let num_wires = <CosetInterpolationGate<F, D> as Gate<F, D>>::num_wires(&gate);
+            let num_constraints =
+                <CosetInterpolationGate<F, D> as Gate<F, D>>::num_constraints(&gate);
+
+            for n in [1usize, 2, 3, 5, 7, 8, 31, 32, 33] {
+                let wires_batch: Vec<F> = (0..num_wires * n).map(|_| F::rand()).collect();
+                let filters: Vec<F> = (0..n)
+                    .map(|i| if i % 5 == 0 { F::ZERO } else { noncanon(i + 1) })
+                    .collect();
+                let initial: Vec<F> =
+                    (0..num_constraints * n).map(|i| noncanon(i + 7)).collect();
+                let public_inputs_hash = HashOut::<F>::ZERO;
+                let vars_batch =
+                    EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+
+                let reference = gate.eval_unfiltered_base_batch(vars_batch);
+                let mut expected = initial.clone();
+                for (combined, row) in
+                    expected.chunks_exact_mut(n).zip(reference.chunks_exact(n))
+                {
+                    for p in 0..n {
+                        combined[p] += row[p] * filters[p];
+                    }
+                }
+
+                let mut actual = initial;
+                gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
+                // Compare as canonical field values (the reduction result is
+                // what the caller consumes); every slot must be defined.
+                for (i, (&a, &e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_canonical_u64(),
+                        e.to_canonical_u64(),
+                        "max_degree {max_degree} n {n} idx {i}"
+                    );
+                }
+            }
         }
     }
 
