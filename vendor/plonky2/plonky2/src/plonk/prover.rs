@@ -1928,6 +1928,7 @@ pub fn range_quotient_microbench<
     }
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,

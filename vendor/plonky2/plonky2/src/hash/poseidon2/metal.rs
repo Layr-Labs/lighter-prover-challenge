@@ -2630,7 +2630,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            // The streamed absorb pass dominates the serialized Metal queue.
+            // Its PSO reports room for 1024 threads with no threadgroup memory;
+            // use a conservative 256-thread step while every other 1D kernel
+            // retains the promoted 128-thread launch.
+            dispatch_capped(encoder, pipeline, leaf_count, 256);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -4453,15 +4457,16 @@ fn dispatch2d(
     );
 }
 
-fn dispatch(
+fn dispatch_capped(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     thread_count: usize,
+    cap: NSUInteger,
 ) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -4475,6 +4480,14 @@ fn dispatch(
             depth: 1,
         },
     );
+}
+
+fn dispatch(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_capped(encoder, pipeline, thread_count, 128);
 }
 
 /// Copies the GPU's level-order node array (leaf digests first, cap level
