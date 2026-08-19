@@ -171,21 +171,14 @@ pub fn cached_two_adic_subgroup<F: Field>(lg_n: usize) -> alloc::sync::Arc<Vec<F
 /// the table a fresh build would produce; the cache only avoids recomputing
 /// the primitive-root power chain and row generation on hot startup paths
 /// that load several same-shaped circuits in one short-lived worker.
-///
-/// Returns the cache's own handle rather than a copy. Every consumer reads the
-/// table through `&FftRootTable<F>` and none mutates it, so handing out a
-/// second owner of the same immutable rows is observationally identical to
-/// handing out a duplicate of them -- and it deletes a `Vec<Vec<F>>` deep
-/// clone (19 inner allocations and ~4 MiB for a degree-2^16 transaction
-/// circuit) from every circuit load.
 #[cfg(feature = "std")]
-pub fn cached_fft_root_table<F: Field>(n: usize) -> alloc::sync::Arc<FftRootTable<F>> {
-    root_table_cache::get::<F>(log2_strict(n))
+pub fn cached_fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
+    (*root_table_cache::get::<F>(log2_strict(n))).clone()
 }
 
 #[cfg(not(feature = "std"))]
-pub fn cached_fft_root_table<F: Field>(n: usize) -> alloc::sync::Arc<FftRootTable<F>> {
-    alloc::sync::Arc::new(fft_root_table::<F>(n))
+pub fn cached_fft_root_table<F: Field>(n: usize) -> FftRootTable<F> {
+    fft_root_table::<F>(n)
 }
 
 #[inline]
@@ -346,13 +339,6 @@ pub(crate) fn ifft_with_options_and_prescaled_postscale<F: Field>(
     ifft_prescaled_inner(poly, zero_factor, root_table, prescaled_scales, false)
 }
 
-/// [`ifft_with_options_and_prescaled_postscale`] that distributes the transform's
-/// outer stages across the worker pool.
-///
-/// Same contract as the serial form and byte-identical output — only the
-/// scheduling of the butterfly layers differs. Callers must only use it when the
-/// transform is not already nested inside a wider parallel phase, which is why
-/// it is gated on the exclusive proving phase at its one call site.
 pub(crate) fn ifft_with_options_and_prescaled_postscale_parallel<F: Field>(
     poly: PolynomialValues<F>,
     zero_factor: Option<usize>,

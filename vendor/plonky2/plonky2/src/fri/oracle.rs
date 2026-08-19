@@ -109,13 +109,6 @@ impl<F> EvenColumns<F> {
     }
 
     /// Derive the even-row companion from a full-domain Metal column store.
-    ///
-    /// `companion[j][k] = full[j][2k]`. The kernel indexes both the wires
-    /// companion and this buffer with stride `wires.rows`, so the compact
-    /// constants must have the same row count as the compact wires. A
-    /// degree-`< 4n` polynomial is determined by its `4n` even-coset
-    /// samples; copying those samples does not change any value the
-    /// full-domain kernel would have read at those rows.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     pub(crate) fn get_or_fill_even_rows(
         &self,
@@ -314,10 +307,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
-                // Compact even-row companion (Metal only, on request): the
-                // fill below writes row `2k` of every column into row `k` of
-                // the companion right after that column's FFT, while the
-                // column is still cache-resident.
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                 let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
                     crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
@@ -408,7 +397,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                             {
                                 EvenColumns::default()
                             }
-                        }
+                        },
                     };
                 }
                 let initialized = timed!(
@@ -443,7 +432,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                             {
                                 EvenColumns::default()
                             }
-                        }
+                        },
                     };
                 }
             }
@@ -1403,6 +1392,51 @@ mod tests {
 
         check::<GoldilocksField>();
         check::<<GoldilocksField as Extendable<2>>::Extension>();
+    }
+
+    /// The base-scalar specialization is used before FFT butterflies and its
+    /// raw Goldilocks representatives therefore have to match the ordinary
+    /// extension multiplication it replaces, not merely be field-equal.
+    #[test]
+    fn base_scalar_mul_matches_embedded_extension_mul_raw_words() {
+        use crate::field::extension::FieldExtension;
+        use crate::field::types::{Field64, PrimeField64};
+
+        type BF = GoldilocksField;
+        type E = <BF as Extendable<2>>::Extension;
+
+        let words = [
+            0,
+            1,
+            BF::ORDER - 1,
+            BF::ORDER,
+            BF::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+            0x9e37_79b9_7f4a_7c15,
+        ];
+        for &a0 in &words {
+            for &a1 in &words {
+                let coefficient = <E as FieldExtension<2>>::from_basefield_array([
+                    GoldilocksField(a0),
+                    GoldilocksField(a1),
+                ]);
+                for &scalar in &words {
+                    let scalar = GoldilocksField(scalar);
+                    let expected = coefficient * <E as FieldExtension<2>>::from_basefield(scalar);
+                    let actual = <E as FieldExtension<2>>::scalar_mul(&coefficient, scalar);
+                    let expected_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
+                        &expected,
+                    )
+                        .map(|x| x.to_noncanonical_u64());
+                    let actual_raw: [u64; 2] = <E as FieldExtension<2>>::to_basefield_array(
+                        &actual,
+                    )
+                        .map(|x| x.to_noncanonical_u64());
+                    assert_eq!(actual_raw, expected_raw, "a0={a0:#x}, a1={a1:#x}");
+                }
+            }
+        }
     }
 
     /// A2's whole claim in one place: for the embedded shift both prover call
