@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -2630,7 +2630,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch_hash(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2671,7 +2671,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     );
                     encoder.set_buffer(2, Some(&context.parameters), 0);
                     set_u32(encoder, 3, parent_count_u32);
-                    dispatch(encoder, &context.parent_pipeline, parent_count);
+                    dispatch_hash(encoder, &context.parent_pipeline, parent_count);
 
                     child_count = parent_count;
                 }
@@ -3866,7 +3866,7 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
-                dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
+                dispatch_hash(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
                 let mut level_offset = 0usize;
@@ -3893,7 +3893,7 @@ impl MetalShared {
                     );
                     parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                     set_u32(parent_encoder, 3, parent_count_u32);
-                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                    dispatch_hash(parent_encoder, &self.parent_pipeline, parent_count);
                     parent_encoder.end_encoding();
 
                     child_count = parent_count;
@@ -4130,7 +4130,7 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
-            dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
+            dispatch_hash(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
             let mut level_offset = 0usize;
@@ -4157,7 +4157,7 @@ impl MetalShared {
                 );
                 parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                 set_u32(parent_encoder, 3, parent_count_u32);
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                dispatch_hash(parent_encoder, &self.parent_pipeline, parent_count);
                 parent_encoder.end_encoding();
 
                 child_count = parent_count;
@@ -4349,7 +4349,7 @@ impl MetalShared {
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
             }
-            dispatch(encoder, leaf_pipeline, leaf_count);
+            dispatch_hash(encoder, leaf_pipeline, leaf_count);
 
             let mut level_offset = 0usize;
             let mut child_count = leaf_count;
@@ -4386,7 +4386,7 @@ impl MetalShared {
                     size_of::<u32>() as NSUInteger,
                     (&parent_count_u32 as *const u32).cast::<c_void>(),
                 );
-                dispatch(encoder, &self.parent_pipeline, parent_count);
+                dispatch_hash(encoder, &self.parent_pipeline, parent_count);
 
                 child_count = parent_count;
             }
@@ -4453,15 +4453,35 @@ fn dispatch2d(
     );
 }
 
-fn dispatch(
+/// Threadgroup cap for Merkle absorb / leaf / parent hashing. Quotient kernels
+/// stay on [`dispatch`]'s 128 clamp: they are the high-register ALU path, and a
+/// blanket occupancy unclamp was never isolated on this tree. Hashing is the
+/// serialized GPU wait inside wires commitment. Default 256 is one doubling of
+/// the historical 128 clamp (8 SIMD-groups of 32) rather than the full 1024
+/// ceiling: a 1024-thread group occupies the whole core and can hide *less*
+/// memory latency than several 128-thread groups. `LIGHTER_HASH_TG=128`
+/// restores the tip; `LIGHTER_HASH_TG=1024` takes the PSO ceiling.
+fn hash_threadgroup_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("LIGHTER_HASH_TG")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| (32..=1024).contains(&n) && n.is_power_of_two())
+            .unwrap_or(256)
+    })
+}
+
+fn dispatch_with_group_cap(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     thread_count: usize,
+    group_cap: u64,
 ) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(group_cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -4475,6 +4495,22 @@ fn dispatch(
             depth: 1,
         },
     );
+}
+
+fn dispatch_hash(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
+}
+
+fn dispatch(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
 }
 
 /// Copies the GPU's level-order node array (leaf digests first, cap level
