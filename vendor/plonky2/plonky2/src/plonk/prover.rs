@@ -1366,6 +1366,24 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+/// Grow-or-truncate per-thread filter scratch. Every used slot
+/// `filters[g * ROWS_PER_CHUNK + r]` for `r < rows` is assigned in the
+/// selector plan loop before it is read, so a full `fill(F::ONE)` is a
+/// dead store — including on reuse, where the previous chunk's values
+/// sit in the prefix until they are overwritten. Newly grown tail is
+/// dummy `ONE` and is never indexed (`r` stops at `rows`).
+#[cfg(any(
+    test,
+    all(feature = "std", target_arch = "aarch64", target_os = "macos")
+))]
+fn prepare_range_filter_scratch<F: Field>(filters: &mut Vec<F>, len: usize) {
+    if filters.len() < len {
+        filters.resize(len, F::ONE);
+    } else {
+        filters.truncate(len);
+    }
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1389,17 +1407,31 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // into the IFFT's normalization pass (`coset_ifft_with_powers`).
     let omega = F::primitive_root_of_unity(lde_bits);
     let omega_powers = precomputed::shift_powers::<F>(omega, half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
+    // `low` is gate-major `[g][k][c0, c1]`. One sequential walk of a gate's
+    // interleaved pair fills both challenge lanes; two independent stride-2
+    // gathers would re-read the same 4n-point buffer. The two IFFT/FFT
+    // identities are unchanged and still independent — only the gather is
+    // fused. Layout of `odd` stays `[g][c]` so the combiner is bit-identical.
+    let odd: Vec<Vec<F>> = (0..gates.len())
         .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
+        .flat_map_iter(|g| {
             let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
+            let mut lane0 = Vec::with_capacity(half_rows);
+            let mut lane1 = Vec::with_capacity(half_rows);
+            for k in 0..half_rows {
+                let p = base + k * 2;
+                lane0.push(low[p]);
+                lane1.push(low[p + 1]);
+            }
+            let odd0 = PolynomialValues::new(lane0)
                 .coset_ifft_with_powers(&omega_powers)
                 .fft()
-                .values
+                .values;
+            let odd1 = PolynomialValues::new(lane1)
+                .coset_ifft_with_powers(&omega_powers)
+                .fft()
+                .values;
+            [odd0, odd1]
         })
         .collect();
     #[cfg(feature = "diagnostic_profile")]
@@ -1447,11 +1479,13 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     let num_gates = gates.len();
     out.par_chunks_mut(2 * ROWS_PER_CHUNK)
         .enumerate()
-        .for_each(|(chunk_i, chunk)| {
+        .for_each_init(Vec::new, |filters, (chunk_i, chunk)| {
             let row0 = chunk_i * ROWS_PER_CHUNK;
             let rows = chunk.len() / 2;
             // Filters for this chunk, gate-major: filters[g * ROWS_PER_CHUNK + r].
-            let mut filters = vec![F::ONE; num_gates * ROWS_PER_CHUNK];
+            // Every `[g][r]` with `r < rows` is written by the plan loop;
+            // the unused tail of `ROWS_PER_CHUNK` is never indexed.
+            prepare_range_filter_scratch(filters, num_gates * ROWS_PER_CHUNK);
             let mut factors = [F::ZERO; MAX_GROUP];
             let mut prefix = [F::ONE; MAX_GROUP + 1];
             let mut suffix = [F::ONE; MAX_GROUP + 1];
@@ -1476,7 +1510,11 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                 }
             }
             // Accumulate gate-major so each pass streams one source array.
-            let mut acc = vec![F::ZERO; 2 * ROWS_PER_CHUNK];
+            // `out` was `set_len`'d without init; this chunk is ours exclusively
+            // (`par_chunks_mut`) and every used slot is stored before any later
+            // reader sees `out`. Zero the used prefix once, then add into it —
+            // no second `acc` buffer and no copy back.
+            chunk.fill(F::ZERO);
             for g in 0..num_gates {
                 let f = &filters[g * ROWS_PER_CHUNK..g * ROWS_PER_CHUNK + rows];
                 let odd0 = &odd[g * 2];
@@ -1491,11 +1529,10 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                         (odd0[i >> 1], odd1[i >> 1])
                     };
                     let filter = f[r];
-                    acc[2 * r] += filter * sv0;
-                    acc[2 * r + 1] += filter * sv1;
+                    chunk[2 * r] += filter * sv0;
+                    chunk[2 * r + 1] += filter * sv1;
                 }
             }
-            chunk.copy_from_slice(&acc[..2 * rows]);
         });
     out
 }
@@ -2065,18 +2102,18 @@ fn start_gpu_range_check_gate_quotient<
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
     let even_wires = wires_commitment.even_columns.get();
-    // Circuit-fixed constants/sigmas live in a deserialized Metal store
-    // with no companion. One even-row copy lets constant-reading deg<=4
-    // gates join the half-domain job: the shader strides both buffers by
-    // `wires.rows`, so the compact constants must match the compact wires.
-    let even_constants = prover_data
-        .constants_sigmas_commitment
-        .even_columns
-        .get_or_fill_even_rows(constants);
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
+        // Circuit-fixed constants/sigmas live in a deserialized Metal store
+        // with no companion. Only derive their even rows after this proof
+        // retained matching even wires and can actually split — otherwise
+        // the OnceLock fill is a dead 4n-row copy of every constants column.
+        let even_constants = prover_data
+            .constants_sigmas_commitment
+            .even_columns
+            .get_or_fill_even_rows(constants);
         // Without a constants companion, kinds that read gate constants
         // stay on the full-domain dispatch (the kernel would otherwise
         // index `col * half_rows + k` into a full-stride store).
@@ -3296,7 +3333,7 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{precomputed, prepare_range_filter_scratch, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
@@ -3334,6 +3371,26 @@ mod quotient_layout_tests {
         let mut pw = PartialWitness::new();
         pw.set_target(x, F::from_canonical_u64(3)).unwrap();
         (data, pw)
+    }
+
+    #[test]
+    fn range_filter_scratch_grows_without_refill() {
+        let mut scratch = Vec::with_capacity(64);
+        let poison = F::from_canonical_u64(0x1234_5678_9abc_def0);
+        scratch.resize(17, poison);
+        let allocation = scratch.as_ptr();
+
+        prepare_range_filter_scratch(&mut scratch, 33);
+        assert_eq!(scratch.as_ptr(), allocation);
+        assert_eq!(scratch.len(), 33);
+        // Existing prefix is kept; only the grown tail is dummy ONE.
+        assert!(scratch[..17].iter().all(|&v| v == poison));
+        assert!(scratch[17..].iter().all(|&v| v == F::ONE));
+
+        prepare_range_filter_scratch(&mut scratch, 8);
+        assert_eq!(scratch.as_ptr(), allocation);
+        assert_eq!(scratch.len(), 8);
+        assert!(scratch.iter().all(|&v| v == poison));
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
