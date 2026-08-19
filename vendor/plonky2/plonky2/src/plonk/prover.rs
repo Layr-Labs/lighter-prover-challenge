@@ -722,10 +722,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let base_0 = wire_value + gamma_0;
+                                let base_1 = wire_value + gamma_1;
+                                numerator_0 *= base_0.multiply_accumulate(beta_k_is_0[j], x);
+                                numerator_1 *= base_1.multiply_accumulate(beta_k_is_1[j], x);
+                                denominator_0 *= base_0.multiply_accumulate(beta_0, sigma);
+                                denominator_1 *= base_1.multiply_accumulate(beta_1, sigma);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -1647,6 +1649,7 @@ pub fn range_quotient_microbench<
     }
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
