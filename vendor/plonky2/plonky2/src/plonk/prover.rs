@@ -236,7 +236,7 @@ where
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_deref(),
+            prover_data.fft_root_table.as_ref(),
             wires_even_companion_wanted(common_data),
         )
     );
@@ -329,7 +329,7 @@ where
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_deref(),
+            prover_data.fft_root_table.as_ref(),
         )
     );
 
@@ -453,7 +453,7 @@ where
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_deref(),
+            prover_data.fft_root_table.as_ref(),
         )
     );
 
@@ -1354,29 +1354,13 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(19)
         });
-        // Upper bound as well as a lower one. The split pays for itself only
-        // where its companion fill and extension can hide behind other work.
-        // On the final block's 2^21 shape it cannot: that proof runs alone on
-        // the serial tail, and the companion it needs there is 136 columns of
-        // 2^20 rows -- a gigabyte -- filled unconditionally by
-        // `from_coeffs_with_even_companion`, before we know whether the block
-        // circuit even has the low-degree gates the split would use.
-        //
-        // Kept env-overridable in step with the floor so that raising
-        // LIGHTER_QSPLIT_MIN_LDE_BITS cannot silently close the window.
-        static MAX_BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let max_bits = *MAX_BITS.get_or_init(|| {
-            std::env::var("LIGHTER_QSPLIT_MAX_LDE_BITS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(19)
-        });
-        let lde_bits = common_data.degree_bits() + common_data.config.fri_config.rate_bits;
         range_quotient_split_enabled()
             && common_data.num_lookup_polys == 0
             && common_data.config.num_challenges == 2
-            && lde_bits >= min_bits
-            && lde_bits <= max_bits
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits >= min_bits
+            // Not the final block's 2^21 shape: measured slower there (its 1 GiB
+            // companion and 2^20-point extension sit on the serial tail).
+            && common_data.degree_bits() + common_data.config.fri_config.rate_bits <= 19
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
@@ -1398,18 +1382,16 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
 ) -> Vec<F> {
     debug_assert_eq!(full_rows, half_rows * 2);
     debug_assert_eq!(low.len(), gates.len() * half_rows * 2);
+    let lde_bits = log2_strict(full_rows);
     // `points[i] = omega^i` on the full domain, so the even rows are the coset
     // `shift * <omega^2>` and the odd rows are `(shift * omega) * <omega^2>`.
     // Even rows are the coset `shift * <omega^2>`; the odd rows are
     // `(shift * omega) * <omega^2>`. Interpolating on the first coset scales
     // coefficient `i` by `shift^-i`, re-evaluating on the second by
     // `(shift * omega)^i`; the net per-coefficient factor is `omega^i`, fused
-    // into the IFFT's normalization pass.
-    // Fold the half-size IFFT's `1/n` normalization into the cached omega
-    // powers. Every reconstructed gate/challenge column then pays one field
-    // multiply per coefficient instead of two; the table is circuit-shape
-    // fixed and shared by every proof in the process.
-    let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
+    // into the IFFT's normalization pass (`coset_ifft_with_powers`).
+    let omega = F::primitive_root_of_unity(lde_bits);
+    let omega_powers = precomputed::shift_powers::<F>(omega, half_rows);
     let odd: Vec<Vec<F>> = (0..gates.len() * 2)
         .into_par_iter()
         .map(|t| {
@@ -1418,7 +1400,7 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let base = g * half_rows * 2;
             let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
             PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                .coset_ifft_with_powers(&omega_powers)
                 .fft()
                 .values
         })
@@ -1554,12 +1536,12 @@ pub fn range_quotient_microbench<
     let t = std::time::Instant::now();
     let _plain = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
         mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_deref(), false);
+        prover_data.fft_root_table.as_ref(), false);
     let plain_ms = t.elapsed().as_secs_f64() * 1e3;
     let t = std::time::Instant::now();
     let wires_commitment = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
         mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_deref(), true);
+        prover_data.fft_root_table.as_ref(), true);
     let comp_ms = t.elapsed().as_secs_f64() * 1e3;
     eprintln!("[qmb] degree_bits={} lde={} wires commit: plain {plain_ms:.1} ms, with companion {comp_ms:.1} ms, companion present={}",
         common_data.degree_bits(), lde_size, wires_commitment.even_columns.get().is_some());
@@ -2090,18 +2072,10 @@ fn start_gpu_range_check_gate_quotient<
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
         even_wires,
     ) {
-        // Circuit-fixed constants/sigmas live in a deserialized Metal store
-        // with no companion. Fill their compact even rows only after the
-        // wires/shape admission succeeds; all other paths have no consumer
-        // for this cache. The shader strides both buffers by `wires.rows`, so
-        // admitted constant readers still receive matching compact columns.
-        let even_constants = prover_data
-            .constants_sigmas_commitment
-            .even_columns
-            .get_or_fill_even_rows(constants);
-        // Without a constants companion, kinds that read gate constants
-        // stay on the full-domain dispatch (the kernel would otherwise
-        // index `col * half_rows + k` into a full-stride store).
+        // Kinds that read gate constants stay on the full-domain (real
+        // constants store) dispatch; everything else of degree <= 4 goes to
+        // the compact even-row companion, which is bound as `wires` with
+        // `lde_rows = quotient_rows / 2`.
         let reads_constants = |kind: &U32QuotientKind| {
             matches!(
                 kind,
@@ -2110,7 +2084,6 @@ fn start_gpu_range_check_gate_quotient<
                     | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
             )
         };
-        let split_constant_readers = even_constants.is_some();
         let mut low_groups = Vec::new();
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
@@ -2132,7 +2105,7 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && (split_constant_readers || !reads_constants(&spec.kind)) {
+            if degree <= 4 && !reads_constants(&spec.kind) {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2150,7 +2123,7 @@ fn start_gpu_range_check_gate_quotient<
         if !low_groups.is_empty() {
             if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
                 even_wires,
-                even_constants.unwrap_or(constants),
+                constants,
                 quotient_rows / 2,
                 1,
                 &low_groups,
@@ -2558,14 +2531,6 @@ fn compute_quotient_polys<
     // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
-    // Offloading the permutation products moves the ONLY reader of the "next"
-    // Z gather off the CPU: `permutation_products_offloaded` implies
-    // `col_major_perm` (the `gpu_permutation` construction above is gated on
-    // it), `col_major_perm` implies `!has_lookup`, and the offloaded branch of
-    // `eval_vanishing_poly_base_batch` destructures `zs_next_cols` away. So the
-    // flag below is exactly "something still reads Z(g x)".
-    let needs_next_zs = !permutation_products_offloaded;
-
     let quotient_len = points.len() * num_challenges;
     let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
     // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
@@ -2629,22 +2594,9 @@ fn compute_quotient_polys<
                     .indices
                     .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
                 scratch.indices_next.clear();
-                // The wrapped "next" indices exist for exactly one consumer: the
-                // permutation argument's Z(g x) column. When the permutation
-                // products are offloaded, `zs_next_range` below is `0..0` and the
-                // offloaded branch of `eval_vanishing_poly_base_batch` never
-                // reads `zs_next_cols`, so this construction and the zero-width
-                // gather it feeds are both dead: one add + mask + push and one
-                // `fill_lde_batch` contiguity scan per LDE point, i.e. 2^19 of
-                // each per degree-2^16 transaction proof and 2^21 per block
-                // proof, on the serial quotient spine. Skipping them leaves
-                // `indices_next` and `zs_next_flat` empty -- exactly the state
-                // `fill_lde_batch`'s `resize(n * 0)` produced.
-                if needs_next_zs {
-                    scratch
-                        .indices_next
-                        .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
-                }
+                scratch
+                    .indices_next
+                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -2752,18 +2704,13 @@ fn compute_quotient_polys<
                     batch_layout,
                     &mut scratch.zs_local_flat,
                 );
-                if needs_next_zs {
-                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                        &scratch.indices_next,
-                        step,
-                        zs_next_range,
-                        batch_layout,
-                        &mut scratch.zs_next_flat,
-                    );
-                } else {
-                    debug_assert!(zs_next_range.is_empty());
-                    scratch.zs_next_flat.clear();
-                }
+                zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                    &scratch.indices_next,
+                    step,
+                    zs_next_range,
+                    batch_layout,
+                    &mut scratch.zs_next_flat,
+                );
 
                 let indices_batch = &scratch.indices;
                 // Per-point row views over the PointMajor gathers, built only
@@ -3171,7 +3118,6 @@ pub(crate) mod precomputed {
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
-        static ODD_COSET_IFFT_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
         static SHIFT_POWERS: OnceLock<ShiftMap> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
@@ -3292,21 +3238,6 @@ pub(crate) mod precomputed {
                     .collect()
             })
         }
-
-        /// Cached `n^-1 * omega^i` table for reconstructing the odd rows of a
-        /// `2n`-point domain from its even `n` rows. `omega` is the primitive
-        /// `2n`-th root, so the table depends only on `n` and the field type.
-        pub(crate) fn odd_coset_ifft_powers_scaled<F: Field>(n: usize) -> Arc<Vec<F>> {
-            get_or_compute(&ODD_COSET_IFFT_POWERS_SCALED, n, || {
-                let n_bits = plonky2_util::log2_strict(n);
-                let n_inv = F::inverse_2exp(n_bits);
-                F::primitive_root_of_unity(n_bits + 1)
-                    .powers()
-                    .take(n)
-                    .map(|power| n_inv * power)
-                    .collect()
-            })
-        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -3346,23 +3277,11 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
-
-        pub(crate) fn odd_coset_ifft_powers_scaled<F: Field>(n: usize) -> Arc<Vec<F>> {
-            let n_bits = plonky2_util::log2_strict(n);
-            let n_inv = F::inverse_2exp(n_bits);
-            Arc::new(
-                F::primitive_root_of_unity(n_bits + 1)
-                    .powers()
-                    .take(n)
-                    .map(|power| n_inv * power)
-                    .collect::<Vec<F>>(),
-            )
-        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers_scaled, odd_coset_ifft_powers_scaled,
-        shift_powers, shifted_two_adic_subgroup, two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_powers_scaled, shift_powers,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 
