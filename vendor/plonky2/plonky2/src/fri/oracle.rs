@@ -624,34 +624,33 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let n = indices.len();
         let start = col_range.start;
         let w = col_range.len();
-        // `out` is per-worker scratch reused across the quotient batches, so it
-        // already has the right length for all but the last (short) batch. Every
-        // arm below writes all `n * w` cells before any is read:
-        //   - Columns/PolyMajor: `ci` covers `0..w`, `k` covers `0..n`, writing
-        //     each `ci * n + k` exactly once;
-        //   - Columns/PointMajor: the same loop nest writes each `k * w + ci`;
-        //   - Rows/PointMajor: each `k` copies a full `w`-element row into
-        //     `out[k * w..(k + 1) * w]`;
-        //   - Rows/PolyMajor: each `k` writes `ci * n + k` for every `ci` in
-        //     `0..w` (`row.len() == w`).
-        // So the zero-fill of a correctly sized buffer is a dead store: adjust
-        // the length only (`resize` is a no-op when it already matches, and
-        // still zero-initializes any newly created or grown scratch).
-        out.resize(n * w, F::ZERO);
+        // `out` is per-worker scratch reused across the quotient batches. Every
+        // arm below writes all `n * w` cells before any is read. Reserve enough
+        // storage but keep the old initialized length while filling through raw
+        // pointers; setting the length before initialization would violate
+        // `Vec::set_len`'s contract even for a `Copy` field type.
+        let output_len = n * w;
+        if output_len > out.capacity() {
+            out.reserve(output_len - out.len());
+        }
+        let output = out.as_mut_ptr();
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
                 for (ci, c) in col_range.enumerate() {
                     let column = columns.col(c);
                     match layout {
                         BatchLayout::PolyMajor => {
-                            let destination = &mut out[ci * n..(ci + 1) * n];
                             for (k, &i) in indices.iter().enumerate() {
-                                destination[k] = column[i * step];
+                                // SAFETY: `ci < w`, `k < n`, and reservation
+                                // above covers `w * n`; each pair is disjoint.
+                                unsafe { output.add(ci * n + k).write(column[i * step]) };
                             }
                         }
                         BatchLayout::PointMajor => {
                             for (k, &i) in indices.iter().enumerate() {
-                                out[k * w + ci] = column[i * step];
+                                // SAFETY: `k < n`, `ci < w`, and each pair is
+                                // written exactly once within reserved storage.
+                                unsafe { output.add(k * w + ci).write(column[i * step]) };
                             }
                         }
                     }
@@ -662,17 +661,30 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     let row = &self.get_lde_values(i, step)[start..start + w];
                     match layout {
                         BatchLayout::PointMajor => {
-                            out[k * w..(k + 1) * w].copy_from_slice(row);
+                            // SAFETY: row has `w` elements and the destination
+                            // range `k * w..(k + 1) * w` is reserved and disjoint.
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    row.as_ptr(),
+                                    output.add(k * w),
+                                    w,
+                                )
+                            };
                         }
                         BatchLayout::PolyMajor => {
                             for (ci, &value) in row.iter().enumerate() {
-                                out[ci * n + k] = value;
+                                // SAFETY: `ci < w`, `k < n`, and each pair is
+                                // written exactly once within reserved storage.
+                                unsafe { output.add(ci * n + k).write(value) };
                             }
                         }
                     }
                 }
             }
         }
+        // SAFETY: every one of the `output_len` slots was initialized exactly
+        // once by the exhaustive storage/layout arms above.
+        unsafe { out.set_len(output_len) };
     }
 
     /// Copies consecutive LDE points into a PolyMajor output buffer.
@@ -689,7 +701,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ) {
         let start = col_range.start;
         let w = col_range.len();
-        out.resize(n * w, F::ZERO);
+        let output_len = n * w;
+        if output_len > out.capacity() {
+            out.reserve(output_len - out.len());
+        }
+        let output = out.as_mut_ptr();
 
         match &self.merkle_tree.leaves {
             MerkleLeaves::Columns { columns, .. } => {
@@ -697,19 +713,33 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     .checked_add(n)
                     .expect("contiguous LDE batch range overflow");
                 for (ci, c) in col_range.enumerate() {
-                    out[ci * n..(ci + 1) * n]
-                        .copy_from_slice(&columns.col(c)[index_start..index_end]);
+                    let source = &columns.col(c)[index_start..index_end];
+                    // SAFETY: `ci < w`, each source contains `n` initialized
+                    // elements, reserved output spans `w * n`, and scratch does
+                    // not alias the commitment's immutable column storage.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            source.as_ptr(),
+                            output.add(ci * n),
+                            n,
+                        )
+                    };
                 }
             }
             MerkleLeaves::Rows { .. } => {
                 for k in 0..n {
                     let row = &self.get_lde_values(index_start + k, 1)[start..start + w];
                     for (ci, &value) in row.iter().enumerate() {
-                        out[ci * n + k] = value;
+                        // SAFETY: `ci < w`, `k < n`, and every pair is written
+                        // exactly once within the reserved `w * n` slots.
+                        unsafe { output.add(ci * n + k).write(value) };
                     }
                 }
             }
         }
+        // SAFETY: every one of the `output_len` slots was initialized exactly
+        // once by either exhaustive storage arm above.
+        unsafe { out.set_len(output_len) };
     }
 
     /// Extracts the stride-`step` LDE values for a whole quotient domain of
@@ -2137,6 +2167,9 @@ mod tests {
                     .collect::<Vec<_>>()
             };
 
+            // Seed and reuse one scratch allocation across small, short, and
+            // growing batches so the overwrite path cannot rely on fresh zeros.
+            let mut uncached = vec![GoldilocksField(u64::MAX); 7];
             for batch_size in [1usize, 3, 8, 32] {
                 let num_batches = domain.div_ceil(batch_size);
                 for batch_i in 0..num_batches {
@@ -2149,7 +2182,6 @@ mod tests {
                         (sigmas_range.clone(), num_constants),
                     ] {
                         let w = range.len();
-                        let mut uncached = Vec::new();
                         batch.fill_lde_batch(
                             &indices,
                             step,
@@ -2168,6 +2200,82 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fill_lde_batch_reused_uninit_scratch_matches_point_oracle_raw_words() {
+        use crate::field::types::{Field64, PrimeField64};
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        let degree = 32usize;
+        let width = 5usize;
+        let values = (0..width)
+            .map(|column| {
+                PolynomialValues::new(
+                    (0..degree)
+                        .map(|row| {
+                            F::from_noncanonical_u64(
+                                F::ORDER
+                                    .wrapping_add((column * degree + row + 1) as u64),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for blinding in [false, true] {
+            let batch = PolynomialBatch::<F, C, D>::from_values(
+                values.clone(),
+                2,
+                blinding,
+                1,
+                &mut TimingTree::default(),
+                None,
+            );
+            let mut out = vec![F::from_noncanonical_u64(u64::MAX); 3];
+            for (indices, step, range) in [
+                (vec![0usize, 1, 2, 3, 4, 5], 1usize, 0usize..5usize),
+                (vec![1usize, 3, 7, 11], 1usize, 1usize..4usize),
+                (vec![0usize, 2, 5, 9], 2usize, 0usize..2usize),
+                (vec![3usize], 1usize, 2usize..5usize),
+            ] {
+                for layout in [BatchLayout::PointMajor, BatchLayout::PolyMajor] {
+                    batch.fill_lde_batch(&indices, step, range.clone(), layout, &mut out);
+                    let value_at = |index: usize, column: usize| match &batch.merkle_tree.leaves {
+                        MerkleLeaves::Columns { columns, .. } => columns.col(column)[index * step],
+                        MerkleLeaves::Rows { .. } => batch.get_lde_values(index, step)[column],
+                    };
+                    let mut expected = Vec::with_capacity(indices.len() * range.len());
+                    match layout {
+                        BatchLayout::PointMajor => {
+                            for &index in &indices {
+                                expected.extend(range.clone().map(|column| value_at(index, column)));
+                            }
+                        }
+                        BatchLayout::PolyMajor => {
+                            for column in range.clone() {
+                                expected.extend(indices.iter().map(|&index| value_at(index, column)));
+                            }
+                        }
+                    }
+                    assert_eq!(out.len(), expected.len());
+                    assert_eq!(
+                        out.iter()
+                            .map(PrimeField64::to_noncanonical_u64)
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(PrimeField64::to_noncanonical_u64)
+                            .collect::<Vec<_>>(),
+                        "blinding={blinding} step={step} range={range:?} layout={layout:?}",
+                    );
                 }
             }
         }

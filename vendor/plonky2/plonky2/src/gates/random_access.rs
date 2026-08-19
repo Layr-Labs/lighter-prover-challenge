@@ -87,6 +87,30 @@ fn accumulate_constraint_direct<F: Field>(
     }
 }
 
+/// Accumulate a constraint whose terms have already been evaluated in the
+/// field's preferred packing. Callers guarantee that the batch has no ragged
+/// suffix; generic/ragged batches use `accumulate_constraint_direct` instead.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn accumulate_constraint_packed<F: Field>(
+    out: &mut [F],
+    filters: &[F],
+    mut term_at: impl FnMut(usize) -> <F as Packable>::Packing,
+) {
+    type Packing<F> = <F as Packable>::Packing;
+    let out = Packing::<F>::pack_slice_mut(out);
+    let filters = Packing::<F>::pack_slice(filters);
+    for (group, (x_out, &x_filter)) in out.iter_mut().zip(filters).enumerate() {
+        *x_out = x_out.multiply_accumulate(term_at(group), x_filter);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn select_packed<P: PackedField>(bit: P, x: P, y: P) -> P {
+    x + bit * (y - x)
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> RandomAccessGate<F, D> {
     const fn new(num_copies: usize, bits: usize, num_extra_constants: usize) -> Self {
         Self {
@@ -161,6 +185,110 @@ impl<F: RichField + Extendable<D>, const D: usize> RandomAccessGate<F, D> {
         debug_assert!(i < self.bits);
         debug_assert!(copy < self.num_copies);
         self.num_routed_wires() + copy * self.bits + i
+    }
+
+    /// Packed, allocation-free evaluator for the production random-access
+    /// shape. Keeping one packed point group live at a time deletes the
+    /// materialized eight-column selector tree used by the generic evaluator.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    fn eval_unfiltered_base_batch_accumulate_bits4_packed(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        type Packing<F> = <F as Packable>::Packing;
+
+        let n = vars_base.len();
+        debug_assert_eq!(self.bits, 4);
+        debug_assert_eq!(n, 32);
+        debug_assert_eq!(n % Packing::<F>::WIDTH, 0);
+
+        let wires = vars_base.local_wires;
+        let constants = vars_base.local_constants;
+        let packed_col = |w: usize| Packing::<F>::pack_slice(&wires[w * n..][..n]);
+        let mut row = 0;
+
+        for copy in 0..self.num_copies {
+            let bits: [&[Packing<F>]; 4] =
+                core::array::from_fn(|i| packed_col(self.wire_bit(i, copy)));
+
+            // Booleanity constraints. Packed arithmetic has the same lane-wise
+            // operation order as the scalar reference.
+            for bit in bits {
+                accumulate_constraint_packed(
+                    &mut combined_gate_constraints[row * n..][..n],
+                    filters,
+                    |group| bit[group] * (bit[group] - F::ONE),
+                );
+                row += 1;
+            }
+
+            let access_index = packed_col(self.wire_access_index(copy));
+            accumulate_constraint_packed(
+                &mut combined_gate_constraints[row * n..][..n],
+                filters,
+                |group| {
+                    let mut reconstructed_index = Packing::<F>::ZEROS;
+                    for bit in bits.iter().rev() {
+                        reconstructed_index =
+                            reconstructed_index + reconstructed_index + bit[group];
+                    }
+                    reconstructed_index - access_index[group]
+                },
+            );
+            row += 1;
+
+            // Evaluate the 16-to-1 selector entirely in packed temporaries.
+            // This is deliberately unrolled: the eight first-level values stay
+            // local to one point group instead of occupying a 2 KiB scratch
+            // matrix for the whole batch.
+            let list: [&[Packing<F>]; 16] =
+                core::array::from_fn(|i| packed_col(self.wire_list_item(i, copy)));
+            let claimed_element = packed_col(self.wire_claimed_element(copy));
+            accumulate_constraint_packed(
+                &mut combined_gate_constraints[row * n..][..n],
+                filters,
+                |group| {
+                    let b0 = bits[0][group];
+                    let x0 = select_packed(b0, list[0][group], list[1][group]);
+                    let x1 = select_packed(b0, list[2][group], list[3][group]);
+                    let x2 = select_packed(b0, list[4][group], list[5][group]);
+                    let x3 = select_packed(b0, list[6][group], list[7][group]);
+                    let x4 = select_packed(b0, list[8][group], list[9][group]);
+                    let x5 = select_packed(b0, list[10][group], list[11][group]);
+                    let x6 = select_packed(b0, list[12][group], list[13][group]);
+                    let x7 = select_packed(b0, list[14][group], list[15][group]);
+
+                    let b1 = bits[1][group];
+                    let x0 = select_packed(b1, x0, x1);
+                    let x1 = select_packed(b1, x2, x3);
+                    let x2 = select_packed(b1, x4, x5);
+                    let x3 = select_packed(b1, x6, x7);
+
+                    let b2 = bits[2][group];
+                    let x0 = select_packed(b2, x0, x1);
+                    let x1 = select_packed(b2, x2, x3);
+
+                    let selected = select_packed(bits[3][group], x0, x1);
+                    selected - claimed_element[group]
+                },
+            );
+            row += 1;
+        }
+
+        for i in 0..self.num_extra_constants {
+            let constant = Packing::<F>::pack_slice(&constants[i * n..][..n]);
+            let wire = packed_col(self.wire_extra_constant(i));
+            accumulate_constraint_packed(
+                &mut combined_gate_constraints[row * n..][..n],
+                filters,
+                |group| constant[group] - wire[group],
+            );
+            row += 1;
+        }
+        debug_assert_eq!(row, self.num_constraints());
     }
 }
 
@@ -323,6 +451,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            type Packing<F> = <F as Packable>::Packing;
+            if self.bits == 4 && n == 32 && n % Packing::<F>::WIDTH == 0 {
+                self.eval_unfiltered_base_batch_accumulate_bits4_packed(
+                    vars_base,
+                    filters,
+                    combined_gate_constraints,
+                );
+                return;
+            }
+        }
 
         let wires = vars_base.local_wires;
         let constants = vars_base.local_constants;
@@ -783,6 +924,92 @@ mod tests {
                         "bits={bits}, n={n}, output={i}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_bits4_matches_reference_with_invalid_selectors_and_ragged_batches() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        // The n=32 case enters the production packed evaluator. The other
+        // sizes protect the scalar fallback, including both sides of 32 and
+        // non-multiples of the preferred packing width.
+        for n in [1, 3, 31, 32, 33] {
+            let gate = RandomAccessGate::<F, D>::new(4, 4, 2);
+            let edge = |i: usize| match i % 9 {
+                0 => F::ZERO,
+                1 => F::ONE,
+                2 => F::from_canonical_u64(2),
+                3 => F::from_canonical_u64(F::ORDER - 1),
+                4 => GoldilocksField(F::ORDER),
+                5 => GoldilocksField(F::ORDER + 1),
+                6 => GoldilocksField(u64::MAX),
+                _ => {
+                    F::from_canonical_u64((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) % F::ORDER)
+                }
+            };
+
+            let mut wires = (0..gate.num_wires() * n).map(edge).collect::<Vec<_>>();
+            // Every bit row sees canonical invalid selectors as well as valid
+            // 0/1 and noncanonical representatives. In particular point zero
+            // is 2, so its boolean constraint must reject it rather than the
+            // selector fold silently treating it as a branch choice.
+            for copy in 0..gate.num_copies {
+                for bit in 0..gate.bits {
+                    for point in 0..n {
+                        let selector = match point % 6 {
+                            0 => F::from_canonical_u64(2),
+                            1 => F::ZERO,
+                            2 => F::ONE,
+                            3 => F::from_canonical_u64(F::ORDER - 1),
+                            4 => GoldilocksField(F::ORDER),
+                            _ => GoldilocksField(F::ORDER + 1),
+                        };
+                        wires[gate.wire_bit(bit, copy) * n + point] = selector;
+                    }
+                }
+            }
+
+            let constants = (0..gate.num_constants() * n)
+                .map(|i| edge(i + 10_000))
+                .collect::<Vec<_>>();
+            let filters = (0..n).map(|i| edge(i + 20_000)).collect::<Vec<_>>();
+            let hash = HashOut::ZERO;
+            let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+
+            for copy in 0..gate.num_copies {
+                for bit in 0..gate.bits {
+                    let row = copy * (gate.bits + 2) + bit;
+                    assert_ne!(
+                        materialized[row * n].to_canonical_u64(),
+                        0,
+                        "invalid selector accepted: n={n}, copy={copy}, bit={bit}"
+                    );
+                }
+            }
+
+            let initial = (0..gate.num_constraints() * n)
+                .map(|i| edge(i + 30_000))
+                .collect::<Vec<_>>();
+            let mut expected = initial.clone();
+            for (acc, constraints) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                batch_multiply_add_inplace(acc, constraints, &filters);
+            }
+
+            let mut actual = initial;
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            for (i, (&expected, &actual)) in expected.iter().zip(&actual).enumerate() {
+                assert_eq!(
+                    actual.to_noncanonical_u64(),
+                    expected.to_noncanonical_u64(),
+                    "n={n}, output={i}"
+                );
             }
         }
     }

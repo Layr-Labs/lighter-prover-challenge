@@ -1020,7 +1020,8 @@ fn fft_classic_simd_single_layer_neon_w4(
 /// `(a0 + a1*u) * (b0 + b1*u) = (a0*b0 + 7*a1*b1) + (a0*b1 + a1*b0)*u`.
 /// Production FRI twiddle rows are almost entirely base-subfield values
 /// `[w, 0]`, for which the product is `[w*a0, w*a1]` — two base multiplications
-/// instead of four. A single row-level scan picks that fast path (one paired
+/// instead of four. The row is powers of one generator, so checking that
+/// generator picks the fast path without scanning the whole row (one paired
 /// `NeonGoldilocksField` mul hides the scalar latency); otherwise the general
 /// four-product form runs. The butterfly `u + t` / `u - t` reductions always
 /// run as two-lane vector adds/subs reproducing `impl Add/Sub for
@@ -1047,9 +1048,10 @@ fn fft_classic_simd_single_layer_neon_ext(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    let base_subfield = omega_row.get(1).map_or_else(
+        || omega_row[..half].iter().all(|w| w.0[1].0 == 0),
+        |generator| generator.0[1].0 == 0,
+    );
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;

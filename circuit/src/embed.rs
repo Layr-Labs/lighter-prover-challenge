@@ -684,14 +684,18 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         }
     };
 
-    // Runtime-only, like `generator_watch_counts`: a pure function of `generators`. Every
+    // Runtime-only, like `generator_watch_counts`: pure functions of `generators`. Every
     // generator this loader produces comes from `read_generator_impl!`, which wraps each
-    // deserialized `SimpleGenerator` in a `SimpleGeneratorAdapter`, so this scan is expected
-    // to return `true`; it is computed rather than assumed so a custom serializer that yields
-    // some other `WitnessGenerator` still gets the conservative behavior.
-    let generators_defer_until_ready = generators
-        .iter()
-        .all(|generator| generator.0.defers_until_ready());
+    // deserialized `SimpleGenerator` in a `SimpleGeneratorAdapter`, so the readiness scan is
+    // expected to return `true`; it is computed rather than assumed so a custom serializer that
+    // yields some other `WitnessGenerator` still gets the conservative behavior.
+    let mut generators_defer_until_ready = true;
+    let mut generator_batch_descriptors = Vec::with_capacity(generators.len());
+    for generator in &generators {
+        let (defers_until_ready, batch_descriptor) = generator.0.scheduling_metadata();
+        generators_defer_until_ready &= defers_until_ready;
+        generator_batch_descriptors.push(batch_descriptor);
+    }
 
     let prover_only = ProverOnlyCircuitData::<F, C, D> {
         constants_sigmas_quotient_cache,
@@ -699,6 +703,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         constants_sigmas_quotient_domain,
         low_range_selector_filter_cache: Default::default(),
         generators,
+        generator_batch_descriptors,
         generator_indices_by_watches,
         generator_watch_counts,
         generators_defer_until_ready,
