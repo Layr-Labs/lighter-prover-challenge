@@ -510,15 +510,23 @@ kernel void poseidon2_gate_quotient(
     }
 
     uint source_row = gid * step;
+    // Every value read out of `wires` and `constants` below is canonical: both
+    // are retained `MetalColumns` stores, and the commitment that produced each
+    // one left it canonical -- the fused NTT path through its last butterfly
+    // stage, the classic and streamed hashing paths through the in-place
+    // canonicalization in `poseidon2_hash_leaves_colmajor` /
+    // `poseidon2_absorb_pass`. That is what lets the canonical-right-operand
+    // forms replace the general ones here; each is bit-identical to the
+    // general form under that precondition, not merely congruent.
     ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
     ulong filter = 1;
     for (uint i = group_start; i < group_end; ++i) {
         if (i != gate_index) {
-            filter = gl_mul(filter, gl_sub((ulong)i, selector));
+            filter = gl_mul(filter, gl_sub_canonical_rhs((ulong)i, selector));
         }
     }
     if (include_unused_selector != 0u) {
-        filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+        filter = gl_mul(filter, gl_sub_canonical_rhs(0xffffffffUL, selector));
     }
 
     // parameters buffer kept for ABI; RCs from compile-time tables.
@@ -538,12 +546,13 @@ kernel void poseidon2_gate_quotient(
         ulong rhs = poseidon2_gate_wire(wires, i + 4, lde_rows, source_row);
         ulong delta = poseidon2_gate_wire(wires, 25 + i, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(gl_mul(swap, gl_sub(rhs, lhs)), delta),
+            gl_sub_canonical_rhs(
+                gl_mul(swap, gl_sub_canonical_rhs(rhs, lhs)), delta),
             alpha_powers,
             accumulators,
             constraint_index);
-        state[i] = gl_add(lhs, delta);
-        state[i + 4] = gl_sub(rhs, delta);
+        state[i] = gl_add_canonical_rhs(lhs, delta);
+        state[i + 4] = gl_sub_canonical_rhs(rhs, delta);
     }
     for (uint i = 8; i < 12; ++i) {
         state[i] = poseidon2_gate_wire(wires, i, lde_rows, source_row);
@@ -564,7 +573,7 @@ kernel void poseidon2_gate_quotient(
                     lde_rows,
                     source_row);
                 poseidon2_gate_emit(
-                    gl_sub(state[i], saved),
+                    gl_sub_canonical_rhs(state[i], saved),
                     alpha_powers,
                     accumulators,
                     constraint_index);
@@ -580,7 +589,8 @@ kernel void poseidon2_gate_quotient(
     for (uint round = 0; round < 22; ++round) {
         ulong saved = poseidon2_gate_wire(wires, 65 + round, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(gl_add_canonical_rhs(state[0], POSEIDON2_INTERNAL_RC[round]), saved),
+            gl_sub_canonical_rhs(
+                gl_add_canonical_rhs(state[0], POSEIDON2_INTERNAL_RC[round]), saved),
             alpha_powers,
             accumulators,
             constraint_index);
@@ -600,7 +610,7 @@ kernel void poseidon2_gate_quotient(
                 lde_rows,
                 source_row);
             poseidon2_gate_emit(
-                gl_sub(state[i], saved),
+                gl_sub_canonical_rhs(state[i], saved),
                 alpha_powers,
                 accumulators,
                 constraint_index);
@@ -612,7 +622,7 @@ kernel void poseidon2_gate_quotient(
     for (uint i = 0; i < 12; ++i) {
         ulong expected = poseidon2_gate_wire(wires, 12 + i, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(state[i], expected),
+            gl_sub_canonical_rhs(state[i], expected),
             alpha_powers,
             accumulators,
             constraint_index);
@@ -666,10 +676,10 @@ kernel void permutation_quotient(
             (ulong)(sigma_start + j_start) * lde_rows + source_row];
         ulong beta_k0 = challenges[4u + j_start];
         ulong beta_k1 = challenges[4u + num_routed_wires + j_start];
-        ulong numerator0 = gl_add(gl_mul_add(beta_k0, x, wire), gamma0);
-        ulong denominator0 = gl_add(gl_mul_add(beta0, sigma, wire), gamma0);
-        ulong numerator1 = gl_add(gl_mul_add(beta_k1, x, wire), gamma1);
-        ulong denominator1 = gl_add(gl_mul_add(beta1, sigma, wire), gamma1);
+        ulong numerator0 = gl_add_canonical_rhs(gl_mul_add(beta_k0, x, wire), gamma0);
+        ulong denominator0 = gl_add_canonical_rhs(gl_mul_add(beta0, sigma, wire), gamma0);
+        ulong numerator1 = gl_add_canonical_rhs(gl_mul_add(beta_k1, x, wire), gamma1);
+        ulong denominator1 = gl_add_canonical_rhs(gl_mul_add(beta1, sigma, wire), gamma1);
         for (uint j = j_start + 1u; j < j_end; ++j) {
             wire = wires[(ulong)j * lde_rows + source_row];
             sigma = constants_sigmas[
@@ -677,13 +687,13 @@ kernel void permutation_quotient(
             beta_k0 = challenges[4u + j];
             beta_k1 = challenges[4u + num_routed_wires + j];
             numerator0 = gl_mul(
-                numerator0, gl_add(gl_mul_add(beta_k0, x, wire), gamma0));
+                numerator0, gl_add_canonical_rhs(gl_mul_add(beta_k0, x, wire), gamma0));
             denominator0 = gl_mul(
-                denominator0, gl_add(gl_mul_add(beta0, sigma, wire), gamma0));
+                denominator0, gl_add_canonical_rhs(gl_mul_add(beta0, sigma, wire), gamma0));
             numerator1 = gl_mul(
-                numerator1, gl_add(gl_mul_add(beta_k1, x, wire), gamma1));
+                numerator1, gl_add_canonical_rhs(gl_mul_add(beta_k1, x, wire), gamma1));
             denominator1 = gl_mul(
-                denominator1, gl_add(gl_mul_add(beta1, sigma, wire), gamma1));
+                denominator1, gl_add_canonical_rhs(gl_mul_add(beta1, sigma, wire), gamma1));
         }
 
         uint previous_column0 = chunk == 0u ? 0u : 1u + chunk;
@@ -776,9 +786,18 @@ inline void alpha_acc_mul_add(thread alpha_acc_t& acc, ulong a, ulong b) {
 // (`gl_mul_add` by the filter, then `gl_canonicalize`) is residue-exact for
 // any 64-bit representative, so the kernel's output is bit-identical to the
 // per-constraint reduction it replaces.
+//
+// The subtrahend `high.lo + high.hi` is therefore always canonical, and that is
+// not a property of today's parameters: the host refuses any dispatch with
+// `alpha_stride * 2 * sizeof(u64) > MAX_INLINE_BYTES` (4096), so
+// `n <= alpha_stride <= 256` and the subtrahend is below
+// `2 * 256 * (2^32 - 1) < 2^41 < p`. `gl_sub_canonical_rhs` is bit-identical to
+// `gl_sub` for a canonical right operand at any left operand, so it applies
+// here without depending on the canonical-columns invariant.
 inline ulong alpha_acc_materialize(alpha_acc_t acc) {
     lazy_t positive = { acc.low.lo, acc.low.hi + acc.high.lo };
-    return gl_sub(lazy_materialize(positive), acc.high.lo + acc.high.hi);
+    return gl_sub_canonical_rhs(
+        lazy_materialize(positive), acc.high.lo + acc.high.hi);
 }
 
 inline void range_check_gate_emit(
@@ -870,6 +889,27 @@ inline ulong random_access_select_8(
     return items[0];
 }
 
+// DO NOT specialize this kernel's `wires` arithmetic to the canonical-right-
+// operand forms (`gl_add_canonical_rhs` / `gl_sub_canonical_rhs`), the way
+// `poseidon2_gate_quotient` does.
+//
+// Those forms omit the second correction fold, which is sound only when the
+// right operand is below the field order. `poseidon2_gate_quotient` gets that
+// from the canonical-columns invariant: its `wires` is always the full retained
+// `MetalColumns` store, which the commitment path left canonical.
+//
+// This kernel's `wires` is not always that store. Its primary dispatch is
+// `start_range_check_gate_quotient_multi`, which binds the compact even-row
+// *companion* (`PolynomialBatch::even_columns`). The companion is filled by
+// `copy_even` inside the LDE group fill in `fri/oracle.rs`, i.e. straight off
+// the CPU FFT output and *before* the absorb pass canonicalizes the retained
+// store, and nothing canonicalizes it afterwards. plonky2's Goldilocks
+// arithmetic is deliberately non-canonicalizing, so those values may be >= p.
+//
+// `constants` is safe: the full constants/sigmas store is canonical, and its
+// companion (`get_or_fill_even_rows`) is a copy taken after that store was
+// built, so it inherits canonicality. Only the selector reads below are
+// specialized for that reason.
 kernel void range_check_gate_quotient(
     const device ulong* wires [[buffer(0)]],
     const device ulong* constants [[buffer(1)]],
@@ -904,11 +944,11 @@ kernel void range_check_gate_quotient(
         ulong filter = 1;
         for (uint i = group_start; i < group_end; ++i) {
             if (i != gate_index) {
-                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+                filter = gl_mul(filter, gl_sub_canonical_rhs((ulong)i, selector));
             }
         }
         if (include_unused_selector != 0u) {
-            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            filter = gl_mul(filter, gl_sub_canonical_rhs(0xffffffffUL, selector));
         }
 
         alpha_acc_t gate_accumulators[2] = {
@@ -978,11 +1018,11 @@ kernel void range_check_gate_quotient(
         ulong filter = 1;
         for (uint i = group_start; i < group_end; ++i) {
             if (i != gate_index) {
-                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+                filter = gl_mul(filter, gl_sub_canonical_rhs((ulong)i, selector));
             }
         }
         if (include_unused_selector != 0u) {
-            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            filter = gl_mul(filter, gl_sub_canonical_rhs(0xffffffffUL, selector));
         }
 
         alpha_acc_t gate_accumulators[2] = {
@@ -1761,13 +1801,22 @@ kernel void ifft_finalize(
     coeffs[colbase + i] = gl_canonicalize(gl_mul(fft_out[colbase + src], n_inv));
 }
 
+// `canonicalize_in_place` (buffer 6) stores each canonicalized input back over
+// the value it was read from. Set it for the retained `MetalColumns` store,
+// whose CPU-computed LDE holds arbitrary u64 representatives (plonky2's
+// Goldilocks arithmetic is deliberately non-canonicalizing) and which the
+// quotient kernels read afterwards; the canonical-right-operand specializations
+// there depend on that. Clear it for a pooled staging copy, which nothing reads
+// again, and for the fused NTT path, whose last butterfly stage already
+// canonicalized `column_buffer` in place.
 kernel void poseidon2_hash_leaves_colmajor(
-    const device ulong* leaves [[buffer(0)]],
+    device ulong* leaves [[buffer(0)]],
     device ulong* hashes [[buffer(1)]],
     constant ulong* parameters [[buffer(2)]],
     constant uint& leaf_width [[buffer(3)]],
     constant uint& leaf_count [[buffer(4)]],
     constant uint& log_leaf_count [[buffer(5)]],
+    constant uint& canonicalize_in_place [[buffer(6)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
@@ -1784,7 +1833,12 @@ kernel void poseidon2_hash_leaves_colmajor(
     if (leaf_width <= 4) {
         uint i = 0;
         for (; i < leaf_width; ++i) {
-            output[i] = gl_canonicalize(leaves[(ulong)i * leaf_count + gid]);
+            ulong index = (ulong)i * leaf_count + gid;
+            ulong value = gl_canonicalize(leaves[index]);
+            if (canonicalize_in_place != 0u) {
+                leaves[index] = value;
+            }
+            output[i] = value;
         }
         for (; i < 4; ++i) {
             output[i] = 0;
@@ -1792,11 +1846,36 @@ kernel void poseidon2_hash_leaves_colmajor(
         return;
     }
 
+    // Only a trailing chunk can be partial, so peel the full-rate passes out
+    // of the runtime bound: their absorb loop then has a compile-time trip
+    // count and compile-time `state` indices. Identical reads in identical
+    // order; the trailing chunk keeps the shipped semantics of leaving the
+    // rate lanes it does not cover at their previous values, expressed with a
+    // uniform predicate rather than a dynamic index.
     ulong state[12] = { 0 };
-    for (uint offset = 0; offset < leaf_width; offset += 8) {
-        uint chunk_size = min(8u, leaf_width - offset);
-        for (uint i = 0; i < chunk_size; ++i) {
-            state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+    uint full = leaf_width & ~7u;
+    for (uint offset = 0; offset < full; offset += 8) {
+        for (uint i = 0; i < 8; ++i) {
+            ulong index = (ulong)(offset + i) * leaf_count + gid;
+            ulong value = gl_canonicalize(leaves[index]);
+            if (canonicalize_in_place != 0u) {
+                leaves[index] = value;
+            }
+            state[i] = value;
+        }
+        poseidon2(state, parameters);
+    }
+    uint tail = leaf_width - full;
+    if (tail != 0u) {
+        for (uint i = 0; i < 8; ++i) {
+            if (i < tail) {
+                ulong index = (ulong)(full + i) * leaf_count + gid;
+                ulong value = gl_canonicalize(leaves[index]);
+                if (canonicalize_in_place != 0u) {
+                    leaves[index] = value;
+                }
+                state[i] = value;
+            }
         }
         poseidon2(state, parameters);
     }
@@ -1829,15 +1908,24 @@ kernel void poseidon2_hash_parents(
 }
 
 // One sponge absorption pass over a group of at most eight natural-order
-// columns, with the running 12-lane state parked in `state` between passes
+// columns, with the running sponge state parked in `state` between passes
 // (column-major: lane i of row gid at state[i * leaf_count + gid]). The
 // final pass writes the four-lane digests to `hashes` at the bit-reversed
 // row, exactly like poseidon2_hash_leaves_colmajor. Splitting the sponge by
 // column group lets the CPU compute group g+1's LDE columns while the GPU
 // absorbs group g; the arithmetic per pass is identical to the fused
 // kernel's corresponding loop iteration.
+//
+// Only the four capacity lanes are live across a pass boundary whenever the
+// next pass absorbs a full rate chunk, because plonky2's sponge overwrites
+// lanes 0..8 with input rather than adding into them. The host sets
+// `carry_rate` on the one pass (if any) whose successor absorbs a partial
+// chunk and therefore does read rate lanes this pass produced; everywhere
+// else the eight rate lanes are dead on arrival and are neither stored nor
+// reloaded. Every `st` index below is a compile-time constant on both paths,
+// so the array stays register-resident.
 kernel void poseidon2_absorb_pass(
-    const device ulong* leaves [[buffer(0)]],
+    device ulong* leaves [[buffer(0)]],
     device ulong* state [[buffer(1)]],
     device ulong* hashes [[buffer(2)]],
     constant ulong* parameters [[buffer(3)]],
@@ -1847,18 +1935,41 @@ kernel void poseidon2_absorb_pass(
     constant uint& chunk_size [[buffer(7)]],
     constant uint& first_pass [[buffer(8)]],
     constant uint& final_pass [[buffer(9)]],
+    constant uint& carry_rate [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
     }
     ulong st[12] = { 0 };
     if (first_pass == 0u) {
-        for (uint i = 0; i < 12; ++i) {
+        if (chunk_size < 8u) {
+            for (uint i = 0; i < 8; ++i) {
+                st[i] = state[(ulong)i * leaf_count + gid];
+            }
+        }
+        for (uint i = 8; i < 12; ++i) {
             st[i] = state[(ulong)i * leaf_count + gid];
         }
     }
-    for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+    // The absorb driver always binds the retained `MetalColumns` buffer here,
+    // so the canonicalized value is always stored back: this is the pass that
+    // establishes the canonical-columns invariant for the streamed commitment.
+    if (chunk_size == 8u) {
+        for (uint i = 0; i < 8; ++i) {
+            ulong index = (ulong)(col_start + i) * leaf_count + gid;
+            ulong value = gl_canonicalize(leaves[index]);
+            leaves[index] = value;
+            st[i] = value;
+        }
+    } else {
+        for (uint i = 0; i < 8; ++i) {
+            if (i < chunk_size) {
+                ulong index = (ulong)(col_start + i) * leaf_count + gid;
+                ulong value = gl_canonicalize(leaves[index]);
+                leaves[index] = value;
+                st[i] = value;
+            }
+        }
     }
     poseidon2(st, parameters);
     if (final_pass != 0u) {
@@ -1870,7 +1981,12 @@ kernel void poseidon2_absorb_pass(
             output[i] = gl_canonicalize(st[i]);
         }
     } else {
-        for (uint i = 0; i < 12; ++i) {
+        if (carry_rate != 0u) {
+            for (uint i = 0; i < 8; ++i) {
+                state[(ulong)i * leaf_count + gid] = st[i];
+            }
+        }
+        for (uint i = 8; i < 12; ++i) {
             state[(ulong)i * leaf_count + gid] = st[i];
         }
     }
