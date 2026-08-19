@@ -135,6 +135,23 @@ fn light_tx_proof_window() -> usize {
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
 const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
 
+/// The final-block circuit build starts while the transaction paths are running,
+/// but it is not needed until their proofs are complete. Keep that slack lane
+/// from taking the entire process-global Rayon pool away from the light path,
+/// which is the critical pipeline. The block construction itself is unchanged;
+/// this only selects the workers on which its existing Rayon jobs run.
+fn block_build_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let threads = (rayon::current_num_threads() / 2).clamp(2, 8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build()
+            .expect("cannot build bounded block-build lane pool")
+    })
+}
+
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
         .expect("block transaction chunk must not be empty")
@@ -1076,7 +1093,7 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        block_build_pool().install(|| circuits.build_block_circuit())
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
