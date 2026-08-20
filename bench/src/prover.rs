@@ -1,6 +1,7 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 // Redraw marker r18 (same-account archive-dedup convention; inert, declared in note)
+// v1-control r1: executable-identical to 1469ef8 plus this line; pair-mul reverted.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
