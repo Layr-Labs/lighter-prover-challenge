@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "4c1969ec8ad8cd3118f34752b13be6d666a588a0c4750e6bf52593fcc9072611";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -2630,7 +2630,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            // Absorb-only occupancy: 256 default; leaf/parent stay on `dispatch` (128).
+            dispatch_hash(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -4453,15 +4454,37 @@ fn dispatch2d(
     );
 }
 
-fn dispatch(
+/// Threadgroup cap for streamed `poseidon2_absorb_pass` only.
+///
+/// Quotient kernels stay on [`dispatch`]'s 128 clamp: they are the high-register
+/// ALU path. Leaf and parent hashing also stay at 128 after this account's
+/// `458be2b` (absorb+leaf+parent at 256) rejected at 32.082. The 236 ms serial
+/// wait inside wires commitment is the absorb family, not the parent ladder, so
+/// this bisect unclamps only that kernel. Default 256 is the geometry that
+/// printed official 32.973 (`75e59a0`). 512 (`8ac9b2f`) printed 32.193 and is
+/// not retried as the default. `LIGHTER_HASH_TG=128` restores the tip;
+/// `LIGHTER_HASH_TG=512` / `1024` remain available for an isolated retry.
+fn hash_threadgroup_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("LIGHTER_HASH_TG")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| (32..=1024).contains(&n) && n.is_power_of_two())
+            .unwrap_or(256)
+    })
+}
+
+fn dispatch_with_group_cap(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     thread_count: usize,
+    group_cap: u64,
 ) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(group_cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -4475,6 +4498,22 @@ fn dispatch(
             depth: 1,
         },
     );
+}
+
+fn dispatch_hash(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
+}
+
+fn dispatch(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
 }
 
 /// Copies the GPU's level-order node array (leaf digests first, cap level

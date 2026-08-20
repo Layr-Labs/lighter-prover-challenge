@@ -666,10 +666,12 @@ kernel void permutation_quotient(
             (ulong)(sigma_start + j_start) * lde_rows + source_row];
         ulong beta_k0 = challenges[4u + j_start];
         ulong beta_k1 = challenges[4u + num_routed_wires + j_start];
-        ulong numerator0 = gl_add(gl_mul_add(beta_k0, x, wire), gamma0);
-        ulong denominator0 = gl_add(gl_mul_add(beta0, sigma, wire), gamma0);
-        ulong numerator1 = gl_add(gl_mul_add(beta_k1, x, wire), gamma1);
-        ulong denominator1 = gl_add(gl_mul_add(beta1, sigma, wire), gamma1);
+        // gamma0/gamma1 are challenges[2]/[3], filled by
+        // `to_canonical_u64()` in `start_permutation_quotient`. One fold.
+        ulong numerator0 = gl_add_canonical_rhs(gl_mul_add(beta_k0, x, wire), gamma0);
+        ulong denominator0 = gl_add_canonical_rhs(gl_mul_add(beta0, sigma, wire), gamma0);
+        ulong numerator1 = gl_add_canonical_rhs(gl_mul_add(beta_k1, x, wire), gamma1);
+        ulong denominator1 = gl_add_canonical_rhs(gl_mul_add(beta1, sigma, wire), gamma1);
         for (uint j = j_start + 1u; j < j_end; ++j) {
             wire = wires[(ulong)j * lde_rows + source_row];
             sigma = constants_sigmas[
@@ -677,13 +679,13 @@ kernel void permutation_quotient(
             beta_k0 = challenges[4u + j];
             beta_k1 = challenges[4u + num_routed_wires + j];
             numerator0 = gl_mul(
-                numerator0, gl_add(gl_mul_add(beta_k0, x, wire), gamma0));
+                numerator0, gl_add_canonical_rhs(gl_mul_add(beta_k0, x, wire), gamma0));
             denominator0 = gl_mul(
-                denominator0, gl_add(gl_mul_add(beta0, sigma, wire), gamma0));
+                denominator0, gl_add_canonical_rhs(gl_mul_add(beta0, sigma, wire), gamma0));
             numerator1 = gl_mul(
-                numerator1, gl_add(gl_mul_add(beta_k1, x, wire), gamma1));
+                numerator1, gl_add_canonical_rhs(gl_mul_add(beta_k1, x, wire), gamma1));
             denominator1 = gl_mul(
-                denominator1, gl_add(gl_mul_add(beta1, sigma, wire), gamma1));
+                denominator1, gl_add_canonical_rhs(gl_mul_add(beta1, sigma, wire), gamma1));
         }
 
         uint previous_column0 = chunk == 0u ? 0u : 1u + chunk;
