@@ -355,7 +355,14 @@ const MAX_BUFFER_SETS: usize = 1;
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;
 /// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
-const MAX_DETACHED_READBACKS: usize = 2;
+///
+/// The light window is depth 6 on a sequential ranked worker: more than two
+/// Merkle builds can complete back-to-back, and with only two slots a third
+/// completion copies tens of MB inline while still holding the single buffer
+/// set, delaying the next GPU submit. Four slots cover a window-6 burst.
+/// Value-exact: only which thread performs the digest copy changes, never
+/// tree bytes. `MAX_BUFFER_SETS` stays 1.
+const MAX_DETACHED_READBACKS: usize = 4;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
@@ -1089,9 +1096,9 @@ struct BufferPool {
     /// Number of readbacks currently running detached from the set. Each
     /// detachment lets the completing build release the set before its
     /// ~tens-of-MB digest copy; while all slots are taken, a completing
-    /// build copies inline holding the set, delaying the next build. Two
-    /// slots cover the common case of two builds completing back-to-back
-    /// under the deeper proof window.
+    /// build copies inline holding the set, delaying the next build. Four
+    /// slots cover a window-6 burst of back-to-back completions without
+    /// adding a second in-flight GPU build.
     detached_readbacks: usize,
 }
 
