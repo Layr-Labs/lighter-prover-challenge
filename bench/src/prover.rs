@@ -3,7 +3,7 @@
 // Redraw marker r18 (same-account archive-dedup convention; inert, declared in note)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -243,6 +243,40 @@ fn mark_thread_utility() {
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_utility() {}
 
+/// Transaction proofs are throughput work and normally occupy the process-wide
+/// Rayon pool. While any of them remain live, put each chain fold's parallel
+/// proving section on a small private pool so the serial chain spine cannot be
+/// buried behind the transaction backlog. Once the count reaches zero, folds
+/// use the full global pool again for the faster uncontended drain.
+static TX_PROOFS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+const CHAIN_PROOF_POOL_THREADS: usize = 5;
+
+static CHAIN_PROOF_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(CHAIN_PROOF_POOL_THREADS)
+        .thread_name(|index| format!("chain-proof-{index}"))
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .start_handler(|_| mark_spine_thread_latency_critical())
+        .build()
+        .expect("dedicated chain proof pool must start")
+});
+
+struct TxProofInFlight;
+
+impl TxProofInFlight {
+    fn begin() -> Self {
+        TX_PROOFS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for TxProofInFlight {
+    fn drop(&mut self) {
+        TX_PROOFS_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -431,7 +465,11 @@ fn chain_step_proof<'a>(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        if TX_PROOFS_IN_FLIGHT.load(Ordering::Relaxed) != 0 {
+            CHAIN_PROOF_POOL.install(|| BlockTxChainCircuit::prove_prepared(pending, chain_data))
+        } else {
+            BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        }
     })();
     // This step is no longer part of the runnable backlog (see the matching
     // spine_backlog_add(1) at all spawn sites).
@@ -717,10 +755,15 @@ fn prove_path(
             }
 
             let witness = current_witness;
+            // Count before spawning so a chain fold cannot observe a false
+            // zero while this proof thread is runnable but not scheduled yet.
+            // If spawning fails, dropping the closure drops the guard too.
+            let tx_in_flight = TxProofInFlight::begin();
             let proof_handle = std::thread::Builder::new()
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
+                    let _tx_in_flight = tx_in_flight;
                     // These threads hold the single GPU buffer set across
                     // submit/wait/readback; see mark_thread_user_initiated.
                     mark_thread_user_initiated();
@@ -1072,6 +1115,20 @@ pub(crate) fn prove_block_after_pre(
                     #[cfg(feature = "diagnostic_profile")]
                     let _profile_span =
                         plonky2::util::profile::span("orchestration", "final_block_build_lane");
+                    // Retire the short heavy path before building the final
+                    // circuit. The long light spine leaves ample slack for the
+                    // fixed builder, while serializing these two lanes lowers
+                    // allocator/page-fault churn and peak footprint.
+                    let heavy_chain_proof = {
+                        #[cfg(feature = "diagnostic_profile")]
+                        let _heavy_wait = plonky2::util::profile::span(
+                            "wait",
+                            "heavy_path_join_before_final_build",
+                        );
+                        heavy_handle_outer
+                            .join()
+                            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+                    };
                     let (block_target, block_data) = {
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
@@ -1107,12 +1164,6 @@ pub(crate) fn prove_block_after_pre(
                     // block proof. Same deallocation, same thread, no value
                     // changes -- only its position moves earlier, off the peak.
                     drop(pre_proof);
-                    #[cfg(feature = "diagnostic_profile")]
-                    let _heavy_wait =
-                        plonky2::util::profile::span("wait", "heavy_path_join_for_final");
-                    let heavy_chain_proof = heavy_handle_outer
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`

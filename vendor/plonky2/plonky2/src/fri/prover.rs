@@ -141,6 +141,9 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
 /// the result is index-for-index identical to the serial fill.
 fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
     const FLATTEN_BLOCK: usize = 1 << 10;
+    /// Rows gathered per software-pipelined group. 64 rows = 128 Goldilocks
+    /// limbs issued together, enough to cover L2 latency without spilling.
+    const UNROLL: usize = 1 << 6;
 
     let n = values.len();
     let log_n = log2_strict(n);
@@ -152,8 +155,26 @@ fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Ext
             .enumerate()
             .for_each(|(block, out)| {
                 let base = block * FLATTEN_BLOCK;
-                for (j, slot) in out.chunks_exact_mut(D).enumerate() {
-                    let limbs = values[reverse_bits(base + j, log_n)].to_basefield_array();
+                // Batch the bit-reversal loads so the miss streams overlap:
+                // ISS issues the scattered loads for a whole 64-row group
+                // before any dependent limb write retires.
+                let mut src = [0usize; UNROLL];
+                for (g, out) in out.chunks_exact_mut(UNROLL * D).enumerate() {
+                    let row = base + g * UNROLL;
+                    for t in 0..UNROLL {
+                        src[t] = reverse_bits(row + t, log_n);
+                    }
+                    for t in 0..UNROLL {
+                        let limbs = values[src[t]].to_basefield_array();
+                        let slot = &mut out[t * D..t * D + D];
+                        for k in 0..D {
+                            slot[k].write(limbs[k]);
+                        }
+                    }
+                }
+                let done = UNROLL * (out.len() / (UNROLL * D));
+                for (j, slot) in out[done * D..].chunks_exact_mut(D).enumerate() {
+                    let limbs = values[reverse_bits(base + done + j, log_n)].to_basefield_array();
                     for k in 0..D {
                         slot[k].write(limbs[k]);
                     }
