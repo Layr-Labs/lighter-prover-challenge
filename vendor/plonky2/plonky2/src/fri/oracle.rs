@@ -131,6 +131,16 @@ impl<F> EvenColumns<F> {
     }
 }
 
+/// Compact even-row companion of one full-domain LDE column: `dest[k] = src[2k]`.
+/// Used by the streamed fill, its group-0 deferred copy, and the lazy
+/// deserialized-constants path. Value-identical to a stride-2 gather.
+fn copy_even_rows<F: Copy>(src: &[F], dest: &mut [F]) {
+    debug_assert!(src.len() >= dest.len().saturating_mul(2));
+    for (k, slot) in dest.iter_mut().enumerate() {
+        *slot = src[2 * k];
+    }
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
     full: &crate::hash::poseidon2::metal::MetalColumns<F>,
@@ -146,9 +156,7 @@ fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
         let src = full.col(j);
         debug_assert_eq!(src.len(), half * 2);
         debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
-        }
+        copy_even_rows(src, dest);
     });
     Some(companion)
 }
@@ -315,44 +323,99 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
-                // Compact even-row companion (Metal only, on request): the
-                // fill below writes row `2k` of every column into row `k` of
-                // the companion right after that column's FFT, while the
-                // column is still cache-resident.
+                // Compact even-row companion (Metal only, on request).
+                // Group 0's stride-2 gather and the companion Metal alloc used
+                // to run inside fill 0, *before* the first absorb `commit`.
+                // Streamed builds always have leaf_width >= 16 (so groups >= 2);
+                // deferring only group 0's copy_even + the alloc to the start
+                // of fill 1 keeps companion[j][k] = LDE[j][2k] but lets the
+                // first GPU pass enqueue after FFT 0 alone. This is not the
+                // killed defer-after-stream (all copies after the final wait).
+                // Companion handle is an AtomicPtr, not OnceLock: MetalColumns
+                // is Send+!Sync (objc Buffer), so OnceLock<MetalColumns> cannot
+                // be captured by the streamed `Fn + Sync` fill callback.
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
-                    crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
-                        polynomials.len(),
-                        lde_len / 2,
-                    )
-                } else {
-                    None
-                };
+                let even_companion_slot = std::sync::atomic::AtomicPtr::new(
+                    core::ptr::null_mut::<crate::hash::poseidon2::metal::MetalColumns<F>>(),
+                );
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs: Option<Vec<usize>> = even_companion.as_mut().and_then(|companion| {
-                    companion
-                        .columns_mut()
-                        .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
-                });
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs = &even_ptrs;
+                let even_ptrs: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                 let half_len = lde_len / 2;
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let want_companion = want_even_companion && lde_len >= 2 && rate_bits >= 1;
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let lde_base = columns.col(0).as_ptr() as usize;
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let lde_rows = lde_len;
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let n_polys = polynomials.len();
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let install_companion = || {
+                    if !want_companion
+                        || !even_companion_slot
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            .is_null()
+                    {
+                        return;
+                    }
+                    let Some(mut companion) =
+                        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
+                            n_polys, half_len,
+                        )
+                    else {
+                        return;
+                    };
+                    let Some(cols) = companion.columns_mut() else {
+                        return;
+                    };
+                    let ptrs: Vec<usize> = cols
+                        .into_iter()
+                        .map(|column| column.as_mut_ptr() as usize)
+                        .collect();
+                    let _ = even_ptrs.set(ptrs);
+                    even_companion_slot.store(
+                        Box::into_raw(Box::new(companion)),
+                        std::sync::atomic::Ordering::Release,
+                    );
+                };
                 let copy_even = |_column: usize, _destination: &[F]| {
                     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    if let Some(ptrs) = even_ptrs {
+                    if let Some(ptrs) = even_ptrs.get() {
                         // SAFETY: each column index is written by exactly one
                         // closure invocation (columns are disjoint), the
                         // companion outlives the fill, and `F` is plain data.
                         let out = unsafe {
                             core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
                         };
-                        for (k, slot) in out.iter_mut().enumerate() {
-                            *slot = _destination[2 * k];
-                        }
+                        copy_even_rows(_destination, out);
                     }
                 };
                 let copy_even = &copy_even;
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let copy_group0_even = || {
+                    let Some(ptrs) = even_ptrs.get() else {
+                        return;
+                    };
+                    let n = 8.min(n_polys);
+                    (0..n).into_par_iter().for_each(|col| {
+                        // SAFETY: fill 0 has already written these disjoint
+                        // columns; absorb 0 is committed and only *reads*
+                        // them (`const device ulong* leaves`). Group 1's
+                        // mutable slices cover columns 8.., so this gather
+                        // does not alias them. Companion slots are unique.
+                        let src = unsafe {
+                            core::slice::from_raw_parts(
+                                (lde_base as *const F).add(col * lde_rows),
+                                lde_rows,
+                            )
+                        };
+                        let out = unsafe {
+                            core::slice::from_raw_parts_mut(ptrs[col] as *mut F, half_len)
+                        };
+                        copy_even_rows(src, out);
+                    });
+                };
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
@@ -361,6 +424,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &columns,
                         cap_height,
                         &|group, destinations: &mut [&mut [F]]| {
+                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                            if group == 1 {
+                                install_companion();
+                                copy_group0_even();
+                            }
                             destinations.par_iter_mut().enumerate().for_each(
                                 |(k, destination)| {
                                     let polynomial = &polys[group * 8 + k];
@@ -382,7 +450,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
+                                    // Group 0's even-row gather runs at the
+                                    // start of fill 1, after absorb 0 commit.
+                                    if group != 0 {
+                                        copy_even(group * 8 + k, destination);
+                                    }
                                 },
                             );
                         },
@@ -403,7 +475,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         even_columns: {
                             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                             {
-                                EvenColumns::from_ready(even_companion)
+                                // SAFETY: the streamed/classic fill closures
+                                // have returned; this is the unique owner.
+                                let ptr = even_companion_slot.swap(
+                                    core::ptr::null_mut(),
+                                    std::sync::atomic::Ordering::AcqRel,
+                                );
+                                EvenColumns::from_ready(if ptr.is_null() {
+                                    None
+                                } else {
+                                    Some(*unsafe { Box::from_raw(ptr) })
+                                })
                             }
                             #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
                             {
@@ -412,6 +494,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         }
                     };
                 }
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                install_companion();
                 let initialized = timed!(
                     timing,
                     "FFT + blinding",
@@ -438,7 +522,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         even_columns: {
                             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                             {
-                                EvenColumns::from_ready(even_companion)
+                                // SAFETY: the streamed/classic fill closures
+                                // have returned; this is the unique owner.
+                                let ptr = even_companion_slot.swap(
+                                    core::ptr::null_mut(),
+                                    std::sync::atomic::Ordering::AcqRel,
+                                );
+                                EvenColumns::from_ready(if ptr.is_null() {
+                                    None
+                                } else {
+                                    Some(*unsafe { Box::from_raw(ptr) })
+                                })
                             }
                             #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
                             {
@@ -446,6 +540,16 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                             }
                         }
                     };
+                }
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                {
+                    let ptr = even_companion_slot.swap(
+                        core::ptr::null_mut(),
+                        std::sync::atomic::Ordering::AcqRel,
+                    );
+                    if !ptr.is_null() {
+                        drop(unsafe { Box::from_raw(ptr) });
+                    }
                 }
             }
         }
@@ -1513,6 +1617,16 @@ mod tests {
         let actual = PolynomialBatch::<F, C, D>::lde_values(&polynomials, RATE_BITS, false, None);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn copy_even_rows_is_stride_two_gather() {
+        let src: Vec<u64> = (0..16).collect();
+        let mut dest = vec![0u64; 8];
+        copy_even_rows(&src, &mut dest);
+        assert_eq!(dest, vec![0, 2, 4, 6, 8, 10, 12, 14]);
+        let mut empty: [u64; 0] = [];
+        copy_even_rows(&src, &mut empty);
     }
 
     #[test]
