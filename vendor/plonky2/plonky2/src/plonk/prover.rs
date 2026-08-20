@@ -1605,7 +1605,14 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     filter_at: impl Fn(usize, usize) -> F,
 ) {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
+    // The previous helper allocated a second chunk-sized `Vec`, zeroed it,
+    // accumulated, then `copy_from_slice`d onto `chunk`. The caller already
+    // owns `chunk` (an `out.par_chunks_mut` partition that covers every
+    // output slot). Zeroing `chunk` itself and accumulating in place is the
+    // same gate-major `+=` association with the same ZERO volume; it deletes
+    // the extra allocation and the full-chunk memcpy. Not a skip-ZERO:
+    // every limb is still stored before it is read.
+    chunk.fill(F::ZERO);
     for g in 0..num_gates {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
@@ -1619,11 +1626,10 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            chunk[2 * r] += filter * sv0;
+            chunk[2 * r + 1] += filter * sv1;
         }
     }
-    chunk.copy_from_slice(&acc);
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -1639,7 +1645,7 @@ fn combine_low_range_quotient<F: RichField>(
     constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
     filter_cache: Option<&LowRangeSelectorFilterCache<F>>,
 ) -> (Vec<F>, bool) {
-    const ROWS_PER_CHUNK: usize = 512;
+    const ROWS_PER_CHUNK: usize = 1024; // stack-34: double chunk to halve Rayon dispatch, same math, fewer joins (+quarter-domain intent)
     const MAX_GROUP: usize = 16;
 
     let plans = low_range_selector_group_plans(gates);
@@ -3658,8 +3664,8 @@ mod quotient_layout_tests {
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
+        accumulate_low_range_quotient_chunk, combine_low_range_quotient,
+        gpu_poseidon_quotient_stats, LowDegreeRangeGate, COMPARE_GPU_QUOTIENT,
     };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64, PrimeField64};
@@ -3711,6 +3717,70 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    /// In-place accumulate must remain raw-limb identical to the materialized
+    /// `acc` + `copy_from_slice` form, including noncanonical Goldilocks limbs.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn low_range_chunk_in_place_matches_materialized_acc() {
+        let rows = 19usize;
+        let half_rows = rows.div_ceil(2);
+        let num_gates = 3usize;
+        let edge = [
+            F::ZERO,
+            F::ONE,
+            F::from_noncanonical_u64(F::ORDER),
+            F::from_noncanonical_u64(F::ORDER + 1),
+            F::from_noncanonical_u64(u64::MAX),
+        ];
+        let value = |i: usize| edge[(i * 7 + 3) % edge.len()];
+        let low = (0..num_gates * half_rows * 2)
+            .map(value)
+            .collect::<Vec<_>>();
+        let odd = (0..num_gates * 2)
+            .map(|column| {
+                (0..half_rows)
+                    .map(|row| value(10_000 + column * half_rows + row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let filters = (0..num_gates * rows)
+            .map(|i| value(20_000 + i))
+            .collect::<Vec<_>>();
+
+        let mut expected = vec![F::ZERO; rows * 2];
+        for g in 0..num_gates {
+            for r in 0..rows {
+                let (sv0, sv1) = if r & 1 == 0 {
+                    let base = g * half_rows * 2 + (r >> 1) * 2;
+                    (low[base], low[base + 1])
+                } else {
+                    (odd[g * 2][r >> 1], odd[g * 2 + 1][r >> 1])
+                };
+                let filter = filters[g * rows + r];
+                expected[2 * r] += filter * sv0;
+                expected[2 * r + 1] += filter * sv1;
+            }
+        }
+
+        let mut actual = vec![F::from_noncanonical_u64(F::ORDER + 99); rows * 2];
+        accumulate_low_range_quotient_chunk(
+            &mut actual,
+            0,
+            half_rows,
+            num_gates,
+            &low,
+            &odd,
+            |g, r| filters[g * rows + r],
+        );
+        let raw = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(raw(&actual), raw(&expected));
     }
 
     /// Raw-limb differential and dispatch guard for the immutable low-range
