@@ -10,8 +10,7 @@ use crate::field::batch_util::batch_multiply_into;
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
-    FftRootTable, cached_fft_root_table, fft_in_place_with_options,
-    fft_in_place_with_options_parallel,
+    FftRootTable, fft_in_place_with_options, fft_in_place_with_options_parallel,
 };
 use crate::field::goldilocks_extensions::ext2_mul_add;
 use crate::field::goldilocks_field::GoldilocksField;
@@ -19,7 +18,7 @@ use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof_with_initial_order;
+use crate::fri::prover::fri_proof;
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
@@ -50,109 +49,6 @@ pub(crate) enum BatchLayout {
     PolyMajor,
 }
 
-/// Optional compact copy of the even LDE rows of a column-major commitment
-/// (row `k` of the companion is row `2k` of the commitment), retained in a
-/// shared Metal buffer so the half-domain quotient kernels read contiguous
-/// columns instead of a stride-2 gather over the full store. Filled either
-/// by the LDE write (`from_coeffs_with_even_companion`) or lazily from an
-/// already-retained full store (`get_or_fill_even_rows`) — the latter is
-/// how deserialized `constants_sigmas` blobs grow a companion: the values
-/// are circuit-fixed, so one fill is reused for every proof.
-/// Absent on non-Metal targets.
-pub struct EvenColumns<F> {
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
-    _phantom: core::marker::PhantomData<F>,
-}
-
-impl<F> Default for EvenColumns<F> {
-    fn default() -> Self {
-        Self {
-            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            inner: std::sync::OnceLock::new(),
-            _phantom: core::marker::PhantomData,
-        }
-    }
-}
-
-// The companion is a derived cache of the commitment's own LDE, so it does
-// not participate in equality; two batches with identical polynomials and
-// trees are equal whether or not either retained a companion.
-impl<F> PartialEq for EvenColumns<F> {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-impl<F> Eq for EvenColumns<F> {}
-impl<F> core::fmt::Debug for EvenColumns<F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("EvenColumns")
-    }
-}
-
-impl<F> EvenColumns<F> {
-    /// Eager companion produced alongside the LDE fill.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn from_ready(
-        columns: Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
-    ) -> Self {
-        let inner = std::sync::OnceLock::new();
-        let _ = inner.set(columns);
-        Self {
-            inner,
-            _phantom: core::marker::PhantomData,
-        }
-    }
-
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn get(&self) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>> {
-        self.inner.get().and_then(Option::as_ref)
-    }
-
-    /// Derive the even-row companion from a full-domain Metal column store.
-    ///
-    /// `companion[j][k] = full[j][2k]`. The kernel indexes both the wires
-    /// companion and this buffer with stride `wires.rows`, so the compact
-    /// constants must have the same row count as the compact wires. A
-    /// degree-`< 4n` polynomial is determined by its `4n` even-coset
-    /// samples; copying those samples does not change any value the
-    /// full-domain kernel would have read at those rows.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    pub(crate) fn get_or_fill_even_rows(
-        &self,
-        full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>>
-    where
-        F: crate::hash::hash_types::RichField,
-    {
-        self.inner
-            .get_or_init(|| fill_even_companion_from_full(full))
-            .as_ref()
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
-    full: &crate::hash::poseidon2::metal::MetalColumns<F>,
-) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
-    if full.rows() < 2 || full.rows() % 2 != 0 || full.cols() == 0 {
-        return None;
-    }
-    let half = full.rows() / 2;
-    let mut companion =
-        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(full.cols(), half)?;
-    let dests = companion.columns_mut()?;
-    dests.into_par_iter().enumerate().for_each(|(j, dest)| {
-        let src = full.col(j);
-        debug_assert_eq!(src.len(), half * 2);
-        debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
-        }
-    });
-    Some(companion)
-}
-
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -162,8 +58,6 @@ pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F =
     pub degree_log: usize,
     pub rate_bits: usize,
     pub blinding: bool,
-    /// See [`EvenColumns`].
-    pub even_columns: EvenColumns<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> Default
@@ -176,7 +70,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             degree_log: 0,
             rate_bits: 0,
             blinding: false,
-            even_columns: EvenColumns::default(),
         }
     }
 }
@@ -216,7 +109,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     degree_log: log2_strict(degree),
                     rate_bits,
                     blinding,
-                    even_columns: EvenColumns::default(),
                 };
             }
         }
@@ -246,33 +138,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        Self::from_coeffs_with_even_companion(
-            polynomials,
-            rate_bits,
-            blinding,
-            cap_height,
-            timing,
-            fft_root_table,
-            false,
-        )
-    }
-
-    /// [`Self::from_coeffs`], additionally retaining the compact even-row
-    /// companion (see [`EvenColumns`]) when `want_even_companion` is set and
-    /// the commitment lands in retained shared column storage. Values and
-    /// tree are identical either way; the companion is a pure read-only copy.
-    pub fn from_coeffs_with_even_companion(
-        polynomials: Vec<PolynomialCoeffs<F>>,
-        rate_bits: usize,
-        blinding: bool,
-        cap_height: usize,
-        timing: &mut TimingTree,
-        fft_root_table: Option<&FftRootTable<F>>,
-        want_even_companion: bool,
-    ) -> Self {
         let degree = polynomials[0].len();
-        #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-        let _ = want_even_companion;
 
         if GPU_NTT_COMMITMENTS && !blinding {
             let coeff_columns: Vec<&[F]> = polynomials
@@ -295,7 +161,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     degree_log: log2_strict(degree),
                     rate_bits,
                     blinding,
-                    even_columns: EvenColumns::default(),
                 };
             }
         }
@@ -315,44 +180,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
-                // Compact even-row companion (Metal only, on request): the
-                // fill below writes row `2k` of every column into row `k` of
-                // the companion right after that column's FFT, while the
-                // column is still cache-resident.
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
-                    crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
-                        polynomials.len(),
-                        lde_len / 2,
-                    )
-                } else {
-                    None
-                };
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs: Option<Vec<usize>> = even_companion.as_mut().and_then(|companion| {
-                    companion
-                        .columns_mut()
-                        .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
-                });
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs = &even_ptrs;
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let half_len = lde_len / 2;
-                let copy_even = |_column: usize, _destination: &[F]| {
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    if let Some(ptrs) = even_ptrs {
-                        // SAFETY: each column index is written by exactly one
-                        // closure invocation (columns are disjoint), the
-                        // companion outlives the fill, and `F` is plain data.
-                        let out = unsafe {
-                            core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
-                        };
-                        for (k, slot) in out.iter_mut().enumerate() {
-                            *slot = _destination[2 * k];
-                        }
-                    }
-                };
-                let copy_even = &copy_even;
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
@@ -382,7 +209,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
                                 },
                             );
                         },
@@ -400,16 +226,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
-                        }
                     };
                 }
                 let initialized = timed!(
@@ -420,7 +236,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &polynomials,
                         rate_bits,
                         fft_root_table,
-                        copy_even,
                     )
                 );
                 if initialized {
@@ -435,16 +250,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         degree_log: log2_strict(degree),
                         rate_bits,
                         blinding,
-                        even_columns: {
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
-                        }
                     };
                 }
             }
@@ -468,7 +273,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             degree_log: log2_strict(degree),
             rate_bits,
             blinding,
-            even_columns: EvenColumns::default(),
         }
     }
 
@@ -538,7 +342,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         polynomials: &[PolynomialCoeffs<F>],
         rate_bits: usize,
         fft_root_table: Option<&FftRootTable<F>>,
-        copy_even: &(dyn Fn(usize, &[F]) + Sync),
     ) -> bool {
         let degree = polynomials[0].len();
         let lde_len = degree << rate_bits;
@@ -552,8 +355,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         destinations
             .into_par_iter()
             .zip(polynomials.par_iter())
-            .enumerate()
-            .for_each(|(column, (destination, polynomial))| {
+            .for_each(|(destination, polynomial)| {
                 assert_eq!(polynomial.len(), degree, "Polynomial degrees inconsistent");
                 // Fused copy-and-scale: the unscaled coefficient image that
                 // `copy_from_slice` used to materialize here is never observed —
@@ -576,7 +378,6 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
                 fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
-                copy_even(column, destination);
             });
         true
     }
@@ -929,31 +730,22 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             // zeros written by the `resize` just above, so the FFT's zero-run
             // shortcut applies and the coset scaling over that tail is a
             // multiply-by-zero: scale only the `live_coeffs` prefix.
-            if fri_params.config.rate_bits == 3 {
-                coset_fft_zero_tail_base_dif_bitrev::<F, D>(
-                    &lde_final_poly,
-                    F::coset_shift(),
-                    live_coeffs,
-                )
-            } else {
-                coset_fft_zero_tail_base::<F, D>(
-                    &lde_final_poly,
-                    F::coset_shift(),
-                    live_coeffs,
-                    Some(fri_params.config.rate_bits),
-                    None,
-                )
-            }
+            coset_fft_zero_tail_base::<F, D>(
+                &lde_final_poly,
+                F::coset_shift(),
+                live_coeffs,
+                Some(fri_params.config.rate_bits),
+                None,
+            )
         );
 
-        let fri_proof = fri_proof_with_initial_order::<F, C, D>(
+        let fri_proof = fri_proof::<F, C, D>(
             &oracles
                 .par_iter()
                 .map(|c| &c.merkle_tree)
                 .collect::<Vec<_>>(),
             lde_final_poly,
             lde_final_values,
-            fri_params.config.rate_bits == 3,
             challenger,
             fri_params,
             final_poly_coeff_len,
@@ -1108,301 +900,6 @@ pub(crate) fn coset_fft_zero_tail_base<F: Extendable<D>, const D: usize>(
     PolynomialValues::new(scaled)
 }
 
-/// Forward FFT in decimation-in-frequency order. Natural-order coefficients
-/// become bit-reversed evaluations, which is exactly the row order consumed
-/// by FRI's Merkle trees.
-fn fft_dif_bitrev_base_twiddles<F: Extendable<D>, const D: usize>(
-    values: &mut [F::Extension],
-) {
-    let lg_n = log2_strict(values.len());
-    assert!(
-        lg_n <= F::TWO_ADICITY,
-        "base-field DIF roots must exist at the transform size",
-    );
-    let roots = cached_fft_root_table::<F>(values.len());
-    let core_top = lg_n.saturating_sub(3);
-    #[cfg(feature = "diagnostic_profile")]
-    let _expand = crate::util::profile::span("fri_dif", "dif_generic_expand3");
-    for lg_m in (core_top + 1..=lg_n).rev() {
-        let m = 1usize << lg_m;
-        let half = m >> 1;
-        let omega = &roots[lg_m - 1][..half];
-        values.par_chunks_mut(m).for_each(|block| {
-            let (low, high) = block.split_at_mut(half);
-            for j in 0..half {
-                let u = low[j];
-                let v = high[j];
-                low[j] = u + v;
-                high[j] = <F::Extension as FieldExtension<D>>::scalar_mul(&(u - v), omega[j]);
-            }
-        });
-    }
-    #[cfg(feature = "diagnostic_profile")]
-    drop(_expand);
-    #[cfg(feature = "diagnostic_profile")]
-    let _core = crate::util::profile::span("fri_dif", "dif_core");
-    for lg_m in (1..=core_top).rev() {
-        let m = 1usize << lg_m;
-        let half = m >> 1;
-        let omega = &roots[lg_m - 1][..half];
-        values.par_chunks_mut(m).for_each(|block| {
-            let (low, high) = block.split_at_mut(half);
-            for j in 0..half {
-                let u = low[j];
-                let v = high[j];
-                low[j] = u + v;
-                high[j] = <F::Extension as FieldExtension<D>>::scalar_mul(&(u - v), omega[j]);
-            }
-        });
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn dif_mul_base_ext2(
-    value: QuadraticExtension<GoldilocksField>,
-    twiddle: GoldilocksField,
-) -> QuadraticExtension<GoldilocksField> {
-    use crate::field::extension::quadratic::NeonGoldilocksField;
-
-    QuadraticExtension((NeonGoldilocksField(value.0) * twiddle).0)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn dif_layer_neon_ext2(
-    values: &mut [QuadraticExtension<GoldilocksField>],
-    lg_half_m: usize,
-    omega: &[GoldilocksField],
-) {
-    use crate::field::extension::quadratic::NeonGoldilocksField;
-
-    let half = 1usize << lg_half_m;
-    let m = half << 1;
-    for block in values.chunks_exact_mut(m) {
-        let (low, high) = block.split_at_mut(half);
-        for j in 0..half {
-            let u = NeonGoldilocksField(low[j].0);
-            let v = NeonGoldilocksField(high[j].0);
-            low[j] = QuadraticExtension((u + v).0);
-            high[j] = QuadraticExtension(((u - v) * omega[j]).0);
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-fn dif_block_neon_ext2(
-    values: &mut [QuadraticExtension<GoldilocksField>],
-    roots: &FftRootTable<GoldilocksField>,
-) {
-    const CACHE_LG: usize = 12;
-
-    let lg_n = log2_strict(values.len());
-    let local_lg = lg_n.min(CACHE_LG);
-    for lg_m in (local_lg + 1..=lg_n).rev() {
-        dif_layer_neon_ext2(values, lg_m - 1, &roots[lg_m - 1]);
-    }
-    let local_len = 1usize << local_lg;
-    for local in values.chunks_exact_mut(local_len) {
-        for lg_m in (1..=local_lg).rev() {
-            dif_layer_neon_ext2(local, lg_m - 1, &roots[lg_m - 1]);
-        }
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-fn dif_expand_block_neon_ext2(
-    source: &[QuadraticExtension<GoldilocksField>],
-    destination: &mut [QuadraticExtension<GoldilocksField>],
-    twiddles: &[GoldilocksField],
-) {
-    assert_eq!(source.len(), destination.len());
-    assert_eq!(source.len(), twiddles.len());
-    for ((destination, &source), &twiddle) in destination.iter_mut().zip(source).zip(twiddles) {
-        *destination = dif_mul_base_ext2(source, twiddle);
-    }
-}
-
-/// Shared destination for the rate-8 expansion. Parallel iteration `j`
-/// exclusively owns offsets `j + block * live`, so concurrent writes never
-/// alias. Keeping the pointer itself behind this wrapper also preserves its
-/// provenance instead of round-tripping it through an integer.
-#[cfg(target_arch = "aarch64")]
-#[derive(Copy, Clone)]
-struct DifExt2Ptr(*mut QuadraticExtension<GoldilocksField>);
-
-#[cfg(target_arch = "aarch64")]
-unsafe impl Send for DifExt2Ptr {}
-#[cfg(target_arch = "aarch64")]
-unsafe impl Sync for DifExt2Ptr {}
-
-#[cfg(target_arch = "aarch64")]
-impl DifExt2Ptr {
-    #[inline(always)]
-    unsafe fn read(&self, index: usize) -> QuadraticExtension<GoldilocksField> {
-        unsafe { self.0.add(index).read() }
-    }
-
-    #[inline(always)]
-    unsafe fn write(&self, index: usize, value: QuadraticExtension<GoldilocksField>) {
-        unsafe { self.0.add(index).write(value) }
-    }
-}
-
-/// Expand the rate-8 live prefix through the first three DIF stages with a
-/// zero-tail DAG, then run eight independent cache-blocked DIF cores.
-#[cfg(target_arch = "aarch64")]
-fn fft_dif_rate8_neon_ext2(
-    values: &mut [QuadraticExtension<GoldilocksField>],
-    live: usize,
-) {
-    // Folded-round codewords are far below the worker-pool crossover and run
-    // inside an already parallel proof pipeline. Avoid launching a DAG task
-    // per live coefficient plus eight nested core tasks for those transforms;
-    // the initial large codewords still have enough work to amortize Rayon.
-    const PARALLEL_MIN_EXT2: usize = 1 << 18;
-
-    assert!(live > 0);
-    assert_eq!(values.len(), live << 3);
-    let lg_n = log2_strict(values.len());
-    let roots = cached_fft_root_table::<GoldilocksField>(values.len());
-    // Slice every row before the parallel writes so malformed root tables fail
-    // at the function boundary rather than halfway through the expansion.
-    let w1 = &roots[lg_n - 1][..live];
-    let w2 = &roots[lg_n - 2][..live];
-    let w3 = &roots[lg_n - 3][..live];
-
-    #[cfg(feature = "diagnostic_profile")]
-    let _expand = crate::util::profile::span("fri_dif", "dif_dag_expand3");
-    let shared = DifExt2Ptr(values.as_mut_ptr());
-    let expand = |j| {
-        // SAFETY: every iteration owns one `j` column across all eight blocks.
-        // Columns are disjoint even when the range executes in parallel, every
-        // tail slot was initialized by the caller's first-touch fill, and
-        // block 0 is read-only here.
-        unsafe {
-            let b0 = shared.read(j);
-            let b4 = dif_mul_base_ext2(b0, w1[j]);
-            let b2 = dif_mul_base_ext2(b0, w2[j]);
-            let b6 = dif_mul_base_ext2(b4, w2[j]);
-            let b1 = dif_mul_base_ext2(b0, w3[j]);
-            let b3 = dif_mul_base_ext2(b2, w3[j]);
-            let b5 = dif_mul_base_ext2(b4, w3[j]);
-            let b7 = dif_mul_base_ext2(b6, w3[j]);
-            shared.write(live + j, b1);
-            shared.write(2 * live + j, b2);
-            shared.write(3 * live + j, b3);
-            shared.write(4 * live + j, b4);
-            shared.write(5 * live + j, b5);
-            shared.write(6 * live + j, b6);
-            shared.write(7 * live + j, b7);
-        }
-    };
-    if values.len() >= PARALLEL_MIN_EXT2 {
-        (0..live).into_par_iter().for_each(expand);
-    } else {
-        // The small transforms run serially, so write one contiguous output
-        // block at a time instead of maintaining seven distant store streams.
-        // The pass order is the same seven-product dependency DAG used above;
-        // only independent `j` iterations are transposed with block writes.
-        let mut blocks = values.chunks_exact_mut(live);
-        let block0 = blocks.next().unwrap();
-        let block1 = blocks.next().unwrap();
-        let block2 = blocks.next().unwrap();
-        let block3 = blocks.next().unwrap();
-        let block4 = blocks.next().unwrap();
-        let block5 = blocks.next().unwrap();
-        let block6 = blocks.next().unwrap();
-        let block7 = blocks.next().unwrap();
-        debug_assert!(blocks.next().is_none());
-
-        dif_expand_block_neon_ext2(block0, block4, w1);
-        dif_expand_block_neon_ext2(block0, block2, w2);
-        dif_expand_block_neon_ext2(block4, block6, w2);
-        dif_expand_block_neon_ext2(block0, block1, w3);
-        dif_expand_block_neon_ext2(block2, block3, w3);
-        dif_expand_block_neon_ext2(block4, block5, w3);
-        dif_expand_block_neon_ext2(block6, block7, w3);
-    }
-    #[cfg(feature = "diagnostic_profile")]
-    drop(_expand);
-
-    #[cfg(feature = "diagnostic_profile")]
-    let _core = crate::util::profile::span("fri_dif", "dif_neon_core");
-    if values.len() >= PARALLEL_MIN_EXT2 {
-        values
-            .par_chunks_mut(live)
-            .for_each(|block| dif_block_neon_ext2(block, &roots));
-    } else {
-        values
-            .chunks_mut(live)
-            .for_each(|block| dif_block_neon_ext2(block, &roots));
-    }
-}
-
-/// Rate-8 FRI producer prototype: retain natural coefficient order and emit
-/// bit-reversed evaluation order directly with a DIF transform.
-pub(crate) fn coset_fft_zero_tail_base_dif_bitrev<
-    F: Extendable<D>,
-    const D: usize,
->(
-    coeffs: &PolynomialCoeffs<F::Extension>,
-    shift_base: F,
-    live: usize,
-) -> PolynomialValues<F::Extension> {
-    let len = coeffs.len();
-    assert_eq!(live, len >> 3, "DIF prototype is specialized to rate_bits=3");
-    let powers = if shift_base == F::coset_shift() {
-        crate::plonk::prover::precomputed::coset_shift_powers::<F>(live)
-    } else {
-        crate::plonk::prover::precomputed::shift_powers::<F>(shift_base, live)
-    };
-    let mut scaled: Vec<F::Extension> = Vec::with_capacity(len);
-    #[cfg(feature = "diagnostic_profile")]
-    let _scale = crate::util::profile::span("fri_dif", "dif_coset_scale");
-    scaled.extend(
-        powers[..live]
-            .iter()
-            .zip(&coeffs.coeffs[..live])
-            .map(|(&r, &c)| <F::Extension as FieldExtension<D>>::scalar_mul(&c, r)),
-    );
-    #[cfg(feature = "diagnostic_profile")]
-    drop(_scale);
-    #[cfg(target_arch = "aarch64")]
-    if TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
-        && TypeId::of::<F::Extension>()
-            == TypeId::of::<QuadraticExtension<GoldilocksField>>()
-    {
-        // SAFETY: the TypeId checks prove the exact base and extension types.
-        // The explicit fill is intentionally retained: it first-touches the
-        // seven output blocks sequentially. Letting the strided DAG fault those
-        // pages in itself measured much slower despite deleting the memset.
-        #[cfg(feature = "diagnostic_profile")]
-        let _zero_fill = crate::util::profile::span("fri_dif", "dif_zero_fill");
-        scaled.resize(len, <F::Extension as Field>::ZERO);
-        #[cfg(feature = "diagnostic_profile")]
-        drop(_zero_fill);
-        let ext2 = unsafe {
-            core::slice::from_raw_parts_mut(
-                scaled
-                    .as_mut_ptr()
-                    .cast::<QuadraticExtension<GoldilocksField>>(),
-                len,
-            )
-        };
-        fft_dif_rate8_neon_ext2(ext2, live);
-        return PolynomialValues::new(scaled);
-    }
-    #[cfg(feature = "diagnostic_profile")]
-    let _zero_fill = crate::util::profile::span("fri_dif", "dif_zero_fill");
-    scaled.resize(len, <F::Extension as Field>::ZERO);
-    #[cfg(feature = "diagnostic_profile")]
-    drop(_zero_fill);
-    fft_dif_bitrev_base_twiddles::<F, D>(&mut scaled);
-    PolynomialValues::new(scaled)
-}
-
 /// Folds one batch's quotient `(p(X) - p(z))/(X - z)` into the running FRI
 /// `final_poly`, fusing the three passes of the previous code into one serial
 /// sweep with no per-batch buffer traffic beyond it:
@@ -1515,78 +1012,6 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    #[test]
-    fn zero_tail_dif_emits_classic_bitrev_order() {
-        use crate::field::types::{Field64, PrimeField64};
-
-        const D: usize = 2;
-        type F = GoldilocksField;
-        type FE = <F as Extendable<D>>::Extension;
-
-        fn raw(x: FE) -> [u64; 2] {
-            let limbs = <FE as FieldExtension<D>>::to_basefield_array(&x);
-            [
-                limbs[0].to_noncanonical_u64(),
-                limbs[1].to_noncanonical_u64(),
-            ]
-        }
-
-        // 13 and 16 cross the 2^12 cache-block boundary used by the optimized
-        // core; smaller sizes exercise the direct local-layer path.
-        for lg_n in [4usize, 6, 9, 11, 13, 16] {
-            let n = 1usize << lg_n;
-            let live = n >> 3;
-            let edges = [
-                F::ZERO,
-                F::ONE,
-                GoldilocksField(u64::MAX),
-                GoldilocksField(F::ORDER),
-                GoldilocksField(F::ORDER - 1),
-                GoldilocksField(0xffff_ffff),
-            ];
-            let adversarial = (0..live)
-                .map(|i| {
-                    FE::from_basefield_array([
-                        edges[i % edges.len()],
-                        edges[(i * 3 + 1) % edges.len()],
-                    ])
-                })
-                .collect::<Vec<_>>();
-            for mut coeffs in [FE::rand_vec(live), adversarial] {
-                coeffs.resize(n, FE::ZERO);
-                let poly = PolynomialCoeffs::new(coeffs);
-                for shift in [
-                    F::coset_shift(),
-                    F::MULTIPLICATIVE_GROUP_GENERATOR,
-                    F::MULTIPLICATIVE_GROUP_GENERATOR.exp_u64(16),
-                ] {
-                    let natural = coset_fft_zero_tail_base::<F, D>(
-                        &poly,
-                        shift,
-                        live,
-                        Some(3),
-                        None,
-                    );
-                    let bitrev = coset_fft_zero_tail_base_dif_bitrev::<F, D>(
-                        &poly, shift, live,
-                    );
-                    for i in 0..n {
-                        assert_eq!(
-                            bitrev.values[i],
-                            natural.values[reverse_bits(i, lg_n)],
-                            "lg_n={lg_n} shift={shift:?} i={i}",
-                        );
-                        assert_eq!(
-                            raw(bitrev.values[i]),
-                            raw(natural.values[reverse_bits(i, lg_n)]),
-                            "raw lg_n={lg_n} shift={shift:?} i={i}",
-                        );
-                    }
-                }
-            }
-        }
-    }
-
     /// Filling retained column storage must preserve the exact raw field-word
     /// sequence produced by the legacy Vec-backed CPU LDE. Seed the unused
     /// tail with nonzero words so this also checks the zero-padded FFT's
@@ -1644,7 +1069,6 @@ mod tests {
                         &polynomials,
                         rate_bits,
                         root_table,
-                        &|_, _| {},
                     ));
 
                     for (column, expected) in expected.iter().enumerate() {
@@ -1711,7 +1135,6 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
-            even_columns: EvenColumns::default(),
         };
         let column_batch: PolynomialBatch<F, C, D> = PolynomialBatch {
             polynomials: Vec::new(),
@@ -1719,7 +1142,6 @@ mod tests {
             degree_log,
             rate_bits,
             blinding: false,
-            even_columns: EvenColumns::default(),
         };
 
         for step in [1usize, 2, 4] {
