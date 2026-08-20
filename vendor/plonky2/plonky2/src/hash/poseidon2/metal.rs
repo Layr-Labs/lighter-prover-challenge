@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -2630,7 +2630,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch_absorb(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -4458,10 +4458,43 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_with_threadgroup_cap(encoder, pipeline, thread_count, 128);
+}
+
+/// Absorb-pass dispatch. The streamed sponge is one thread per leaf over a
+/// 2^19 / 2^21 domain; 256 threads/group (still clamped by the pipeline's
+/// own `max_total_threads_per_threadgroup`) is the host-side occupancy
+/// that was screened for this kernel alone. Leaf, parent, quotient and
+/// arithmetic dispatches stay at 128. `LIGHTER_ABSORB_TG=128` restores
+/// the historical cap in the same binary.
+fn dispatch_absorb(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_threadgroup_cap(encoder, pipeline, thread_count, absorb_threadgroup_cap());
+}
+
+fn absorb_threadgroup_cap() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        match std::env::var("LIGHTER_ABSORB_TG").ok().as_deref() {
+            Some("128") => 128,
+            _ => 256,
+        }
+    })
+}
+
+fn dispatch_with_threadgroup_cap(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    cap: u64,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {

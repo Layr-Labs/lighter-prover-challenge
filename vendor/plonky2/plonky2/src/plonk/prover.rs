@@ -581,6 +581,57 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Pack one inversion-batch of routed witness columns into a row-major tile.
+///
+/// `MatrixWitness` stores `wire_values[wire][row]`. The historical inner loop
+/// called `get_wire(row, wire)` which strides to a different multi-megabyte
+/// column on every `j`. At production shape that is 80 gathers per row across
+/// columns that do not fit in L2 together (80 × 2^16 × 8 B ≈ 40 MiB on a
+/// light circuit; 80 × 2^18 × 8 B ≈ 160 MiB on the exclusive-phase final
+/// block).
+///
+/// This writes `tile[t * num_routed_wires + j] = wire_values[j][base + t]`
+/// by streaming each column's `[base, base+len)` slice contiguously, then
+/// letting the arithmetic loop walk each packed row. Multiplication order
+/// per row stays `for j in start..end`; only the load path changes, so every
+/// limb is bit-identical to `get_wire`. `LIGHTER_PERM_COL_BLOCK=0` skips
+/// the pack and keeps the gather.
+fn perm_col_block_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ENABLED.get_or_init(|| {
+            !std::env::var_os("LIGHTER_PERM_COL_BLOCK").is_some_and(|v| v == "0")
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+fn fill_routed_wire_tile<F: Field>(
+    witness: &MatrixWitness<F>,
+    base: usize,
+    len: usize,
+    num_routed_wires: usize,
+    tile: &mut Vec<F>,
+) {
+    let need = len * num_routed_wires;
+    tile.reserve(need.saturating_sub(tile.len()));
+    // SAFETY: every slot `t * num_routed_wires + j` is written below before
+    // the arithmetic loop reads the tile. `F` is plain data.
+    unsafe {
+        tile.set_len(need);
+    }
+    for j in 0..num_routed_wires {
+        let src = &witness.wire_values[j][base..base + len];
+        for t in 0..len {
+            tile[t * num_routed_wires + j] = src[t];
+        }
+    }
+}
+
 #[inline]
 fn divide_chunk_products<F: Field>(
     numerator_products: &mut [F],
@@ -695,16 +746,32 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     (
                         Vec::with_capacity(2 * num_chunks * INV_BATCH),
                         Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::with_capacity(INV_BATCH * num_routed_wires),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators, denominator_inverses) = scratch;
+                    let (denominators, denominator_inverses, wire_tile) = scratch;
                     denominators.clear();
+                    let packed = perm_col_block_enabled();
+                    if packed {
+                        fill_routed_wire_tile(
+                            witness,
+                            base,
+                            xs.len(),
+                            num_routed_wires,
+                            wire_tile,
+                        );
+                    }
                     for (t, &x) in xs.iter().enumerate() {
                         let i = base + t;
                         let s_sigmas = &prover_data.sigmas[i];
                         let routed_base = i * num_routed_wires;
+                        let packed_row = if packed {
+                            t * num_routed_wires
+                        } else {
+                            0
+                        };
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
@@ -724,7 +791,11 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 ) {
                                     continue;
                                 }
-                                let wire_value = witness.get_wire(i, j);
+                                let wire_value = if packed {
+                                    wire_tile[packed_row + j]
+                                } else {
+                                    witness.get_wire(i, j)
+                                };
                                 let sigma = s_sigmas[j];
                                 numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
                                 numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
@@ -843,22 +914,42 @@ fn wires_permutation_partial_products_and_zs<
                 (
                     Vec::with_capacity(num_chunks * INV_BATCH),
                     Vec::with_capacity(num_chunks * INV_BATCH),
+                    Vec::with_capacity(INV_BATCH * num_routed_wires),
                 )
             },
             |scratch, (chunk_idx, (quotient_products, xs))| {
                 let base = chunk_idx * INV_BATCH;
-                let (denominator_products, denominator_inverses) = scratch;
+                let (denominator_products, denominator_inverses, wire_tile) = scratch;
                 denominator_products.clear();
+                let packed = perm_col_block_enabled();
+                if packed {
+                    fill_routed_wire_tile(
+                        witness,
+                        base,
+                        xs.len(),
+                        num_routed_wires,
+                        wire_tile,
+                    );
+                }
                 for (t, &x) in xs.iter().enumerate() {
                     let i = base + t;
                     let s_sigmas = &prover_data.sigmas[i];
+                    let packed_row = if packed {
+                        t * num_routed_wires
+                    } else {
+                        0
+                    };
                     for chunk in 0..num_chunks {
                         let start = chunk * degree;
                         let end = min(start + degree, num_routed_wires);
                         let mut numerator_product = F::ONE;
                         let mut denominator_product = F::ONE;
                         for j in start..end {
-                            let wire_value = witness.get_wire(i, j);
+                            let wire_value = if packed {
+                                wire_tile[packed_row + j]
+                            } else {
+                                witness.get_wire(i, j)
+                            };
                             numerator_product *= wire_value + beta_k_is[j] * x + gamma;
                             denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
                         }
@@ -1742,6 +1833,65 @@ fn combine_low_range_quotient<F: RichField>(
     }
 }
 
+/// `LIGHTER_LOW_RANGE_DEINTERLEAVE=0` keeps the per-challenge strided gather;
+/// default on. Layout-only: both paths feed the same IFFT/FFT the same values.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn low_range_deinterleave_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_LOW_RANGE_DEINTERLEAVE").is_some_and(|v| v == "0")
+    })
+}
+
+/// Splits one gate's interleaved `[c0, c1, c0, c1, ...]` half-domain block into
+/// two contiguous challenge columns. Value-exact vs the strided
+/// `low[base + k * 2 + c]` gather.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn deinterleave_challenge_pair<F: RichField>(src: &[F], half_rows: usize) -> (Vec<F>, Vec<F>) {
+    debug_assert_eq!(src.len(), half_rows * 2);
+    let mut even = vec![F::ZERO; half_rows];
+    let mut odd = vec![F::ZERO; half_rows];
+    if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() == 8 {
+        // SAFETY: production Goldilocks is `repr(transparent)` over `u64`.
+        // `src`/`even`/`odd` are distinct allocations of the advertised lengths.
+        unsafe {
+            deinterleave_u64_neon(
+                src.as_ptr().cast::<u64>(),
+                even.as_mut_ptr().cast::<u64>(),
+                odd.as_mut_ptr().cast::<u64>(),
+                half_rows,
+            );
+        }
+    } else {
+        for k in 0..half_rows {
+            even[k] = src[k * 2];
+            odd[k] = src[k * 2 + 1];
+        }
+    }
+    (even, odd)
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+unsafe fn deinterleave_u64_neon(src: *const u64, even: *mut u64, odd: *mut u64, n: usize) {
+    use core::arch::aarch64::{vld2q_u64, vst1q_u64};
+    let mut i = 0;
+    while i + 2 <= n {
+        let pair = unsafe { vld2q_u64(src.add(i * 2)) };
+        unsafe {
+            vst1q_u64(even.add(i), pair.0);
+            vst1q_u64(odd.add(i), pair.1);
+        }
+        i += 2;
+    }
+    while i < n {
+        unsafe {
+            *even.add(i) = *src.add(i * 2);
+            *odd.add(i) = *src.add(i * 2 + 1);
+        }
+        i += 1;
+    }
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1768,19 +1918,45 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
+    let odd: Vec<Vec<F>> = if low_range_deinterleave_enabled() {
+        let pairs: Vec<(Vec<F>, Vec<F>)> = (0..gates.len())
+            .into_par_iter()
+            .map(|g| {
+                let base = g * half_rows * 2;
+                let (c0, c1) =
+                    deinterleave_challenge_pair(&low[base..base + half_rows * 2], half_rows);
+                let col0 = PolynomialValues::new(c0)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                let col1 = PolynomialValues::new(c1)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                (col0, col1)
+            })
+            .collect();
+        let mut cols = Vec::with_capacity(pairs.len() * 2);
+        for (c0, c1) in pairs {
+            cols.push(c0);
+            cols.push(c1);
+        }
+        cols
+    } else {
+        (0..gates.len() * 2)
+            .into_par_iter()
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values
+            })
+            .collect()
+    };
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(
@@ -4829,6 +5005,36 @@ mod permutation_pairing_tests {
                         paired[challenge][column].values, reference[column],
                         "fused path disagrees with the naive reference \
                          (challenge {challenge}, column {column}, {n_points} points)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn routed_wire_tile_matches_get_wire_raw_limbs() {
+        let mut rng = Rng::new(0x8515_7ed1_c0ff_ee01);
+        for &(base, len, n_wires, n_rows) in &[
+            (0usize, 1usize, 3usize, 1usize),
+            (0, 8, 80, 8),
+            (3, 5, 17, 16),
+            (0, 128, 80, 128),
+            (64, 64, 80, 128),
+        ] {
+            let witness = MatrixWitness {
+                wire_values: (0..n_wires)
+                    .map(|_| (0..n_rows).map(|_| rng.next_field()).collect())
+                    .collect(),
+            };
+            let mut tile = Vec::new();
+            fill_routed_wire_tile(&witness, base, len, n_wires, &mut tile);
+            assert_eq!(tile.len(), len * n_wires);
+            for t in 0..len {
+                for j in 0..n_wires {
+                    assert_eq!(
+                        tile[t * n_wires + j].to_noncanonical_u64(),
+                        witness.get_wire(base + t, j).to_noncanonical_u64(),
+                        "tile mismatch base={base} len={len} t={t} j={j}"
                     );
                 }
             }
