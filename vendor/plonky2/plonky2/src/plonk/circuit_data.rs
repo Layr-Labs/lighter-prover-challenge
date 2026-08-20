@@ -805,6 +805,10 @@ pub struct ProverOnlyCircuitData<
     /// only when the process-wide cache budget admits the exact table.
     /// Runtime-only: derived from the constants commitment and not serialized.
     pub low_range_selector_filter_cache: LowRangeSelectorFilterCache<F>,
+    /// Same as [`Self::low_range_selector_filter_cache`] for the degree-2
+    /// quarter-domain split. Separate slot so the two gate sets cannot
+    /// clobber each other's signature.
+    pub quarter_range_selector_filter_cache: LowRangeSelectorFilterCache<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
