@@ -698,6 +698,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         constants_sigmas_quotient_step,
         constants_sigmas_quotient_domain,
         low_range_selector_filter_cache: Default::default(),
+        quarter_range_selector_filter_cache: Default::default(),
         generators,
         generator_indices_by_watches,
         generator_watch_counts,
