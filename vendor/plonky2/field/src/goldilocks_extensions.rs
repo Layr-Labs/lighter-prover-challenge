@@ -799,7 +799,81 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
-    for (i, o) in out.iter_mut().enumerate() {
+    // Pairing wins only on production-wide blocks. Small batches lose
+    // more to register pressure than they save in descriptor loads, so retain
+    // the previous scalar-slot traversal exactly. Count only polynomials that
+    // are live anywhere in this output range.
+    if full.len() + partial.len() <= 16 {
+        for (i, o) in out.iter_mut().enumerate() {
+            let (mut lo0, mut hi0) = (0u128, 0u32);
+            let (mut lo1, mut hi1) = (0u128, 0u32);
+            for &(p, QuadraticExtension([b0, b1])) in &full {
+                // SAFETY: every slice in `full` has length exactly `out.len()`.
+                let c = unsafe { p.get_unchecked(i).0 };
+                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+            }
+            for &(p, QuadraticExtension([b0, b1])) in &partial {
+                if i < p.len() {
+                    let c = p[i].0;
+                    u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                    u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                }
+            }
+            *o = QuadraticExtension([
+                unsafe { reduce160(lo0, hi0) },
+                unsafe { reduce160(lo1, hi1) },
+            ]);
+        }
+        return;
+    }
+
+    let paired = out.len() & !1;
+    for i in (0..paired).step_by(2) {
+        let (mut lo00, mut hi00) = (0u128, 0u32);
+        let (mut lo01, mut hi01) = (0u128, 0u32);
+        let (mut lo10, mut hi10) = (0u128, 0u32);
+        let (mut lo11, mut hi11) = (0u128, 0u32);
+        for &(p, QuadraticExtension([b0, b1])) in &full {
+            // SAFETY: every slice in `full` has length exactly `out.len()`,
+            // and `i + 1 < paired <= out.len()`.
+            let c0 = unsafe { p.get_unchecked(i).0 };
+            let c1 = unsafe { p.get_unchecked(i + 1).0 };
+            u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+            u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+            u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+            u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+        }
+        for &(p, QuadraticExtension([b0, b1])) in &partial {
+            if i + 1 < p.len() {
+                let c0 = p[i].0;
+                let c1 = p[i + 1].0;
+                u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+                u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+                u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+                u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+            } else if i < p.len() {
+                let c0 = p[i].0;
+                u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+                u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+            }
+        }
+        // SAFETY: each accumulator has the bound documented above — below
+        // `polys.len() * 2^128 < 2^152` — far under reduce160's precondition.
+        out[i] = QuadraticExtension([
+            unsafe { reduce160(lo00, hi00) },
+            unsafe { reduce160(lo01, hi01) },
+        ]);
+        out[i + 1] = QuadraticExtension([
+            unsafe { reduce160(lo10, hi10) },
+            unsafe { reduce160(lo11, hi11) },
+        ]);
+    }
+
+    // Preserve the scalar path for an odd final slot, including a partial
+    // polynomial that ends exactly at that tail.
+    if paired != out.len() {
+        let i = paired;
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
         for &(p, QuadraticExtension([b0, b1])) in &full {
@@ -815,10 +889,7 @@ pub fn ext2_base_scalar_dot_slots(
                 u160_add_product(&mut lo1, &mut hi1, b1.0, c);
             }
         }
-        // SAFETY: the accumulator bound documented above — below
-        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
-        // precondition.
-        *o = QuadraticExtension([
+        out[i] = QuadraticExtension([
             unsafe { reduce160(lo0, hi0) },
             unsafe { reduce160(lo1, hi1) },
         ]);
@@ -1195,6 +1266,51 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 #[cfg(test)]
 mod dot_slot_coverage_tests {
     use super::*;
+    use crate::extension::FieldExtension;
+    use crate::types::{Field64, PrimeField64};
+
+    /// The previous scalar-slot kernel, kept test-only as an exact raw-output
+    /// oracle and as the A/B control for the focused microbenchmark below.
+    fn scalar_control(
+        out: &mut [QuadraticExtension<GoldilocksField>],
+        start: usize,
+        polys: &[&[GoldilocksField]],
+        powers: &[QuadraticExtension<GoldilocksField>],
+    ) {
+        assert_eq!(polys.len(), powers.len());
+        let end = start + out.len();
+        let mut full: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> =
+            Vec::with_capacity(polys.len());
+        let mut partial: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> =
+            Vec::new();
+        for (&p, &pw) in polys.iter().zip(powers) {
+            if p.len() >= end {
+                full.push((&p[start..end], pw));
+            } else if p.len() > start {
+                partial.push((&p[start..], pw));
+            }
+        }
+        for (i, o) in out.iter_mut().enumerate() {
+            let (mut lo0, mut hi0) = (0u128, 0u32);
+            let (mut lo1, mut hi1) = (0u128, 0u32);
+            for &(p, QuadraticExtension([b0, b1])) in &full {
+                let c = unsafe { p.get_unchecked(i).0 };
+                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+            }
+            for &(p, QuadraticExtension([b0, b1])) in &partial {
+                if i < p.len() {
+                    let c = p[i].0;
+                    u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                    u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                }
+            }
+            *o = QuadraticExtension([
+                unsafe { reduce160(lo0, hi0) },
+                unsafe { reduce160(lo1, hi1) },
+            ]);
+        }
+    }
 
     /// Q4: the composition accumulator is allocated uninitialized because
     /// `ext2_base_scalar_dot_slots` assigns *every* output slot. Poison the
@@ -1241,6 +1357,240 @@ mod dot_slot_coverage_tests {
                 }
             }
         }
+    }
+
+    /// Exercise paired slots, their odd tail, and every ragged-boundary case
+    /// with both noncanonical raw representatives and canonical values. The
+    /// raw comparison is deliberately stronger than field equality: pairing
+    /// must not perturb the scalar kernel's representative.
+    #[test]
+    fn dot_slots_pair_matches_scalar_raw_and_canonical() {
+        let p = GoldilocksField::ORDER;
+        let specials = [0, 1, 2, p - 1, p, p + 1, u64::MAX - 1, u64::MAX];
+        let lengths = [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+        ];
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let polys: Vec<Vec<GoldilocksField>> = lengths
+            .iter()
+            .enumerate()
+            .map(|(poly, &len)| {
+                (0..len)
+                    .map(|i| {
+                        let raw = if (i + poly) % 3 == 0 {
+                            specials[(i * 5 + poly * 3) % specials.len()]
+                        } else {
+                            next()
+                        };
+                        GoldilocksField(raw)
+                    })
+                    .collect()
+            })
+            .collect();
+        let slices: Vec<&[GoldilocksField]> = polys.iter().map(Vec::as_slice).collect();
+        let powers: Vec<QuadraticExtension<GoldilocksField>> = lengths
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                QuadraticExtension([
+                    GoldilocksField(specials[(i * 5) % specials.len()]),
+                    GoldilocksField(if i % 2 == 0 {
+                        specials[(i * 7 + 3) % specials.len()]
+                    } else {
+                        next()
+                    }),
+                ])
+            })
+            .collect();
+
+        // Zero, odd and even output lengths; starts on both sides of exact
+        // polynomial ends; and ranges wholly beyond all inputs.
+        let shapes = [
+            (0usize, 0usize),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (1, 7),
+            (2, 8),
+            (7, 9),
+            (8, 16),
+            (15, 17),
+            (31, 3),
+            (32, 9),
+            (63, 1),
+            (64, 3),
+            (65, 5),
+            (96, 7),
+        ];
+        for (start, len) in shapes {
+            let poison = QuadraticExtension([
+                GoldilocksField(u64::MAX),
+                GoldilocksField(u64::MAX - 1),
+            ]);
+            let mut actual = vec![poison; len];
+            let mut raw_expected = vec![poison; len];
+            ext2_base_scalar_dot_slots(&mut actual, start, &slices, &powers);
+            scalar_control(&mut raw_expected, start, &slices, &powers);
+            assert_eq!(actual, raw_expected, "raw mismatch for {start}..{}", start + len);
+
+            for (slot, got) in actual.iter().enumerate() {
+                let coefficient = start + slot;
+                let mut canonical_expected = QuadraticExtension::ZERO;
+                for (&power, poly) in powers.iter().zip(&slices) {
+                    if coefficient < poly.len() {
+                        canonical_expected +=
+                            <QuadraticExtension<GoldilocksField> as FieldExtension<2>>::scalar_mul(
+                                &power,
+                                poly[coefficient],
+                            );
+                    }
+                }
+                for limb in 0..2 {
+                    assert_eq!(
+                        got.0[limb].to_canonical_u64(),
+                        canonical_expected.0[limb].to_canonical_u64(),
+                        "canonical mismatch at coefficient {coefficient}, limb {limb}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Cover the production-width threshold and representative wide counts
+    /// with exact raw comparisons, including an odd tail and ragged batches.
+    #[test]
+    fn dot_slots_wide_counts_match_scalar_raw() {
+        let p = GoldilocksField::ORDER;
+        let specials = [0, 1, p - 1, p, p + 1, u64::MAX];
+        const START: usize = 3;
+        const SLOTS: usize = 9;
+        for count in [16usize, 17, 32, 239, 256] {
+            for ragged in [false, true] {
+                let lengths: Vec<usize> = (0..count)
+                    .map(|poly| {
+                        if ragged {
+                            START + 1 + poly % SLOTS
+                        } else {
+                            START + SLOTS
+                        }
+                    })
+                    .collect();
+                let polys: Vec<Vec<GoldilocksField>> = lengths
+                    .iter()
+                    .enumerate()
+                    .map(|(poly, &len)| {
+                        (0..len)
+                            .map(|slot| {
+                                GoldilocksField(
+                                    specials[(poly * 3 + slot * 5) % specials.len()]
+                                        .wrapping_add((poly as u64).rotate_left(slot as u32)),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let slices: Vec<&[GoldilocksField]> =
+                    polys.iter().map(Vec::as_slice).collect();
+                let powers: Vec<QuadraticExtension<GoldilocksField>> = (0..count)
+                    .map(|i| {
+                        QuadraticExtension([
+                            GoldilocksField(specials[(i * 5) % specials.len()]),
+                            GoldilocksField(
+                                specials[(i * 7 + 1) % specials.len()]
+                                    .wrapping_add(i as u64),
+                            ),
+                        ])
+                    })
+                    .collect();
+                let mut actual = vec![QuadraticExtension::ZERO; SLOTS];
+                let mut expected = vec![QuadraticExtension::ZERO; SLOTS];
+                ext2_base_scalar_dot_slots(&mut actual, START, &slices, &powers);
+                scalar_control(&mut expected, START, &slices, &powers);
+                assert_eq!(
+                    actual, expected,
+                    "raw mismatch for count={count}, ragged={ragged}",
+                );
+            }
+        }
+    }
+
+    /// Focused production-block A/B. Run with:
+    /// `cargo test -p plonky2_field --release dot_slots_production_shape_bench -- --ignored --nocapture`.
+    /// Calls alternate pair/control and control/pair to cancel ordering drift.
+    #[test]
+    #[ignore = "focused microbenchmark"]
+    fn dot_slots_production_shape_bench() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const START: usize = 2048;
+        const SLOTS: usize = 2048;
+        const ROUNDS: usize = 100;
+        let mut lengths = vec![5000usize; 34];
+        lengths.extend([0, 1, 2047, 2048, 2049, 4096]);
+        let mut state = 0xA076_1D64_78BD_642Fu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let polys: Vec<Vec<GoldilocksField>> = lengths
+            .iter()
+            .map(|&len| (0..len).map(|_| GoldilocksField(next())).collect())
+            .collect();
+        let slices: Vec<&[GoldilocksField]> = polys.iter().map(Vec::as_slice).collect();
+        let powers: Vec<QuadraticExtension<GoldilocksField>> = lengths
+            .iter()
+            .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+            .collect();
+        let mut paired_out = vec![QuadraticExtension::ZERO; SLOTS];
+        let mut scalar_out = vec![QuadraticExtension::ZERO; SLOTS];
+
+        for _ in 0..4 {
+            ext2_base_scalar_dot_slots(&mut paired_out, START, &slices, &powers);
+            scalar_control(&mut scalar_out, START, &slices, &powers);
+        }
+        assert_eq!(paired_out, scalar_out);
+
+        let mut paired_ns = 0u128;
+        let mut scalar_ns = 0u128;
+        for round in 0..ROUNDS {
+            if round & 1 == 0 {
+                let now = Instant::now();
+                ext2_base_scalar_dot_slots(&mut paired_out, START, &slices, &powers);
+                paired_ns += now.elapsed().as_nanos();
+                black_box(&paired_out);
+
+                let now = Instant::now();
+                scalar_control(&mut scalar_out, START, &slices, &powers);
+                scalar_ns += now.elapsed().as_nanos();
+                black_box(&scalar_out);
+            } else {
+                let now = Instant::now();
+                scalar_control(&mut scalar_out, START, &slices, &powers);
+                scalar_ns += now.elapsed().as_nanos();
+                black_box(&scalar_out);
+
+                let now = Instant::now();
+                ext2_base_scalar_dot_slots(&mut paired_out, START, &slices, &powers);
+                paired_ns += now.elapsed().as_nanos();
+                black_box(&paired_out);
+            }
+        }
+        assert_eq!(paired_out, scalar_out);
+        eprintln!(
+            "dot slots, 40 polys x 2048 slots: paired {:.3} ms, scalar {:.3} ms, ratio {:.4}",
+            paired_ns as f64 / ROUNDS as f64 / 1_000_000.0,
+            scalar_ns as f64 / ROUNDS as f64 / 1_000_000.0,
+            paired_ns as f64 / scalar_ns as f64,
+        );
     }
 
     /// Sabotage control: a writer that skips the all-zero slots — the exact
