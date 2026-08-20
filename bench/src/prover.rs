@@ -1,6 +1,6 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
-// Redraw marker r18 (same-account archive-dedup convention; inert, declared in note)
+// Redraw marker r19-barangunay0-1787237369148 (stack-34 inert redraw)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
