@@ -62,6 +62,9 @@ pub(crate) enum BatchLayout {
 pub struct EvenColumns<F> {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
+    /// Mod-4 (every 4th LDE row) companion, independent of `inner`.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    quarter_inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
     _phantom: core::marker::PhantomData<F>,
 }
 
@@ -70,6 +73,8 @@ impl<F> Default for EvenColumns<F> {
         Self {
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
             inner: std::sync::OnceLock::new(),
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            quarter_inner: std::sync::OnceLock::new(),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -100,6 +105,7 @@ impl<F> EvenColumns<F> {
         let _ = inner.set(columns);
         Self {
             inner,
+            quarter_inner: std::sync::OnceLock::new(),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -129,6 +135,28 @@ impl<F> EvenColumns<F> {
             .get_or_init(|| fill_even_companion_from_full(full))
             .as_ref()
     }
+
+    /// Derive the mod-4 companion. Prefers subsampling an already-filled
+    /// even companion (`even[2k] == full[4k]`) so the full-domain store is
+    /// not walked again.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn get_or_fill_quarter_rows(
+        &self,
+        full: &crate::hash::poseidon2::metal::MetalColumns<F>,
+    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>>
+    where
+        F: crate::hash::hash_types::RichField,
+    {
+        self.quarter_inner
+            .get_or_init(|| {
+                if let Some(even) = self.get() {
+                    fill_quarter_companion_from_even(even)
+                } else {
+                    fill_quarter_companion_from_full(full)
+                }
+            })
+            .as_ref()
+    }
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -148,6 +176,52 @@ fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
         debug_assert_eq!(dest.len(), half);
         for (k, slot) in dest.iter_mut().enumerate() {
             *slot = src[2 * k];
+        }
+    });
+    Some(companion)
+}
+
+/// `companion[j][k] = even[j][2k] = full[j][4k]`.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn fill_quarter_companion_from_even<F: crate::hash::hash_types::RichField>(
+    even: &crate::hash::poseidon2::metal::MetalColumns<F>,
+) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
+    if even.rows() < 2 || even.rows() % 2 != 0 || even.cols() == 0 {
+        return None;
+    }
+    let quarter = even.rows() / 2;
+    let mut companion =
+        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(even.cols(), quarter)?;
+    let dests = companion.columns_mut()?;
+    dests.into_par_iter().enumerate().for_each(|(j, dest)| {
+        let src = even.col(j);
+        debug_assert_eq!(src.len(), quarter * 2);
+        debug_assert_eq!(dest.len(), quarter);
+        for (k, slot) in dest.iter_mut().enumerate() {
+            *slot = src[2 * k];
+        }
+    });
+    Some(companion)
+}
+
+/// `companion[j][k] = full[j][4k]`. Used when no even companion is available.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn fill_quarter_companion_from_full<F: crate::hash::hash_types::RichField>(
+    full: &crate::hash::poseidon2::metal::MetalColumns<F>,
+) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
+    if full.rows() < 4 || full.rows() % 4 != 0 || full.cols() == 0 {
+        return None;
+    }
+    let quarter = full.rows() / 4;
+    let mut companion =
+        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(full.cols(), quarter)?;
+    let dests = companion.columns_mut()?;
+    dests.into_par_iter().enumerate().for_each(|(j, dest)| {
+        let src = full.col(j);
+        debug_assert_eq!(src.len(), quarter * 4);
+        debug_assert_eq!(dest.len(), quarter);
+        for (k, slot) in dest.iter_mut().enumerate() {
+            *slot = src[4 * k];
         }
     });
     Some(companion)
