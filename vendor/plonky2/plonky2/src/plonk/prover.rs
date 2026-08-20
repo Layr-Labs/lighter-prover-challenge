@@ -26,10 +26,6 @@ use crate::iop::target::Target;
 use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-use crate::plonk::circuit_data::{
-    LowRangeSelectorFilterCache, LowRangeSelectorFilterCacheEntry,
-};
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
@@ -41,7 +37,7 @@ use crate::plonk::vanishing_poly::{
 use crate::plonk::vars::EvaluationVarsBaseBatch;
 use crate::timed;
 use crate::util::timing::TimingTree;
-use crate::util::{log2_ceil, log2_strict};
+use crate::util::{log2_ceil};
 
 /// Set all the lookup gate wires (including multiplicities) and pad unused LU slots.
 /// Warning: rows are in descending order: the first gate to appear is the last LU gate, and
@@ -234,14 +230,13 @@ where
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
+        PolynomialBatch::<F, C, D>::from_coeffs(
             wires_coeffs,
             config.fri_config.rate_bits,
             config.zero_knowledge && PlonkOracle::WIRES.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_deref(),
-            wires_even_companion_wanted(common_data),
+            prover_data.fft_root_table.as_ref(),
         )
     );
 
@@ -333,7 +328,7 @@ where
             config.zero_knowledge && PlonkOracle::ZS_PARTIAL_PRODUCTS.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_deref(),
+            prover_data.fft_root_table.as_ref(),
         )
     );
 
@@ -457,7 +452,7 @@ where
             config.zero_knowledge && PlonkOracle::QUOTIENT.blinding,
             config.fri_config.cap_height,
             timing,
-            prover_data.fft_root_table.as_deref(),
+            prover_data.fft_root_table.as_ref(),
         )
     );
 
@@ -1303,631 +1298,6 @@ fn supported_quotient_result_limbs(base_bits: usize) -> Option<usize> {
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-/// One gate whose alpha-combined constraint sum `S_g(x)` (no selector filter)
-/// was evaluated by the GPU on the half-size quotient sub-domain (every other
-/// LDE row). `S_g` has degree at most `4 * (n - 1)` for a gate of degree at
-/// most four, so its values on the size-`4n` coset determine it exactly; the
-/// CPU extends it to the odd rows by one IFFT/FFT pair and applies the same
-/// filter `prod_{j in group, j != g} (j - s(x)) [* (UNUSED - s(x))]` the kernel
-/// would have applied at every row. Value-exact: the extended polynomial IS
-/// `S_g`, and field arithmetic is exact, so every quotient row is the field
-/// element the full-domain kernel computes.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-pub(crate) struct LowDegreeRangeGate {
-    gate_index: usize,
-    selector_column: usize,
-    group: core::ops::Range<usize>,
-    include_unused_selector: bool,
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-pub(crate) enum RangeQuotientJobs<F: RichField> {
-    /// Every advertised gate in one full-domain dispatch (the original path).
-    Whole(crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>),
-    /// Degree <= 4 gates on the half domain (per-gate, unfiltered) plus the
-    /// remaining higher-degree gates on the full domain (filtered, as before).
-    Split {
-        low: crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
-        low_gates: Vec<LowDegreeRangeGate>,
-        low_rows: usize,
-        high: Option<crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>>,
-    },
-}
-
-/// `LIGHTER_QSPLIT=0` disables the half-domain split (A/B switch); default on.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn range_quotient_split_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT").is_some_and(|v| v == "0"))
-}
-
-/// Whether the wires commitment should retain its compact even-row companion
-/// for the half-domain quotient split: only where the split runs (Metal, no
-/// lookups, two challenges) and only for the pipelined 2^19-row LDE shapes
-/// where the quotient kernel dominates (`LIGHTER_QSPLIT_MIN_LDE_BITS`
-/// overrides the floor).
-fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
-    common_data: &CommonCircuitData<F, D>,
-) -> bool {
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    {
-        static MIN_BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let min_bits = *MIN_BITS.get_or_init(|| {
-            std::env::var("LIGHTER_QSPLIT_MIN_LDE_BITS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(19)
-        });
-        // Upper bound as well as a lower one. The split pays for itself only
-        // where its companion fill and extension can hide behind other work.
-        // On the final block's 2^21 shape it cannot: that proof runs alone on
-        // the serial tail, and the companion it needs there is 136 columns of
-        // 2^20 rows -- a gigabyte -- filled unconditionally by
-        // `from_coeffs_with_even_companion`, before we know whether the block
-        // circuit even has the low-degree gates the split would use.
-        //
-        // Kept env-overridable in step with the floor so that raising
-        // LIGHTER_QSPLIT_MIN_LDE_BITS cannot silently close the window.
-        static MAX_BITS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let max_bits = *MAX_BITS.get_or_init(|| {
-            std::env::var("LIGHTER_QSPLIT_MAX_LDE_BITS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(19)
-        });
-        let lde_bits = common_data.degree_bits() + common_data.config.fri_config.rate_bits;
-        range_quotient_split_enabled()
-            && common_data.num_lookup_polys == 0
-            && common_data.config.num_challenges == 2
-            && lde_bits >= min_bits
-            && lde_bits <= max_bits
-    }
-    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-    {
-        let _ = common_data;
-        false
-    }
-}
-
-/// Process-wide retained payload limit for immutable low-range selector filters.
-/// The budget is deliberately well below one recurring proof's live working set
-/// and is shared by every circuit loaded in the worker. Oversized and late
-/// caches stay on the unchanged chunk-local path.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-const MAX_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 96 * 1024 * 1024;
-
-/// Reject a single table above the recurring light transaction shape. On the
-/// ranked circuits this admits the 64 MiB / 49-proof light table but rejects
-/// the 76 MiB / 3-proof heavy table and the one-off final block even if they
-/// happen to reach the quotient lane first.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-const MAX_SINGLE_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 68 * 1024 * 1024;
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-static LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// `LIGHTER_LOW_SELECTOR_FILTER_CACHE=0` keeps the exact chunk-local baseline;
-/// default on. The switch is process-local so one compiled binary supports A/B.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn low_range_selector_filter_cache_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var_os("LIGHTER_LOW_SELECTOR_FILTER_CACHE").is_some_and(|v| v == "0")
-    })
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn reserve_low_range_selector_filter_cache(bytes: usize) -> bool {
-    use core::sync::atomic::Ordering;
-
-    let mut current = LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES.load(Ordering::Relaxed);
-    loop {
-        let Some(next) = current.checked_add(bytes) else {
-            return false;
-        };
-        if next > MAX_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES {
-            return false;
-        }
-        match LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES.compare_exchange_weak(
-            current,
-            next,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
-        }
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-struct LowRangeSelectorGroupPlan {
-    selector_column: usize,
-    group_start: usize,
-    group_len: usize,
-    include_unused_selector: bool,
-    /// (gate slot in `gates`, position of the gate inside the group)
-    members: Vec<(usize, usize)>,
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn low_range_selector_group_plans(
-    gates: &[LowDegreeRangeGate],
-) -> Vec<LowRangeSelectorGroupPlan> {
-    let mut plans: Vec<LowRangeSelectorGroupPlan> = Vec::new();
-    for (slot, gate) in gates.iter().enumerate() {
-        let position = gate.gate_index - gate.group.start;
-        match plans.iter_mut().find(|p| {
-            p.selector_column == gate.selector_column
-                && p.group_start == gate.group.start
-                && p.group_len == gate.group.len()
-                && p.include_unused_selector == gate.include_unused_selector
-        }) {
-            Some(plan) => plan.members.push((slot, position)),
-            None => plans.push(LowRangeSelectorGroupPlan {
-                selector_column: gate.selector_column,
-                group_start: gate.group.start,
-                group_len: gate.group.len(),
-                include_unused_selector: gate.include_unused_selector,
-                members: vec![(slot, position)],
-            }),
-        }
-    }
-    plans
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn low_range_gate_signature(
-    gates: &[LowDegreeRangeGate],
-) -> Vec<(usize, usize, usize, usize, bool)> {
-    gates
-        .iter()
-        .map(|gate| {
-            (
-                gate.gate_index,
-                gate.selector_column,
-                gate.group.start,
-                gate.group.end,
-                gate.include_unused_selector,
-            )
-        })
-        .collect()
-}
-
-/// Builds one exact gate-major filter column per low gate. Each selector group
-/// retains the baseline prefix/suffix multiplication order. Groups build in
-/// parallel without unsafe disjoint writes or a second full-size transpose.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn build_low_range_selector_filter_cache<F: RichField>(
-    gates: &[LowDegreeRangeGate],
-    plans: &[LowRangeSelectorGroupPlan],
-    selector_cols: &[&[F]],
-    full_rows: usize,
-    gate_signature: Vec<(usize, usize, usize, usize, bool)>,
-) -> Option<LowRangeSelectorFilterCacheEntry<F>> {
-    const MAX_GROUP: usize = 16;
-    if gates.is_empty()
-        || plans.len() != selector_cols.len()
-        || plans.iter().any(|plan| plan.group_len > MAX_GROUP)
-        || selector_cols.iter().any(|col| col.len() < full_rows)
-    {
-        return None;
-    }
-
-    // Account for all retained heap allocations, not just field payloads. The
-    // reservation is intentionally never returned: circuits live for the
-    // worker lifetime, and retaining a stale reservation after an unusual drop
-    // is conservative rather than allowing the hard process cap to be crossed.
-    let entries = gates.len().checked_mul(full_rows)?;
-    let bytes = entries
-        .checked_mul(core::mem::size_of::<F>())?
-        .checked_add(gates.len().checked_mul(core::mem::size_of::<Vec<F>>())?)?
-        .checked_add(
-            gates
-                .len()
-                .checked_mul(core::mem::size_of::<(usize, usize, usize, usize, bool)>())?,
-        )?;
-    if bytes > MAX_SINGLE_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES
-        || !reserve_low_range_selector_filter_cache(bytes)
-    {
-        return None;
-    }
-
-    let unused = F::from_canonical_u64(u32::MAX as u64);
-    let by_group: Vec<Vec<(usize, Vec<F>)>> = plans
-        .par_iter()
-        .zip(selector_cols.par_iter())
-        .map(|(plan, &selector_col)| {
-            let n = plan.group_len;
-            let mut member_filters = plan
-                .members
-                .iter()
-                .map(|_| vec![F::ONE; full_rows])
-                .collect::<Vec<_>>();
-            let mut factors = [F::ZERO; MAX_GROUP];
-            let mut prefix = [F::ONE; MAX_GROUP + 1];
-            let mut suffix = [F::ONE; MAX_GROUP + 1];
-            for row in 0..full_rows {
-                let s_val = selector_col[row];
-                for (k, factor) in factors[..n].iter_mut().enumerate() {
-                    *factor = F::from_canonical_usize(plan.group_start + k) - s_val;
-                }
-                prefix[0] = if plan.include_unused_selector {
-                    unused - s_val
-                } else {
-                    F::ONE
-                };
-                for k in 0..n {
-                    prefix[k + 1] = prefix[k] * factors[k];
-                }
-                suffix[n] = F::ONE;
-                for k in (0..n).rev() {
-                    suffix[k] = suffix[k + 1] * factors[k];
-                }
-                for (member_i, &(_, position)) in plan.members.iter().enumerate() {
-                    member_filters[member_i][row] = prefix[position] * suffix[position + 1];
-                }
-            }
-            plan.members
-                .iter()
-                .map(|&(slot, _)| slot)
-                .zip(member_filters)
-                .collect()
-        })
-        .collect();
-
-    let mut by_gate = (0..gates.len()).map(|_| None).collect::<Vec<_>>();
-    for group in by_group {
-        for (slot, filters) in group {
-            if slot >= by_gate.len() || by_gate[slot].replace(filters).is_some() {
-                return None;
-            }
-        }
-    }
-    let filters = by_gate.into_iter().collect::<Option<Vec<_>>>()?;
-    Some(LowRangeSelectorFilterCacheEntry {
-        full_rows,
-        gate_signature,
-        filters,
-    })
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-#[inline(always)]
-fn accumulate_low_range_quotient_chunk<F: RichField>(
-    chunk: &mut [F],
-    row0: usize,
-    half_rows: usize,
-    num_gates: usize,
-    low: &[F],
-    odd: &[Vec<F>],
-    filter_at: impl Fn(usize, usize) -> F,
-) {
-    let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
-    for g in 0..num_gates {
-        let odd0 = &odd[g * 2];
-        let odd1 = &odd[g * 2 + 1];
-        let low_base = g * half_rows * 2;
-        for r in 0..rows {
-            let i = row0 + r;
-            let (sv0, sv1) = if i & 1 == 0 {
-                let base = low_base + (i >> 1) * 2;
-                (low[base], low[base + 1])
-            } else {
-                (odd0[i >> 1], odd1[i >> 1])
-            };
-            let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
-        }
-    }
-    chunk.copy_from_slice(&acc);
-}
-
-/// Applies selector filters and combines already-extended low-gate values.
-/// The boolean reports whether the immutable cache dispatched; tests use it to
-/// distinguish raw equality from accidentally comparing the fallback twice.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn combine_low_range_quotient<F: RichField>(
-    low: &[F],
-    odd: &[Vec<F>],
-    gates: &[LowDegreeRangeGate],
-    half_rows: usize,
-    full_rows: usize,
-    constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    filter_cache: Option<&LowRangeSelectorFilterCache<F>>,
-) -> (Vec<F>, bool) {
-    const ROWS_PER_CHUNK: usize = 512;
-    const MAX_GROUP: usize = 16;
-
-    let plans = low_range_selector_group_plans(gates);
-    assert!(plans.iter().all(|plan| plan.group_len <= MAX_GROUP));
-    let selector_cols = plans
-        .iter()
-        .map(|plan| constants.col(plan.selector_column))
-        .collect::<Vec<_>>();
-    let signature = low_range_gate_signature(gates);
-    let cached_filters = filter_cache
-        .and_then(|cache| {
-            cache.get_or_init(|| {
-                build_low_range_selector_filter_cache(
-                    gates,
-                    &plans,
-                    &selector_cols,
-                    full_rows,
-                    signature.clone(),
-                )
-            })
-        })
-        .filter(|entry| {
-            entry.full_rows == full_rows
-                && entry.gate_signature == signature
-                && entry.filters.len() == gates.len()
-                && entry.filters.iter().all(|filter| filter.len() == full_rows)
-        })
-        .map(|entry| entry.filters.as_slice());
-
-    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
-    // SAFETY: both disjoint parallel branches below write every output slot
-    // before the vector is returned, exactly as the pre-cache implementation.
-    unsafe { out.set_len(full_rows * 2) };
-    let num_gates = gates.len();
-    if let Some(filters) = cached_filters {
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
-            .enumerate()
-            .for_each(|(chunk_i, chunk)| {
-                let row0 = chunk_i * ROWS_PER_CHUNK;
-                accumulate_low_range_quotient_chunk(
-                    chunk,
-                    row0,
-                    half_rows,
-                    num_gates,
-                    low,
-                    odd,
-                    |g, r| filters[g][row0 + r],
-                );
-            });
-        (out, true)
-    } else {
-        let unused = F::from_canonical_u64(u32::MAX as u64);
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
-            .enumerate()
-            .for_each(|(chunk_i, chunk)| {
-                let row0 = chunk_i * ROWS_PER_CHUNK;
-                let rows = chunk.len() / 2;
-                // Exact pre-cache baseline: chunk-local, gate-major filters.
-                let mut filters = vec![F::ONE; num_gates * ROWS_PER_CHUNK];
-                let mut factors = [F::ZERO; MAX_GROUP];
-                let mut prefix = [F::ONE; MAX_GROUP + 1];
-                let mut suffix = [F::ONE; MAX_GROUP + 1];
-                for (plan, selector_col) in plans.iter().zip(&selector_cols) {
-                    let n = plan.group_len;
-                    for r in 0..rows {
-                        let s_val = selector_col[row0 + r];
-                        for k in 0..n {
-                            factors[k] =
-                                F::from_canonical_usize(plan.group_start + k) - s_val;
-                        }
-                        prefix[0] = if plan.include_unused_selector {
-                            unused - s_val
-                        } else {
-                            F::ONE
-                        };
-                        for k in 0..n {
-                            prefix[k + 1] = prefix[k] * factors[k];
-                        }
-                        suffix[n] = F::ONE;
-                        for k in (0..n).rev() {
-                            suffix[k] = suffix[k + 1] * factors[k];
-                        }
-                        for &(g, position) in &plan.members {
-                            filters[g * ROWS_PER_CHUNK + r] =
-                                prefix[position] * suffix[position + 1];
-                        }
-                    }
-                }
-                accumulate_low_range_quotient_chunk(
-                    chunk,
-                    row0,
-                    half_rows,
-                    num_gates,
-                    low,
-                    odd,
-                    |g, r| filters[g * ROWS_PER_CHUNK + r],
-                );
-            });
-        (out, false)
-    }
-}
-
-/// Extends the per-gate half-domain sums to the odd rows and applies the
-/// selector filters, producing the same point-major `[row * 2 + challenge]`
-/// layout as a full-domain range job. See [`LowDegreeRangeGate`].
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-fn extend_and_combine_low_range_quotient<F: RichField>(
-    low: &[F],
-    gates: &[LowDegreeRangeGate],
-    half_rows: usize,
-    full_rows: usize,
-    constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
-    filter_cache: &LowRangeSelectorFilterCache<F>,
-) -> Vec<F> {
-    debug_assert_eq!(full_rows, half_rows * 2);
-    debug_assert_eq!(low.len(), gates.len() * half_rows * 2);
-    // `points[i] = omega^i` on the full domain, so the even rows are the coset
-    // `shift * <omega^2>` and the odd rows are `(shift * omega) * <omega^2>`.
-    // Even rows are the coset `shift * <omega^2>`; the odd rows are
-    // `(shift * omega) * <omega^2>`. Interpolating on the first coset scales
-    // coefficient `i` by `shift^-i`, re-evaluating on the second by
-    // `(shift * omega)^i`; the net per-coefficient factor is `omega^i`, fused
-    // into the IFFT's normalization pass.
-    // Fold the half-size IFFT's `1/n` normalization into the cached omega
-    // powers. Every reconstructed gate/challenge column then pays one field
-    // multiply per coefficient instead of two; the table is circuit-shape
-    // fixed and shared by every proof in the process.
-    let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
-    #[cfg(feature = "diagnostic_profile")]
-    let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
-    combine_low_range_quotient(
-        low,
-        &odd,
-        gates,
-        half_rows,
-        full_rows,
-        constants,
-        low_range_selector_filter_cache_enabled().then_some(filter_cache),
-    )
-    .0
-}
-
-/// Standalone timing harness for the range/u32 quotient kernel variants on a
-/// quiet GPU (no proofs in flight): builds a random wires commitment of the
-/// circuit's shape through the production path (with even-row companion) and
-/// prints per-variant minimum wall times. Diagnostics only; never used by the
-/// prover.
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-pub fn range_quotient_microbench<
-    F: RichField + Extendable<D>,
-    C: GenericConfig<D, F = F>,
-    const D: usize,
->(
-    common_data: &CommonCircuitData<F, D>,
-    prover_data: &ProverOnlyCircuitData<F, C, D>,
-    reps: usize,
-) {
-    use crate::gates::gate::U32QuotientGate;
-    let degree = 1usize << common_data.degree_bits();
-    let rate_bits = common_data.config.fri_config.rate_bits;
-    let quotient_degree_bits = log2_ceil(common_data.quotient_degree_factor);
-    let step = 1 << (rate_bits - quotient_degree_bits);
-    let lde_size = degree << rate_bits;
-    let quotient_rows = lde_size / step;
-    let num_wires = common_data.config.num_wires;
-    let mut timing = TimingTree::default();
-    let mk_wires = || {
-        (0..num_wires)
-            .map(|_| PolynomialCoeffs::new(F::rand_vec(degree)))
-            .collect::<Vec<_>>()
-    };
-    // Companion fill cost.
-    let t = std::time::Instant::now();
-    let _plain = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
-        mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_deref(), false);
-    let plain_ms = t.elapsed().as_secs_f64() * 1e3;
-    let t = std::time::Instant::now();
-    let wires_commitment = PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
-        mk_wires(), rate_bits, false, common_data.config.fri_config.cap_height, &mut timing,
-        prover_data.fft_root_table.as_deref(), true);
-    let comp_ms = t.elapsed().as_secs_f64() * 1e3;
-    eprintln!("[qmb] degree_bits={} lde={} wires commit: plain {plain_ms:.1} ms, with companion {comp_ms:.1} ms, companion present={}",
-        common_data.degree_bits(), lde_size, wires_commitment.even_columns.get().is_some());
-    let alphas = vec![F::rand(), F::rand()];
-    // Reuse the production spec builder through the split-disabled and
-    // split-enabled entry points; time by finishing each job.
-    let time = |name: &str, f: &dyn Fn() -> Option<f64>| {
-        let mut best = f64::MAX;
-        for _ in 0..reps {
-            if let Some(v) = f() { best = best.min(v); }
-        }
-        eprintln!("[qmb]   {name}: {best:.2} ms");
-    };
-    // Whole (as production without split): call start_gpu_... with split disabled is env-based;
-    // instead build the jobs directly.
-    let wires = wires_commitment.merkle_tree.shared_columns().expect("metal wires");
-    let even = wires_commitment.even_columns.get();
-    let constants = prover_data.constants_sigmas_commitment.merkle_tree.shared_columns().expect("metal constants");
-    // Build specs exactly as start_gpu_range_check_gate_quotient does, by calling it (split may be on).
-    let Some((_gates, jobs)) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas) else {
-        eprintln!("[qmb] range job declined"); return;
-    };
-    drop(jobs);
-    // Extract specs by re-running the spec collection: simplest is to re-implement minimal
-    // collection here via the same helper closure used in production. To avoid duplication we
-    // just time via the public entry points with the env switch:
-    let _ = U32QuotientGate::Arithmetic { num_ops: 0 };
-    let run_whole = |q: usize, st: usize| -> Option<f64> {
-        let t = std::time::Instant::now();
-        // Whole job = production path with split disabled: emulate by calling metal directly
-        // through start_gpu_range_check_gate_quotient with LIGHTER_QSPLIT=0 semantics is not
-        // possible per-call; so we rely on the caller running this harness twice (QSPLIT=0/1).
-        let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, q, st, &alphas)?;
-        match &jobs {
-            RangeQuotientJobs::Whole(job) => { job.finish().ok()?; }
-            RangeQuotientJobs::Split { low, high, .. } => { low.finish().ok()?; if let Some(h) = high { h.finish().ok()?; } }
-        }
-        Some(t.elapsed().as_secs_f64() * 1e3)
-    };
-    time(&format!("production range job (split={}) full rows", range_quotient_split_enabled()), &|| run_whole(quotient_rows, step));
-    // Split pieces individually + CPU extension.
-    if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high })) =
-        start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)
-    {
-        let _ = (wires, even);
-        low.finish().ok();
-        if let Some(h) = &high { h.finish().ok(); }
-        time("  low job only (re-dispatched)", &|| {
-            let t = std::time::Instant::now();
-            let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)?;
-            if let RangeQuotientJobs::Split { low, .. } = &jobs { low.finish().ok()?; }
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        let low_values = low.finish().unwrap();
-        time("  CPU extension FFTs only (30 tasks)", &|| {
-            let t = std::time::Instant::now();
-            let half = low_rows;
-            let omega = F::primitive_root_of_unity(log2_strict(lde_size));
-            let omega_powers = precomputed::shift_powers::<F>(omega, half);
-            let odd: Vec<Vec<F>> = (0..low_gates.len() * 2).into_par_iter().map(|tt| {
-                let g = tt / 2; let c = tt % 2; let base = g * half * 2;
-                let values: Vec<F> = (0..half).map(|k| low_values[base + k * 2 + c]).collect();
-                PolynomialValues::new(values).coset_ifft_with_powers(&omega_powers).fft().values
-            }).collect();
-            core::hint::black_box(&odd);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        time("  single IFFT+FFT 2^18 (1 thread)", &|| {
-            let half = low_rows;
-            let omega = F::primitive_root_of_unity(log2_strict(lde_size));
-            let omega_powers = precomputed::shift_powers::<F>(omega, half);
-            let values: Vec<F> = (0..half).map(|k| low_values[k * 2]).collect();
-            let t = std::time::Instant::now();
-            let v = PolynomialValues::new(values).coset_ifft_with_powers(&omega_powers).fft().values;
-            core::hint::black_box(&v);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        time("  CPU extend+combine", &|| {
-            let t = std::time::Instant::now();
-            let out = extend_and_combine_low_range_quotient(
-                low_values,
-                &low_gates,
-                low_rows,
-                lde_size,
-                constants,
-                &prover_data.low_range_selector_filter_cache,
-            );
-            core::hint::black_box(&out);
-            Some(t.elapsed().as_secs_f64() * 1e3)
-        });
-        eprintln!("[qmb]   low gates={} high={}", low_gates.len(), high.is_some());
-    }
-}
-
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -1939,7 +1309,10 @@ fn start_gpu_range_check_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
-) -> Option<(Vec<usize>, RangeQuotientJobs<F>)> {
+) -> Option<(
+    Vec<usize>,
+    crate::hash::poseidon2::metal::RangeCheckGateQuotientJob<F>,
+)> {
     use core::sync::atomic::Ordering;
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
@@ -1981,8 +1354,6 @@ fn start_gpu_range_check_gate_quotient<
     let mut random_access_gate_indices = Vec::new();
     let mut specs = Vec::new();
     let mut u32_specs = Vec::new();
-    let mut spec_degrees = Vec::new();
-    let mut u32_spec_degrees = Vec::new();
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
@@ -2023,7 +1394,6 @@ fn start_gpu_range_check_gate_quotient<
                 num_ops: range.num_ops,
                 bit_size: range.bit_size,
             });
-            spec_degrees.push(gate.0.degree());
             gate_indices.push(gate_index);
         }
         if let Some(u32_gate) = u32_gate {
@@ -2234,7 +1604,6 @@ fn start_gpu_range_check_gate_quotient<
                 num_ops,
                 kind,
             });
-            u32_spec_degrees.push(gate.0.degree());
             if matches!(u32_gate, U32QuotientGate::RandomAccess { .. }) {
                 random_access_gate_indices.push(gate_index);
             } else {
@@ -2331,7 +1700,6 @@ fn start_gpu_range_check_gate_quotient<
                 num_ops,
                 kind,
             });
-            u32_spec_degrees.push(gate.0.degree());
             gate_indices.push(gate_index);
         }
     }
@@ -2361,111 +1729,7 @@ fn start_gpu_range_check_gate_quotient<
     // These gate rows share the same alpha positions as every other gate.
     // Only the permutation/Z prefix precedes the combined gate-row block.
     let alpha_offset = common_data.config.num_challenges * (common_data.num_partial_products + 2);
-    // Half-domain split: every gate of degree <= 4 is dispatched alone,
-    // unfiltered (group `g..g+1`, no UNUSED factor => filter == 1), on every
-    // other row; the rest keep the full-domain filtered dispatch. Falls back
-    // to the whole-domain job if the multi launch is declined.
-    let mut split_job = None;
-    let even_wires = wires_commitment.even_columns.get();
-    if let (true, Some(even_wires)) = (
-        range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
-        even_wires,
-    ) {
-        // Circuit-fixed constants/sigmas live in a deserialized Metal store
-        // with no companion. Fill their compact even rows only after the
-        // wires/shape admission succeeds; all other paths have no consumer
-        // for this cache. The shader strides both buffers by `wires.rows`, so
-        // admitted constant readers still receive matching compact columns.
-        let even_constants = prover_data
-            .constants_sigmas_commitment
-            .even_columns
-            .get_or_fill_even_rows(constants);
-        // Without a constants companion, kinds that read gate constants
-        // stay on the full-domain dispatch (the kernel would otherwise
-        // index `col * half_rows + k` into a full-stride store).
-        let reads_constants = |kind: &U32QuotientKind| {
-            matches!(
-                kind,
-                U32QuotientKind::Equality { .. }
-                    | U32QuotientKind::BaseAddition { .. }
-                    | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
-            )
-        };
-        let split_constant_readers = even_constants.is_some();
-        let mut low_groups = Vec::new();
-        let mut low_gates = Vec::new();
-        let mut high_specs = Vec::new();
-        let mut high_u32_specs = Vec::new();
-        for (spec, &degree) in specs.iter().zip(&spec_degrees) {
-            if degree <= 4 {
-                let mut alone = spec.clone();
-                alone.group = spec.gate_index..spec.gate_index + 1;
-                alone.include_unused_selector = false;
-                low_groups.push((vec![alone], Vec::new()));
-                low_gates.push(LowDegreeRangeGate {
-                    gate_index: spec.gate_index,
-                    selector_column: spec.selector_column,
-                    group: spec.group.clone(),
-                    include_unused_selector: spec.include_unused_selector,
-                });
-            } else {
-                high_specs.push(spec.clone());
-            }
-        }
-        for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && (split_constant_readers || !reads_constants(&spec.kind)) {
-                let mut alone = spec.clone();
-                alone.group = spec.gate_index..spec.gate_index + 1;
-                alone.include_unused_selector = false;
-                low_groups.push((Vec::new(), vec![alone]));
-                low_gates.push(LowDegreeRangeGate {
-                    gate_index: spec.gate_index,
-                    selector_column: spec.selector_column,
-                    group: spec.group.clone(),
-                    include_unused_selector: spec.include_unused_selector,
-                });
-            } else {
-                high_u32_specs.push(spec.clone());
-            }
-        }
-        if !low_groups.is_empty() {
-            if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
-                even_wires,
-                even_constants.unwrap_or(constants),
-                quotient_rows / 2,
-                1,
-                &low_groups,
-                alphas,
-                alpha_offset,
-            ) {
-                let high = if high_specs.is_empty() && high_u32_specs.is_empty() {
-                    None
-                } else {
-                    crate::hash::poseidon2::metal::start_range_check_gate_quotient(
-                        wires,
-                        constants,
-                        quotient_rows,
-                        step,
-                        &high_specs,
-                        &high_u32_specs,
-                        alphas,
-                        alpha_offset,
-                    )
-                };
-                if high.is_some() || (high_specs.is_empty() && high_u32_specs.is_empty()) {
-                    split_job = Some(RangeQuotientJobs::Split {
-                        low,
-                        low_gates,
-                        low_rows: quotient_rows / 2,
-                        high,
-                    });
-                }
-            }
-        }
-    }
-    let job = if let Some(job) = split_job {
-        job
-    } else if let Some(job) = crate::hash::poseidon2::metal::start_range_check_gate_quotient(
+    let Some(job) = crate::hash::poseidon2::metal::start_range_check_gate_quotient(
         wires,
         constants,
         quotient_rows,
@@ -2474,9 +1738,7 @@ fn start_gpu_range_check_gate_quotient<
         &u32_specs,
         alphas,
         alpha_offset,
-    ) {
-        RangeQuotientJobs::Whole(job)
-    } else {
+    ) else {
         if gpu_poseidon_quotient_diagnostics_enabled() {
             eprintln!(
                 "[gpu-range-quotient] Metal launch rejected: gates={gate_indices:?} \
@@ -2839,51 +2101,13 @@ fn compute_quotient_polys<
     // real serial store loop, not `alloc_zeroed`: 8 MiB per d16 tx proof,
     // 2 MiB per chain-step proof, on the per-proof spine between the Zs
     // commitment and the quotient commitment.
-    // Offloading the permutation products moves the ONLY reader of the "next"
-    // Z gather off the CPU: `permutation_products_offloaded` implies
-    // `col_major_perm` (the `gpu_permutation` construction above is gated on
-    // it), `col_major_perm` implies `!has_lookup`, and the offloaded branch of
-    // `eval_vanishing_poly_base_batch` destructures `zs_next_cols` away. So the
-    // flag below is exactly "something still reads Z(g x)".
-    let needs_next_zs = !permutation_products_offloaded;
-
     let quotient_len = points.len() * num_challenges;
     let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
     // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
     // writes every element before any is read (see above). Same idiom as the
     // promoted zero-tail fast path in `fri/oracle.rs`.
     unsafe { quotient_values.set_len(quotient_len) };
-    // The half-domain range job's CPU extension runs concurrently with the
-    // CPU gate batch loop below (both on the pool), so its latency hides
-    // behind work the proof does anyway; its result is consumed after.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let low_extension = || -> core::result::Result<Option<Vec<F>>, String> {
-        if let Some((_, RangeQuotientJobs::Split { low, low_gates, low_rows, .. })) = &gpu_range {
-            let low_values = low.finish()?;
-            let constants = prover_data
-                .constants_sigmas_commitment
-                .merkle_tree
-                .shared_columns()
-                .ok_or_else(|| "split range quotient requires Metal-backed constants".to_string())?;
-            #[cfg(feature = "diagnostic_profile")]
-            let _extend_span = crate::util::profile::span("quotient", "range_low_extend_combine");
-            Ok(Some(extend_and_combine_low_range_quotient(
-                low_values,
-                low_gates,
-                *low_rows,
-                points.len(),
-                constants,
-                &prover_data.low_range_selector_filter_cache,
-            )))
-        } else {
-            Ok(None)
-        }
-    };
-    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-    let low_extension = || -> core::result::Result<Option<Vec<F>>, String> { Ok(None) };
-    let quotient_values_ref = &mut quotient_values;
-    let z_h_on_coset_ref = &z_h_on_coset;
-    let run_batches = move || quotient_values_ref
+    quotient_values
         .par_chunks_mut(BATCH_SIZE * num_challenges)
         .zip(points_batches)
         .enumerate()
@@ -2911,22 +2135,9 @@ fn compute_quotient_polys<
                     .indices
                     .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
                 scratch.indices_next.clear();
-                // The wrapped "next" indices exist for exactly one consumer: the
-                // permutation argument's Z(g x) column. When the permutation
-                // products are offloaded, `zs_next_range` below is `0..0` and the
-                // offloaded branch of `eval_vanishing_poly_base_batch` never
-                // reads `zs_next_cols`, so this construction and the zero-width
-                // gather it feeds are both dead: one add + mask + push and one
-                // `fill_lde_batch` contiguity scan per LDE point, i.e. 2^19 of
-                // each per degree-2^16 transaction proof and 2^21 per block
-                // proof, on the serial quotient spine. Skipping them leaves
-                // `indices_next` and `zs_next_flat` empty -- exactly the state
-                // `fill_lde_batch`'s `resize(n * 0)` produced.
-                if needs_next_zs {
-                    scratch
-                        .indices_next
-                        .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
-                }
+                scratch
+                    .indices_next
+                    .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
 
                 let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
                 debug_assert!(
@@ -3034,18 +2245,13 @@ fn compute_quotient_polys<
                     batch_layout,
                     &mut scratch.zs_local_flat,
                 );
-                if needs_next_zs {
-                    zs_partial_products_and_lookup_commitment.fill_lde_batch(
-                        &scratch.indices_next,
-                        step,
-                        zs_next_range,
-                        batch_layout,
-                        &mut scratch.zs_next_flat,
-                    );
-                } else {
-                    debug_assert!(zs_next_range.is_empty());
-                    scratch.zs_next_flat.clear();
-                }
+                zs_partial_products_and_lookup_commitment.fill_lde_batch(
+                    &scratch.indices_next,
+                    step,
+                    zs_next_range,
+                    batch_layout,
+                    &mut scratch.zs_next_flat,
+                );
 
                 let indices_batch = &scratch.indices;
                 // Per-point row views over the PointMajor gathers, built only
@@ -3145,7 +2351,7 @@ fn compute_quotient_polys<
                     interleave_pair.as_ref(),
                     permutation_products_offloaded,
                     &permutation_gate_scales,
-                    z_h_on_coset_ref,
+                    &z_h_on_coset,
                     &lut_re_poly_evals_refs,
                     &mut scratch.vanishing,
                     quotient_values_batch,
@@ -3163,7 +2369,6 @@ fn compute_quotient_polys<
                 // from disagreeing when a launched job yields no values.
             },
         );
-    let ((), low_extension_result) = plonky2_maybe_rayon::join(run_batches, low_extension);
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
@@ -3205,20 +2410,20 @@ fn compute_quotient_polys<
     };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let mut gpu_range_low_values: Option<Vec<F>> = None;
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range_values: Option<&[F]> = if let Some((_, jobs)) = &gpu_range {
-        macro_rules! range_fallback {
-            ($job:expr, $error:expr) => {{
+    let gpu_range_values = if let Some((_, job)) = &gpu_range {
+        let values = match job.finish() {
+            Ok(values) => {
+                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                values
+            }
+            Err(error) => {
                 GPU_RANGE_QUOTIENT_FALLBACKS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 log::warn!(
-                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {}",
-                    $error
+                    "Metal RangeCheck gate quotient failed; recomputing quotient on CPU: {error}"
                 );
                 if gpu_poseidon_quotient_diagnostics_enabled() {
                     eprintln!(
-                        "[gpu-range-quotient] runtime failure; falling back to CPU: {}",
-                        $error
+                        "[gpu-range-quotient] runtime failure; falling back to CPU: {error}"
                     );
                 }
                 let result = compute_quotient_polys(
@@ -3236,42 +2441,12 @@ fn compute_quotient_polys<
                     false,
                 );
                 #[cfg(test)]
-                $job.mark_cpu_recompute_completed_for_tests();
+                job.mark_cpu_recompute_completed_for_tests();
                 return result;
-            }};
-        }
-        match jobs {
-            RangeQuotientJobs::Whole(job) => {
-                let values = match job.finish() {
-                    Ok(values) => {
-                        GPU_RANGE_QUOTIENT_COMPLETED
-                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                        values
-                    }
-                    Err(error) => range_fallback!(job, error),
-                };
-                debug_assert_eq!(values.len(), quotient_values.len());
-                Some(values)
             }
-            RangeQuotientJobs::Split { low, high, .. } => {
-                match low_extension_result {
-                    Ok(values) => gpu_range_low_values = values,
-                    Err(error) => range_fallback!(low, error),
-                }
-                GPU_RANGE_QUOTIENT_COMPLETED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-                match high {
-                    Some(job) => {
-                        let values = match job.finish() {
-                            Ok(values) => values,
-                            Err(error) => range_fallback!(job, error),
-                        };
-                        debug_assert_eq!(values.len(), quotient_values.len());
-                        Some(values)
-                    }
-                    None => None,
-                }
-            }
-        }
+        };
+        debug_assert_eq!(values.len(), quotient_values.len());
+        Some(values)
     } else {
         None
     };
@@ -3329,7 +2504,6 @@ fn compute_quotient_polys<
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let has_gpu_values = gpu_poseidon_values.is_some()
         || gpu_range_values.is_some()
-        || gpu_range_low_values.is_some()
         || gpu_permutation_values.is_some();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let has_gpu_values = false;
@@ -3356,9 +2530,6 @@ fn compute_quotient_polys<
                             value += values[start + challenge];
                         }
                         if let Some(values) = gpu_range_values {
-                            value += values[start + challenge];
-                        }
-                        if let Some(values) = &gpu_range_low_values {
                             value += values[start + challenge];
                         }
                         if let Some(values) = gpu_permutation_values {
@@ -3453,7 +2624,6 @@ pub(crate) mod precomputed {
         static COSET_POWERS: OnceLock<Map> = OnceLock::new();
         static SHIFTED_SUBGROUPS: OnceLock<Map> = OnceLock::new();
         static INVERSE_COSET_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
-        static ODD_COSET_IFFT_POWERS_SCALED: OnceLock<Map> = OnceLock::new();
         static SHIFT_POWERS: OnceLock<ShiftMap> = OnceLock::new();
 
         fn get_or_compute<F: Field>(
@@ -3574,21 +2744,6 @@ pub(crate) mod precomputed {
                     .collect()
             })
         }
-
-        /// Cached `n^-1 * omega^i` table for reconstructing the odd rows of a
-        /// `2n`-point domain from its even `n` rows. `omega` is the primitive
-        /// `2n`-th root, so the table depends only on `n` and the field type.
-        pub(crate) fn odd_coset_ifft_powers_scaled<F: Field>(n: usize) -> Arc<Vec<F>> {
-            get_or_compute(&ODD_COSET_IFFT_POWERS_SCALED, n, || {
-                let n_bits = plonky2_util::log2_strict(n);
-                let n_inv = F::inverse_2exp(n_bits);
-                F::primitive_root_of_unity(n_bits + 1)
-                    .powers()
-                    .take(n)
-                    .map(|power| n_inv * power)
-                    .collect()
-            })
-        }
     }
 
     /// Without `std` there is no process-global synchronization; fall back to
@@ -3628,23 +2783,11 @@ pub(crate) mod precomputed {
                     .collect::<Vec<F>>(),
             )
         }
-
-        pub(crate) fn odd_coset_ifft_powers_scaled<F: Field>(n: usize) -> Arc<Vec<F>> {
-            let n_bits = plonky2_util::log2_strict(n);
-            let n_inv = F::inverse_2exp(n_bits);
-            Arc::new(
-                F::primitive_root_of_unity(n_bits + 1)
-                    .powers()
-                    .take(n)
-                    .map(|power| n_inv * power)
-                    .collect::<Vec<F>>(),
-            )
-        }
     }
 
     pub(crate) use imp::{
-        coset_shift_powers, inverse_coset_shift_powers_scaled, odd_coset_ifft_powers_scaled,
-        shift_powers, shifted_two_adic_subgroup, two_adic_subgroup,
+        coset_shift_powers, inverse_coset_shift_powers_scaled, shift_powers,
+        shifted_two_adic_subgroup, two_adic_subgroup,
     };
 }
 
@@ -3657,12 +2800,9 @@ mod quotient_layout_tests {
     use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
-    };
+    use super::{gpu_poseidon_quotient_stats, COMPARE_GPU_QUOTIENT};
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field, Field64, PrimeField64};
+    use crate::field::types::{Field, Field64};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::gates::gate::U32QuotientGate;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -3672,8 +2812,6 @@ mod quotient_layout_tests {
     use crate::iop::witness::{PartialWitness, WitnessWrite};
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    use crate::plonk::circuit_data::LowRangeSelectorFilterCache;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use crate::plonk::config::Poseidon2GoldilocksConfig;
@@ -3711,154 +2849,6 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
-    }
-
-    /// Raw-limb differential and dispatch guard for the immutable low-range
-    /// selector cache. This exercises multiple selector groups, UNUSED, a
-    /// short final chunk, the first fill, a cache hit, and signature mismatch.
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    #[test]
-    fn low_range_selector_filter_cache_matches_chunked_raw_and_dispatches() {
-        let half_rows = 333usize;
-        let full_rows = half_rows * 2;
-        let Some(mut constants) =
-            crate::hash::poseidon2::metal::allocate_plain_columns::<F>(2, full_rows)
-        else {
-            return;
-        };
-        for (column_i, column) in constants
-            .columns_mut()
-            .expect("plain Metal columns are CPU writable")
-            .into_iter()
-            .enumerate()
-        {
-            for (row, value) in column.iter_mut().enumerate() {
-                let limb = ((column_i * 97 + row * 29) % 10_000 + 1) as u64;
-                *value = if (row + column_i) % 3 == 0 {
-                    F::from_noncanonical_u64(F::ORDER + limb)
-                } else {
-                    F::from_canonical_u64(limb)
-                };
-            }
-        }
-
-        let gates = vec![
-            LowDegreeRangeGate {
-                gate_index: 0,
-                selector_column: 0,
-                group: 0..4,
-                include_unused_selector: true,
-            },
-            LowDegreeRangeGate {
-                gate_index: 2,
-                selector_column: 0,
-                group: 0..4,
-                include_unused_selector: true,
-            },
-            LowDegreeRangeGate {
-                gate_index: 3,
-                selector_column: 0,
-                group: 0..4,
-                include_unused_selector: true,
-            },
-            LowDegreeRangeGate {
-                gate_index: 6,
-                selector_column: 1,
-                group: 6..9,
-                include_unused_selector: false,
-            },
-            LowDegreeRangeGate {
-                gate_index: 8,
-                selector_column: 1,
-                group: 6..9,
-                include_unused_selector: false,
-            },
-        ];
-        let field = |i: usize| {
-            let limb = ((i * 43 + 11) % 100_000 + 1) as u64;
-            if i % 5 == 0 {
-                F::from_noncanonical_u64(F::ORDER + limb)
-            } else {
-                F::from_canonical_u64(limb)
-            }
-        };
-        let low = (0..gates.len() * half_rows * 2)
-            .map(field)
-            .collect::<Vec<_>>();
-        let odd = (0..gates.len() * 2)
-            .map(|column| {
-                (0..half_rows)
-                    .map(|row| field(1_000_000 + column * half_rows + row))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-
-        let (chunked, chunked_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &gates,
-            half_rows,
-            full_rows,
-            &constants,
-            None,
-        );
-        assert!(!chunked_dispatched);
-
-        let cache = LowRangeSelectorFilterCache::default();
-        let (filled, fill_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &gates,
-            half_rows,
-            full_rows,
-            &constants,
-            Some(&cache),
-        );
-        assert!(fill_dispatched, "first eligible call did not fill/dispatch the cache");
-        let (hit, hit_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &gates,
-            half_rows,
-            full_rows,
-            &constants,
-            Some(&cache),
-        );
-        assert!(hit_dispatched, "second eligible call did not hit the cache");
-
-        let raw = |values: &[F]| {
-            values
-                .iter()
-                .map(PrimeField64::to_noncanonical_u64)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(raw(&filled), raw(&chunked), "cache fill changed raw limbs");
-        assert_eq!(raw(&hit), raw(&chunked), "cache hit changed raw limbs");
-
-        // The cache is owned by one exact circuit/shape. A different gate
-        // signature must reject the entry and use the value-identical fallback.
-        let mut changed_gates = gates;
-        changed_gates[0].include_unused_selector = false;
-        let (changed_reference, _) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &changed_gates,
-            half_rows,
-            full_rows,
-            &constants,
-            None,
-        );
-        let (changed_cached, changed_dispatched) = combine_low_range_quotient(
-            &low,
-            &odd,
-            &changed_gates,
-            half_rows,
-            full_rows,
-            &constants,
-            Some(&cache),
-        );
-        assert!(!changed_dispatched, "cache crossed its circuit signature guard");
-        assert_eq!(raw(&changed_cached), raw(&changed_reference));
     }
 
     /// B1/B2/D1 differential gate: within a single prove call — same witness,
