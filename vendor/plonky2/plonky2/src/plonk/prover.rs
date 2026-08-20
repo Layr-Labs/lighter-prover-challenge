@@ -726,10 +726,18 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                // Numerator and denominator share `wire + gamma`.
+                                // Field-equal to `wire + beta_* * point + gamma`.
+                                let wire_plus_gamma_0 = wire_value + gamma_0;
+                                let wire_plus_gamma_1 = wire_value + gamma_1;
+                                numerator_0 *=
+                                    wire_plus_gamma_0.multiply_accumulate(beta_k_is_0[j], x);
+                                numerator_1 *=
+                                    wire_plus_gamma_1.multiply_accumulate(beta_k_is_1[j], x);
+                                denominator_0 *=
+                                    wire_plus_gamma_0.multiply_accumulate(beta_0, sigma);
+                                denominator_1 *=
+                                    wire_plus_gamma_1.multiply_accumulate(beta_1, sigma);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -859,8 +867,11 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let wire_plus_gamma = wire_value + gamma;
+                            numerator_product *=
+                                wire_plus_gamma.multiply_accumulate(beta_k_is[j], x);
+                            denominator_product *=
+                                wire_plus_gamma.multiply_accumulate(beta, s_sigmas[j]);
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
