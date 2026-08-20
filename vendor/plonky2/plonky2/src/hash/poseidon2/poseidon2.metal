@@ -512,13 +512,16 @@ kernel void poseidon2_gate_quotient(
     uint source_row = gid * step;
     ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
     ulong filter = 1;
+    // Wires and constants come from the retained `MetalColumns` store, never
+    // an even-row companion. That store is canonical on the GPU build path
+    // and is folded on the CPU Merkle decline path.
     for (uint i = group_start; i < group_end; ++i) {
         if (i != gate_index) {
-            filter = gl_mul(filter, gl_sub((ulong)i, selector));
+            filter = gl_mul(filter, gl_sub_canonical_rhs((ulong)i, selector));
         }
     }
     if (include_unused_selector != 0u) {
-        filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+        filter = gl_mul(filter, gl_sub_canonical_rhs(0xffffffffUL, selector));
     }
 
     // parameters buffer kept for ABI; RCs from compile-time tables.
@@ -538,7 +541,7 @@ kernel void poseidon2_gate_quotient(
         ulong rhs = poseidon2_gate_wire(wires, i + 4, lde_rows, source_row);
         ulong delta = poseidon2_gate_wire(wires, 25 + i, lde_rows, source_row);
         poseidon2_gate_emit(
-            gl_sub(gl_mul(swap, gl_sub(rhs, lhs)), delta),
+            gl_sub_canonical_rhs(gl_mul(swap, gl_sub_canonical_rhs(rhs, lhs)), delta),
             alpha_powers,
             accumulators,
             constraint_index);
@@ -666,10 +669,12 @@ kernel void permutation_quotient(
             (ulong)(sigma_start + j_start) * lde_rows + source_row];
         ulong beta_k0 = challenges[4u + j_start];
         ulong beta_k1 = challenges[4u + num_routed_wires + j_start];
-        ulong numerator0 = gl_add(gl_mul_add(beta_k0, x, wire), gamma0);
-        ulong denominator0 = gl_add(gl_mul_add(beta0, sigma, wire), gamma0);
-        ulong numerator1 = gl_add(gl_mul_add(beta_k1, x, wire), gamma1);
-        ulong denominator1 = gl_add(gl_mul_add(beta1, sigma, wire), gamma1);
+        // gamma0/gamma1 are challenges[2]/[3], filled by
+        // `to_canonical_u64()` in `start_permutation_quotient`. One fold.
+        ulong numerator0 = gl_add_canonical_rhs(gl_mul_add(beta_k0, x, wire), gamma0);
+        ulong denominator0 = gl_add_canonical_rhs(gl_mul_add(beta0, sigma, wire), gamma0);
+        ulong numerator1 = gl_add_canonical_rhs(gl_mul_add(beta_k1, x, wire), gamma1);
+        ulong denominator1 = gl_add_canonical_rhs(gl_mul_add(beta1, sigma, wire), gamma1);
         for (uint j = j_start + 1u; j < j_end; ++j) {
             wire = wires[(ulong)j * lde_rows + source_row];
             sigma = constants_sigmas[
@@ -677,13 +682,13 @@ kernel void permutation_quotient(
             beta_k0 = challenges[4u + j];
             beta_k1 = challenges[4u + num_routed_wires + j];
             numerator0 = gl_mul(
-                numerator0, gl_add(gl_mul_add(beta_k0, x, wire), gamma0));
+                numerator0, gl_add_canonical_rhs(gl_mul_add(beta_k0, x, wire), gamma0));
             denominator0 = gl_mul(
-                denominator0, gl_add(gl_mul_add(beta0, sigma, wire), gamma0));
+                denominator0, gl_add_canonical_rhs(gl_mul_add(beta0, sigma, wire), gamma0));
             numerator1 = gl_mul(
-                numerator1, gl_add(gl_mul_add(beta_k1, x, wire), gamma1));
+                numerator1, gl_add_canonical_rhs(gl_mul_add(beta_k1, x, wire), gamma1));
             denominator1 = gl_mul(
-                denominator1, gl_add(gl_mul_add(beta1, sigma, wire), gamma1));
+                denominator1, gl_add_canonical_rhs(gl_mul_add(beta1, sigma, wire), gamma1));
         }
 
         uint previous_column0 = chunk == 0u ? 0u : 1u + chunk;
@@ -778,7 +783,11 @@ inline void alpha_acc_mul_add(thread alpha_acc_t& acc, ulong a, ulong b) {
 // per-constraint reduction it replaces.
 inline ulong alpha_acc_materialize(alpha_acc_t acc) {
     lazy_t positive = { acc.low.lo, acc.low.hi + acc.high.lo };
-    return gl_sub(lazy_materialize(positive), acc.high.lo + acc.high.hi);
+    // `H0 + H1` is ≤ 2 n (2^32 - 1). Host admission requires
+    // `2 * alpha_stride * sizeof(u64) ≤ 4096`, so n ≤ 256 and the sum is
+    // below 2^41 < p. One fold; bit-identical given that bound.
+    return gl_sub_canonical_rhs(
+        lazy_materialize(positive), acc.high.lo + acc.high.hi);
 }
 
 inline void range_check_gate_emit(
@@ -902,13 +911,16 @@ kernel void range_check_gate_quotient(
 
         ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
         ulong filter = 1;
+        // Selector comes from the constants store (or its even-row copy,
+        // taken after that store is built). Those limbs are < p, so the
+        // second EPSILON fold in `gl_sub` is unreachable.
         for (uint i = group_start; i < group_end; ++i) {
             if (i != gate_index) {
-                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+                filter = gl_mul(filter, gl_sub_canonical_rhs((ulong)i, selector));
             }
         }
         if (include_unused_selector != 0u) {
-            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            filter = gl_mul(filter, gl_sub_canonical_rhs(0xffffffffUL, selector));
         }
 
         alpha_acc_t gate_accumulators[2] = {
@@ -978,11 +990,11 @@ kernel void range_check_gate_quotient(
         ulong filter = 1;
         for (uint i = group_start; i < group_end; ++i) {
             if (i != gate_index) {
-                filter = gl_mul(filter, gl_sub((ulong)i, selector));
+                filter = gl_mul(filter, gl_sub_canonical_rhs((ulong)i, selector));
             }
         }
         if (include_unused_selector != 0u) {
-            filter = gl_mul(filter, gl_sub(0xffffffffUL, selector));
+            filter = gl_mul(filter, gl_sub_canonical_rhs(0xffffffffUL, selector));
         }
 
         alpha_acc_t gate_accumulators[2] = {

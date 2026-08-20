@@ -813,6 +813,15 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             };
         }
 
+        // GPU routing returned None. The retained Shared store may already
+        // hold FFT limbs (classic fill, or a streamed build that filled then
+        // failed). Canonicalize once, as a wrapper around the routing
+        // function, so a future early return cannot skip the fold.
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        if let ColumnStore::Shared(ref shared) = columns {
+            shared.canonicalize_in_place();
+        }
+
         // CPU fallback. The leaves are already in memory as natural-order
         // columns, so the row-major bit-reversed matrix the hashing wants is
         // pure data movement: the materializing path below writes every leaf

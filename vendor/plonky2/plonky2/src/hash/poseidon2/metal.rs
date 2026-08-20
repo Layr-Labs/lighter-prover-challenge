@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::{size_of, size_of_val};
 use core::slice;
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "c988fb939d0810d9a7b447b38ccf16a9d69294fa1dac4df701010f381ec232a6";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -1019,6 +1019,32 @@ impl<F: RichField> MetalColumns<F> {
         // handle was returned and never mutated afterwards.
         unsafe {
             slice::from_raw_parts((self.base as *const F).add(j * self.rows), self.rows)
+        }
+    }
+
+    /// One `if w >= p { w -= p }` fold, which is the body of Goldilocks
+    /// `to_canonical_u64`. The GPU absorb/hash path leaves the retained LDE
+    /// as FFT representatives; when that build declines, CPU Merkle hashing
+    /// still reads this buffer, and `poseidon2_gate_quotient` takes wire and
+    /// constant RHS as canonical. Folding here closes that hole. Idempotent:
+    /// any `u64 >= p` lands in `[0, 2^32-2]` after one subtraction.
+    pub(crate) fn canonicalize_in_place(&self) {
+        const P: u64 = 0xffff_ffff_0000_0001;
+        if F::ORDER != P {
+            return;
+        }
+        let n = self.rows.saturating_mul(self.cols);
+        let ptr = self.base as *mut u64;
+        // SAFETY: the decline-path caller holds the retained store; CPU Merkle
+        // is about to read every limb. `F` is the Goldilocks u64 wrapper.
+        unsafe {
+            for i in 0..n {
+                let slot = ptr.add(i);
+                let w = *slot;
+                if w >= P {
+                    *slot = w - P;
+                }
+            }
         }
     }
 
@@ -2630,7 +2656,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            // Absorb-only occupancy: 256 default; leaf/parent stay on `dispatch` (128).
+            dispatch_hash(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2692,6 +2719,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
+        // Post-fill failure: the retained store already holds FFT limbs and
+        // `shared_columns()` will hand them to the quotient kernels. Fold
+        // now so the CPU Merkle fallback and `poseidon2_gate_quotient` see
+        // canonical representatives. Earlier `None` returns in this function
+        // happen before any fill.
+        columns.canonicalize_in_place();
         return None;
     }
 
@@ -4453,15 +4486,37 @@ fn dispatch2d(
     );
 }
 
-fn dispatch(
+/// Threadgroup cap for streamed `poseidon2_absorb_pass` only.
+///
+/// Quotient kernels stay on [`dispatch`]'s 128 clamp: they are the high-register
+/// ALU path. Leaf and parent hashing also stay at 128 after this account's
+/// `458be2b` (absorb+leaf+parent at 256) rejected at 32.082. The 236 ms serial
+/// wait inside wires commitment is the absorb family, not the parent ladder, so
+/// this bisect unclamps only that kernel. Default 256 is the geometry that
+/// printed official 32.973 (`75e59a0`). 512 (`8ac9b2f`) printed 32.193 and is
+/// not retried as the default. `LIGHTER_HASH_TG=128` restores the tip;
+/// `LIGHTER_HASH_TG=512` / `1024` remain available for an isolated retry.
+fn hash_threadgroup_cap() -> u64 {
+    static CAP: OnceLock<u64> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("LIGHTER_HASH_TG")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| (32..=1024).contains(&n) && n.is_power_of_two())
+            .unwrap_or(256)
+    })
+}
+
+fn dispatch_with_group_cap(
     encoder: &metal::ComputeCommandEncoderRef,
     pipeline: &ComputePipelineState,
     thread_count: usize,
+    group_cap: u64,
 ) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(group_cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -4475,6 +4530,22 @@ fn dispatch(
             depth: 1,
         },
     );
+}
+
+fn dispatch_hash(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
+}
+
+fn dispatch(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
 }
 
 /// Copies the GPU's level-order node array (leaf digests first, cap level
@@ -4564,7 +4635,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::{Field64, PrimeField64};
+    use crate::field::types::{Field, Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
@@ -5212,6 +5283,43 @@ mod tests {
                     expected.to_canonical_u64(),
                     "Poseidon2 gate quotient mismatch at word {i}, step {step}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn declined_shared_build_leaves_the_retained_store_canonical() {
+        type F = GoldilocksField;
+        let context = shared_context().expect("Metal context must initialize");
+        let mut columns = context
+            .allocate_columns::<F>(8, 4)
+            .expect("column store must allocate");
+        {
+            let mut slots = columns.columns_mut().expect("a fresh handle is unique");
+            let mut i = 0u64;
+            for column in slots.iter_mut() {
+                for value in column.iter_mut() {
+                    *value = F::from_noncanonical_u64(match i % 3 {
+                        0 => F::ORDER,
+                        1 => F::ORDER + 1,
+                        _ => u64::MAX,
+                    });
+                    i += 1;
+                }
+            }
+        }
+        columns.canonicalize_in_place();
+        for j in 0..4 {
+            for &value in columns.col(j) {
+                let raw = value.to_noncanonical_u64();
+                assert!(raw < F::ORDER, "limb {raw} still >= p");
+                assert_eq!(raw, value.to_canonical_u64());
+            }
+        }
+        columns.canonicalize_in_place();
+        for j in 0..4 {
+            for &value in columns.col(j) {
+                assert!(value.to_noncanonical_u64() < F::ORDER);
             }
         }
     }
