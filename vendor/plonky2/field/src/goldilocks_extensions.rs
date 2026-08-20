@@ -752,6 +752,109 @@ pub fn ext2_fri_fold_arity16_batch(
     }
 }
 
+type Ext2BaseScalarSlotDescriptor<'a> =
+    (&'a [GoldilocksField], QuadraticExtension<GoldilocksField>);
+
+#[inline(always)]
+fn ext2_base_scalar_dot_slot(
+    index: usize,
+    full: &[Ext2BaseScalarSlotDescriptor<'_>],
+    partial: &[Ext2BaseScalarSlotDescriptor<'_>],
+) -> QuadraticExtension<GoldilocksField> {
+    let (mut lo0, mut hi0) = (0u128, 0u32);
+    let (mut lo1, mut hi1) = (0u128, 0u32);
+    for &(p, QuadraticExtension([b0, b1])) in full {
+        // SAFETY: every slice in `full` covers the complete output range.
+        let c = unsafe { p.get_unchecked(index).0 };
+        u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+        u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+    }
+    for &(p, QuadraticExtension([b0, b1])) in partial {
+        if index < p.len() {
+            let c = p[index].0;
+            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+        }
+    }
+    // SAFETY: callers enforce the descriptor-count bound documented on
+    // `ext2_base_scalar_dot_slots`.
+    QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
+        reduce160(lo1, hi1)
+    }])
+}
+
+/// Add the products for two adjacent coefficient slots to two independent
+/// accumulators. The Apple path reuses the paired scalar-multiply block used by
+/// arity-16 FRI rows; the portable spelling exists only so the exact paired
+/// algorithm can be differential-tested on non-Apple development hosts.
+#[cfg(any(test, all(target_arch = "aarch64", target_vendor = "apple")))]
+#[inline(always)]
+fn u160_add_adjacent_products(
+    lo0: &mut u128,
+    hi0: &mut u32,
+    coefficient0: u64,
+    lo1: &mut u128,
+    hi1: &mut u32,
+    coefficient1: u64,
+    power: u64,
+) {
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    u160_add_product_pair(lo0, hi0, power, coefficient0, lo1, hi1, power, coefficient1);
+    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    {
+        u160_add_product(lo0, hi0, power, coefficient0);
+        u160_add_product(lo1, hi1, power, coefficient1);
+    }
+}
+
+#[cfg(any(test, all(target_arch = "aarch64", target_vendor = "apple")))]
+#[inline(always)]
+fn ext2_base_scalar_dot_dense_pair(
+    index: usize,
+    full: &[Ext2BaseScalarSlotDescriptor<'_>],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    let (mut slot0_lo0, mut slot0_hi0) = (0u128, 0u32);
+    let (mut slot0_lo1, mut slot0_hi1) = (0u128, 0u32);
+    let (mut slot1_lo0, mut slot1_hi0) = (0u128, 0u32);
+    let (mut slot1_lo1, mut slot1_hi1) = (0u128, 0u32);
+
+    for &(p, QuadraticExtension([b0, b1])) in full {
+        // SAFETY: this helper is called only for a two-slot chunk, and every
+        // descriptor in `full` covers the complete parent output range.
+        let c0 = unsafe { p.get_unchecked(index).0 };
+        let c1 = unsafe { p.get_unchecked(index + 1).0 };
+        u160_add_adjacent_products(
+            &mut slot0_lo0,
+            &mut slot0_hi0,
+            c0,
+            &mut slot1_lo0,
+            &mut slot1_hi0,
+            c1,
+            b0.0,
+        );
+        u160_add_adjacent_products(
+            &mut slot0_lo1,
+            &mut slot0_hi1,
+            c0,
+            &mut slot1_lo1,
+            &mut slot1_hi1,
+            c1,
+            b1.0,
+        );
+    }
+
+    // SAFETY: these are the same bounded descriptor sums as two independent
+    // calls to `ext2_base_scalar_dot_slot`; only their instructions interleave.
+    [
+        QuadraticExtension([unsafe { reduce160(slot0_lo0, slot0_hi0) }, unsafe {
+            reduce160(slot0_lo1, slot0_hi1)
+        }]),
+        QuadraticExtension([unsafe { reduce160(slot1_lo0, slot1_hi0) }, unsafe {
+            reduce160(slot1_lo1, slot1_hi1)
+        }]),
+    ]
+}
+
 /// For each output slot `i`, compute
 /// `out[i] = sum_j powers[j].scalar_mul(polys[j][start + i])`
 /// over every polynomial long enough to reach that slot, delaying modular
@@ -799,29 +902,30 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
+
+    // Production's wide zeta batch is dense and contains hundreds of
+    // descriptors. On Apple AArch64, consume two adjacent coefficient slots
+    // while each descriptor and coefficient cache line is live. Four exact
+    // accumulators preserve each slot's descriptor order and reduction input.
+    // Ragged batches, narrow batches, odd tails and every non-Apple target keep
+    // the scalar path below verbatim.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    if partial.is_empty() && full.len() > 16 {
+        let paired_len = out.len() & !1;
+        let mut pairs = out.chunks_exact_mut(2);
+        for (pair_index, pair) in pairs.by_ref().enumerate() {
+            let [slot0, slot1] = ext2_base_scalar_dot_dense_pair(pair_index * 2, &full);
+            pair[0] = slot0;
+            pair[1] = slot1;
+        }
+        if let Some(tail) = pairs.into_remainder().first_mut() {
+            *tail = ext2_base_scalar_dot_slot(paired_len, &full, &partial);
+        }
+        return;
+    }
+
     for (i, o) in out.iter_mut().enumerate() {
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
-            // SAFETY: every slice in `full` has length exactly `out.len()`.
-            let c = unsafe { p.get_unchecked(i).0 };
-            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
-        }
-        for &(p, QuadraticExtension([b0, b1])) in &partial {
-            if i < p.len() {
-                let c = p[i].0;
-                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
-            }
-        }
-        // SAFETY: the accumulator bound documented above — below
-        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
-        // precondition.
-        *o = QuadraticExtension([
-            unsafe { reduce160(lo0, hi0) },
-            unsafe { reduce160(lo1, hi1) },
-        ]);
+        *o = ext2_base_scalar_dot_slot(i, &full, &partial);
     }
 }
 
@@ -1195,6 +1299,142 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 #[cfg(test)]
 mod dot_slot_coverage_tests {
     use super::*;
+    use crate::types::Field64;
+
+    fn scalar_dot_slots_reference(
+        start: usize,
+        len: usize,
+        polys: &[&[GoldilocksField]],
+        powers: &[QuadraticExtension<GoldilocksField>],
+    ) -> Vec<QuadraticExtension<GoldilocksField>> {
+        (0..len)
+            .map(|slot| {
+                let (mut lo0, mut hi0) = (0u128, 0u32);
+                let (mut lo1, mut hi1) = (0u128, 0u32);
+                for (&poly, &QuadraticExtension([b0, b1])) in polys.iter().zip(powers) {
+                    if let Some(c) = poly.get(start + slot) {
+                        u160_add_product(&mut lo0, &mut hi0, b0.0, c.0);
+                        u160_add_product(&mut lo1, &mut hi1, b1.0, c.0);
+                    }
+                }
+                QuadraticExtension([unsafe { reduce160(lo0, hi0) }, unsafe {
+                    reduce160(lo1, hi1)
+                }])
+            })
+            .collect()
+    }
+
+    fn assert_raw_slots_eq(
+        actual: &[QuadraticExtension<GoldilocksField>],
+        expected: &[QuadraticExtension<GoldilocksField>],
+        context: &str,
+    ) {
+        assert_eq!(actual.len(), expected.len(), "length mismatch: {context}");
+        for (slot, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            for limb in 0..2 {
+                assert_eq!(
+                    actual.0[limb].0, expected.0[limb].0,
+                    "raw mismatch at slot {slot} limb {limb}: {context}"
+                );
+            }
+        }
+    }
+
+    /// Raw-representative differential for the Apple adjacent-slot algorithm.
+    /// The direct helper runs on every development host (using the portable
+    /// pair spelling off Apple), while the public dispatch additionally covers
+    /// the exact 16/17-descriptor threshold on Apple builds. Dense even and odd
+    /// ranges include a nonzero start and adversarial raw field representatives.
+    #[test]
+    fn paired_dot_slots_match_scalar_raw_for_dense_inputs() {
+        let p = GoldilocksField::ORDER;
+        let raw = [0, 1, p - 1, p, p + 1, u64::MAX];
+        for descriptor_count in [16usize, 17, 32] {
+            for (start, len) in [(0usize, 4usize), (3, 4), (3, 5)] {
+                let poly_len = start + len + 2;
+                let owned: Vec<Vec<GoldilocksField>> = (0..descriptor_count)
+                    .map(|descriptor| {
+                        (0..poly_len)
+                            .map(|slot| {
+                                GoldilocksField(
+                                    raw[(descriptor * 3 + slot * 5) % raw.len()]
+                                        .wrapping_add((descriptor as u64).rotate_left(17)),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let polys: Vec<&[GoldilocksField]> = owned.iter().map(Vec::as_slice).collect();
+                let powers: Vec<QuadraticExtension<GoldilocksField>> = (0..descriptor_count)
+                    .map(|descriptor| {
+                        QuadraticExtension([
+                            GoldilocksField(raw[(descriptor * 2) % raw.len()]),
+                            GoldilocksField(raw[(descriptor * 2 + 1) % raw.len()]),
+                        ])
+                    })
+                    .collect();
+                let context =
+                    format!("dense descriptors={descriptor_count} start={start} len={len}");
+                let expected = scalar_dot_slots_reference(start, len, &polys, &powers);
+
+                let mut dispatched = vec![QuadraticExtension::ZERO; len];
+                ext2_base_scalar_dot_slots(&mut dispatched, start, &polys, &powers);
+                assert_raw_slots_eq(&dispatched, &expected, &context);
+
+                let end = start + len;
+                let full: Vec<Ext2BaseScalarSlotDescriptor<'_>> = polys
+                    .iter()
+                    .zip(&powers)
+                    .map(|(&poly, &power)| (&poly[start..end], power))
+                    .collect();
+                let paired_len = len & !1;
+                let mut direct = Vec::with_capacity(len);
+                for index in (0..paired_len).step_by(2) {
+                    direct.extend_from_slice(&ext2_base_scalar_dot_dense_pair(index, &full));
+                }
+                if paired_len != len {
+                    direct.push(ext2_base_scalar_dot_slot(paired_len, &full, &[]));
+                }
+                assert_raw_slots_eq(&direct, &expected, &context);
+            }
+        }
+    }
+
+    /// Any boundary-length descriptor keeps the production dispatch on the
+    /// historical scalar path, even when more than sixteen other descriptors
+    /// are dense. This covers descriptors ending before, inside and after the
+    /// requested range and checks their exact raw accumulator result.
+    #[test]
+    fn wide_ragged_dot_slots_preserve_scalar_raw_path() {
+        let p = GoldilocksField::ORDER;
+        let raw = [0, 1, p - 1, p, p + 1, u64::MAX];
+        let start = 3usize;
+        let len = 5usize;
+        let mut lengths = vec![start + len + 2; 20];
+        lengths.extend([start - 1, start, start + 1, start + len - 1]);
+        let owned: Vec<Vec<GoldilocksField>> = lengths
+            .iter()
+            .enumerate()
+            .map(|(descriptor, &poly_len)| {
+                (0..poly_len)
+                    .map(|slot| GoldilocksField(raw[(descriptor + slot * 3) % raw.len()]))
+                    .collect()
+            })
+            .collect();
+        let polys: Vec<&[GoldilocksField]> = owned.iter().map(Vec::as_slice).collect();
+        let powers: Vec<QuadraticExtension<GoldilocksField>> = (0..owned.len())
+            .map(|descriptor| {
+                QuadraticExtension([
+                    GoldilocksField(raw[(descriptor * 5) % raw.len()]),
+                    GoldilocksField(raw[(descriptor * 5 + 1) % raw.len()]),
+                ])
+            })
+            .collect();
+        let expected = scalar_dot_slots_reference(start, len, &polys, &powers);
+        let mut actual = vec![QuadraticExtension::ZERO; len];
+        ext2_base_scalar_dot_slots(&mut actual, start, &polys, &powers);
+        assert_raw_slots_eq(&actual, &expected, "wide ragged fallback");
+    }
 
     /// Q4: the composition accumulator is allocated uninitialized because
     /// `ext2_base_scalar_dot_slots` assigns *every* output slot. Poison the
