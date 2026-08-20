@@ -390,7 +390,38 @@ inline void mat4(thread lazy_t* values) {
     values[3] = lazy_add(lazy_add(lazy_add(total, x3), x0), x0);
 }
 
+inline void external_linear_layer_from_lazy(
+    thread lazy_t lazy[12],
+    thread ulong state[12]) {
+    mat4(lazy);
+    mat4(lazy + 4);
+    mat4(lazy + 8);
+
+    lazy_t sums[4];
+    for (uint i = 0; i < 4; ++i) {
+        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+    }
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = lazy_materialize(lazy_add(lazy[i], sums[i & 3]));
+    }
+}
+
 inline void external_linear_layer(thread ulong state[12]) {
+    lazy_t lazy[12];
+    for (uint i = 0; i < 12; ++i) {
+        lazy[i] = lazy_of(state[i]);
+    }
+    external_linear_layer_from_lazy(lazy, state);
+}
+
+// Projects the external matrix onto the sponge capacity. A following full
+// rate-8 absorb overwrites lanes 0..7 before they can be observed, so those
+// eight materializations are dead at that pass boundary. The three mat4s and
+// four cross-block sums remain identical to the full layer; lanes 8..11 are
+// therefore bit-for-bit the same representatives it would have produced.
+inline void external_linear_layer_capacity_lazy(
+    thread ulong state[12],
+    thread lazy_t capacity[4]) {
     lazy_t lazy[12];
     for (uint i = 0; i < 12; ++i) {
         lazy[i] = lazy_of(state[i]);
@@ -403,8 +434,37 @@ inline void external_linear_layer(thread ulong state[12]) {
     for (uint i = 0; i < 4; ++i) {
         sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
     }
+    for (uint i = 0; i < 4; ++i) {
+        capacity[i] = lazy_add(lazy[i + 8], sums[i]);
+    }
+}
+
+inline void external_linear_layer_capacity(thread ulong state[12]) {
+    lazy_t capacity[4];
+    external_linear_layer_capacity_lazy(state, capacity);
+    for (uint i = 0; i < 4; ++i) {
+        state[i + 8] = lazy_materialize(capacity[i]);
+    }
+}
+
+// Projects the same matrix onto the four digest lanes. Leaf and parent
+// kernels observe no other lane after their final permutation, so reducing
+// lanes 4..11 would be dead work.
+inline void external_linear_layer_digest(thread ulong state[12]) {
+    lazy_t lazy[12];
     for (uint i = 0; i < 12; ++i) {
-        state[i] = lazy_materialize(lazy_add(lazy[i], sums[i & 3]));
+        lazy[i] = lazy_of(state[i]);
+    }
+    mat4(lazy);
+    mat4(lazy + 4);
+    mat4(lazy + 8);
+
+    lazy_t sums[4];
+    for (uint i = 0; i < 4; ++i) {
+        sums[i] = lazy_add(lazy_add(lazy[i], lazy[i + 4]), lazy[i + 8]);
+    }
+    for (uint i = 0; i < 4; ++i) {
+        state[i] = lazy_materialize(lazy_add(lazy[i], sums[i]));
     }
 }
 
@@ -442,9 +502,11 @@ inline void internal_linear_layer(thread ulong state[12]) {
 // Parameter buffer remains in the ABI for host binding; sponge arithmetic uses
 // compile-time constant tables so RC adds do not depend on device buffer loads.
 // Round loops stay compact (unlike full unroll) to preserve occupancy.
-inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
-    external_linear_layer(state);
-
+inline void poseidon2_rounds(
+    thread ulong state[12],
+    constant ulong* /*parameters*/,
+    uint output_mode,
+    thread lazy_t lazy_capacity[4]) {
     for (uint round = 0; round < 4; ++round) {
         for (uint i = 0; i < 12; ++i) {
             state[i] = pow7(gl_add_canonical_rhs(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
@@ -457,12 +519,60 @@ inline void poseidon2(thread ulong state[12], constant ulong* /*parameters*/) {
         internal_linear_layer(state);
     }
 
-    for (uint round = 4; round < 8; ++round) {
+    for (uint round = 4; round < 7; ++round) {
         for (uint i = 0; i < 12; ++i) {
             state[i] = pow7(gl_add_canonical_rhs(state[i], POSEIDON2_EXTERNAL_RC[round][i]));
         }
         external_linear_layer(state);
     }
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = pow7(gl_add_canonical_rhs(
+            state[i], POSEIDON2_EXTERNAL_RC[7][i]));
+    }
+    if (output_mode == 1u) {
+        external_linear_layer_capacity(state);
+    } else if (output_mode == 2u) {
+        external_linear_layer_digest(state);
+    } else if (output_mode == 3u) {
+        external_linear_layer_capacity_lazy(state, lazy_capacity);
+    } else {
+        external_linear_layer(state);
+    }
+}
+
+inline void poseidon2_with_output(
+    thread ulong state[12],
+    constant ulong* parameters,
+    uint output_mode,
+    thread lazy_t lazy_capacity[4]) {
+    external_linear_layer(state);
+    poseidon2_rounds(state, parameters, output_mode, lazy_capacity);
+}
+
+inline void poseidon2_with_lazy_capacity(
+    thread ulong state[12],
+    thread lazy_t capacity[4],
+    constant ulong* parameters,
+    uint output_mode,
+    thread lazy_t lazy_capacity[4]) {
+    lazy_t initial[12];
+    for (uint i = 0; i < 8; ++i) {
+        initial[i] = lazy_of(state[i]);
+    }
+    for (uint i = 0; i < 4; ++i) {
+        initial[i + 8] = capacity[i];
+    }
+    external_linear_layer_from_lazy(initial, state);
+    poseidon2_rounds(state, parameters, output_mode, lazy_capacity);
+}
+
+inline void poseidon2(
+    thread ulong state[12],
+    constant ulong* parameters,
+    uint output_mode) {
+    lazy_t unused_capacity[4];
+    poseidon2_with_output(
+        state, parameters, output_mode, unused_capacity);
 }
 
 inline ulong poseidon2_gate_wire(
@@ -666,24 +776,24 @@ kernel void permutation_quotient(
             (ulong)(sigma_start + j_start) * lde_rows + source_row];
         ulong beta_k0 = challenges[4u + j_start];
         ulong beta_k1 = challenges[4u + num_routed_wires + j_start];
-        ulong numerator0 = gl_add(gl_mul_add(beta_k0, x, wire), gamma0);
-        ulong denominator0 = gl_add(gl_mul_add(beta0, sigma, wire), gamma0);
-        ulong numerator1 = gl_add(gl_mul_add(beta_k1, x, wire), gamma1);
-        ulong denominator1 = gl_add(gl_mul_add(beta1, sigma, wire), gamma1);
+        ulong base0 = gl_add(wire, gamma0);
+        ulong base1 = gl_add(wire, gamma1);
+        ulong numerator0 = gl_mul_add(beta_k0, x, base0);
+        ulong denominator0 = gl_mul_add(beta0, sigma, base0);
+        ulong numerator1 = gl_mul_add(beta_k1, x, base1);
+        ulong denominator1 = gl_mul_add(beta1, sigma, base1);
         for (uint j = j_start + 1u; j < j_end; ++j) {
             wire = wires[(ulong)j * lde_rows + source_row];
             sigma = constants_sigmas[
                 (ulong)(sigma_start + j) * lde_rows + source_row];
             beta_k0 = challenges[4u + j];
             beta_k1 = challenges[4u + num_routed_wires + j];
-            numerator0 = gl_mul(
-                numerator0, gl_add(gl_mul_add(beta_k0, x, wire), gamma0));
-            denominator0 = gl_mul(
-                denominator0, gl_add(gl_mul_add(beta0, sigma, wire), gamma0));
-            numerator1 = gl_mul(
-                numerator1, gl_add(gl_mul_add(beta_k1, x, wire), gamma1));
-            denominator1 = gl_mul(
-                denominator1, gl_add(gl_mul_add(beta1, sigma, wire), gamma1));
+            base0 = gl_add(wire, gamma0);
+            base1 = gl_add(wire, gamma1);
+            numerator0 = gl_mul(numerator0, gl_mul_add(beta_k0, x, base0));
+            denominator0 = gl_mul(denominator0, gl_mul_add(beta0, sigma, base0));
+            numerator1 = gl_mul(numerator1, gl_mul_add(beta_k1, x, base1));
+            denominator1 = gl_mul(denominator1, gl_mul_add(beta1, sigma, base1));
         }
 
         uint previous_column0 = chunk == 0u ? 0u : 1u + chunk;
@@ -1675,7 +1785,8 @@ kernel void poseidon2_hash_leaves(
         for (uint i = 0; i < chunk_size; ++i) {
             state[i] = gl_canonicalize(input[offset + i]);
         }
-        poseidon2(state, parameters);
+        uint final_chunk = (offset + chunk_size == leaf_width) ? 2u : 0u;
+        poseidon2(state, parameters, final_chunk);
     }
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
@@ -1798,7 +1909,8 @@ kernel void poseidon2_hash_leaves_colmajor(
         for (uint i = 0; i < chunk_size; ++i) {
             state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
         }
-        poseidon2(state, parameters);
+        uint final_chunk = (offset + chunk_size == leaf_width) ? 2u : 0u;
+        poseidon2(state, parameters, final_chunk);
     }
     for (uint i = 0; i < 4; ++i) {
         output[i] = gl_canonicalize(state[i]);
@@ -1820,7 +1932,7 @@ kernel void poseidon2_hash_parents(
     for (uint i = 0; i < 8; ++i) {
         state[i] = input[i];
     }
-    poseidon2(state, parameters);
+    poseidon2(state, parameters, 2u);
 
     device ulong* output = parents + (ulong)gid * 4;
     for (uint i = 0; i < 4; ++i) {
@@ -1847,20 +1959,47 @@ kernel void poseidon2_absorb_pass(
     constant uint& chunk_size [[buffer(7)]],
     constant uint& first_pass [[buffer(8)]],
     constant uint& final_pass [[buffer(9)]],
+    constant uint& next_pass_full [[buffer(10)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
     }
     ulong st[12] = { 0 };
+    lazy_t input_capacity[4];
+    bool lazy_capacity_input = first_pass == 0u && chunk_size == 8u;
     if (first_pass == 0u) {
-        for (uint i = 0; i < 12; ++i) {
-            st[i] = state[(ulong)i * leaf_count + gid];
+        if (lazy_capacity_input) {
+            // Full passes consume the previous capacity before any other lane
+            // is observed. Keep its carry-free matrix output split across the
+            // boundary and feed it directly into this pass's initial matrix.
+            for (uint i = 0; i < 4; ++i) {
+                input_capacity[i] = {
+                    state[(ulong)i * leaf_count + gid],
+                    state[(ulong)(i + 4) * leaf_count + gid],
+                };
+            }
+        } else {
+            // A short final pass retains untouched rate lanes and therefore
+            // reloads the complete prior state.
+            for (uint i = 0; i < 12; ++i) {
+                st[i] = state[(ulong)i * leaf_count + gid];
+            }
         }
     }
     for (uint i = 0; i < chunk_size; ++i) {
         st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
     }
-    poseidon2(st, parameters);
+    uint output_mode = final_pass != 0u
+        ? 2u
+        : ((next_pass_full != 0u) ? 3u : 0u);
+    lazy_t output_capacity[4];
+    if (lazy_capacity_input) {
+        poseidon2_with_lazy_capacity(
+            st, input_capacity, parameters, output_mode, output_capacity);
+    } else {
+        poseidon2_with_output(
+            st, parameters, output_mode, output_capacity);
+    }
     if (final_pass != 0u) {
         uint out_row = log_leaf_count == 0
             ? gid
@@ -1868,6 +2007,11 @@ kernel void poseidon2_absorb_pass(
         device ulong* output = hashes + (ulong)out_row * 4;
         for (uint i = 0; i < 4; ++i) {
             output[i] = gl_canonicalize(st[i]);
+        }
+    } else if (next_pass_full != 0u) {
+        for (uint i = 0; i < 4; ++i) {
+            state[(ulong)i * leaf_count + gid] = output_capacity[i].lo;
+            state[(ulong)(i + 4) * leaf_count + gid] = output_capacity[i].hi;
         }
     } else {
         for (uint i = 0; i < 12; ++i) {
