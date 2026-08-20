@@ -2,6 +2,8 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use core::any::TypeId;
 use core::cmp::min;
 
 use anyhow::{ensure, Result};
@@ -11,6 +13,8 @@ use plonky2_maybe_rayon::*;
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -521,6 +525,22 @@ where
     })
 }
 
+/// The four-lane permutation recurrence is intentionally ranked to the one
+/// production tuple whose lane layout and chunking were screened in release
+/// assembly. Every other configuration retains the scalar general path.
+#[inline]
+const fn use_four_lane_permutation_recurrence(
+    num_challenges: usize,
+    quotient_degree_factor: usize,
+    num_routed_wires: usize,
+    packing_width: usize,
+) -> bool {
+    num_challenges == 2
+        && quotient_degree_factor == 8
+        && num_routed_wires == 80
+        && packing_width == 4
+}
+
 /// Compute the partial products used in the `Z` polynomials.
 fn all_wires_permutation_partial_products<
     F: RichField + Extendable<D>,
@@ -538,11 +558,15 @@ fn all_wires_permutation_partial_products<
     let num_routed_wires = common_data.config.num_routed_wires;
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    // Production runs two challenges, and `MatrixWitness` is column-major, so
-    // the per-challenge loop below streams the whole witness and sigma matrices
-    // twice with no reuse between the passes. Fuse the two challenges into one
-    // traversal; every other configuration keeps the general path unchanged.
-    if num_challenges == 2 {
+    // Only the screened production tuple enters the four-lane fused traversal.
+    // Challenges, quotient chunking, routed widths, and preferred packings outside
+    // this exact tuple retain the established independent scalar calls below.
+    if use_four_lane_permutation_recurrence(
+        num_challenges,
+        common_data.quotient_degree_factor,
+        num_routed_wires,
+        <<F as Packable>::Packing as PackedField>::WIDTH,
+    ) {
         PAIRED_PERMUTATION_BATCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         return two_challenge_wires_permutation_partial_products_and_zs(
             witness,
@@ -567,10 +591,9 @@ fn all_wires_permutation_partial_products<
         .collect()
 }
 
-/// Process-wide count of permutation batches that took the fused
-/// two-challenge path. A nonzero count is the proof that the production
-/// configuration (`num_challenges == 2`) really dispatches to the fused
-/// traversal rather than the general per-challenge loop; one relaxed
+/// Process-wide count of permutation batches that took the exact ranked
+/// four-lane path. A nonzero count proves that production really dispatches to
+/// the packed traversal rather than the general per-challenge loop; one relaxed
 /// increment per proof, off any inner loop.
 static PAIRED_PERMUTATION_BATCHES: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
@@ -643,6 +666,267 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// inversion batch in the same push order, and its own Z chain. Only the
 /// memory traversal and the Rayon scheduling are shared, so every output limb
 /// is bit-identical to running the per-challenge path twice.
+#[allow(clippy::too_many_arguments)]
+fn fill_two_challenge_quotient_chunk_products<
+    F: Field,
+    const FOUR_LANE: bool,
+>(
+    witness: &MatrixWitness<F>,
+    subgroup: &[F],
+    sigmas: &[Vec<F>],
+    fixed_routed_wires: &[u8],
+    beta_k_is_0: &[F],
+    beta_k_is_1: &[F],
+    beta_0: F,
+    beta_1: F,
+    gamma_0: F,
+    gamma_1: F,
+    degree: usize,
+    num_routed_wires: usize,
+    num_chunks: usize,
+    product_slots_0: &mut [core::mem::MaybeUninit<F>],
+    product_slots_1: &mut [core::mem::MaybeUninit<F>],
+) {
+    type Packing<T> = <T as Packable>::Packing;
+    const INV_BATCH: usize = 128;
+
+    if FOUR_LANE {
+        debug_assert_eq!(Packing::<F>::WIDTH, 4);
+        debug_assert_eq!(degree, 8);
+        debug_assert_eq!(num_routed_wires, 80);
+    }
+
+    product_slots_0
+        .par_chunks_mut(INV_BATCH * num_chunks)
+        .zip(product_slots_1.par_chunks_mut(INV_BATCH * num_chunks))
+        .zip(subgroup.par_chunks(INV_BATCH))
+        .enumerate()
+        .for_each_init(
+            || {
+                (
+                    Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                    Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                )
+            },
+            |scratch, (chunk_idx, ((products_0, products_1), xs))| {
+                let batch_base = chunk_idx * INV_BATCH;
+                let (denominators, denominator_inverses) = scratch;
+                denominators.clear();
+                for (t, &x) in xs.iter().enumerate() {
+                    let i = batch_base + t;
+                    let s_sigmas = &sigmas[i];
+                    let routed_base = i * num_routed_wires;
+
+                    if FOUR_LANE {
+                        for chunk in 0..num_chunks {
+                            let start = chunk * degree;
+                            let end = min(start + degree, num_routed_wires);
+                            // Lanes are deliberately challenge-major within kind:
+                            // [numerator 0, numerator 1, denominator 0, denominator 1].
+                            // Each lane sees j in the same ascending order as the scalar
+                            // recurrence; packing only overlaps the four independent reductions.
+                            let mut products = Packing::<F>::ONES;
+                            for j in start..end {
+                                // A singleton routed copy component maps this position to itself:
+                                // sigma(i,j) = k_j * x. Its factors cancel symbolically, including
+                                // when both evaluate to zero. Keep the mask check before every
+                                // witness, sigma, x-shift, and packed operation.
+                                if fixed_routed_wire(fixed_routed_wires, routed_base + j) {
+                                    continue;
+                                }
+                                let wire_value = witness.get_wire(i, j);
+                                let sigma = s_sigmas[j];
+                                let base_0 = wire_value + gamma_0;
+                                let base_1 = wire_value + gamma_1;
+                                let bases = [base_0, base_1, base_0, base_1];
+                                let coefficients = [
+                                    beta_k_is_0[j],
+                                    beta_k_is_1[j],
+                                    beta_0,
+                                    beta_1,
+                                ];
+                                let scales = [x, x, sigma, sigma];
+                                let factors = Packing::<F>::from_slice(&bases)
+                                    .multiply_accumulate(
+                                        *Packing::<F>::from_slice(&coefficients),
+                                        *Packing::<F>::from_slice(&scales),
+                                    );
+                                products *= factors;
+                            }
+                            let lanes = products.as_slice();
+                            let output = t * num_chunks + chunk;
+                            products_0[output].write(lanes[0]);
+                            products_1[output].write(lanes[1]);
+                            // Preserve the established interleaved inversion push/extraction
+                            // order. Montgomery's trick is representation-sensitive.
+                            denominators.push(lanes[2]);
+                            denominators.push(lanes[3]);
+                        }
+                    } else {
+                        for chunk in 0..num_chunks {
+                            let start = chunk * degree;
+                            let end = min(start + degree, num_routed_wires);
+                            let mut numerator_0 = F::ONE;
+                            let mut numerator_1 = F::ONE;
+                            let mut denominator_0 = F::ONE;
+                            let mut denominator_1 = F::ONE;
+                            for j in start..end {
+                                if fixed_routed_wire(fixed_routed_wires, routed_base + j) {
+                                    continue;
+                                }
+                                let wire_value = witness.get_wire(i, j);
+                                let sigma = s_sigmas[j];
+                                let base_0 = wire_value + gamma_0;
+                                let base_1 = wire_value + gamma_1;
+                                // Fully qualified scalar operations are intentional: every
+                                // non-ranked tuple must retain the pre-packing recurrence.
+                                numerator_0 *= <F as Field>::multiply_accumulate(
+                                    &base_0,
+                                    beta_k_is_0[j],
+                                    x,
+                                );
+                                numerator_1 *= <F as Field>::multiply_accumulate(
+                                    &base_1,
+                                    beta_k_is_1[j],
+                                    x,
+                                );
+                                denominator_0 *= <F as Field>::multiply_accumulate(
+                                    &base_0,
+                                    beta_0,
+                                    sigma,
+                                );
+                                denominator_1 *= <F as Field>::multiply_accumulate(
+                                    &base_1,
+                                    beta_1,
+                                    sigma,
+                                );
+                            }
+                            let output = t * num_chunks + chunk;
+                            products_0[output].write(numerator_0);
+                            products_1[output].write(numerator_1);
+                            denominators.push(denominator_0);
+                            denominators.push(denominator_1);
+                        }
+                    }
+                }
+
+                // SAFETY: each `(t, chunk)` slot in both slices was initialized above.
+                let products_0 = unsafe {
+                    &mut *(products_0 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                };
+                let products_1 = unsafe {
+                    &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
+                };
+                F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
+                debug_assert_eq!(denominator_inverses.len(), 2 * products_0.len());
+                for ((product_0, product_1), inverses) in products_0
+                    .iter_mut()
+                    .zip(products_1.iter_mut())
+                    .zip(denominator_inverses.chunks_exact(2))
+                {
+                    *product_0 *= inverses[0];
+                    *product_1 *= inverses[1];
+                }
+            },
+        );
+}
+
+/// Produce the two interleaved-inversion quotient-product streams. Keeping this
+/// seam separate lets raw-word tests compare the packed and scalar recurrences
+/// before the common Z-chain helper could hide a mismatch.
+fn two_challenge_permutation_quotient_chunk_products<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    four_lane: bool,
+) -> (Vec<F>, Vec<F>) {
+    debug_assert_eq!(betas.len(), 2);
+    debug_assert_eq!(gammas.len(), 2);
+    let degree = common_data.quotient_degree_factor;
+    let subgroup = &prover_data.subgroup;
+    let num_routed_wires = common_data.config.num_routed_wires;
+    let num_chunks = common_data.num_partial_products + 1;
+    debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
+    debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
+    debug_assert!(
+        !four_lane
+            || use_four_lane_permutation_recurrence(
+                2,
+                degree,
+                num_routed_wires,
+                <<F as Packable>::Packing as PackedField>::WIDTH,
+            )
+    );
+    let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
+    let (beta_0, beta_1) = (betas[0], betas[1]);
+    let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+
+    let product_count = subgroup.len() * num_chunks;
+    let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
+    let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
+    {
+        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_0,
+            product_count,
+        );
+        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
+            &mut quotient_products_1,
+            product_count,
+        );
+        if four_lane {
+            fill_two_challenge_quotient_chunk_products::<F, true>(
+                witness,
+                subgroup,
+                &prover_data.sigmas,
+                &prover_data.fixed_routed_wires,
+                beta_k_is_0,
+                beta_k_is_1,
+                beta_0,
+                beta_1,
+                gamma_0,
+                gamma_1,
+                degree,
+                num_routed_wires,
+                num_chunks,
+                product_slots_0,
+                product_slots_1,
+            );
+        } else {
+            fill_two_challenge_quotient_chunk_products::<F, false>(
+                witness,
+                subgroup,
+                &prover_data.sigmas,
+                &prover_data.fixed_routed_wires,
+                beta_k_is_0,
+                beta_k_is_1,
+                beta_0,
+                beta_1,
+                gamma_0,
+                gamma_1,
+                degree,
+                num_routed_wires,
+                num_chunks,
+                product_slots_0,
+                product_slots_1,
+            );
+        }
+    }
+
+    // SAFETY: the parallel fill initialized and divided every slot in each buffer.
+    unsafe {
+        quotient_products_0.set_len(product_count);
+        quotient_products_1.set_len(product_count);
+    }
+    (quotient_products_0, quotient_products_1)
+}
+
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -655,133 +939,30 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
-    debug_assert_eq!(betas.len(), 2);
-    debug_assert_eq!(gammas.len(), 2);
-    let degree = common_data.quotient_degree_factor;
-    let subgroup = &prover_data.subgroup;
     let num_prods = common_data.num_partial_products;
-    let num_routed_wires = common_data.config.num_routed_wires;
-    let num_chunks = num_prods + 1;
-    debug_assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
-    debug_assert_eq!(beta_k_is.len(), 2 * num_routed_wires);
-    let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
-    let (beta_0, beta_1) = (betas[0], betas[1]);
-    let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
-
-    const INV_BATCH: usize = 128;
-    let product_count = subgroup.len() * num_chunks;
-    // Same uninitialised-capacity handling as the per-challenge path: every
-    // slot is written below before anything reads it, so zero-filling first is
-    // dead work (5.2 MiB of serial stores per challenge at the production
-    // shape).
-    let mut quotient_products_0: Vec<F> = Vec::with_capacity(product_count);
-    let mut quotient_products_1: Vec<F> = Vec::with_capacity(product_count);
-    {
-        let product_slots_0 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_0,
-            product_count,
+    let four_lane = use_four_lane_permutation_recurrence(
+        common_data.config.num_challenges,
+        common_data.quotient_degree_factor,
+        common_data.config.num_routed_wires,
+        <<F as Packable>::Packing as PackedField>::WIDTH,
+    );
+    let (quotient_products_0, quotient_products_1) =
+        two_challenge_permutation_quotient_chunk_products(
+            witness,
+            betas,
+            beta_k_is,
+            gammas,
+            prover_data,
+            common_data,
+            four_lane,
         );
-        let product_slots_1 = crate::hash::merkle_tree::capacity_up_to_mut(
-            &mut quotient_products_1,
-            product_count,
-        );
-        product_slots_0
-            .par_chunks_mut(INV_BATCH * num_chunks)
-            .zip(product_slots_1.par_chunks_mut(INV_BATCH * num_chunks))
-            .zip(subgroup.par_chunks(INV_BATCH))
-            .enumerate()
-            .for_each_init(
-                || {
-                    (
-                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
-                        Vec::with_capacity(2 * num_chunks * INV_BATCH),
-                    )
-                },
-                |scratch, (chunk_idx, ((products_0, products_1), xs))| {
-                    let base = chunk_idx * INV_BATCH;
-                    let (denominators, denominator_inverses) = scratch;
-                    denominators.clear();
-                    for (t, &x) in xs.iter().enumerate() {
-                        let i = base + t;
-                        let s_sigmas = &prover_data.sigmas[i];
-                        let routed_base = i * num_routed_wires;
-                        for chunk in 0..num_chunks {
-                            let start = chunk * degree;
-                            let end = min(start + degree, num_routed_wires);
-                            let mut numerator_0 = F::ONE;
-                            let mut numerator_1 = F::ONE;
-                            let mut denominator_0 = F::ONE;
-                            let mut denominator_1 = F::ONE;
-                            for j in start..end {
-                                // A singleton routed copy component maps this position to itself:
-                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
-                                // therefore identical for both challenges and cancel symbolically,
-                                // including when that common factor evaluates to zero. Check the
-                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
-                                if fixed_routed_wire(
-                                    &prover_data.fixed_routed_wires,
-                                    routed_base + j,
-                                ) {
-                                    continue;
-                                }
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
-                            }
-                            let output = t * num_chunks + chunk;
-                            products_0[output].write(numerator_0);
-                            products_1[output].write(numerator_1);
-                            denominators.push(denominator_0);
-                            denominators.push(denominator_1);
-                        }
-                    }
-                    // SAFETY: the loop above wrote every slot of both
-                    // sub-slices — `t` covers `0..xs.len()` and `chunk` covers
-                    // `0..num_chunks`, and each sub-slice length is exactly
-                    // `xs.len() * num_chunks` (the `zip`s pair each pair of
-                    // chunks with its own `xs`, so a short final chunk is still
-                    // covered exactly).
-                    let products_0 = unsafe {
-                        &mut *(products_0 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
-                    };
-                    let products_1 = unsafe {
-                        &mut *(products_1 as *mut [core::mem::MaybeUninit<F>] as *mut [F])
-                    };
-                    // Montgomery's trick pays for one ordinary inverse per
-                    // call. Interleave both challenges so this chunk pays it
-                    // once, while retaining each challenge's denominator and
-                    // quotient-product order.
-                    F::batch_multiplicative_inverse_into(denominators, denominator_inverses);
-                    debug_assert_eq!(denominator_inverses.len(), 2 * products_0.len());
-                    for ((product_0, product_1), inverses) in products_0
-                        .iter_mut()
-                        .zip(products_1.iter_mut())
-                        .zip(denominator_inverses.chunks_exact(2))
-                    {
-                        *product_0 *= inverses[0];
-                        *product_1 *= inverses[1];
-                    }
-                },
-            );
-    }
-
-    // SAFETY: the parallel pass above wrote and then divided every one of the
-    // `product_count` slots of both buffers; `par_chunks_mut` partitions each
-    // buffer exactly, so none is left uninitialized.
-    unsafe {
-        quotient_products_0.set_len(product_count);
-        quotient_products_1.set_len(product_count);
-    }
 
     // The final block's two independent Z chains each traverse 2^18 rows and
     // form `num_chunks` dependent products per row. They were run serially
     // after the parallel ratio pass even though this exclusive tail has no
     // competing proof work. Keep smaller transaction/chain proofs sequential
     // so the steady pipeline's Rayon demand and scheduling stay unchanged.
-    let (columns_0, columns_1) = if subgroup.len() >= 1 << 18 {
+    let (columns_0, columns_1) = if prover_data.subgroup.len() >= 1 << 18 {
         rayon::join(
             || z_polynomials_from_quotient_chunk_products(quotient_products_0, num_prods),
             || z_polynomials_from_quotient_chunk_products(quotient_products_1, num_prods),
@@ -859,8 +1040,17 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let base = wire_value + gamma;
+                            numerator_product *= <F as Field>::multiply_accumulate(
+                                &base,
+                                beta_k_is[j],
+                                x,
+                            );
+                            denominator_product *= <F as Field>::multiply_accumulate(
+                                &base,
+                                beta,
+                                s_sigmas[j],
+                            );
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -1603,9 +1793,56 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     low: &[F],
     odd: &[Vec<F>],
     filter_at: impl Fn(usize, usize) -> F,
-) {
+) -> bool {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
+    if TypeId::of::<F>() == TypeId::of::<crate::field::goldilocks_field::GoldilocksField>() {
+        use crate::field::extension::quadratic::NeonGoldilocksField;
+        use crate::field::goldilocks_field::GoldilocksField;
+
+        // SAFETY: the TypeId guard proves `F = GoldilocksField`; every cast
+        // keeps the original allocation, length, alignment and ownership.
+        let low = unsafe {
+            core::slice::from_raw_parts(low.as_ptr().cast::<GoldilocksField>(), low.len())
+        };
+        let acc = unsafe {
+            core::slice::from_raw_parts_mut(
+                chunk.as_mut_ptr().cast::<GoldilocksField>(),
+                chunk.len(),
+            )
+        };
+        for g in 0..num_gates {
+            let odd0 = unsafe {
+                core::slice::from_raw_parts(
+                    odd[g * 2].as_ptr().cast::<GoldilocksField>(),
+                    odd[g * 2].len(),
+                )
+            };
+            let odd1 = unsafe {
+                core::slice::from_raw_parts(
+                    odd[g * 2 + 1].as_ptr().cast::<GoldilocksField>(),
+                    odd[g * 2 + 1].len(),
+                )
+            };
+            let low_base = g * half_rows * 2;
+            for r in 0..rows {
+                let i = row0 + r;
+                let values = if i & 1 == 0 {
+                    let base = low_base + (i >> 1) * 2;
+                    NeonGoldilocksField([low[base], low[base + 1]])
+                } else {
+                    NeonGoldilocksField([odd0[i >> 1], odd1[i >> 1]])
+                };
+                let filter_f = filter_at(g, r);
+                let filter = unsafe { *(&filter_f as *const F).cast::<GoldilocksField>() };
+                let pair = NeonGoldilocksField([acc[2 * r], acc[2 * r + 1]]);
+                let updated = pair + values * filter;
+                acc[2 * r] = updated.0[0];
+                acc[2 * r + 1] = updated.0[1];
+            }
+        }
+        return true;
+    }
+
     for g in 0..num_gates {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
@@ -1619,11 +1856,11 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            chunk[2 * r] += filter * sv0;
+            chunk[2 * r + 1] += filter * sv1;
         }
     }
-    chunk.copy_from_slice(&acc);
+    false
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -1669,10 +1906,11 @@ fn combine_low_range_quotient<F: RichField>(
         })
         .map(|entry| entry.filters.as_slice());
 
-    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
-    // SAFETY: both disjoint parallel branches below write every output slot
-    // before the vector is returned, exactly as the pre-cache implementation.
-    unsafe { out.set_len(full_rows * 2) };
+    // Each chunk now accumulates directly into this initialized output. The
+    // previous helper allocated and zeroed a second chunk-sized `Vec`, then
+    // copied it over `out`; initializing once here deletes every per-chunk
+    // allocation and the full output copy without changing accumulation order.
+    let mut out = vec![F::ZERO; full_rows * 2];
     let num_gates = gates.len();
     if let Some(filters) = cached_filters {
         out.par_chunks_mut(2 * ROWS_PER_CHUNK)
@@ -3658,8 +3896,8 @@ mod quotient_layout_tests {
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
+        accumulate_low_range_quotient_chunk, combine_low_range_quotient,
+        gpu_poseidon_quotient_stats, LowDegreeRangeGate, COMPARE_GPU_QUOTIENT,
     };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64, PrimeField64};
@@ -3711,6 +3949,69 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn low_range_chunk_uses_paired_neon_and_preserves_raw_limbs() {
+        let rows = 19usize;
+        let half_rows = rows.div_ceil(2);
+        let num_gates = 3usize;
+        let edge = [
+            F::ZERO,
+            F::ONE,
+            F::from_noncanonical_u64(F::ORDER),
+            F::from_noncanonical_u64(F::ORDER + 1),
+            F::from_noncanonical_u64(u64::MAX),
+        ];
+        let value = |i: usize| edge[(i * 7 + 3) % edge.len()];
+        let low = (0..num_gates * half_rows * 2)
+            .map(value)
+            .collect::<Vec<_>>();
+        let odd = (0..num_gates * 2)
+            .map(|column| {
+                (0..half_rows)
+                    .map(|row| value(10_000 + column * half_rows + row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let filters = (0..num_gates * rows)
+            .map(|i| value(20_000 + i))
+            .collect::<Vec<_>>();
+
+        let mut expected = vec![F::ZERO; rows * 2];
+        for g in 0..num_gates {
+            for r in 0..rows {
+                let (sv0, sv1) = if r & 1 == 0 {
+                    let base = g * half_rows * 2 + (r >> 1) * 2;
+                    (low[base], low[base + 1])
+                } else {
+                    (odd[g * 2][r >> 1], odd[g * 2 + 1][r >> 1])
+                };
+                let filter = filters[g * rows + r];
+                expected[2 * r] += filter * sv0;
+                expected[2 * r + 1] += filter * sv1;
+            }
+        }
+
+        let mut actual = vec![F::ZERO; rows * 2];
+        let dispatched = accumulate_low_range_quotient_chunk(
+            &mut actual,
+            0,
+            half_rows,
+            num_gates,
+            &low,
+            &odd,
+            |g, r| filters[g * rows + r],
+        );
+        assert!(dispatched, "Goldilocks production path did not use paired NEON");
+        let raw = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(raw(&actual), raw(&expected));
     }
 
     /// Raw-limb differential and dispatch guard for the immutable low-range
@@ -4497,6 +4798,8 @@ mod l_0_table_tests {
 /// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
+    use crate::field::packable::Packable;
+    use crate::field::packed::PackedField;
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::iop::witness::MatrixWitness;
@@ -4506,8 +4809,10 @@ mod permutation_pairing_tests {
 
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
+        two_challenge_permutation_quotient_chunk_products,
         two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
+        use_four_lane_permutation_recurrence, wires_permutation_partial_products_and_zs,
+        z_polynomials_from_quotient_chunk_products,
     };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
@@ -4596,6 +4901,36 @@ mod permutation_pairing_tests {
             .collect()
     }
 
+    fn raw_values(values: &[F]) -> Vec<u64> {
+        values.iter().map(|v| v.to_noncanonical_u64()).collect()
+    }
+
+    #[test]
+    fn four_lane_dispatch_is_exactly_the_ranked_tuple() {
+        for num_challenges in [1usize, 2, 3] {
+            for quotient_degree_factor in [4usize, 8] {
+                for num_routed_wires in [79usize, 80, 81] {
+                    for packing_width in [1usize, 2, 4, 8] {
+                        let expected = num_challenges == 2
+                            && quotient_degree_factor == 8
+                            && num_routed_wires == 80
+                            && packing_width == 4;
+                        assert_eq!(
+                            use_four_lane_permutation_recurrence(
+                                num_challenges,
+                                quotient_degree_factor,
+                                num_routed_wires,
+                                packing_width,
+                            ),
+                            expected,
+                            "dispatch ({num_challenges}, {quotient_degree_factor}, {num_routed_wires}, {packing_width})",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Independent, deliberately naive reference: per-point chunk ratios with a
     /// *per-element* inverse (not Montgomery batch inversion) and the Z chain
     /// written out longhand. Compared by field value rather than by limb —
@@ -4664,6 +4999,8 @@ mod permutation_pairing_tests {
             data.common.config.num_challenges, 2,
             "the production config this graft targets"
         );
+        assert_eq!(degree, 8, "production quotient-degree factor");
+        assert_eq!(num_routed_wires, 80, "production routed-wire count");
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
@@ -4705,6 +5042,40 @@ mod permutation_pairing_tests {
 
             data.prover_only.subgroup = subgroup.clone();
             data.prover_only.sigmas = sigmas.clone();
+
+            // Compare immediately after the interleaved Montgomery inversion as well as after
+            // the Z chain below. This seam detects lane extraction or denominator-order errors
+            // which a later field-value-only comparison could obscure.
+            if <<F as Packable>::Packing as PackedField>::WIDTH == 4 {
+                let packed_products = two_challenge_permutation_quotient_chunk_products(
+                    &witness,
+                    &betas,
+                    &beta_k_is,
+                    &gammas,
+                    &data.prover_only,
+                    &data.common,
+                    true,
+                );
+                let scalar_products = two_challenge_permutation_quotient_chunk_products(
+                    &witness,
+                    &betas,
+                    &beta_k_is,
+                    &gammas,
+                    &data.prover_only,
+                    &data.common,
+                    false,
+                );
+                assert_eq!(
+                    raw_values(&packed_products.0),
+                    raw_values(&scalar_products.0),
+                    "challenge-0 quotient products at {n_points} points",
+                );
+                assert_eq!(
+                    raw_values(&packed_products.1),
+                    raw_values(&scalar_products.1),
+                    "challenge-1 quotient products at {n_points} points",
+                );
+            }
 
             // Reference: the general per-challenge loop, two complete passes.
             let general: Vec<Vec<PolynomialValues<F>>> = (0..2)
@@ -4756,10 +5127,16 @@ mod permutation_pairing_tests {
                 &data.common,
             );
             let after = paired_permutation_batch_count();
+            let exact_ranked_dispatch = use_four_lane_permutation_recurrence(
+                data.common.config.num_challenges,
+                degree,
+                num_routed_wires,
+                <<F as Packable>::Packing as PackedField>::WIDTH,
+            );
             assert_eq!(
                 after,
-                before + 1,
-                "dispatcher did not take the fused path at num_challenges = 2"
+                before + usize::from(exact_ranked_dispatch),
+                "dispatcher decision did not match the exact ranked tuple"
             );
             assert_eq!(
                 raw_limbs(&dispatched),
@@ -4930,6 +5307,207 @@ mod permutation_pairing_tests {
             );
             for column in 0..=num_prods {
                 assert_eq!(paired[challenge][column].values, reference[column]);
+            }
+        }
+    }
+
+    fn five_production_fixed_masks(n_points: usize, num_routed_wires: usize) -> [Vec<u8>; 5] {
+        let bit_len = n_points * num_routed_wires;
+        let byte_len = bit_len.div_ceil(8);
+        let clear = vec![0u8; byte_len];
+        let full = vec![u8::MAX; byte_len];
+
+        // Cross chunk (7/8), byte (7/8), row (79/80), and inversion-batch
+        // (127/128) boundaries without turning the mask into a regular stride.
+        let mut edges = vec![0u8; byte_len];
+        for row in [0usize, 1, 126, 127, 128, 129, n_points - 1] {
+            if row >= n_points {
+                continue;
+            }
+            for column in [0usize, 6, 7, 8, 9, 62, 63, 64, 71, 72, 78, 79] {
+                let index = row * num_routed_wires + column;
+                edges[index >> 3] |= 1 << (index & 7);
+            }
+        }
+
+        let striped = (0..byte_len)
+            .map(|i| [0x81, 0x42, 0x24, 0x18, 0xa5][i % 5])
+            .collect::<Vec<_>>();
+        let mut state = 0xd1b5_4a32_d192_ed03u64;
+        let random = (0..byte_len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect::<Vec<_>>();
+
+        [clear, full, edges, striped, random]
+    }
+
+    /// Five exact production-sized bitmap shapes exercise empty/full masks, every lane/chunk/byte
+    /// boundary, and irregular skip schedules. Packed and scalar recurrences are compared both
+    /// immediately after the shared interleaved inversion and across every Z/partial column.
+    #[test]
+    fn four_lane_production_masks_match_scalar_quotients_and_columns_raw() {
+        if <<F as Packable>::Packing as PackedField>::WIDTH != 4 {
+            // The exact dispatch test above proves this target takes the scalar fallback.
+            return;
+        }
+
+        let mut data = build_circuit();
+        let n_points = 256usize;
+        let num_routed_wires = data.common.config.num_routed_wires;
+        let degree = data.common.quotient_degree_factor;
+        let num_prods = data.common.num_partial_products;
+        assert_eq!(data.common.config.num_challenges, 2);
+        assert_eq!(degree, 8);
+        assert_eq!(num_routed_wires, 80);
+        assert!(use_four_lane_permutation_recurrence(2, degree, num_routed_wires, 4));
+
+        let mut rng = Rng::new(0xa59f_04a1_5eed_0001);
+        let mut subgroup = (0..n_points)
+            .map(|_| rng.next_field())
+            .collect::<Vec<_>>();
+        // Guaranteed raw-representation sentinels rather than relying on random coverage.
+        subgroup[0] = F::from_noncanonical_u64(F::ORDER);
+        subgroup[1] = F::from_noncanonical_u64(F::ORDER + 1);
+        subgroup[2] = F::from_noncanonical_u64(u64::MAX);
+        assert_eq!(subgroup[0].to_noncanonical_u64(), F::ORDER);
+        assert_eq!(subgroup[1].to_noncanonical_u64(), F::ORDER + 1);
+        assert_eq!(subgroup[2].to_noncanonical_u64(), u64::MAX);
+
+        let sigmas = (0..n_points)
+            .map(|_| {
+                (0..num_routed_wires)
+                    .map(|_| rng.next_field())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut witness = MatrixWitness {
+            wire_values: (0..num_routed_wires)
+                .map(|_| (0..n_points).map(|_| rng.next_field()).collect())
+                .collect(),
+        };
+        let betas = (0..2)
+            .map(|_| rng.next_nonzero_field())
+            .collect::<Vec<_>>();
+        let gammas = (0..2)
+            .map(|_| rng.next_nonzero_field())
+            .collect::<Vec<_>>();
+        let beta_k_is = betas
+            .iter()
+            .flat_map(|&beta| data.common.k_is.iter().map(move |&k_i| beta * k_i))
+            .collect::<Vec<_>>();
+
+        // No selected bitmap may expose a zero denominator. Repair all positions, including
+        // positions some masks skip, so every one of the five schedules is independently valid.
+        for i in 0..n_points {
+            for j in 0..num_routed_wires {
+                while betas.iter().zip(&gammas).any(|(&beta, &gamma)| {
+                    <F as Field>::multiply_accumulate(
+                        &(witness.get_wire(i, j) + gamma),
+                        beta,
+                        sigmas[i][j],
+                    )
+                    .is_zero()
+                }) {
+                    witness.wire_values[j][i] += F::ONE;
+                }
+            }
+        }
+        data.prover_only.subgroup = subgroup;
+        data.prover_only.sigmas = sigmas;
+
+        let masks = five_production_fixed_masks(n_points, num_routed_wires);
+        assert_eq!(masks.len(), 5);
+        for (mask_index, mask) in masks.into_iter().enumerate() {
+            assert_eq!(mask.len(), (n_points * num_routed_wires).div_ceil(8));
+            data.prover_only.fixed_routed_wires = mask;
+
+            let packed_products = two_challenge_permutation_quotient_chunk_products(
+                &witness,
+                &betas,
+                &beta_k_is,
+                &gammas,
+                &data.prover_only,
+                &data.common,
+                true,
+            );
+            let scalar_products = two_challenge_permutation_quotient_chunk_products(
+                &witness,
+                &betas,
+                &beta_k_is,
+                &gammas,
+                &data.prover_only,
+                &data.common,
+                false,
+            );
+            assert_eq!(
+                raw_values(&packed_products.0),
+                raw_values(&scalar_products.0),
+                "challenge-0 quotient products, mask {mask_index}",
+            );
+            assert_eq!(
+                raw_values(&packed_products.1),
+                raw_values(&scalar_products.1),
+                "challenge-1 quotient products, mask {mask_index}",
+            );
+
+            let packed_columns = vec![
+                z_polynomials_from_quotient_chunk_products(packed_products.0, num_prods),
+                z_polynomials_from_quotient_chunk_products(packed_products.1, num_prods),
+            ];
+            let scalar_columns = vec![
+                z_polynomials_from_quotient_chunk_products(scalar_products.0, num_prods),
+                z_polynomials_from_quotient_chunk_products(scalar_products.1, num_prods),
+            ];
+            assert_eq!(
+                raw_limbs(&packed_columns),
+                raw_limbs(&scalar_columns),
+                "Z/partial columns, mask {mask_index}",
+            );
+
+            let dispatched = two_challenge_wires_permutation_partial_products_and_zs(
+                &witness,
+                &betas,
+                &beta_k_is,
+                &gammas,
+                &data.prover_only,
+                &data.common,
+            );
+            assert_eq!(
+                raw_limbs(&dispatched),
+                raw_limbs(&packed_columns),
+                "ranked dispatch, mask {mask_index}",
+            );
+
+            if let Some(repetitions) = std::env::var("LIGHTER_PERMUTATION_MICRO_REPETITIONS")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| value > 0)
+            {
+                // Balanced scalar/packed/packed/scalar arms. Each arm owns all allocation,
+                // factor, inversion, and extraction work, and black_box retains the products.
+                for (arm, four_lane) in [false, true, true, false].into_iter().enumerate() {
+                    let start = std::time::Instant::now();
+                    for _ in 0..repetitions {
+                        std::hint::black_box(two_challenge_permutation_quotient_chunk_products(
+                            &witness,
+                            &betas,
+                            &beta_k_is,
+                            &gammas,
+                            &data.prover_only,
+                            &data.common,
+                            four_lane,
+                        ));
+                    }
+                    eprintln!(
+                        "permutation_micro mask={mask_index} arm={arm} four_lane={four_lane} repetitions={repetitions} elapsed_us={}",
+                        start.elapsed().as_micros(),
+                    );
+                }
             }
         }
     }
