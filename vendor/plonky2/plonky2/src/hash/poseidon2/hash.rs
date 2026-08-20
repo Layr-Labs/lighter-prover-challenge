@@ -448,6 +448,17 @@ pub trait Poseidon2: PrimeField64 {
 #[inline]
 #[unroll::unroll_for_loops]
 fn external_linear_layer_u128(state: &mut [u128; WIDTH]) {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if super::external_neon::enabled() {
+        super::external_neon::external_linear_layer_u128(state);
+        return;
+    }
+    external_linear_layer_u128_scalar(state);
+}
+
+#[inline]
+#[unroll::unroll_for_loops]
+fn external_linear_layer_u128_scalar(state: &mut [u128; WIDTH]) {
     // First, we apply M_4 to each consecutive four elements of the state.
     // In Appendix B's terminology, this replaces each x_i with x_i'.
     for i in (0..WIDTH).step_by(4) {
