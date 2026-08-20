@@ -381,29 +381,37 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     }
 
     /// Returns whether the slot at the given representative index has been set.
-    #[inline]
+    #[inline(always)]
     pub fn is_set_by_rep_index(&self, rep_index: usize) -> bool {
         (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0
     }
 
     #[inline]
+    #[inline(always)]
     fn mark_set(&mut self, rep_index: usize) {
         self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
     }
 
+    #[cold]
+    #[inline(never)]
+    fn set_twice_error(target: Target, old_value: F, value: F) -> anyhow::Error {
+        anyhow!(
+            "Partition containing {:?} was set twice with different values: {} != {}",
+            target,
+            old_value,
+            value
+        )
+    }
+
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
+    #[inline(always)]
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)] as usize;
         if self.is_set_by_rep_index(rep_index) {
             let old_value = self.values[rep_index];
             if value != old_value {
-                return Err(anyhow!(
-                    "Partition containing {:?} was set twice with different values: {} != {}",
-                    target,
-                    old_value,
-                    value
-                ));
+                return Err(Self::set_twice_error(target, old_value, value));
             }
 
             Ok(None)
