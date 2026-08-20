@@ -1593,7 +1593,10 @@ fn build_low_range_selector_filter_cache<F: RichField>(
     })
 }
 
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[cfg(any(
+    test,
+    all(feature = "std", target_arch = "aarch64", target_os = "macos")
+))]
 #[inline(always)]
 fn accumulate_low_range_quotient_chunk<F: RichField>(
     chunk: &mut [F],
@@ -1604,12 +1607,20 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     odd: &[Vec<F>],
     filter_at: impl Fn(usize, usize) -> F,
 ) {
-    let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
-    for g in 0..num_gates {
-        let odd0 = &odd[g * 2];
-        let odd1 = &odd[g * 2 + 1];
-        let low_base = g * half_rows * 2;
+    #[inline(always)]
+    fn apply_gate<F: RichField, const ASSIGN: bool>(
+        chunk: &mut [F],
+        row0: usize,
+        half_rows: usize,
+        gate: usize,
+        low: &[F],
+        odd: &[Vec<F>],
+        filter_at: &impl Fn(usize, usize) -> F,
+    ) {
+        let rows = chunk.len() / 2;
+        let odd0 = &odd[gate * 2];
+        let odd1 = &odd[gate * 2 + 1];
+        let low_base = gate * half_rows * 2;
         for r in 0..rows {
             let i = row0 + r;
             let (sv0, sv1) = if i & 1 == 0 {
@@ -1618,12 +1629,31 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
             } else {
                 (odd0[i >> 1], odd1[i >> 1])
             };
-            let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            let filter = filter_at(gate, r);
+            let term0 = filter * sv0;
+            let term1 = filter * sv1;
+            if ASSIGN {
+                chunk[2 * r] = term0;
+                chunk[2 * r + 1] = term1;
+            } else {
+                chunk[2 * r] += term0;
+                chunk[2 * r + 1] += term1;
+            }
         }
     }
-    chunk.copy_from_slice(&acc);
+
+    // Every output starts with the first gate's term instead of ZERO + term.
+    // Goldilocks addition preserves a right-hand representative when the left
+    // side is ZERO, so this is raw-limb identical while deleting the full
+    // chunk zero-fill and two additions per row.
+    if num_gates == 0 {
+        chunk.fill(F::ZERO);
+        return;
+    }
+    apply_gate::<F, true>(chunk, row0, half_rows, 0, low, odd, &filter_at);
+    for gate in 1..num_gates {
+        apply_gate::<F, false>(chunk, row0, half_rows, gate, low, odd, &filter_at);
+    }
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -1928,6 +1958,7 @@ pub fn range_quotient_microbench<
     }
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -3654,7 +3685,9 @@ mod quotient_layout_tests {
 
     use anyhow::Result;
 
-    use super::{precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS};
+    use super::{
+        accumulate_low_range_quotient_chunk, precomputed, BatchLayout, COMPARE_QUOTIENT_LAYOUTS,
+    };
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{
@@ -3711,6 +3744,81 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    /// In-place accumulation must remain raw-limb identical to the former
+    /// materialized accumulator, including noncanonical Goldilocks limbs.
+    #[test]
+    fn low_range_chunk_in_place_matches_materialized_acc() {
+        let rows = 19usize;
+        let half_rows = rows.div_ceil(2);
+        let num_gates = 3usize;
+        let edge = [
+            F::ZERO,
+            F::ONE,
+            F::from_noncanonical_u64(F::ORDER),
+            F::from_noncanonical_u64(F::ORDER + 1),
+            F::from_noncanonical_u64(u64::MAX),
+        ];
+        let value = |i: usize| edge[(i * 7 + 3) % edge.len()];
+        let low = (0..num_gates * half_rows * 2)
+            .map(value)
+            .collect::<Vec<_>>();
+        let odd = (0..num_gates * 2)
+            .map(|column| {
+                (0..half_rows)
+                    .map(|row| value(10_000 + column * half_rows + row))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let filters = (0..num_gates * rows)
+            .map(|i| value(20_000 + i))
+            .collect::<Vec<_>>();
+
+        let mut expected = vec![F::ZERO; rows * 2];
+        for g in 0..num_gates {
+            for r in 0..rows {
+                let (sv0, sv1) = if r & 1 == 0 {
+                    let base = g * half_rows * 2 + (r >> 1) * 2;
+                    (low[base], low[base + 1])
+                } else {
+                    (odd[g * 2][r >> 1], odd[g * 2 + 1][r >> 1])
+                };
+                let filter = filters[g * rows + r];
+                expected[2 * r] += filter * sv0;
+                expected[2 * r + 1] += filter * sv1;
+            }
+        }
+
+        let mut actual = vec![F::from_noncanonical_u64(F::ORDER + 99); rows * 2];
+        accumulate_low_range_quotient_chunk(
+            &mut actual,
+            0,
+            half_rows,
+            num_gates,
+            &low,
+            &odd,
+            |g, r| filters[g * rows + r],
+        );
+        let raw = |values: &[F]| {
+            values
+                .iter()
+                .map(PrimeField64::to_noncanonical_u64)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(raw(&actual), raw(&expected));
+
+        let mut no_gates = vec![F::from_noncanonical_u64(F::ORDER + 99); rows * 2];
+        accumulate_low_range_quotient_chunk(
+            &mut no_gates,
+            0,
+            half_rows,
+            0,
+            &[],
+            &[],
+            |_, _| unreachable!("zero-gate accumulation must not read a filter"),
+        );
+        assert_eq!(no_gates, vec![F::ZERO; rows * 2]);
     }
 
     /// Raw-limb differential and dispatch guard for the immutable low-range
