@@ -45,6 +45,362 @@ const PARALLEL_WORKLIST_THRESHOLD: usize = 64;
 /// overhead across cheap generators while leaving enough tasks for load balancing.
 const PARALLEL_WORKLIST_CHUNK: usize = 64;
 
+/// Caps failed sparse-batch searches so a ready singleton cannot rescan an
+/// arbitrarily long unresolved suffix. Four heads of the production Poseidon2
+/// chains are normally within a few dozen queue entries.
+const BATCH4_SEARCH_LIMIT: usize = 256;
+
+/// Compact scheduler metadata for generators that have a bit-identical grouped
+/// implementation. Stored parallel to the generator table, this stays four
+/// bytes per generator rather than doubling the 16-byte trait-object table.
+#[doc(hidden)]
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct GeneratorBatchDescriptor(u32);
+
+impl GeneratorBatchDescriptor {
+    const KIND_BIT: u32 = 1 << 31;
+    pub const NONE: Self = Self(u32::MAX);
+
+    pub(crate) fn poseidon2(row: usize) -> Self {
+        match u32::try_from(row).ok().and_then(|row| row.checked_add(1)) {
+            Some(encoded) if encoded < Self::KIND_BIT => Self(encoded),
+            _ => Self::NONE,
+        }
+    }
+
+    #[cfg(test)]
+    fn test(slot: usize) -> Self {
+        match u32::try_from(slot).ok().and_then(|slot| slot.checked_add(1)) {
+            Some(encoded) if encoded < Self::KIND_BIT => Self(Self::KIND_BIT | encoded),
+            _ => Self::NONE,
+        }
+    }
+
+    #[inline]
+    fn is_none(self) -> bool {
+        self == Self::NONE
+    }
+
+    #[inline]
+    fn same_kind(self, other: Self) -> bool {
+        !self.is_none()
+            && !other.is_none()
+            && (self.0 & Self::KIND_BIT) == (other.0 & Self::KIND_BIT)
+    }
+
+    pub(crate) fn poseidon2_row(self) -> Option<usize> {
+        (!self.is_none() && self.0 & Self::KIND_BIT == 0)
+            .then_some((self.0 - 1) as usize)
+    }
+
+    #[cfg(test)]
+    fn test_slot(self) -> Option<usize> {
+        (!self.is_none() && self.0 & Self::KIND_BIT != 0)
+            .then_some(((self.0 & !Self::KIND_BIT) - 1) as usize)
+    }
+}
+
+/// Number of values emitted by one Poseidon2 gate generator, in its descriptor-fixed order.
+///
+/// Keeping this const in the scheduler module lets the trait expose a single typed output without
+/// leaking gate-private wire helpers. `poseidon2.rs` has a compile-time assertion tying it to the
+/// round configuration.
+#[doc(hidden)]
+pub const POSEIDON2_FIXED_OUTPUT_COUNT: usize = 122;
+
+/// Four fixed-size, target-less generator outputs.
+///
+/// Values cannot be observed until [`FixedBatch4Sink::finish`] has verified that every lane wrote
+/// exactly `N` entries. Targets deliberately are not stored here: the scheduler reconstructs them
+/// from the batch descriptor only when it needs legacy-compatible contradiction diagnostics.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FixedBatch4Output<F: Field, const N: usize> {
+    rows: [usize; 4],
+    values: [[F; N]; 4],
+}
+
+impl<F: Field, const N: usize> FixedBatch4Output<F, N> {
+    #[inline]
+    pub(crate) fn rows(&self) -> [usize; 4] {
+        self.rows
+    }
+
+    #[inline]
+    pub(crate) fn lane(&self, lane: usize) -> &[F; N] {
+        &self.values[lane]
+    }
+}
+
+/// Safe, typed writer for a four-lane fixed-output generator.
+///
+/// `push` is bounds checked and `finish` fails closed unless all lanes have exactly the promised
+/// length. The zero initialization is never semantically visible for an incomplete output.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct FixedBatch4Sink<F: Field, const N: usize> {
+    values: [[F; N]; 4],
+    cursors: [usize; 4],
+}
+
+impl<F: Field, const N: usize> FixedBatch4Sink<F, N> {
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self {
+            values: [[F::ZERO; N]; 4],
+            cursors: [0; 4],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, lane: usize, value: F) -> bool {
+        let Some(cursor) = self.cursors.get_mut(lane) else {
+            return false;
+        };
+        let Some(slot) = self.values[lane].get_mut(*cursor) else {
+            return false;
+        };
+        *slot = value;
+        *cursor += 1;
+        true
+    }
+
+    #[inline]
+    pub(crate) fn finish(self, rows: [usize; 4]) -> Option<FixedBatch4Output<F, N>> {
+        (self.cursors == [N; 4]).then_some(FixedBatch4Output {
+            rows,
+            values: self.values,
+        })
+    }
+}
+
+/// Compact merge plan for one generator result produced in a parallel worklist chunk.
+enum ParallelRoundEntry {
+    GeneratedValues {
+        generator_index: usize,
+        finished: bool,
+        value_count: usize,
+    },
+    Poseidon2Fixed {
+        generator_indices: [usize; 4],
+        output_index: usize,
+    },
+}
+
+/// Target-less Poseidon2 values plus snapshot watcher annotations. Representatives remain in the
+/// circuit-fixed layout cache; targets are reconstructed only during the ordered merge.
+struct ParallelPoseidon2Output<'a, F: Field> {
+    output: FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>,
+    watchers: [[Option<&'a [u32]>; POSEIDON2_FIXED_OUTPUT_COUNT]; 4],
+}
+
+/// Circuit-fixed representatives for one typed Poseidon2 generator output.
+pub struct FixedGeneratorOutputLayout {
+    generator_address: usize,
+    representatives: [u32; POSEIDON2_FIXED_OUTPUT_COUNT],
+}
+
+impl PartialEq for FixedGeneratorOutputLayout {
+    fn eq(&self, other: &Self) -> bool {
+        // Allocation identity is a runtime binding, not serialized circuit content.
+        self.representatives == other.representatives
+    }
+}
+
+impl Eq for FixedGeneratorOutputLayout {}
+
+impl Debug for FixedGeneratorOutputLayout {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FixedGeneratorOutputLayout")
+            .field("representative_count", &POSEIDON2_FIXED_OUTPUT_COUNT)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Runtime-only fixed-output layouts bound to the prover's generator table.
+///
+/// The topology dimensions are part of the cache so every witness use can be conservatively
+/// preflighted. `entries` is a compact generator-to-dense-layout index; keeping all 122-word
+/// layouts in one allocation avoids one heap allocation per Poseidon2 row.
+pub struct FixedGeneratorOutputLayouts {
+    num_wires: usize,
+    degree: usize,
+    representative_map_len: usize,
+    representative_map_address: usize,
+    entries: Vec<u32>,
+    layouts: Vec<FixedGeneratorOutputLayout>,
+}
+
+impl PartialEq for FixedGeneratorOutputLayouts {
+    fn eq(&self, other: &Self) -> bool {
+        // The map address is intentionally absent: deserialization rebinds identical topology to
+        // a new allocation, while `preflight` still requires its live runtime identity.
+        self.num_wires == other.num_wires
+            && self.degree == other.degree
+            && self.representative_map_len == other.representative_map_len
+            && self.entries == other.entries
+            && self.layouts == other.layouts
+    }
+}
+
+impl Eq for FixedGeneratorOutputLayouts {}
+
+impl Debug for FixedGeneratorOutputLayouts {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FixedGeneratorOutputLayouts")
+            .field("num_wires", &self.num_wires)
+            .field("degree", &self.degree)
+            .field("generator_count", &self.entries.len())
+            .field("layout_count", &self.layouts.len())
+            .finish()
+    }
+}
+
+impl FixedGeneratorOutputLayouts {
+    const NONE: u32 = u32::MAX;
+
+    /// Derives layouts from the exact generator table, descriptor table, representative map and
+    /// common-data dimensions that will be stored together in one prover instance. Any mismatch
+    /// produces a missing per-generator entry rather than a partially trusted layout.
+    #[doc(hidden)]
+    pub fn build<F: RichField + Extendable<D>, const D: usize>(
+        generators: &[WitnessGeneratorRef<F, D>],
+        descriptors: &[GeneratorBatchDescriptor],
+        representative_map: &[u32],
+        num_wires: usize,
+        degree: usize,
+    ) -> Self {
+        let mut entries = Vec::with_capacity(generators.len());
+        let layout_capacity = generators
+            .iter()
+            .zip(descriptors)
+            .filter(|(generator, descriptor)| {
+                generator.0.fixed_batch_descriptor() == **descriptor
+                    && descriptor.poseidon2_row().is_some()
+            })
+            .count();
+        let mut layouts = Vec::with_capacity(layout_capacity);
+        for (generator_index, generator) in generators.iter().enumerate() {
+            let layout = (|| {
+                let descriptor = *descriptors.get(generator_index)?;
+                if generator.0.fixed_batch_descriptor() != descriptor {
+                    return None;
+                }
+                let row = descriptor.poseidon2_row()?;
+                if row >= degree {
+                    return None;
+                }
+                let mut representatives = [0u32; POSEIDON2_FIXED_OUTPUT_COUNT];
+                for (output_index, representative) in representatives.iter_mut().enumerate() {
+                    let target = crate::gates::poseidon2::poseidon2_generator_output_target(
+                        row,
+                        output_index,
+                    )?;
+                    let Target::Wire(wire) = target else {
+                        return None;
+                    };
+                    if wire.row != row || wire.column >= num_wires {
+                        return None;
+                    }
+                    let target_index = wire.row.checked_mul(num_wires)?.checked_add(wire.column)?;
+                    *representative = *representative_map.get(target_index)?;
+                    if *representative as usize >= representative_map.len() {
+                        return None;
+                    }
+                }
+                let generator_address = generator.0.as_ref()
+                    as *const dyn WitnessGenerator<F, D>
+                    as *const () as usize;
+                Some(FixedGeneratorOutputLayout {
+                    generator_address,
+                    representatives,
+                })
+            })();
+            let Some(layout) = layout else {
+                entries.push(Self::NONE);
+                continue;
+            };
+            let Ok(layout_index) = u32::try_from(layouts.len()) else {
+                entries.push(Self::NONE);
+                continue;
+            };
+            if layout_index == Self::NONE {
+                entries.push(Self::NONE);
+                continue;
+            }
+            layouts.push(layout);
+            entries.push(layout_index);
+        }
+        Self {
+            num_wires,
+            degree,
+            representative_map_len: representative_map.len(),
+            representative_map_address: representative_map.as_ptr() as usize,
+            entries,
+            layouts,
+        }
+    }
+
+    #[inline]
+    fn get(&self, generator_index: usize) -> Option<&FixedGeneratorOutputLayout> {
+        let layout_index = *self.entries.get(generator_index)?;
+        if layout_index == Self::NONE {
+            return None;
+        }
+        self.layouts.get(layout_index as usize)
+    }
+
+    #[inline]
+    fn preflight<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
+        &'a self,
+        generator_indices: [usize; 4],
+        prover_data: &ProverOnlyCircuitData<F, C, D>,
+        witness: &PartitionWitness<F>,
+    ) -> Option<[&'a FixedGeneratorOutputLayout; 4]> {
+        if self.num_wires != witness.num_wires
+            || self.degree != witness.degree
+            || self.representative_map_len != witness.representative_map.len()
+            || self.representative_map_address
+                != prover_data.representative_map.as_ptr() as usize
+            || self.entries.len() != prover_data.generators.len()
+            || prover_data.generator_batch_descriptors.len() != prover_data.generators.len()
+            || !core::ptr::eq(
+                witness.representative_map,
+                prover_data.representative_map.as_slice(),
+            )
+        {
+            return None;
+        }
+        let layouts = generator_indices.map(|generator_index| self.get(generator_index));
+        let [Some(a), Some(b), Some(c), Some(d)] = layouts else {
+            return None;
+        };
+        let layouts = [a, b, c, d];
+        for lane in 0..4 {
+            let generator_index = generator_indices[lane];
+            let descriptor = *prover_data
+                .generator_batch_descriptors
+                .get(generator_index)?;
+            // Re-query the live trait object. This makes replacing/reordering a public prover
+            // generator table after cache construction a safe miss instead of stale layout use.
+            let generator_address = prover_data.generators[generator_index].0.as_ref()
+                as *const dyn WitnessGenerator<F, D>
+                as *const () as usize;
+            if layouts[lane].generator_address != generator_address
+                || prover_data.generators[generator_index]
+                    .0
+                    .fixed_batch_descriptor()
+                    != descriptor
+                || descriptor.poseidon2_row().is_none()
+            {
+                return None;
+            }
+        }
+        Some(layouts)
+    }
+}
+
 #[cfg(all(feature = "parallel", feature = "std"))]
 mod parallel_witness_context {
     use core::cell::Cell;
@@ -103,6 +459,157 @@ fn parallel_rounds_enabled() -> bool {
 #[cfg(not(all(feature = "parallel", feature = "std")))]
 fn parallel_rounds_enabled() -> bool {
     false
+}
+
+/// Process-wide same-binary control for the grouped generator scheduler.
+/// Only the exact value `0` disables it; unset and every other value keep the
+/// production default enabled. The environment is read once, before entering
+/// any witness worklist loop.
+#[cfg(feature = "std")]
+fn poseidon_generator_x4_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PLONKY2_POSEIDON_GENERATOR_X4").as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn poseidon_generator_x4_enabled() -> bool {
+    true
+}
+
+/// Tries the typed target-less Poseidon2 path after binding all four generator entries to the
+/// exact prover topology and current witness. A miss is side-effect free and must fall back to
+/// scalar dispatch; Poseidon2 never falls through to the target-pair batch API.
+#[inline]
+fn try_run_poseidon2_batch4<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    generator_indices: [usize; 4],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    witness: &PartitionWitness<F>,
+) -> Option<FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>> {
+    for lane in 1..4 {
+        if generator_indices[..lane].contains(&generator_indices[lane]) {
+            return None;
+        }
+    }
+    prover_data.fixed_generator_output_layouts.preflight(
+        generator_indices,
+        prover_data,
+        witness,
+    )?;
+    let descriptors = generator_indices.map(|generator_index| {
+        prover_data.generator_batch_descriptors[generator_index]
+    });
+    let expected_rows: [usize; 4] = core::array::from_fn(|lane| {
+        descriptors[lane]
+            .poseidon2_row()
+            .expect("preflight accepted a non-Poseidon2 descriptor")
+    });
+    let output = prover_data.generators[generator_indices[0]]
+        .0
+        .run_batch4_fixed(descriptors, witness)?;
+    (output.rows() == expected_rows).then_some(output)
+}
+
+/// Tries the opt-in grouped path for four already-ready, distinct generators.
+/// The first generator owns the implementation and validates all descriptors;
+/// a rejected group falls back to the existing scalar dispatch.
+#[inline]
+fn try_run_batch4<F: RichField + Extendable<D>, const D: usize>(
+    generator_indices: [usize; 4],
+    generators: &[WitnessGeneratorRef<F, D>],
+    generator_batch_descriptors: &[GeneratorBatchDescriptor],
+    witness: &PartitionWitness<F>,
+    out_buffers: &mut [GeneratedValues<F>; 4],
+) -> Option<[bool; 4]> {
+    // Sequential pending queues may contain the same generator more than once.
+    // Scalar dispatch expires it after the first occurrence; never turn those
+    // duplicates into four completions.
+    for lane in 1..4 {
+        if generator_indices[..lane].contains(&generator_indices[lane]) {
+            return None;
+        }
+    }
+    debug_assert!(out_buffers
+        .iter()
+        .all(|buffer| buffer.target_values.is_empty()));
+    let descriptors = core::array::from_fn(|lane| {
+        generator_batch_descriptors[generator_indices[lane]]
+    });
+    // Poseidon2's descriptor promises the typed fixed-output contract. If its topology preflight
+    // missed, scalar dispatch is the only conservative fallback; do not let a foreign generator
+    // bearing the same compact kind be completed by lane zero's legacy implementation.
+    if descriptors[0].poseidon2_row().is_some() {
+        return None;
+    }
+    generators[generator_indices[0]]
+        .0
+        .run_batch4(descriptors, witness, out_buffers)
+}
+
+/// Finds four compatible ready generators without crossing any generator that
+/// could have an observable scalar dispatch. Expired generators and, when all
+/// generators defer until ready, unresolved generators are proven no-ops and
+/// can safely be skipped. This is important for parallel hash chains: each
+/// chain's next ready Poseidon2 row is commonly separated from the next chain
+/// by the unresolved tail of the first chain.
+#[inline]
+fn find_batch4(
+    pending: &[usize],
+    start: usize,
+    generator_is_expired: &[bool],
+    unresolved_watches: &[u32],
+    skip_unready: bool,
+    descriptors: &[GeneratorBatchDescriptor],
+) -> Option<([usize; 4], [usize; 4], usize)> {
+    let mut batch = [usize::MAX; 4];
+    let mut batch_positions = [usize::MAX; 4];
+    let mut batch_len = 0;
+    let mut first_descriptor: Option<GeneratorBatchDescriptor> = None;
+    let mut position = start;
+    let search_end = pending.len().min(start.saturating_add(BATCH4_SEARCH_LIMIT));
+    while position < search_end {
+        let generator_idx = pending[position];
+        position += 1;
+        if generator_is_expired[generator_idx] {
+            continue;
+        }
+        let ready = unresolved_watches[generator_idx] == 0;
+        if !ready {
+            if skip_unready {
+                continue;
+            }
+            return None;
+        }
+        let descriptor = descriptors[generator_idx];
+        if descriptor.is_none() {
+            return None;
+        }
+        if let Some(first) = first_descriptor {
+            if !first.same_kind(descriptor) {
+                return None;
+            }
+        } else {
+            first_descriptor = Some(descriptor);
+        }
+        // A sequential pending queue may contain duplicate entries. The first
+        // scalar run would expire its later occurrences, so they are inert.
+        if batch[..batch_len].contains(&generator_idx) {
+            continue;
+        }
+        batch[batch_len] = generator_idx;
+        batch_positions[batch_len] = position - 1;
+        batch_len += 1;
+        if batch_len == 4 {
+            return Some((batch, batch_positions, position));
+        }
+    }
+    None
 }
 
 /// Dense per-generator readiness state driven by first-population events of representative
@@ -251,6 +758,7 @@ fn run_generator_worklist<
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
+    let generator_batch_descriptors = &prover_data.generator_batch_descriptors;
     let generator_indices_by_watches = readiness.watchers;
     // When every generator defers until ready, it enters a worklist only after its unresolved
     // count reaches zero. Keep the readiness check as a defensive backstop for duplicate entries
@@ -258,7 +766,12 @@ fn run_generator_worklist<
     let skip_unready = prover_data.generators_defer_until_ready;
 
     let parallel_rounds = parallel_rounds_enabled();
+    let batch4_enabled = poseidon_generator_x4_enabled();
     let mut buffer = GeneratedValues::empty();
+    // Reused by sequential rounds. A Poseidon2 generator emits 122 values, so
+    // this avoids four fresh geometric growth chains for every grouped call.
+    let mut batch_buffers: [GeneratedValues<F>; 4] =
+        core::array::from_fn(|_| GeneratedValues::with_capacity(128));
 
     // The two round queues are swapped rather than reallocated. Every round used
     // to start from a fresh `Vec::new()` and end by *moving* it over the old
@@ -296,8 +809,9 @@ fn run_generator_worklist<
             let round_generator_is_expired: &[bool] = generator_is_expired;
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
-                Vec<(usize, bool, usize)>,
+                Vec<ParallelRoundEntry>,
                 Vec<(Target, F, usize, Option<&[u32]>)>,
+                Vec<ParallelPoseidon2Output<'_, F>>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -306,77 +820,199 @@ fn run_generator_worklist<
                     // generator, so the geometric doubling chain starts past its
                     // first few reallocations instead of from zero.
                     let mut annotated_values = Vec::with_capacity(chunk.len());
+                    let mut fixed_outputs = Vec::with_capacity(chunk.len() / 4);
                     let mut round_buffer = GeneratedValues::empty();
-                    for &generator_idx in chunk {
+                    let mut batch_buffers: [GeneratedValues<F>; 4] =
+                        core::array::from_fn(|_| GeneratedValues::empty());
+                    macro_rules! append_run {
+                        ($generator_idx:expr, $finished:expr, $run_buffer:expr) => {{
+                            let run_buffer: &mut GeneratedValues<F> = $run_buffer;
+                            entries.push(ParallelRoundEntry::GeneratedValues {
+                                generator_index: $generator_idx,
+                                finished: $finished,
+                                value_count: run_buffer.target_values.len(),
+                            });
+                            for (t, v) in run_buffer.target_values.drain(..) {
+                                let rep_index = round_witness.representative_map
+                                    [round_witness.target_index(t)]
+                                    as usize;
+                                let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
+                                    generator_indices_by_watches.get(&rep_index)
+                                } else {
+                                    // The representative is populated in the snapshot, so the merge
+                                    // cannot newly populate it and never needs watchers.
+                                    None
+                                };
+                                annotated_values.push((t, v, rep_index, watchers));
+                            }
+                        }};
+                    }
+
+                    let mut position = 0;
+                    while position < chunk.len() {
+                        let generator_idx = chunk[position];
                         if round_generator_is_expired[generator_idx] {
+                            position += 1;
                             continue;
                         }
                         let ready = round_unresolved_watches[generator_idx] == 0;
                         if skip_unready && !ready {
+                            position += 1;
                             continue;
                         }
+
+                        if batch4_enabled && ready {
+                            if let Some((batch_indices, _, next_position)) = find_batch4(
+                                chunk,
+                                position,
+                                round_generator_is_expired,
+                                round_unresolved_watches,
+                                skip_unready,
+                                generator_batch_descriptors,
+                            ) {
+                                if let Some(fixed_output) = try_run_poseidon2_batch4(
+                                    batch_indices,
+                                    prover_data,
+                                    round_witness,
+                                ) {
+                                    let mut watchers =
+                                        [[None; POSEIDON2_FIXED_OUTPUT_COUNT]; 4];
+                                    for lane in 0..4 {
+                                        let layout = prover_data.fixed_generator_output_layouts
+                                            .get(batch_indices[lane])
+                                            .expect("fixed-output preflight lost its layout");
+                                        for output_index in 0..POSEIDON2_FIXED_OUTPUT_COUNT {
+                                            let rep_index =
+                                                layout.representatives[output_index] as usize;
+                                            if !round_witness.is_set_by_rep_index(rep_index) {
+                                                watchers[lane][output_index] =
+                                                    generator_indices_by_watches.get(&rep_index);
+                                            }
+                                        }
+                                    }
+                                    entries.push(ParallelRoundEntry::Poseidon2Fixed {
+                                        generator_indices: batch_indices,
+                                        output_index: fixed_outputs.len(),
+                                    });
+                                    fixed_outputs.push(ParallelPoseidon2Output {
+                                        output: fixed_output,
+                                        watchers,
+                                    });
+                                    position = next_position;
+                                    continue;
+                                }
+                                if let Some(finished) = try_run_batch4(
+                                    batch_indices,
+                                    generators,
+                                    generator_batch_descriptors,
+                                    round_witness,
+                                    &mut batch_buffers,
+                                ) {
+                                    for lane in 0..4 {
+                                        append_run!(
+                                            batch_indices[lane],
+                                            finished[lane],
+                                            &mut batch_buffers[lane]
+                                        );
+                                    }
+                                    position = next_position;
+                                    continue;
+                                }
+                            }
+                        }
+
                         let finished = generators[generator_idx].0.run_with_ready_hint(
                             round_witness,
                             &mut round_buffer,
                             ready,
                         );
-                        entries.push((generator_idx, finished, round_buffer.target_values.len()));
-                        for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
-                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
-                                generator_indices_by_watches.get(&rep_index)
-                            } else {
-                                // The representative is populated in the snapshot, so the merge
-                                // cannot newly populate it and never needs watchers.
-                                None
-                            };
-                            annotated_values.push((t, v, rep_index, watchers));
-                        }
+                        append_run!(generator_idx, finished, &mut round_buffer);
+                        position += 1;
                     }
-                    (entries, annotated_values)
+                    (entries, annotated_values, fixed_outputs)
                 })
                 .collect();
 
             // Merge phase: sequential and in ascending generator-index order, exactly like the
             // sequential loop's per-generator merge.
-            for (entries, annotated_values) in round_outputs {
+            for (entries, annotated_values, fixed_outputs) in round_outputs {
                 let mut annotated_values = annotated_values.into_iter();
-                for (generator_idx, finished, value_count) in entries {
-                    if finished {
-                        generator_is_expired[generator_idx] = true;
-                        *remaining_generators -= 1;
-                    }
-
-                    for (t, v, rep_index, watchers) in annotated_values.by_ref().take(value_count) {
-                        // Reuse the representative the run phase already gathered
-                        // instead of gathering it again. `round_witness` above is an
-                        // immutable reborrow of this very `witness`, and
-                        // `representative_map` is an immutable `&[u32]` for the
-                        // witness's whole lifetime, so the index is by construction
-                        // the one `set_target_returning_rep` would have looked up.
-                        // `set_rep_index_returning_new` is documented as running the
-                        // identical sequence on the identical slot from that point on,
-                        // so the resulting witness is bit-for-bit unchanged. What goes
-                        // away is a second scattered 4-byte read out of a table of
-                        // `num_wires * degree` entries — one per generated value, on
-                        // the order of 10^6 per proof — and it is a read that misses
-                        // twice, because the whole round's outputs are collected
-                        // between the two lookups.
-                        if witness
-                            .set_rep_index_returning_new(rep_index, t, v)?
-                            .is_none()
-                        {
-                            continue;
+                for entry in entries {
+                    match entry {
+                        ParallelRoundEntry::GeneratedValues {
+                            generator_index,
+                            finished,
+                            value_count,
+                        } => {
+                            if finished {
+                                generator_is_expired[generator_index] = true;
+                                *remaining_generators -= 1;
+                            }
+                            for (t, v, rep_index, watchers) in
+                                annotated_values.by_ref().take(value_count)
+                            {
+                                // Reuse the representative the run phase already gathered instead
+                                // of gathering it again. The snapshot and merge witness share the
+                                // same immutable representative map for their whole lifetime.
+                                if witness
+                                    .set_rep_index_returning_new(rep_index, t, v)?
+                                    .is_none()
+                                {
+                                    continue;
+                                }
+                                if let Some(watchers) = watchers {
+                                    readiness.populate_watchers(
+                                        watchers,
+                                        generator_is_expired,
+                                        &mut next_pending_generator_indices,
+                                        skip_unready,
+                                    );
+                                }
+                            }
                         }
-                        if let Some(watchers) = watchers {
-                            readiness.populate_watchers(
-                                watchers,
-                                generator_is_expired,
-                                &mut next_pending_generator_indices,
-                                skip_unready,
-                            );
+                        ParallelRoundEntry::Poseidon2Fixed {
+                            generator_indices,
+                            output_index,
+                        } => {
+                            let fixed = &fixed_outputs[output_index];
+                            for lane in 0..4 {
+                                let generator_index = generator_indices[lane];
+                                generator_is_expired[generator_index] = true;
+                                *remaining_generators -= 1;
+                                let layout = prover_data.fixed_generator_output_layouts
+                                    .get(generator_index)
+                                    .expect("fixed-output preflight lost its layout");
+                                let row = generator_batch_descriptors[generator_index]
+                                    .poseidon2_row()
+                                    .expect("fixed-output preflight lost its row");
+                                for generated_index in 0..POSEIDON2_FIXED_OUTPUT_COUNT {
+                                    let target = crate::gates::poseidon2::poseidon2_generator_output_target(
+                                        row,
+                                        generated_index,
+                                    )
+                                    .expect("preflighted Poseidon2 output index");
+                                    let representative =
+                                        layout.representatives[generated_index] as usize;
+                                    if witness
+                                        .set_rep_index_returning_new(
+                                            representative,
+                                            target,
+                                            fixed.output.lane(lane)[generated_index],
+                                        )?
+                                        .is_none()
+                                    {
+                                        continue;
+                                    }
+                                    if let Some(watchers) = fixed.watchers[lane][generated_index] {
+                                        readiness.populate_watchers(
+                                            watchers,
+                                            generator_is_expired,
+                                            &mut next_pending_generator_indices,
+                                            skip_unready,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -389,13 +1025,138 @@ fn run_generator_worklist<
             continue;
         }
 
-        for &generator_idx in &pending_generator_indices {
+        let mut position = 0;
+        let mut active_fixed_batch: Option<(
+            [usize; 4],
+            [usize; 4],
+            FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>,
+            usize,
+        )> = None;
+        let mut active_batch: Option<([usize; 4], [usize; 4], [bool; 4], usize)> = None;
+        while position < pending_generator_indices.len() {
+            let generator_idx = pending_generator_indices[position];
+
+            // Consume a target-less lane at precisely the queue position where scalar dispatch
+            // would have run it. Targets are reconstructed solely for identical diagnostics;
+            // cached representatives select the exact slots without a map gather.
+            let consume_fixed_lane = active_fixed_batch
+                .as_ref()
+                .is_some_and(|(_, batch_positions, _, lane)| position == batch_positions[*lane]);
+            if consume_fixed_lane {
+                let (batch_indices, _, output, lane) = active_fixed_batch.as_ref().unwrap();
+                let lane = *lane;
+                debug_assert_eq!(generator_idx, batch_indices[lane]);
+                generator_is_expired[generator_idx] = true;
+                *remaining_generators -= 1;
+                let layout = prover_data.fixed_generator_output_layouts
+                    .get(generator_idx)
+                    .expect("fixed-output preflight lost its layout");
+                let row = generator_batch_descriptors[generator_idx]
+                    .poseidon2_row()
+                    .expect("fixed-output preflight lost its row");
+                for output_index in 0..POSEIDON2_FIXED_OUTPUT_COUNT {
+                    let target = crate::gates::poseidon2::poseidon2_generator_output_target(
+                        row,
+                        output_index,
+                    )
+                    .expect("preflighted Poseidon2 output index");
+                    let representative = layout.representatives[output_index] as usize;
+                    if witness
+                        .set_rep_index_returning_new(
+                            representative,
+                            target,
+                            output.lane(lane)[output_index],
+                        )?
+                        .is_some()
+                    {
+                        readiness.populate_representative(
+                            representative,
+                            generator_is_expired,
+                            &mut next_pending_generator_indices,
+                            skip_unready,
+                        );
+                    }
+                }
+                if lane == 3 {
+                    active_fixed_batch = None;
+                } else {
+                    active_fixed_batch.as_mut().unwrap().3 += 1;
+                }
+                position += 1;
+                continue;
+            }
+
+            // A grouped computation may cross only generators that were inert
+            // at its snapshot. Consume each saved lane at its original queue
+            // position, allowing an intervening generator made ready by an
+            // earlier lane to run exactly where the scalar schedule ran it.
+            if let Some((batch_indices, batch_positions, finished, lane)) = active_batch {
+                if position == batch_positions[lane] {
+                    debug_assert_eq!(generator_idx, batch_indices[lane]);
+                    if finished[lane] {
+                        generator_is_expired[generator_idx] = true;
+                        *remaining_generators -= 1;
+                    }
+                    for (t, v) in batch_buffers[lane].target_values.drain(..) {
+                        if let Some(representative) = witness.set_target_returning_rep(t, v)? {
+                            readiness.populate_representative(
+                                representative,
+                                generator_is_expired,
+                                &mut next_pending_generator_indices,
+                                skip_unready,
+                            );
+                        }
+                    }
+                    if lane == 3 {
+                        active_batch = None;
+                    } else {
+                        active_batch.as_mut().unwrap().3 += 1;
+                    }
+                    position += 1;
+                    continue;
+                }
+            }
+
             if generator_is_expired[generator_idx] {
+                position += 1;
                 continue;
             }
             let ready = readiness.is_ready(generator_idx);
             if skip_unready && !ready {
+                position += 1;
                 continue;
+            }
+
+            if batch4_enabled
+                && ready
+                && active_fixed_batch.is_none()
+                && active_batch.is_none()
+            {
+                if let Some((batch_indices, batch_positions, _)) = find_batch4(
+                    &pending_generator_indices,
+                    position,
+                    generator_is_expired,
+                    &readiness.unresolved,
+                    skip_unready,
+                    generator_batch_descriptors,
+                ) {
+                    if let Some(output) =
+                        try_run_poseidon2_batch4(batch_indices, prover_data, witness)
+                    {
+                        active_fixed_batch = Some((batch_indices, batch_positions, output, 0));
+                        continue;
+                    }
+                    if let Some(finished) = try_run_batch4(
+                        batch_indices,
+                        generators,
+                        generator_batch_descriptors,
+                        witness,
+                        &mut batch_buffers,
+                    ) {
+                        active_batch = Some((batch_indices, batch_positions, finished, 0));
+                        continue;
+                    }
+                }
             }
 
             let finished =
@@ -424,7 +1185,10 @@ fn run_generator_worklist<
                     );
                 }
             }
+            position += 1;
         }
+        debug_assert!(active_fixed_batch.is_none());
+        debug_assert!(active_batch.is_none());
 
         core::mem::swap(
             &mut pending_generator_indices,
@@ -1115,6 +1879,47 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         self.run(witness, out_buffer)
     }
 
+    /// Describes a generator that can participate in a four-generator grouped
+    /// dispatch. The conservative default leaves every existing generator on
+    /// its scalar path.
+    #[doc(hidden)]
+    fn batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        GeneratorBatchDescriptor::NONE
+    }
+
+    /// Independently opts this exact generator implementation into the typed Poseidon2 output
+    /// contract. Keeping it separate from `batch_descriptor` makes descriptor-only foreign
+    /// generators a conservative scalar fallback.
+    #[doc(hidden)]
+    fn fixed_batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        GeneratorBatchDescriptor::NONE
+    }
+
+    /// Target-less fixed-output analog of [`Self::run_batch4`]. The default is a side-effect-free
+    /// miss; only a generator also carrying a preflighted fixed layout may be dispatched here.
+    #[doc(hidden)]
+    fn run_batch4_fixed(
+        &self,
+        _descriptors: [GeneratorBatchDescriptor; 4],
+        _witness: &PartitionWitness<F>,
+    ) -> Option<FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>> {
+        None
+    }
+
+    /// Attempts to run four ready generators against the same witness
+    /// snapshot. Outputs stay separated by generator so the scheduler can
+    /// merge them in exactly the scalar generator-index order. Returning
+    /// `None` must leave all four output buffers unchanged.
+    #[doc(hidden)]
+    fn run_batch4(
+        &self,
+        _descriptors: [GeneratorBatchDescriptor; 4],
+        _witness: &PartitionWitness<F>,
+        _out_buffers: &mut [GeneratedValues<F>; 4],
+    ) -> Option<[bool; 4]> {
+        None
+    }
+
     /// Whether `run_with_ready_hint(_, _, false)` is guaranteed to be a pure no-op: it writes
     /// nothing to `out_buffer`, reads nothing from the witness, and returns `false`.
     ///
@@ -1131,6 +1936,14 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     /// short-circuits before `run_once` is reached.
     fn defers_until_ready(&self) -> bool {
         false
+    }
+
+    /// Returns all build-time scheduling metadata in one virtual dispatch.
+    /// Loaders already scan every generator for readiness behavior; folding the
+    /// compact batch descriptor into that scan avoids a second trait-object walk.
+    #[doc(hidden)]
+    fn scheduling_metadata(&self) -> (bool, GeneratorBatchDescriptor) {
+        (self.defers_until_ready(), self.batch_descriptor())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
@@ -1231,6 +2044,39 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
 
+    /// See [`WitnessGenerator::batch_descriptor`].
+    #[doc(hidden)]
+    fn batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        GeneratorBatchDescriptor::NONE
+    }
+
+    /// See [`WitnessGenerator::fixed_batch_descriptor`].
+    #[doc(hidden)]
+    fn fixed_batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        GeneratorBatchDescriptor::NONE
+    }
+
+    /// See [`WitnessGenerator::run_batch4_fixed`].
+    #[doc(hidden)]
+    fn run_batch4_fixed(
+        &self,
+        _descriptors: [GeneratorBatchDescriptor; 4],
+        _witness: &PartitionWitness<F>,
+    ) -> Option<FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>> {
+        None
+    }
+
+    /// See [`WitnessGenerator::run_batch4`].
+    #[doc(hidden)]
+    fn run_batch4(
+        &self,
+        _descriptors: [GeneratorBatchDescriptor; 4],
+        _witness: &PartitionWitness<F>,
+        _out_buffers: &mut [GeneratedValues<F>; 4],
+    ) -> Option<[bool; 4]> {
+        None
+    }
+
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
         Self: Sized,
@@ -1286,10 +2132,39 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
     }
 
+    fn batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        self.inner.batch_descriptor()
+    }
+
+    fn fixed_batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        self.inner.fixed_batch_descriptor()
+    }
+
+    fn run_batch4_fixed(
+        &self,
+        descriptors: [GeneratorBatchDescriptor; 4],
+        witness: &PartitionWitness<F>,
+    ) -> Option<FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>> {
+        self.inner.run_batch4_fixed(descriptors, witness)
+    }
+
+    fn run_batch4(
+        &self,
+        descriptors: [GeneratorBatchDescriptor; 4],
+        witness: &PartitionWitness<F>,
+        out_buffers: &mut [GeneratedValues<F>; 4],
+    ) -> Option<[bool; 4]> {
+        self.inner.run_batch4(descriptors, witness, out_buffers)
+    }
+
     /// `&&` short-circuits, so a `false` hint returns `false` without reaching `run_once`:
     /// nothing is read and nothing is written. See [`WitnessGenerator::defers_until_ready`].
     fn defers_until_ready(&self) -> bool {
         true
+    }
+
+    fn scheduling_metadata(&self) -> (bool, GeneratorBatchDescriptor) {
+        (true, self.inner.batch_descriptor())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -1489,6 +2364,7 @@ mod tests {
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::gates::noop::NoopGate;
+    use crate::gates::poseidon2::Poseidon2Gate;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
@@ -1527,6 +2403,142 @@ mod tests {
                 .map(|&target| witness.get_target(target))
                 .sum();
             out_buffer.set_target(self.output, value)
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
+    #[derive(Debug)]
+    struct BatchTestGenerator {
+        slot: usize,
+        inputs: [Target; 4],
+        outputs: [Target; 4],
+        scalar_calls: Arc<AtomicUsize>,
+        batch_calls: Arc<AtomicUsize>,
+    }
+
+    impl SimpleGenerator<F, D> for BatchTestGenerator {
+        fn id(&self) -> String {
+            "BatchTestGenerator".to_string()
+        }
+
+        fn dependencies(&self) -> Vec<Target> {
+            vec![self.inputs[self.slot]]
+        }
+
+        fn run_once(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+        ) -> Result<()> {
+            self.scalar_calls.fetch_add(1, Ordering::Relaxed);
+            out_buffer.set_target(
+                self.outputs[self.slot],
+                witness.get_target(self.inputs[self.slot]) + F::from_canonical_usize(self.slot + 1),
+            )
+        }
+
+        fn batch_descriptor(&self) -> GeneratorBatchDescriptor {
+            GeneratorBatchDescriptor::test(self.slot)
+        }
+
+        fn run_batch4(
+            &self,
+            descriptors: [GeneratorBatchDescriptor; 4],
+            witness: &PartitionWitness<F>,
+            out_buffers: &mut [GeneratedValues<F>; 4],
+        ) -> Option<[bool; 4]> {
+            let slots = descriptors.map(GeneratorBatchDescriptor::test_slot);
+            let [Some(a), Some(b), Some(c), Some(d)] = slots else {
+                return None;
+            };
+            let slots = [a, b, c, d];
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            for lane in 0..4 {
+                let slot = slots[lane];
+                out_buffers[lane]
+                    .set_target(
+                        self.outputs[slot],
+                        witness.get_target(self.inputs[slot]) + F::from_canonical_usize(slot + 1),
+                    )
+                    .unwrap();
+            }
+            Some([true; 4])
+        }
+
+        fn serialize(
+            &self,
+            _dst: &mut Vec<u8>,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<()> {
+            unreachable!("test generator is never serialized")
+        }
+
+        fn deserialize(
+            _src: &mut Buffer,
+            _common_data: &CommonCircuitData<F, D>,
+        ) -> IoResult<Self> {
+            unreachable!("test generator is never deserialized")
+        }
+    }
+
+    /// Deliberately carries the compact Poseidon2 batch kind without opting into the independent
+    /// typed fixed-output contract. The scheduler must treat it as foreign and dispatch scalar.
+    #[derive(Debug)]
+    struct ForeignPoseidonDescriptorGenerator {
+        row: usize,
+        input: Target,
+        output: Target,
+        scalar_calls: Arc<AtomicUsize>,
+        legacy_batch_calls: Arc<AtomicUsize>,
+    }
+
+    impl SimpleGenerator<F, D> for ForeignPoseidonDescriptorGenerator {
+        fn id(&self) -> String {
+            "ForeignPoseidonDescriptorGenerator".to_string()
+        }
+
+        fn dependencies(&self) -> Vec<Target> {
+            vec![self.input]
+        }
+
+        fn run_once(
+            &self,
+            witness: &PartitionWitness<F>,
+            out_buffer: &mut GeneratedValues<F>,
+        ) -> Result<()> {
+            self.scalar_calls.fetch_add(1, Ordering::Relaxed);
+            out_buffer.set_target(
+                self.output,
+                witness.get_target(self.input) + F::from_canonical_usize(self.row + 1),
+            )
+        }
+
+        fn batch_descriptor(&self) -> GeneratorBatchDescriptor {
+            GeneratorBatchDescriptor::poseidon2(self.row)
+        }
+
+        fn run_batch4(
+            &self,
+            _descriptors: [GeneratorBatchDescriptor; 4],
+            _witness: &PartitionWitness<F>,
+            _out_buffers: &mut [GeneratedValues<F>; 4],
+        ) -> Option<[bool; 4]> {
+            self.legacy_batch_calls.fetch_add(1, Ordering::Relaxed);
+            Some([true; 4])
         }
 
         fn serialize(
@@ -1627,6 +2639,264 @@ mod tests {
             dependency_calls.load(Ordering::Relaxed),
             dependency_calls_after_build
         );
+    }
+
+    #[test]
+    fn fixed_layout_preflight_binds_topology_generator_and_schedule() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        for _ in 0..4 {
+            builder.add_gate(Poseidon2Gate::<F, D>::new(), vec![]);
+        }
+        let mut circuit = builder.build::<C>();
+        let generator_indices: [usize; 4] = circuit
+            .prover_only
+            .generator_batch_descriptors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, descriptor)| descriptor.poseidon2_row().map(|_| index))
+            .collect::<Vec<_>>()
+            .try_into()
+            .expect("exactly four Poseidon2 generators");
+        let num_wires = circuit.common.config.num_wires;
+        let degree = circuit.common.degree();
+
+        let exact = PartitionWitness::<F>::new(
+            num_wires,
+            degree,
+            &circuit.prover_only.representative_map,
+        );
+        assert!(
+            circuit
+                .prover_only
+                .fixed_generator_output_layouts
+                .preflight(generator_indices, &circuit.prover_only, &exact)
+                .is_some()
+        );
+
+        // Equal contents from a foreign topology allocation are not an exact binding.
+        let cloned_map = circuit.prover_only.representative_map.clone();
+        let foreign_map = PartitionWitness::<F>::new(num_wires, degree, &cloned_map);
+        assert!(
+            circuit
+                .prover_only
+                .fixed_generator_output_layouts
+                .preflight(generator_indices, &circuit.prover_only, &foreign_map)
+                .is_none()
+        );
+        let wrong_common = PartitionWitness::<F>::new(
+            num_wires + 1,
+            degree,
+            &circuit.prover_only.representative_map,
+        );
+        assert!(
+            circuit
+                .prover_only
+                .fixed_generator_output_layouts
+                .preflight(generator_indices, &circuit.prover_only, &wrong_common)
+                .is_none()
+        );
+
+        // A live generator-table replacement and stale scheduling metadata both fail closed.
+        let replaced_index = generator_indices[2];
+        let replacement = WitnessGeneratorRef::new(
+            ForeignPoseidonDescriptorGenerator {
+                row: 2,
+                input: Target::VirtualTarget { index: 0 },
+                output: Target::VirtualTarget { index: 1 },
+                scalar_calls: Arc::new(AtomicUsize::new(0)),
+                legacy_batch_calls: Arc::new(AtomicUsize::new(0)),
+            }
+            .adapter(),
+        );
+        let original = core::mem::replace(
+            &mut circuit.prover_only.generators[replaced_index],
+            replacement,
+        );
+        let witness = PartitionWitness::<F>::new(
+            num_wires,
+            degree,
+            &circuit.prover_only.representative_map,
+        );
+        assert!(
+            circuit
+                .prover_only
+                .fixed_generator_output_layouts
+                .preflight(generator_indices, &circuit.prover_only, &witness)
+                .is_none()
+        );
+        circuit.prover_only.generators[replaced_index] = original;
+        let descriptor = circuit.prover_only.generator_batch_descriptors[replaced_index];
+        circuit.prover_only.generator_batch_descriptors[replaced_index] =
+            GeneratorBatchDescriptor::NONE;
+        let witness = PartitionWitness::<F>::new(
+            num_wires,
+            degree,
+            &circuit.prover_only.representative_map,
+        );
+        assert!(
+            circuit
+                .prover_only
+                .fixed_generator_output_layouts
+                .preflight(generator_indices, &circuit.prover_only, &witness)
+                .is_none()
+        );
+        circuit.prover_only.generator_batch_descriptors[replaced_index] = descriptor;
+
+        let replacement_map = circuit.prover_only.representative_map.clone();
+        let original_map = core::mem::replace(
+            &mut circuit.prover_only.representative_map,
+            replacement_map,
+        );
+        let witness = PartitionWitness::<F>::new(
+            num_wires,
+            degree,
+            &circuit.prover_only.representative_map,
+        );
+        assert!(
+            circuit
+                .prover_only
+                .fixed_generator_output_layouts
+                .preflight(generator_indices, &circuit.prover_only, &witness)
+                .is_none(),
+            "cache accepted an equal but foreign prover representative map"
+        );
+        circuit.prover_only.representative_map = original_map;
+    }
+
+    #[test]
+    fn poseidon_descriptor_without_typed_contract_falls_back_to_scalar() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let inputs: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
+        let outputs: [Target; 4] = core::array::from_fn(|_| builder.add_virtual_target());
+        let scalar_calls = Arc::new(AtomicUsize::new(0));
+        let legacy_batch_calls = Arc::new(AtomicUsize::new(0));
+        for row in 0..4 {
+            builder.add_simple_generator(ForeignPoseidonDescriptorGenerator {
+                row,
+                input: inputs[row],
+                output: outputs[row],
+                scalar_calls: Arc::clone(&scalar_calls),
+                legacy_batch_calls: Arc::clone(&legacy_batch_calls),
+            });
+            builder.register_public_input(outputs[row]);
+        }
+        let circuit = builder.build::<C>();
+        let generator_indices: [usize; 4] = circuit
+            .prover_only
+            .generators
+            .iter()
+            .enumerate()
+            .filter_map(|(generator_index, generator)| {
+                (generator.0.id() == "ForeignPoseidonDescriptorGenerator")
+                    .then_some(generator_index)
+            })
+            .collect::<Vec<_>>()
+            .try_into()
+            .unwrap();
+        for &generator_index in &generator_indices {
+            assert!(
+                circuit.prover_only.fixed_generator_output_layouts
+                    .get(generator_index)
+                    .is_none(),
+                "descriptor-only foreign generator acquired a fixed layout"
+            );
+        }
+        let empty_witness = PartitionWitness::<F>::new(
+            circuit.common.config.num_wires,
+            circuit.common.degree(),
+            &circuit.prover_only.representative_map,
+        );
+        assert!(
+            try_run_poseidon2_batch4(
+                generator_indices,
+                &circuit.prover_only,
+                &empty_witness,
+            )
+            .is_none()
+        );
+        let mut buffers: [GeneratedValues<F>; 4] =
+            core::array::from_fn(|_| GeneratedValues::empty());
+        assert!(
+            try_run_batch4(
+                generator_indices,
+                &circuit.prover_only.generators,
+                &circuit.prover_only.generator_batch_descriptors,
+                &empty_witness,
+                &mut buffers,
+            )
+            .is_none()
+        );
+        assert!(buffers.iter().all(|buffer| buffer.target_values.is_empty()));
+
+        let mut partial = PartialWitness::new();
+        for (row, input) in inputs.into_iter().enumerate() {
+            partial
+                .set_target(input, F::from_canonical_usize(100 + row))
+                .unwrap();
+        }
+        let witness =
+            generate_partial_witness(partial, &circuit.prover_only, &circuit.common).unwrap();
+        assert_eq!(scalar_calls.load(Ordering::Relaxed), 4);
+        assert_eq!(legacy_batch_calls.load(Ordering::Relaxed), 0);
+        for row in 0..4 {
+            assert_eq!(
+                witness.get_target(outputs[row]),
+                F::from_canonical_usize(101 + 2 * row)
+            );
+        }
+    }
+
+    #[test]
+    fn ready_generators_separated_by_unresolved_tails_dispatch_through_batch4() {
+        let mut builder = CircuitBuilder::<F, D>::new(CircuitConfig::standard_recursion_config());
+        let inputs = core::array::from_fn(|_| builder.add_virtual_target());
+        let outputs = core::array::from_fn(|_| builder.add_virtual_target());
+        let tail_outputs: [Target; 4] =
+            core::array::from_fn(|_| builder.add_virtual_target());
+        let scalar_calls = Arc::new(AtomicUsize::new(0));
+        let batch_calls = Arc::new(AtomicUsize::new(0));
+        let tail_dependency_calls = Arc::new(AtomicUsize::new(0));
+        let tail_run_calls = Arc::new(AtomicUsize::new(0));
+        for slot in 0..4 {
+            builder.add_simple_generator(BatchTestGenerator {
+                slot,
+                inputs,
+                outputs,
+                scalar_calls: Arc::clone(&scalar_calls),
+                batch_calls: Arc::clone(&batch_calls),
+            });
+            // Model the unresolved tail of a hash chain between the ready
+            // heads of adjacent chains in generator-index order.
+            builder.add_simple_generator(CountingSimpleGenerator {
+                dependencies: vec![outputs[slot]],
+                output: tail_outputs[slot],
+                dependency_calls: Arc::clone(&tail_dependency_calls),
+                run_calls: Arc::clone(&tail_run_calls),
+            });
+            builder.register_public_input(tail_outputs[slot]);
+        }
+        let circuit = builder.build::<C>();
+
+        let mut partial = PartialWitness::new();
+        for (slot, input) in inputs.into_iter().enumerate() {
+            partial
+                .set_target(input, F::from_canonical_usize(100 + slot))
+                .unwrap();
+        }
+        let witness =
+            generate_partial_witness(partial, &circuit.prover_only, &circuit.common).unwrap();
+
+        let disabled = std::env::var_os("PLONKY2_POSEIDON_GENERATOR_X4").as_deref()
+            == Some(std::ffi::OsStr::new("0"));
+        assert_eq!(batch_calls.load(Ordering::Relaxed), usize::from(!disabled));
+        assert_eq!(scalar_calls.load(Ordering::Relaxed), if disabled { 4 } else { 0 });
+        assert_eq!(tail_run_calls.load(Ordering::Relaxed), 4);
+        for slot in 0..4 {
+            assert_eq!(
+                witness.get_target(tail_outputs[slot]),
+                F::from_canonical_usize(101 + 2 * slot)
+            );
+        }
     }
 
     #[test]

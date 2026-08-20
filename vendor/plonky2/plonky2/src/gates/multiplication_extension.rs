@@ -11,6 +11,8 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -54,6 +56,70 @@ impl<const D: usize> MulExtensionGate<D> {
     }
     pub(crate) const fn wires_ith_output(i: usize) -> Range<usize> {
         3 * D * i + 2 * D..3 * D * i + 3 * D
+    }
+}
+
+/// Exact ranked D=2/n=32 packed coefficient evaluator. Generic dimensions, shapes, widths, and
+/// scalar tails retain the established extension-field path below.
+fn eval_quadratic_packed_direct_n32<F: RichField + Extendable<D>, const D: usize>(
+    vars: EvaluationVarsBaseBatch<F>,
+    filters: &[F],
+    combined_gate_constraints: &mut [F],
+) {
+    type Packing<T> = <T as Packable>::Packing;
+    const N: usize = 32;
+    const WIDTH: usize = 4;
+    const PACKS_PER_COLUMN: usize = N / WIDTH;
+    const NUM_OPS: usize = 13;
+    const WIRES_PER_OP: usize = 6;
+    const CONSTRAINTS_PER_OP: usize = 2;
+
+    debug_assert_eq!(D, 2);
+    debug_assert_eq!(vars.len(), N);
+    debug_assert_eq!(Packing::<F>::WIDTH, WIDTH);
+    debug_assert_eq!(filters.len(), N);
+    debug_assert!(
+        combined_gate_constraints.len() >= NUM_OPS * CONSTRAINTS_PER_OP * N
+    );
+
+    // Reinterpret each complete four-point lane group once. Exact prefixes give LLVM fixed
+    // bounds for every indexed load/store below and `PackedField` guarantees the scalar/packed
+    // layout; this is the AArch64 `WideGoldilocksField` path in production.
+    let wires = Packing::<F>::pack_slice(
+        &vars.local_wires[..NUM_OPS * WIRES_PER_OP * N],
+    );
+    let constants = Packing::<F>::pack_slice(&vars.local_constants[..N]);
+    let filters = Packing::<F>::pack_slice(filters);
+    let combined = Packing::<F>::pack_slice_mut(
+        &mut combined_gate_constraints[..NUM_OPS * CONSTRAINTS_PER_OP * N],
+    );
+    let w = Packing::<F>::from(<F as Extendable<D>>::W);
+
+    for op in 0..NUM_OPS {
+        // With D=2, each operation occupies [a0,a1,b0,b1,out0,out1].
+        let m0 = WIRES_PER_OP * PACKS_PER_COLUMN * op;
+        for group in 0..PACKS_PER_COLUMN {
+            let a0 = wires[m0 + group];
+            let a1 = wires[m0 + PACKS_PER_COLUMN + group];
+            let b0 = wires[m0 + 2 * PACKS_PER_COLUMN + group];
+            let b1 = wires[m0 + 3 * PACKS_PER_COLUMN + group];
+            let out0 = wires[m0 + 4 * PACKS_PER_COLUMN + group];
+            let out1 = wires[m0 + 5 * PACKS_PER_COLUMN + group];
+
+            // Direct coefficients of (a0 + a1 X)(b0 + b1 X), X^2 = W. The first
+            // product in each sum remains the accumulator; the second is the existing packed
+            // multiply-accumulate primitive.
+            let prod0 = (a0 * b0)
+                .multiply_accumulate(w * a1, b1);
+            let prod1 = (a0 * b1).multiply_accumulate(a1, b0);
+            let constraint0 = out0 - prod0 * constants[group];
+            let constraint1 = out1 - prod1 * constants[group];
+
+            let row0 = (CONSTRAINTS_PER_OP * op) * PACKS_PER_COLUMN + group;
+            combined[row0] = combined[row0].multiply_accumulate(constraint0, filters[group]);
+            let row1 = row0 + PACKS_PER_COLUMN;
+            combined[row1] = combined[row1].multiply_accumulate(constraint1, filters[group]);
+        }
     }
 }
 
@@ -117,6 +183,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+
+        if D == 2
+            && self.num_ops == 13
+            && n == 32
+            && <<F as Packable>::Packing as PackedField>::WIDTH == 4
+        {
+            eval_quadratic_packed_direct_n32::<F, D>(
+                vars_base,
+                filters,
+                combined_gate_constraints,
+            );
+            return;
+        }
 
         let wires = vars_base.local_wires;
         let const_0 = &vars_base.local_constants[..n];
@@ -302,7 +381,9 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::{Field, Field64, PrimeField64};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
     #[test]
@@ -318,5 +399,124 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = MulExtensionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    fn scalar_extension_accumulate_reference(
+        gate: &MulExtensionGate<2>,
+        vars: EvaluationVarsBaseBatch<GoldilocksField>,
+        filters: &[GoldilocksField],
+        combined: &mut [GoldilocksField],
+    ) {
+        type F = GoldilocksField;
+        let n = vars.len();
+        let wires = vars.local_wires;
+        let constants = &vars.local_constants[..n];
+        let ext = |start: usize, point: usize| {
+            <F as Extendable<2>>::Extension::from_basefield_array([
+                wires[start * n + point],
+                wires[(start + 1) * n + point],
+            ])
+        };
+        let mut scratch = vec![F::ZERO; 2 * n];
+        for op in 0..gate.num_ops {
+            let m0 = MulExtensionGate::<2>::wires_ith_multiplicand_0(op).start;
+            let m1 = MulExtensionGate::<2>::wires_ith_multiplicand_1(op).start;
+            let out = MulExtensionGate::<2>::wires_ith_output(op).start;
+            for point in 0..n {
+                let product = ext(m0, point) * ext(m1, point);
+                let computed = <<F as Extendable<2>>::Extension as FieldExtension<2>>::scalar_mul(
+                    &product,
+                    constants[point],
+                );
+                let difference = ext(out, point) - computed;
+                let coefficients =
+                    <<F as Extendable<2>>::Extension as FieldExtension<2>>::to_basefield_array(
+                        &difference,
+                    );
+                scratch[point] = coefficients[0];
+                scratch[n + point] = coefficients[1];
+            }
+            batch_multiply_add_inplace(
+                &mut combined[(2 * op) * n..][..n],
+                &scratch[..n],
+                filters,
+            );
+            batch_multiply_add_inplace(
+                &mut combined[(2 * op + 1) * n..][..n],
+                &scratch[n..],
+                filters,
+            );
+        }
+    }
+
+    fn quadratic_raw_value(i: usize) -> GoldilocksField {
+        type F = GoldilocksField;
+        const EDGES: [u64; 9] = [
+            0,
+            1,
+            2,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX,
+        ];
+        let edge = i % 23;
+        let raw = if edge < EDGES.len() {
+            EDGES[edge]
+        } else {
+            let mut x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^= x >> 29;
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x ^ (x >> 31)
+        };
+        F::from_noncanonical_u64(raw)
+    }
+
+    fn raw_words(values: &[GoldilocksField]) -> Vec<u64> {
+        values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    /// Production n=32 exercises the packed quadratic specialization. Width and batch boundaries
+    /// exercise the untouched scalar/extension fallback. The comparison is raw-word strict.
+    #[test]
+    fn quadratic_packed_accumulate_matches_scalar_extension_raw_and_canonical() {
+        for num_ops in [1usize, 12, 13, 14] {
+            let gate = MulExtensionGate::<2> { num_ops };
+            for n in [1usize, 3, 4, 5, 31, 32, 33] {
+                let wires = (0..6 * num_ops * n)
+                    .map(|i| quadratic_raw_value(i + 0x1000 + 29 * num_ops + n))
+                    .collect::<Vec<_>>();
+                let constants = (0..n)
+                    .map(|i| quadratic_raw_value(5 * i + 0x2000 + 31 * num_ops + n))
+                    .collect::<Vec<_>>();
+                let filters = (0..n)
+                    .map(|i| quadratic_raw_value(7 * i + 0x3000 + 37 * num_ops + n))
+                    .collect::<Vec<_>>();
+                let initial = (0..2 * num_ops * n)
+                    .map(|i| quadratic_raw_value(13 * i + 0x4000 + 41 * num_ops + n))
+                    .collect::<Vec<_>>();
+                let hash = HashOut {
+                    elements: core::array::from_fn(|i| {
+                        quadratic_raw_value(0x5000 + 17 * i + 43 * num_ops + n)
+                    }),
+                };
+                let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+                let mut reference = initial.clone();
+                scalar_extension_accumulate_reference(&gate, vars, &filters, &mut reference);
+                let mut candidate = initial;
+                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut candidate);
+                assert_eq!(
+                    candidate, reference,
+                    "canonical mismatch at num_ops={num_ops}, n={n}"
+                );
+                assert_eq!(
+                    raw_words(&candidate),
+                    raw_words(&reference),
+                    "raw mismatch at num_ops={num_ops}, n={n}"
+                );
+            }
+        }
     }
 }

@@ -355,6 +355,18 @@ pub struct PartitionWitness<'a, F: Field> {
     pub degree: usize,
 }
 
+/// Format the contradictory-assignment error off the overwhelmingly common setter path.
+#[cold]
+#[inline(never)]
+fn partition_duplicate_error<F: Field>(target: Target, old_value: F, value: F) -> anyhow::Error {
+    anyhow!(
+        "Partition containing {:?} was set twice with different values: {} != {}",
+        target,
+        old_value,
+        value
+    )
+}
+
 impl<'a, F: Field> PartitionWitness<'a, F> {
     pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
         let len = representative_map.len();
@@ -386,30 +398,26 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0
     }
 
-    #[inline]
-    fn mark_set(&mut self, rep_index: usize) {
-        self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
-    }
-
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
+    #[inline(always)]
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)] as usize;
-        if self.is_set_by_rep_index(rep_index) {
+        let mask = 1u64 << (rep_index & 63);
+        let word = &mut self.set_bitmap[rep_index >> 6];
+        let current_word = *word;
+        if current_word & mask != 0 {
             let old_value = self.values[rep_index];
             if value != old_value {
-                return Err(anyhow!(
-                    "Partition containing {:?} was set twice with different values: {} != {}",
-                    target,
-                    old_value,
-                    value
-                ));
+                return Err(partition_duplicate_error(target, old_value, value));
             }
 
             Ok(None)
         } else {
+            // Publish the value before the bit: every reader uses the bitmap as
+            // the initialization guard for the otherwise-uninitialized slot.
             self.values[rep_index] = value;
-            self.mark_set(rep_index);
+            *word = current_word | mask;
             Ok(Some(rep_index))
         }
     }
@@ -425,27 +433,27 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// contradiction check, the store and the mark -- is the identical
     /// sequence on the identical slot, so the resulting witness is bit-for-bit
     /// what `set_target_returning_rep` would have produced.
+    #[inline(always)]
     pub fn set_rep_index_returning_new(
         &mut self,
         rep_index: usize,
         target: Target,
         value: F,
     ) -> Result<Option<usize>> {
-        if self.is_set_by_rep_index(rep_index) {
+        let mask = 1u64 << (rep_index & 63);
+        let word = &mut self.set_bitmap[rep_index >> 6];
+        let current_word = *word;
+        if current_word & mask != 0 {
             let old_value = self.values[rep_index];
             if value != old_value {
-                return Err(anyhow!(
-                    "Partition containing {:?} was set twice with different values: {} != {}",
-                    target,
-                    old_value,
-                    value
-                ));
+                return Err(partition_duplicate_error(target, old_value, value));
             }
 
             Ok(None)
         } else {
+            // Keep the initialization store ordered before publishing its bit.
             self.values[rep_index] = value;
-            self.mark_set(rep_index);
+            *word = current_word | mask;
             Ok(Some(rep_index))
         }
     }
@@ -557,5 +565,292 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    /// The setter implementation immediately before the hot-path rewrite. Its storage is
+    /// initialized in tests so the oracle never relies on `PartitionWitness` internals.
+    struct LegacySetter {
+        values: Vec<F>,
+        set_bitmap: Vec<u64>,
+    }
+
+    impl LegacySetter {
+        fn new(len: usize) -> Self {
+            Self {
+                values: vec![F::ZERO; len],
+                set_bitmap: vec![0; len.div_ceil(64)],
+            }
+        }
+
+        fn set(&mut self, rep_index: usize, target: Target, value: F) -> Result<Option<usize>> {
+            if (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0 {
+                let old_value = self.values[rep_index];
+                if value != old_value {
+                    return Err(anyhow!(
+                        "Partition containing {:?} was set twice with different values: {} != {}",
+                        target,
+                        old_value,
+                        value
+                    ));
+                }
+
+                Ok(None)
+            } else {
+                self.values[rep_index] = value;
+                self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
+                Ok(Some(rep_index))
+            }
+        }
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    enum Expected {
+        New(usize),
+        Repeat,
+        Conflict,
+    }
+
+    #[derive(Copy, Clone, Debug)]
+    struct Event {
+        target_index: usize,
+        value: u64,
+        expected: Expected,
+    }
+
+    fn differential_events() -> Vec<Event> {
+        use Expected::{Conflict, New, Repeat};
+
+        vec![
+            // The ends of the first bitmap word.
+            Event {
+                target_index: 0,
+                value: 10,
+                expected: New(0),
+            },
+            Event {
+                target_index: 1,
+                value: 11,
+                expected: New(1),
+            },
+            Event {
+                target_index: 62,
+                value: 12,
+                expected: New(62),
+            },
+            // Target 10 is an alias for representative 63. Exercise new-through-alias,
+            // same-value repeat through the canonical target, and conflicting alias.
+            Event {
+                target_index: 10,
+                value: 13,
+                expected: New(63),
+            },
+            Event {
+                target_index: 63,
+                value: 13,
+                expected: Repeat,
+            },
+            Event {
+                target_index: 11,
+                value: 14,
+                expected: Conflict,
+            },
+            // Cross 63 -> 64 with a real zero assignment, which must still publish a bit.
+            Event {
+                target_index: 70,
+                value: 0,
+                expected: New(64),
+            },
+            Event {
+                target_index: 64,
+                value: 0,
+                expected: Repeat,
+            },
+            Event {
+                target_index: 71,
+                value: 15,
+                expected: Conflict,
+            },
+            Event {
+                target_index: 65,
+                value: 16,
+                expected: New(65),
+            },
+            Event {
+                target_index: 126,
+                value: 17,
+                expected: New(126),
+            },
+            Event {
+                target_index: 140,
+                value: 18,
+                expected: New(127),
+            },
+            Event {
+                target_index: 127,
+                value: 18,
+                expected: Repeat,
+            },
+            Event {
+                target_index: 141,
+                value: 19,
+                expected: Conflict,
+            },
+            // Cross 127 -> 128 and cover the next complete bitmap word.
+            Event {
+                target_index: 180,
+                value: 20,
+                expected: New(128),
+            },
+            Event {
+                target_index: 128,
+                value: 20,
+                expected: Repeat,
+            },
+            Event {
+                target_index: 181,
+                value: 21,
+                expected: Conflict,
+            },
+            Event {
+                target_index: 129,
+                value: 22,
+                expected: New(129),
+            },
+            Event {
+                target_index: 190,
+                value: 23,
+                expected: New(190),
+            },
+            Event {
+                target_index: 191,
+                value: 24,
+                expected: New(191),
+            },
+            // Cross 191 -> 192 into the partially-used final word.
+            Event {
+                target_index: 194,
+                value: 25,
+                expected: New(192),
+            },
+            Event {
+                target_index: 192,
+                value: 25,
+                expected: Repeat,
+            },
+            Event {
+                target_index: 193,
+                value: 26,
+                expected: New(193),
+            },
+            // A conflict at the opposite end verifies that errors leave old state intact.
+            Event {
+                target_index: 0,
+                value: 27,
+                expected: Conflict,
+            },
+            Event {
+                target_index: 0,
+                value: 10,
+                expected: Repeat,
+            },
+        ]
+    }
+
+    fn representative_map() -> Vec<u32> {
+        let mut map: Vec<u32> = (0..195).map(|i| i as u32).collect();
+        for (target, representative) in [
+            (10, 63),
+            (11, 63),
+            (70, 64),
+            (71, 64),
+            (140, 127),
+            (141, 127),
+            (180, 128),
+            (181, 128),
+            (194, 192),
+        ] {
+            map[target] = representative;
+        }
+        map
+    }
+
+    fn normalized(result: Result<Option<usize>>) -> core::result::Result<Option<usize>, String> {
+        result.map_err(|error| error.to_string())
+    }
+
+    fn assert_same_state(actual: &PartitionWitness<'_, F>, legacy: &LegacySetter) {
+        assert_eq!(actual.set_bitmap, legacy.set_bitmap);
+        for rep_index in 0..legacy.values.len() {
+            if (legacy.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0 {
+                // Never inspect an unset `actual.values` slot: those are deliberately
+                // uninitialized and the bitmap is their initialization guard.
+                assert_eq!(actual.values[rep_index], legacy.values[rep_index]);
+            }
+        }
+    }
+
+    fn run_setter_differential(use_supplied_representative: bool) {
+        let map = representative_map();
+        let mut actual = PartitionWitness::new(1, map.len(), &map);
+        let mut legacy = LegacySetter::new(map.len());
+
+        for event in differential_events() {
+            let target = Target::wire(event.target_index, 0);
+            let rep_index = map[event.target_index] as usize;
+            let value = F::from_canonical_u64(event.value);
+            let before_bitmap = actual.set_bitmap.clone();
+            let before_values: Vec<(usize, F)> = (0..map.len())
+                .filter(|&i| actual.is_set_by_rep_index(i))
+                .map(|i| (i, actual.values[i]))
+                .collect();
+
+            let actual_result = if use_supplied_representative {
+                actual.set_rep_index_returning_new(rep_index, target, value)
+            } else {
+                actual.set_target_returning_rep(target, value)
+            };
+            let legacy_result = legacy.set(rep_index, target, value);
+            let actual_result = normalized(actual_result);
+            let legacy_result = normalized(legacy_result);
+
+            assert_eq!(actual_result, legacy_result, "event: {event:?}");
+            match event.expected {
+                Expected::New(expected_rep) => {
+                    assert_eq!(actual_result, Ok(Some(expected_rep)), "event: {event:?}");
+                }
+                Expected::Repeat => {
+                    assert_eq!(actual_result, Ok(None), "event: {event:?}");
+                }
+                Expected::Conflict => {
+                    assert!(actual_result.is_err(), "event: {event:?}");
+                    assert_eq!(actual.set_bitmap, before_bitmap, "event: {event:?}");
+                    for (rep, old_value) in before_values {
+                        assert_eq!(actual.values[rep], old_value, "event: {event:?}");
+                    }
+                }
+            }
+            assert_same_state(&actual, &legacy);
+        }
+
+        let edge_bits = 3 | (1u64 << 62) | (1u64 << 63);
+        assert_eq!(actual.set_bitmap, vec![edge_bits, edge_bits, edge_bits, 3]);
+    }
+
+    #[test]
+    fn gathered_partition_setter_matches_legacy_at_aliases_and_bitmap_boundaries() {
+        run_setter_differential(false);
+    }
+
+    #[test]
+    fn supplied_rep_partition_setter_matches_legacy_at_aliases_and_bitmap_boundaries() {
+        run_setter_differential(true);
     }
 }
