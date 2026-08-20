@@ -1491,6 +1491,58 @@ fn fft_zero_padded_rate_8_first_layer_block(
     }
 }
 
+/// Rate-8 expansion using paired AArch64 reductions and vector butterflies.
+/// This preserves the generic packed path's raw `u64` representatives while
+/// keeping the repeated source word and eight twiddles live across the block.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_zero_padded_rate_8_first_layer_block_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    source_start: usize,
+    nonzero_len: usize,
+    destination: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+
+    use crate::arch::aarch64::neon_goldilocks_field::mul_reduce_pair_keep;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    debug_assert!(nonzero_len >= 2);
+    assert!(omega_row.len() >= 8);
+    assert!(source_start + nonzero_len <= values.len());
+    assert!(destination + (nonzero_len / 2) * 16 <= values.len());
+
+    let base = values.as_mut_ptr().cast::<u64>();
+    let w: [u64; 8] = core::array::from_fn(|i| omega_row[i].0);
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        for pair in (0..nonzero_len / 2).rev() {
+            let src = base.add(source_start + pair * 2);
+            let u = *src;
+            let v = *src.add(1);
+            let (t0, t1) = mul_reduce_pair_keep(w[0], v, w[1], v);
+            let (t2, t3) = mul_reduce_pair_keep(w[2], v, w[3], v);
+            let (t4, t5) = mul_reduce_pair_keep(w[4], v, w[5], v);
+            let (t6, t7) = mul_reduce_pair_keep(w[6], v, w[7], v);
+            let uv = vdupq_n_u64(u);
+            let a0 = vcombine_u64(vcreate_u64(t0), vcreate_u64(t1));
+            let a1 = vcombine_u64(vcreate_u64(t2), vcreate_u64(t3));
+            let a2 = vcombine_u64(vcreate_u64(t4), vcreate_u64(t5));
+            let a3 = vcombine_u64(vcreate_u64(t6), vcreate_u64(t7));
+            let dst = base.add(destination + pair * 16);
+            vst1q_u64(dst, gl_add_neon(uv, a0, eps));
+            vst1q_u64(dst.add(2), gl_add_neon(uv, a1, eps));
+            vst1q_u64(dst.add(4), gl_add_neon(uv, a2, eps));
+            vst1q_u64(dst.add(6), gl_add_neon(uv, a3, eps));
+            vst1q_u64(dst.add(8), gl_sub_neon(uv, a0, eps));
+            vst1q_u64(dst.add(10), gl_sub_neon(uv, a1, eps));
+            vst1q_u64(dst.add(12), gl_sub_neon(uv, a2, eps));
+            vst1q_u64(dst.add(14), gl_sub_neon(uv, a3, eps));
+        }
+    }
+}
+
 /// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
 ///
 /// This is called only when each repeated run contains at least one packed vector.
@@ -1545,19 +1597,30 @@ fn fft_zero_padded_cache_blocks<P, M>(
         #[cfg(target_arch = "aarch64")]
         if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
         {
-            let wide_values = unsafe {
+            let scalar_values = unsafe {
                 // SAFETY: The TypeId check proves this is the exact concrete packed type;
                 // only the generic spelling of the slice differs at this point.
                 core::slice::from_raw_parts_mut(
-                    packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
-                    packed_values.len(),
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    packed_values.len() * P::WIDTH,
                 )
             };
-            fft_zero_padded_rate_8_first_layer_block(
-                wide_values,
+            let omega_row = unsafe {
+                core::slice::from_raw_parts(
+                    omega_table
+                        .as_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    omega_table.len() * P::WIDTH,
+                )
+            };
+            fft_zero_padded_rate_8_first_layer_block_neon(
+                scalar_values,
                 source_start,
                 nonzero_per_block,
-                destination,
+                destination * P::WIDTH,
+                omega_row,
             );
         } else {
             fft_zero_padded_first_layer_block_with::<P, M>(
@@ -3361,6 +3424,62 @@ mod tests {
                 actual.iter().map(|x| x.0).collect::<Vec<_>>(),
                 expected.iter().map(|x| x.0).collect::<Vec<_>>(),
                 "raw limb mismatch at 2^{lg_n}, r={r}"
+            );
+        }
+    }
+
+    /// The vector rate-8 block must reproduce the previous production block
+    /// word-for-word over the ranked cache-block geometry.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn rate_8_expansion_neon_matches_previous_raw_words() {
+        use super::{
+            fft_zero_padded_rate_8_first_layer_block,
+            fft_zero_padded_rate_8_first_layer_block_neon,
+        };
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+        use crate::packed::PackedField;
+
+        for (lg_n, lg_block_n) in [(19usize, 13usize), (17, 13), (13, 13), (6, 6)] {
+            let n = 1usize << lg_n;
+            let block_len = 1usize << lg_block_n;
+            let nonzero_per_block = block_len >> 3;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let seed = (0..n)
+                .map(|i| {
+                    let x = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1);
+                    GoldilocksField(match i % 5 {
+                        0 => x,
+                        1 => u64::MAX - i as u64,
+                        2 => x | 0xFFFF_FFFF_0000_0000,
+                        3 => i as u64 % 3,
+                        _ => x ^ 0xFFFF_FFFF_FFFF_0000,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut expected = seed.clone();
+            let mut actual = seed;
+
+            for block in (0..n / block_len).rev() {
+                fft_zero_padded_rate_8_first_layer_block(
+                    WideGoldilocksField::pack_slice_mut(&mut expected),
+                    block * nonzero_per_block,
+                    nonzero_per_block,
+                    block * block_len / WideGoldilocksField::WIDTH,
+                );
+                fft_zero_padded_rate_8_first_layer_block_neon(
+                    &mut actual,
+                    block * nonzero_per_block,
+                    nonzero_per_block,
+                    block * block_len,
+                    &roots[3],
+                );
+            }
+
+            assert_eq!(
+                actual.iter().map(|x| x.0).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "raw mismatch at 2^{lg_n}"
             );
         }
     }

@@ -1777,6 +1777,14 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
         selector_filter_suffix,
     );
     for &i in cpu_gate_indices {
+        let gate = &common_data.gates[i];
+        // A gate that declares no constraints contributes no rows to the
+        // shared accumulator. Skip before constructing either form of its
+        // selector filter; both branches would otherwise do observable CPU
+        // work only to zip it against an empty constraint set.
+        if gate.0.num_constraints() == 0 {
+            continue;
+        }
         if let Some(plan) = interleave_pair {
             if i == plan.interleave_index {
                 if shared_gate_filter_plan[plan.interleave_index]
@@ -1849,7 +1857,6 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
                 continue;
             }
         }
-        let gate = &common_data.gates[i];
         if shared_gate_filter_plan[i] {
             let batch_size = vars_batch.len();
             let filter = &shared_gate_filters[i * batch_size..(i + 1) * batch_size];

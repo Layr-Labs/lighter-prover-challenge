@@ -6,7 +6,6 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
 
 use anyhow::Result;
 use itertools::Itertools;
@@ -84,6 +83,41 @@ fn accumulate_constraint_direct<F: Field>(
 
     for (offset, (x_out, &x_filter)) in out_leftovers.iter_mut().zip(filter_leftovers).enumerate() {
         *x_out += term_at(packed_len + offset) * x_filter;
+    }
+}
+
+/// Fold one selector level into storage disjoint from both input columns.
+/// Disjointness lets the maximal point prefix use the field's preferred
+/// packing; the ragged suffix retains the identical scalar expression.
+#[inline]
+fn fold_selector_level<F: Field>(out: &mut [F], xs: &[F], ys: &[F], selector: &[F]) {
+    assert_eq!(out.len(), xs.len());
+    assert_eq!(out.len(), ys.len());
+    assert_eq!(out.len(), selector.len());
+
+    type Packing<F> = <F as Packable>::Packing;
+    let width = Packing::<F>::WIDTH;
+    let packed_len = out.len() - out.len() % width;
+    let (out_prefix, out_tail) = out.split_at_mut(packed_len);
+    let (xs_prefix, xs_tail) = xs.split_at(packed_len);
+    let (ys_prefix, ys_tail) = ys.split_at(packed_len);
+    let (selector_prefix, selector_tail) = selector.split_at(packed_len);
+
+    for (((out, &x), &y), &b) in Packing::<F>::pack_slice_mut(out_prefix)
+        .iter_mut()
+        .zip(Packing::<F>::pack_slice(xs_prefix))
+        .zip(Packing::<F>::pack_slice(ys_prefix))
+        .zip(Packing::<F>::pack_slice(selector_prefix))
+    {
+        *out = x + b * (y - x);
+    }
+    for (((out, &x), &y), &b) in out_tail
+        .iter_mut()
+        .zip(xs_tail)
+        .zip(ys_tail)
+        .zip(selector_tail)
+    {
+        *out = x + b * (y - x);
     }
 }
 
@@ -329,21 +363,22 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         let col = |w: usize| &wires[w * n..][..n];
         let vec_size = self.vec_size();
         let mut row = 0;
-        // The first selector fold reads the immutable wire columns directly,
-        // so only its `vec_size / 2` output columns need scratch storage. The
-        // former path zero-filled and copied all `vec_size` input columns here,
-        // then immediately consumed and discarded that mirror.
-        let item_count = (vec_size / 2) * n;
-        // The ranked shape is bits=4 over a 32-point batch: eight folded
-        // columns fit exactly here. Larger generic shapes retain heap storage.
-        let mut items_stack = [MaybeUninit::<F>::uninit(); 8 * 32];
+        // Alternate selector levels between disjoint halves. This removes the
+        // apparent source/destination alias that forced the old in-place fold
+        // to stay scalar across points.
+        let item_capacity = (vec_size / 2) * n;
+        let item_count = 2 * item_capacity;
+        // The ranked shape is bits=4 over a 32-point batch: two eight-column
+        // halves fit exactly here. Larger generic shapes retain heap storage.
+        let mut items_stack = [F::ZERO; 16 * 32];
         let mut items_heap;
-        let items_uninit: &mut [MaybeUninit<F>] = if item_count <= items_stack.len() {
+        let items: &mut [F] = if item_count <= items_stack.len() {
             &mut items_stack[..item_count]
         } else {
-            items_heap = vec![MaybeUninit::uninit(); item_count];
+            items_heap = vec![F::ZERO; item_count];
             &mut items_heap
         };
+        let (items_a, items_b) = items.split_at_mut(item_capacity);
 
         for copy in 0..self.num_copies {
             // Assert that each bit wire value is indeed boolean.
@@ -382,29 +417,27 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
                 for k in 0..vec_size / 2 {
                     let xs = col(self.wire_list_item(2 * k, copy));
                     let ys = col(self.wire_list_item(2 * k + 1, copy));
-                    for p in 0..n {
-                        let x = xs[p];
-                        let y = ys[p];
-                        items_uninit[k * n + p].write(x + b[p] * (y - x));
-                    }
+                    fold_selector_level(&mut items_a[k * n..][..n], xs, ys, b);
                 }
             }
-            // SAFETY: With zero index bits the slice is empty. Otherwise the
-            // first selector level initialized every element exactly once;
-            // `MaybeUninit<F>` has the same layout and alignment as `F`.
-            let items = unsafe {
-                core::slice::from_raw_parts_mut(items_uninit.as_mut_ptr().cast::<F>(), item_count)
-            };
             let mut level_size = vec_size / 2;
+            let mut current_in_a = true;
             for i in 1..self.bits {
                 let b = col(self.wire_bit(i, copy));
-                for k in 0..level_size / 2 {
-                    for p in 0..n {
-                        let x = items[2 * k * n + p];
-                        let y = items[(2 * k + 1) * n + p];
-                        items[k * n + p] = x + b[p] * (y - x);
+                if current_in_a {
+                    for k in 0..level_size / 2 {
+                        let xs = &items_a[2 * k * n..][..n];
+                        let ys = &items_a[(2 * k + 1) * n..][..n];
+                        fold_selector_level(&mut items_b[k * n..][..n], xs, ys, b);
+                    }
+                } else {
+                    for k in 0..level_size / 2 {
+                        let xs = &items_b[2 * k * n..][..n];
+                        let ys = &items_b[(2 * k + 1) * n..][..n];
+                        fold_selector_level(&mut items_a[k * n..][..n], xs, ys, b);
                     }
                 }
+                current_in_a = !current_in_a;
                 level_size /= 2;
             }
             let claimed_element = col(self.wire_claimed_element(copy));
@@ -414,8 +447,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
                 |p| {
                     let selected = if self.bits == 0 {
                         col(self.wire_list_item(0, copy))[p]
+                    } else if current_in_a {
+                        items_a[p]
                     } else {
-                        items[p]
+                        items_b[p]
                     };
                     selected - claimed_element[p]
                 },

@@ -49,6 +49,11 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // only syscall batching, never the serialized bytes.
 const PROOF_OUTPUT_BUFFER_BYTES: usize = 512 * 1024;
 
+const HOST_PIPELINE_ARCHIVE: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/poseidon2-host-pipelines.metalarchive"
+));
+
 fn main() {
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context("worker", 0, &[]);
@@ -72,6 +77,7 @@ fn main() {
     let mut args = env::args().skip(1);
     let fixture = args.next().expect("usage: prove FIXTURE OUTPUT");
     let output = args.next().expect("usage: prove FIXTURE OUTPUT");
+    plonky2::hash::poseidon2::set_pipeline_archive_bytes(HOST_PIPELINE_ARCHIVE);
     if let Some(dir) = std::path::Path::new(&output).parent() {
         plonky2::hash::poseidon2::set_pipeline_archive_dir(dir);
     }
@@ -267,4 +273,4 @@ fn main() {
     unsafe { _exit(0) }
 }
 
-// zarar-arc-1
+// newjordan r21-newjordan-3522832

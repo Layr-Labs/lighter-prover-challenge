@@ -726,10 +726,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let base_0 = wire_value + gamma_0;
+                                let base_1 = wire_value + gamma_1;
+                                numerator_0 *= base_0.multiply_accumulate(beta_k_is_0[j], x);
+                                numerator_1 *= base_1.multiply_accumulate(beta_k_is_1[j], x);
+                                denominator_0 *= base_0.multiply_accumulate(beta_0, sigma);
+                                denominator_1 *= base_1.multiply_accumulate(beta_1, sigma);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -859,8 +861,9 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let base = wire_value + gamma;
+                            numerator_product *= base.multiply_accumulate(beta_k_is[j], x);
+                            denominator_product *= base.multiply_accumulate(beta, s_sigmas[j]);
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -1605,8 +1608,15 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     filter_at: impl Fn(usize, usize) -> F,
 ) {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
-    for g in 0..num_gates {
+    if num_gates == 0 {
+        chunk.fill(F::ZERO);
+        return;
+    }
+    // The first gate initializes every destination slot, deleting the old
+    // allocation, zero-fill, and copy without putting a gate-index branch in
+    // the hot row loop.
+    let g = 0;
+    {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
         let low_base = g * half_rows * 2;
@@ -1619,11 +1629,27 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            chunk[2 * r] = filter * sv0;
+            chunk[2 * r + 1] = filter * sv1;
         }
     }
-    chunk.copy_from_slice(&acc);
+    for g in 1..num_gates {
+        let odd0 = &odd[g * 2];
+        let odd1 = &odd[g * 2 + 1];
+        let low_base = g * half_rows * 2;
+        for r in 0..rows {
+            let i = row0 + r;
+            let (sv0, sv1) = if i & 1 == 0 {
+                let base = low_base + (i >> 1) * 2;
+                (low[base], low[base + 1])
+            } else {
+                (odd0[i >> 1], odd1[i >> 1])
+            };
+            let filter = filter_at(g, r);
+            chunk[2 * r] += filter * sv0;
+            chunk[2 * r + 1] += filter * sv1;
+        }
+    }
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -1928,6 +1954,7 @@ pub fn range_quotient_microbench<
     }
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn start_gpu_range_check_gate_quotient<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,

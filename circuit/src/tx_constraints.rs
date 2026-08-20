@@ -3340,12 +3340,17 @@ impl TxTarget {
 
 pub trait TxTargetWitness<F: PrimeField64 + Extendable<5> + RichField> {
     fn set_tx_target(&mut self, a: &TxTarget, b: &Tx<F>) -> Result<()>;
+    fn set_tx_target_for_path(&mut self, a: &TxTarget, b: &Tx<F>, light: bool) -> Result<()>;
 }
 
 impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + RichField>
     TxTargetWitness<F> for T
 {
     fn set_tx_target(&mut self, a: &TxTarget, b: &Tx<F>) -> Result<()> {
+        self.set_tx_target_for_path(a, b, false)
+    }
+
+    fn set_tx_target_for_path(&mut self, a: &TxTarget, b: &Tx<F>, light: bool) -> Result<()> {
         self.set_target(a.tx_type, F::from_canonical_u8(b.tx_type))?;
         self.set_target(a.tx_index, F::from_canonical_u64(b.tx_index))?;
 
@@ -3590,7 +3595,8 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         /*****************************/
         /*  State Tree Merkle Proofs */
         /*****************************/
-        for i in 0..NB_ACCOUNTS_PER_TX {
+        let live_accounts = if light { 1 } else { NB_ACCOUNTS_PER_TX };
+        for i in 0..live_accounts {
             for j in 0..ACCOUNT_MERKLE_LEVELS {
                 self.set_hash_target(
                     a.account_tree_merkle_proofs[i][j],
@@ -3598,28 +3604,26 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
                 )?;
             }
         }
-        for i in 0..NB_ACCOUNTS_PER_TX {
-            for j in 0..ACCOUNT_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.account_pub_data_tree_merkle_proofs[i][j],
-                    b.account_pub_data_tree_merkle_proofs[i][j],
-                )?;
+        if !light {
+            for i in 0..NB_ACCOUNTS_PER_TX {
+                for j in 0..ACCOUNT_MERKLE_LEVELS {
+                    self.set_hash_target(
+                        a.account_pub_data_tree_merkle_proofs[i][j],
+                        b.account_pub_data_tree_merkle_proofs[i][j],
+                    )?;
+                    self.set_hash_target(
+                        a.account_delta_tree_merkle_proofs[i][j],
+                        b.account_delta_tree_merkle_proofs[i][j],
+                    )?;
+                }
             }
-        }
-        for i in 0..NB_ACCOUNTS_PER_TX {
-            for j in 0..ACCOUNT_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.account_delta_tree_merkle_proofs[i][j],
-                    b.account_delta_tree_merkle_proofs[i][j],
-                )?;
-            }
-        }
-        for i in 0..NB_ACCOUNTS_PER_TX - 1 {
-            for j in 0..POSITION_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.position_delta_merkle_proofs[i][j],
-                    b.position_delta_merkle_proofs[i][j],
-                )?;
+            for i in 0..NB_ACCOUNTS_PER_TX - 1 {
+                for j in 0..POSITION_MERKLE_LEVELS {
+                    self.set_hash_target(
+                        a.position_delta_merkle_proofs[i][j],
+                        b.position_delta_merkle_proofs[i][j],
+                    )?;
+                }
             }
         }
         for i in 0..API_KEY_MERKLE_LEVELS {
@@ -3628,29 +3632,36 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
                 b.api_key_tree_merkle_proof[i],
             )?;
         }
+        let live_account_order_paths = if light {
+            NB_CLOID_UNIQUENESS_CHECK_PER_TX
+        } else {
+            NB_ACCOUNT_ORDERS_PATHS_PER_TX
+        };
         for i in 0..ACCOUNT_ORDERS_MERKLE_LEVELS {
-            for j in 0..NB_ACCOUNT_ORDERS_PATHS_PER_TX {
+            for j in 0..live_account_order_paths {
                 self.set_hash_target(
                     a.account_orders_tree_merkle_proof[j][i],
                     b.account_orders_tree_merkle_proof[j][i],
                 )?;
             }
         }
-        for i in 0..NB_ACCOUNTS_PER_TX {
+        for i in 0..live_accounts {
             for j in 0..NB_ASSETS_PER_TX {
                 for k in 0..ASSET_MERKLE_LEVELS {
                     self.set_hash_target(
                         a.asset_tree_merkle_proofs[i][j][k],
                         b.asset_tree_merkle_proofs[i][j][k],
                     )?;
-                    self.set_hash_target(
-                        a.public_asset_tree_merkle_proofs[i][j][k],
-                        b.public_asset_tree_merkle_proofs[i][j][k],
-                    )?;
-                    self.set_hash_target(
-                        a.asset_delta_tree_merkle_proofs[i][j][k],
-                        b.asset_delta_tree_merkle_proofs[i][j][k],
-                    )?;
+                    if !light {
+                        self.set_hash_target(
+                            a.public_asset_tree_merkle_proofs[i][j][k],
+                            b.public_asset_tree_merkle_proofs[i][j][k],
+                        )?;
+                        self.set_hash_target(
+                            a.asset_delta_tree_merkle_proofs[i][j][k],
+                            b.asset_delta_tree_merkle_proofs[i][j][k],
+                        )?;
+                    }
                 }
             }
         }

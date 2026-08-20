@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -174,6 +175,37 @@ impl<F: RichField + Extendable<D>, const D: usize> CosetInterpolationGate<F, D> 
         let start = self.start_intermediates() + D * 2 * self.num_intermediates();
         start..start + D
     }
+
+    /// Run one interpolation segment directly from the strided wire view.
+    /// Each interpolant is consumed exactly once, so collecting all values in
+    /// a temporary vector only adds allocation and stores without improving
+    /// locality. The recurrence and field-operation order match
+    /// [`partial_interpolate`] exactly.
+    fn partial_interpolate_base_wires(
+        &self,
+        vars: &EvaluationVarsBase<'_, F>,
+        value_indices: Range<usize>,
+        domain: &[F],
+        weights: &[F],
+        x: F::Extension,
+        initial_eval: F::Extension,
+        initial_partial_prod: F::Extension,
+    ) -> (F::Extension, F::Extension) {
+        debug_assert!(value_indices.start < value_indices.end);
+        debug_assert!(value_indices.end <= self.num_points());
+        debug_assert!(value_indices.end <= domain.len());
+        debug_assert!(value_indices.end <= weights.len());
+
+        let mut eval = initial_eval;
+        let mut partial_prod = initial_partial_prod;
+        for i in value_indices {
+            let weighted_value = vars.get_local_ext(self.wires_value(i)).scalar_mul(weights[i]);
+            let term = x - domain[i].into();
+            eval = eval * term + weighted_value * partial_prod;
+            partial_prod = partial_prod * term;
+        }
+        (eval, partial_prod)
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpolationGate<F, D> {
@@ -301,11 +333,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
     }
 
     /// Batched fused evaluation. The interpolation itself is inherently
-    /// per-point, but this override hoists the subgroup computation and the
-    /// values buffer out of the point loop (the default path recomputes the
-    /// two-adic subgroup and collects the values `Vec` once per point) and
-    /// multiply-adds the filtered constraint rows straight into the shared
-    /// buffer.
+    /// per-point, but this override hoists the subgroup computation, reads each
+    /// interpolant directly at its one use, and multiply-adds the filtered
+    /// constraint rows straight into the shared buffer.
     fn eval_unfiltered_base_batch_accumulate(
         &self,
         vars_base: EvaluationVarsBaseBatch<F>,
@@ -322,8 +352,22 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        let scratch_len = num_constraints * n;
+        // Production is 12 constraints x 32 points. Every slot is assigned
+        // once below before the row-wise reduction reads it, so a fixed
+        // uninitialized reservation removes both heap traffic and zero-fill.
+        // Wider generic gates retain a heap fallback with the same overwrite
+        // discipline.
+        const RANKED_SCRATCH_ELEMENTS: usize = 12 * 32;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); RANKED_SCRATCH_ELEMENTS];
+        let mut scratch_heap;
+        let scratch_uninit: &mut [MaybeUninit<F>] =
+            if scratch_len <= scratch_stack.len() {
+                &mut scratch_stack[..scratch_len]
+            } else {
+                scratch_heap = vec![MaybeUninit::uninit(); scratch_len];
+                &mut scratch_heap
+            };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];
@@ -333,17 +377,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
             let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
                 .to_basefield_array();
             for (d, a) in arr.iter().enumerate() {
-                scratch[d * n + p] = *a;
+                scratch_uninit[d * n + p].write(*a);
             }
 
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = vars.get_local_ext(self.wires_value(i));
-            }
-
-            let (mut computed_eval, mut computed_prod) = partial_interpolate(
-                &domain[..self.degree()],
-                &values[..self.degree()],
-                &weights[..self.degree()],
+            let (mut computed_eval, mut computed_prod) = self.partial_interpolate_base_wires(
+                &vars,
+                0..self.degree(),
+                &domain,
+                weights,
                 shifted_evaluation_point,
                 F::Extension::ZERO,
                 F::Extension::ONE,
@@ -355,21 +396,22 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
                 let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
                 let arr = (intermediate_eval - computed_eval).to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
+                    scratch_uninit[(row + d) * n + p].write(*a);
                 }
                 row += D;
                 let arr = (intermediate_prod - computed_prod).to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[(row + d) * n + p] = *a;
+                    scratch_uninit[(row + d) * n + p].write(*a);
                 }
                 row += D;
 
                 let start_index = 1 + (self.degree() - 1) * (i + 1);
                 let end_index = (start_index + self.degree() - 1).min(self.num_points());
-                (computed_eval, computed_prod) = partial_interpolate(
-                    &domain[start_index..end_index],
-                    &values[start_index..end_index],
-                    &weights[start_index..end_index],
+                (computed_eval, computed_prod) = self.partial_interpolate_base_wires(
+                    &vars,
+                    start_index..end_index,
+                    &domain,
+                    weights,
                     shifted_evaluation_point,
                     intermediate_eval,
                     intermediate_prod,
@@ -379,10 +421,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
             let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
             let arr = (evaluation_value - computed_eval).to_basefield_array();
             for (d, a) in arr.iter().enumerate() {
-                scratch[(row + d) * n + p] = *a;
+                scratch_uninit[(row + d) * n + p].write(*a);
             }
         }
 
+        // SAFETY: every constraint row at every point is assigned exactly once
+        // by the loop above; `MaybeUninit<F>` has `F`'s layout and alignment.
+        let scratch = unsafe {
+            core::slice::from_raw_parts(scratch_uninit.as_ptr().cast::<F>(), scratch_len)
+        };
         for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
             batch_multiply_add_inplace(
                 &mut combined_gate_constraints[j * n..][..n],

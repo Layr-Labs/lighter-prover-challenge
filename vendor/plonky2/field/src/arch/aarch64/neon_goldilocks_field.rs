@@ -396,6 +396,51 @@ fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
     (result0, result1)
 }
 
+/// [`mul_reduce_pair`] with non-clobbering operand constraints for callers
+/// that reuse both factors across several products.
+#[inline(always)]
+pub(crate) fn mul_reduce_pair_keep(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
+    let result0: u64;
+    let result1: u64;
+
+    unsafe {
+        asm!(
+            "umulh {hi0}, {a0}, {b0}",
+            "umulh {hi1}, {a1}, {b1}",
+            "mul   {result0}, {a0}, {b0}",
+            "mul   {result1}, {a1}, {b1}",
+            "umull {scratch0}, {hi0:w}, {epsilon:w}",
+            "umull {scratch1}, {hi1:w}, {epsilon:w}",
+            "subs  {result0}, {result0}, {hi0}, lsr #32",
+            "csetm {hi0:w}, cc",
+            "subs  {result1}, {result1}, {hi1}, lsr #32",
+            "csetm {hi1:w}, cc",
+            "sub   {result0}, {result0}, {hi0}",
+            "sub   {result1}, {result1}, {hi1}",
+            "adds  {result0}, {result0}, {scratch0}",
+            "csetm {scratch0:w}, cs",
+            "adds  {result1}, {result1}, {scratch1}",
+            "csetm {scratch1:w}, cs",
+            "add   {result0}, {result0}, {scratch0}",
+            "add   {result1}, {result1}, {scratch1}",
+            a0 = in(reg) a0,
+            b0 = in(reg) b0,
+            a1 = in(reg) a1,
+            b1 = in(reg) b1,
+            result0 = out(reg) result0,
+            result1 = out(reg) result1,
+            scratch0 = out(reg) _,
+            scratch1 = out(reg) _,
+            hi0 = out(reg) _,
+            hi1 = out(reg) _,
+            epsilon = in(reg) GoldilocksField::ORDER.wrapping_neg(),
+            options(pure, nomem, nostack),
+        );
+    }
+
+    (result0, result1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::NeonGoldilocksField;
