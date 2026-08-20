@@ -15,7 +15,10 @@ use crate::hash::hash_types::RichField;
 use crate::hash::poseidon2::config::*;
 use crate::hash::poseidon2::hash::Poseidon2;
 use crate::iop::ext_target::ExtensionTarget;
-use crate::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
+use crate::iop::generator::{
+    FixedBatch4Output, FixedBatch4Sink, GeneratedValues, GeneratorBatchDescriptor,
+    SimpleGenerator, WitnessGeneratorRef, POSEIDON2_FIXED_OUTPUT_COUNT,
+};
 use crate::iop::target::Target;
 use crate::iop::wire::Wire;
 use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
@@ -571,6 +574,150 @@ fn swap_deltas<F: Field>(state: &[F; WIDTH], swap_value: F) -> ([F; 4], bool) {
     }
 }
 
+const _: () = assert!(
+    POSEIDON2_FIXED_OUTPUT_COUNT
+        == 4 + WIDTH * (ROUNDS_F_HALF - 1) + ROUNDS_P + WIDTH * ROUNDS_F_HALF + WIDTH
+);
+
+type OutputIndexGate = Poseidon2Gate<crate::field::goldilocks_field::GoldilocksField, 2>;
+
+/// Reconstructs the target at one descriptor-fixed Poseidon2 generator output position.
+/// This stays off the value-production path; the scheduler calls it only while binding a circuit
+/// layout and when preserving the legacy contradiction diagnostic.
+pub(crate) fn poseidon2_generator_output_target(row: usize, output_index: usize) -> Option<Target> {
+    let mut index = output_index;
+    if index < 4 {
+        return Some(Target::wire(row, OutputIndexGate::wire_delta(index)));
+    }
+    index -= 4;
+    let first_full_count = WIDTH * (ROUNDS_F_HALF - 1);
+    if index < first_full_count {
+        return Some(Target::wire(
+            row,
+            OutputIndexGate::wire_full_sbox_0(1 + index / WIDTH, index % WIDTH),
+        ));
+    }
+    index -= first_full_count;
+    if index < ROUNDS_P {
+        return Some(Target::wire(row, OutputIndexGate::wire_partial_sbox(index)));
+    }
+    index -= ROUNDS_P;
+    let second_full_count = WIDTH * ROUNDS_F_HALF;
+    if index < second_full_count {
+        return Some(Target::wire(
+            row,
+            OutputIndexGate::wire_full_sbox_1(index / WIDTH, index % WIDTH),
+        ));
+    }
+    index -= second_full_count;
+    (index < WIDTH).then(|| Target::wire(row, OutputIndexGate::wire_output(index)))
+}
+
+/// Runs four gate generators in lockstep into a typed fixed-size, target-less sink. Each state's
+/// operation order is the scalar `run_once` order; only independent states are interleaved, using
+/// Poseidon2's existing bit-identical x4 internal layer.
+#[inline]
+fn run_poseidon2_generator_batch4<F: RichField + Extendable<D> + Poseidon2, const D: usize>(
+    rows: [usize; 4],
+    witness: &PartitionWitness<F>,
+) -> Option<FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>> {
+    let wire = |lane: usize, column: usize| Wire {
+        row: rows[lane],
+        column,
+    };
+    let mut sink = FixedBatch4Sink::<F, POSEIDON2_FIXED_OUTPUT_COUNT>::new();
+    let mut set_value = |lane: usize, value: F| sink.push(lane, value);
+
+    let mut states: [[F; WIDTH]; 4] = core::array::from_fn(|lane| {
+        core::array::from_fn(|i| witness.get_wire(wire(lane, Poseidon2Gate::<F, D>::wire_input(i))))
+    });
+
+    for lane in 0..4 {
+        let swap_value = witness.get_wire(wire(lane, Poseidon2Gate::<F, D>::WIRE_SWAP));
+        debug_assert!(swap_value == F::ZERO || swap_value == F::ONE);
+        let (deltas, do_swap) = swap_deltas(&states[lane], swap_value);
+        for delta in deltas {
+            if !set_value(lane, delta) {
+                return None;
+            }
+        }
+        if do_swap {
+            for i in 0..4 {
+                states[lane].swap(i, 4 + i);
+            }
+        }
+    }
+
+    for state in &mut states {
+        F::external_linear_layer(state);
+    }
+
+    for r in 0..ROUNDS_F_HALF {
+        for state in &mut states {
+            F::add_rc(state, r);
+        }
+        if r != 0 {
+            for lane in 0..4 {
+                for i in 0..WIDTH {
+                    if !set_value(lane, states[lane][i]) {
+                        return None;
+                    }
+                }
+            }
+        }
+        for state in &mut states {
+            F::sbox(state);
+        }
+        for state in &mut states {
+            F::external_linear_layer(state);
+        }
+    }
+
+    for r in 0..ROUNDS_P {
+        for lane in 0..4 {
+            states[lane][0] += F::from_canonical_u64(INTERNAL_CONSTANTS[r]);
+            if !set_value(lane, states[lane][0]) {
+                return None;
+            }
+        }
+        let [a, b, c, d] = &mut states;
+        a[0] = F::sbox_p(&a[0]);
+        b[0] = F::sbox_p(&b[0]);
+        c[0] = F::sbox_p(&c[0]);
+        d[0] = F::sbox_p(&d[0]);
+        F::internal_linear_layer_x4(a, b, c, d);
+    }
+
+    for r in ROUNDS_F_HALF..ROUNDS_F {
+        for state in &mut states {
+            F::add_rc(state, r);
+        }
+        for lane in 0..4 {
+            for i in 0..WIDTH {
+                if !set_value(lane, states[lane][i]) {
+                    return None;
+                }
+            }
+        }
+        for state in &mut states {
+            F::sbox(state);
+        }
+        for state in &mut states {
+            F::external_linear_layer(state);
+        }
+    }
+
+    for lane in 0..4 {
+        for i in 0..WIDTH {
+            if !set_value(lane, states[lane][i]) {
+                return None;
+            }
+        }
+    }
+    drop(set_value);
+    sink.finish(rows)
+}
+
 #[derive(Debug, Default)]
 pub struct Poseidon2Generator<F: RichField + Extendable<D> + Poseidon2, const D: usize> {
     row: usize,
@@ -669,6 +816,45 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
         }
 
         Ok(())
+    }
+
+    fn batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        GeneratorBatchDescriptor::poseidon2(self.row)
+    }
+
+    fn fixed_batch_descriptor(&self) -> GeneratorBatchDescriptor {
+        GeneratorBatchDescriptor::poseidon2(self.row)
+    }
+
+    fn run_batch4_fixed(
+        &self,
+        descriptors: [GeneratorBatchDescriptor; 4],
+        witness: &PartitionWitness<F>,
+    ) -> Option<FixedBatch4Output<F, POSEIDON2_FIXED_OUTPUT_COUNT>> {
+        let rows = descriptors.map(GeneratorBatchDescriptor::poseidon2_row);
+        let [Some(a), Some(b), Some(c), Some(d)] = rows else {
+            return None;
+        };
+        run_poseidon2_generator_batch4::<F, D>([a, b, c, d], witness)
+    }
+
+    fn run_batch4(
+        &self,
+        descriptors: [GeneratorBatchDescriptor; 4],
+        witness: &PartitionWitness<F>,
+        out_buffers: &mut [GeneratedValues<F>; 4],
+    ) -> Option<[bool; 4]> {
+        let output = self.run_batch4_fixed(descriptors, witness)?;
+        let rows = output.rows();
+        for lane in 0..4 {
+            for output_index in 0..POSEIDON2_FIXED_OUTPUT_COUNT {
+                out_buffers[lane].target_values.push((
+                    poseidon2_generator_output_target(rows[lane], output_index)?,
+                    output.lane(lane)[output_index],
+                ));
+            }
+        }
+        Some([true; 4])
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, _common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -932,6 +1118,338 @@ mod tests {
             });
             assert_eq!(out, expected_outputs[i]);
         }
+    }
+
+    #[test]
+    fn generator_x4_matches_four_scalar_runs_for_every_emitted_wire() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type Gate = Poseidon2Gate<F, D>;
+
+        let num_wires = Gate::new().num_wires();
+        let degree = 4;
+        let representative_map: Vec<u32> = (0..num_wires * degree).map(|i| i as u32).collect();
+        let mut witness = PartitionWitness::new(num_wires, degree, &representative_map);
+        for row in 0..degree {
+            witness
+                .set_wire(
+                    Wire {
+                        row,
+                        column: Gate::WIRE_SWAP,
+                    },
+                    if row & 1 == 0 { F::ZERO } else { F::ONE },
+                )
+                .unwrap();
+            for i in 0..WIDTH {
+                witness
+                    .set_wire(
+                        Wire {
+                            row,
+                            column: Gate::wire_input(i),
+                        },
+                        F::from_canonical_usize(10_003 * row + 257 * i + i * i + 1),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let generators: [Poseidon2Generator<F, D>; 4] =
+            core::array::from_fn(|row| Poseidon2Generator {
+                row,
+                _phantom: PhantomData,
+            });
+        let mut scalar: [GeneratedValues<F>; 4] =
+            core::array::from_fn(|_| GeneratedValues::empty());
+        for lane in 0..4 {
+            generators[lane]
+                .run_once(&witness, &mut scalar[lane])
+                .unwrap();
+        }
+
+        let descriptors = core::array::from_fn(GeneratorBatchDescriptor::poseidon2);
+        let mut grouped: [GeneratedValues<F>; 4] =
+            core::array::from_fn(|_| GeneratedValues::empty());
+        assert_eq!(
+            generators[0].run_batch4(descriptors, &witness, &mut grouped),
+            Some([true; 4])
+        );
+        for lane in 0..4 {
+            assert_eq!(
+                grouped[lane].target_values, scalar[lane].target_values,
+                "lane {lane} changed an intermediate or output wire"
+            );
+        }
+
+        let fixed = generators[0]
+            .run_batch4_fixed(descriptors, &witness)
+            .expect("four Poseidon2 descriptors have a typed output");
+        assert_eq!(fixed.rows(), [0, 1, 2, 3]);
+        for lane in 0..4 {
+            assert_eq!(
+                scalar[lane].target_values.len(),
+                POSEIDON2_FIXED_OUTPUT_COUNT
+            );
+            for output_index in 0..POSEIDON2_FIXED_OUTPUT_COUNT {
+                assert_eq!(
+                    scalar[lane].target_values[output_index].0,
+                    poseidon2_generator_output_target(lane, output_index).unwrap()
+                );
+                assert_eq!(
+                    scalar[lane].target_values[output_index].1,
+                    fixed.lane(lane)[output_index]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_output_merge_matches_legacy_for_aliases_conflicts_and_diagnostics() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type Gate = Poseidon2Gate<F, D>;
+
+        let num_wires = Gate::new().num_wires();
+        let degree = 4;
+        let mut representative_map: Vec<u32> = (0..num_wires * degree).map(|i| i as u32).collect();
+        // Alias selected generated positions across all four rows. Identical lane inputs make
+        // these repeated writes consistent, exercising first-population/watcher-event order.
+        for output_index in [0usize, 3, 17, 63, 90, 121] {
+            let root = poseidon2_generator_output_target(0, output_index)
+                .unwrap()
+                .index(num_wires, degree) as u32;
+            for row in 1..4 {
+                let target_index = poseidon2_generator_output_target(row, output_index)
+                    .unwrap()
+                    .index(num_wires, degree);
+                representative_map[target_index] = root;
+            }
+        }
+
+        let mut input_witness = PartitionWitness::new(num_wires, degree, &representative_map);
+        for row in 0..4 {
+            input_witness
+                .set_wire(
+                    Wire {
+                        row,
+                        column: Gate::WIRE_SWAP,
+                    },
+                    F::ONE,
+                )
+                .unwrap();
+            for i in 0..WIDTH {
+                input_witness
+                    .set_wire(
+                        Wire {
+                            row,
+                            column: Gate::wire_input(i),
+                        },
+                        F::from_canonical_usize(257 * i + i * i + 1),
+                    )
+                    .unwrap();
+            }
+        }
+        let generators: [Poseidon2Generator<F, D>; 4] =
+            core::array::from_fn(|row| Poseidon2Generator {
+                row,
+                _phantom: PhantomData,
+            });
+        let descriptors = core::array::from_fn(GeneratorBatchDescriptor::poseidon2);
+        let fixed = generators[0]
+            .run_batch4_fixed(descriptors, &input_witness)
+            .unwrap();
+        let mut scalar: [GeneratedValues<F>; 4] =
+            core::array::from_fn(|_| GeneratedValues::empty());
+        for lane in 0..4 {
+            generators[lane]
+                .run_once(&input_witness, &mut scalar[lane])
+                .unwrap();
+        }
+
+        let mut legacy = input_witness.clone();
+        let mut legacy_events = Vec::new();
+        for lane in 0..4 {
+            for &(target, value) in &scalar[lane].target_values {
+                if let Some(representative) =
+                    legacy.set_target_returning_rep(target, value).unwrap()
+                {
+                    legacy_events.push(representative);
+                }
+            }
+        }
+        let mut typed = input_witness.clone();
+        let mut typed_events = Vec::new();
+        for lane in 0..4 {
+            for output_index in 0..POSEIDON2_FIXED_OUTPUT_COUNT {
+                let target = poseidon2_generator_output_target(lane, output_index).unwrap();
+                let representative = representative_map[target.index(num_wires, degree)] as usize;
+                if typed
+                    .set_rep_index_returning_new(
+                        representative,
+                        target,
+                        fixed.lane(lane)[output_index],
+                    )
+                    .unwrap()
+                    .is_some()
+                {
+                    typed_events.push(representative);
+                }
+            }
+        }
+        assert_eq!(typed_events, legacy_events, "watcher event order changed");
+        assert_eq!(typed.set_bitmap, legacy.set_bitmap);
+        assert_eq!(typed.values, legacy.values);
+
+        // Pre-populate a late output with a conflicting value. Both paths must fail after the
+        // same prefix and name the exact same reconstructed Target in the error.
+        let conflict_index = 79;
+        let conflict_target = poseidon2_generator_output_target(0, conflict_index).unwrap();
+        let conflict_value = scalar[0].target_values[conflict_index].1 + F::ONE;
+        let mut legacy_conflict = input_witness.clone();
+        legacy_conflict
+            .set_target(conflict_target, conflict_value)
+            .unwrap();
+        let mut typed_conflict = legacy_conflict.clone();
+        let legacy_error = scalar[0]
+            .target_values
+            .iter()
+            .try_for_each(|&(target, value)| {
+                legacy_conflict
+                    .set_target_returning_rep(target, value)
+                    .map(|_| ())
+            })
+            .unwrap_err();
+        let typed_error = (0..POSEIDON2_FIXED_OUTPUT_COUNT)
+            .try_for_each(|output_index| {
+                let target = poseidon2_generator_output_target(0, output_index).unwrap();
+                let representative = representative_map[target.index(num_wires, degree)] as usize;
+                typed_conflict
+                    .set_rep_index_returning_new(
+                        representative,
+                        target,
+                        fixed.lane(0)[output_index],
+                    )
+                    .map(|_| ())
+            })
+            .unwrap_err();
+        assert_eq!(typed_error.to_string(), legacy_error.to_string());
+        assert!(typed_error
+            .to_string()
+            .contains(&format!("{conflict_target:?}")));
+        assert_eq!(typed_conflict.set_bitmap, legacy_conflict.set_bitmap);
+        assert_eq!(typed_conflict.values, legacy_conflict.values);
+    }
+
+    /// Focused merge-only profile for the descriptor-fixed sink. Run with:
+    /// `cargo test --release --manifest-path vendor/plonky2/plonky2/Cargo.toml \
+    /// fixed_output_sink_microbenchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn fixed_output_sink_microbenchmark() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const D: usize = 2;
+        const ITERS: usize = 20_000;
+        type F = GoldilocksField;
+        type Gate = Poseidon2Gate<F, D>;
+        let num_wires = Gate::new().num_wires();
+        let degree = 4;
+        let representative_map: Vec<u32> =
+            (0..num_wires * degree).map(|i| i as u32).collect();
+        let mut inputs = PartitionWitness::new(num_wires, degree, &representative_map);
+        for row in 0..4 {
+            inputs
+                .set_wire(Wire { row, column: Gate::WIRE_SWAP }, F::ZERO)
+                .unwrap();
+            for i in 0..WIDTH {
+                inputs
+                    .set_wire(
+                        Wire { row, column: Gate::wire_input(i) },
+                        F::from_canonical_usize(1009 * row + 257 * i + 1),
+                    )
+                    .unwrap();
+            }
+        }
+        let generators: [Poseidon2Generator<F, D>; 4] =
+            core::array::from_fn(|row| Poseidon2Generator {
+                row,
+                _phantom: PhantomData,
+            });
+        let descriptors = core::array::from_fn(GeneratorBatchDescriptor::poseidon2);
+        let fixed = generators[0].run_batch4_fixed(descriptors, &inputs).unwrap();
+        let mut scalar: [GeneratedValues<F>; 4] =
+            core::array::from_fn(|_| GeneratedValues::empty());
+        for lane in 0..4 {
+            generators[lane].run_once(&inputs, &mut scalar[lane]).unwrap();
+        }
+        let representatives: [[usize; POSEIDON2_FIXED_OUTPUT_COUNT]; 4] =
+            core::array::from_fn(|lane| {
+                core::array::from_fn(|output_index| {
+                    let target = poseidon2_generator_output_target(lane, output_index).unwrap();
+                    representative_map[target.index(num_wires, degree)] as usize
+                })
+            });
+        let input_bitmap = inputs.set_bitmap.clone();
+        let mut legacy_witness = inputs.clone();
+        let mut fixed_witness = inputs.clone();
+        let mut legacy_samples = Vec::new();
+        let mut fixed_samples = Vec::new();
+        for trial in 0..7 {
+            let run_legacy = |witness: &mut PartitionWitness<F>| {
+                let start = Instant::now();
+                for _ in 0..ITERS {
+                    witness.set_bitmap.copy_from_slice(&input_bitmap);
+                    for lane in 0..4 {
+                        for &(target, value) in &scalar[lane].target_values {
+                            black_box(witness.set_target_returning_rep(target, value).unwrap());
+                        }
+                    }
+                }
+                black_box(&witness.values);
+                start.elapsed().as_secs_f64()
+            };
+            let run_fixed = |witness: &mut PartitionWitness<F>| {
+                let start = Instant::now();
+                for _ in 0..ITERS {
+                    witness.set_bitmap.copy_from_slice(&input_bitmap);
+                    for lane in 0..4 {
+                        for output_index in 0..POSEIDON2_FIXED_OUTPUT_COUNT {
+                            let target =
+                                poseidon2_generator_output_target(lane, output_index).unwrap();
+                            black_box(
+                                witness
+                                    .set_rep_index_returning_new(
+                                        representatives[lane][output_index],
+                                        target,
+                                        fixed.lane(lane)[output_index],
+                                    )
+                                    .unwrap(),
+                            );
+                        }
+                    }
+                }
+                black_box(&witness.values);
+                start.elapsed().as_secs_f64()
+            };
+            if trial & 1 == 0 {
+                legacy_samples.push(run_legacy(&mut legacy_witness));
+                fixed_samples.push(run_fixed(&mut fixed_witness));
+            } else {
+                fixed_samples.push(run_fixed(&mut fixed_witness));
+                legacy_samples.push(run_legacy(&mut legacy_witness));
+            }
+        }
+        legacy_samples.sort_by(f64::total_cmp);
+        fixed_samples.sort_by(f64::total_cmp);
+        let legacy = legacy_samples[legacy_samples.len() / 2];
+        let fixed_time = fixed_samples[fixed_samples.len() / 2];
+        eprintln!(
+            "Poseidon2 x4 merge: legacy target pairs {legacy:.6}s, fixed sink {fixed_time:.6}s, speedup {:.3}x ({} values)",
+            legacy / fixed_time,
+            ITERS * 4 * POSEIDON2_FIXED_OUTPUT_COUNT,
+        );
+        assert_eq!(legacy_witness.set_bitmap, fixed_witness.set_bitmap);
+        assert_eq!(legacy_witness.values, fixed_witness.values);
     }
 
     #[test]
