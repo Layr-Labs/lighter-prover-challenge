@@ -1,6 +1,6 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
-// Redraw marker r18 (same-account archive-dedup convention; inert, declared in note)
+// Redraw marker r18-joelchristianai3-jpg-1787247300498 (qd-3276 inert)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
