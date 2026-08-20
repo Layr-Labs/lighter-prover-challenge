@@ -581,6 +581,45 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Two independent Goldilocks multiplies, interleaved on AArch64.
+/// Raw limbs match `(a0 * b0, a1 * b1)`. `LIGHTER_PAIR_MUL=0` keeps the
+/// sequential `*` pair in the same binary.
+fn pair_mul_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ENABLED.get_or_init(|| {
+            !std::env::var_os("LIGHTER_PAIR_MUL").is_some_and(|v| v == "0")
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
+#[inline]
+fn goldilocks_mul_pair<F: Field>(a0: F, b0: F, a1: F, b1: F) -> (F, F) {
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        use core::any::TypeId;
+        use crate::field::goldilocks_field::GoldilocksField;
+        if pair_mul_enabled()
+            && TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+            && core::mem::size_of::<F>() == 8
+        {
+            // SAFETY: `F` is GoldilocksField, `repr(transparent)` over `u64`.
+            let to_g = |x: F| unsafe { core::mem::transmute_copy::<F, GoldilocksField>(&x) };
+            let from_g = |x: GoldilocksField| unsafe {
+                core::mem::transmute_copy::<GoldilocksField, F>(&x)
+            };
+            let (r0, r1) = GoldilocksField::mul_pair(to_g(a0), to_g(b0), to_g(a1), to_g(b1));
+            return (from_g(r0), from_g(r1));
+        }
+    }
+    (a0 * b0, a1 * b1)
+}
+
 #[inline]
 fn divide_chunk_products<F: Field>(
     numerator_products: &mut [F],
@@ -726,10 +765,14 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let tnum0 = wire_value + beta_k_is_0[j] * x + gamma_0;
+                                let tnum1 = wire_value + beta_k_is_1[j] * x + gamma_1;
+                                (numerator_0, numerator_1) =
+                                    goldilocks_mul_pair(numerator_0, tnum0, numerator_1, tnum1);
+                                let tden0 = wire_value + beta_0 * sigma + gamma_0;
+                                let tden1 = wire_value + beta_1 * sigma + gamma_1;
+                                (denominator_0, denominator_1) =
+                                    goldilocks_mul_pair(denominator_0, tden0, denominator_1, tden1);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -761,8 +804,12 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         .zip(products_1.iter_mut())
                         .zip(denominator_inverses.chunks_exact(2))
                     {
-                        *product_0 *= inverses[0];
-                        *product_1 *= inverses[1];
+                        (*product_0, *product_1) = goldilocks_mul_pair(
+                            *product_0,
+                            inverses[0],
+                            *product_1,
+                            inverses[1],
+                        );
                     }
                 },
             );
@@ -1619,8 +1666,9 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            let (p0, p1) = goldilocks_mul_pair(filter, sv0, filter, sv1);
+            acc[2 * r] += p0;
+            acc[2 * r + 1] += p1;
         }
     }
     chunk.copy_from_slice(&acc);
@@ -1742,6 +1790,65 @@ fn combine_low_range_quotient<F: RichField>(
     }
 }
 
+/// `LIGHTER_LOW_RANGE_DEINTERLEAVE=0` keeps the per-challenge strided gather;
+/// default on. Layout-only: both paths feed the same IFFT/FFT the same values.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn low_range_deinterleave_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_LOW_RANGE_DEINTERLEAVE").is_some_and(|v| v == "0")
+    })
+}
+
+/// Splits one gate's interleaved `[c0, c1, c0, c1, ...]` half-domain block into
+/// two contiguous challenge columns. Value-exact vs the strided
+/// `low[base + k * 2 + c]` gather.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn deinterleave_challenge_pair<F: RichField>(src: &[F], half_rows: usize) -> (Vec<F>, Vec<F>) {
+    debug_assert_eq!(src.len(), half_rows * 2);
+    let mut even = vec![F::ZERO; half_rows];
+    let mut odd = vec![F::ZERO; half_rows];
+    if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() == 8 {
+        // SAFETY: production Goldilocks is `repr(transparent)` over `u64`.
+        // `src`/`even`/`odd` are distinct allocations of the advertised lengths.
+        unsafe {
+            deinterleave_u64_neon(
+                src.as_ptr().cast::<u64>(),
+                even.as_mut_ptr().cast::<u64>(),
+                odd.as_mut_ptr().cast::<u64>(),
+                half_rows,
+            );
+        }
+    } else {
+        for k in 0..half_rows {
+            even[k] = src[k * 2];
+            odd[k] = src[k * 2 + 1];
+        }
+    }
+    (even, odd)
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+unsafe fn deinterleave_u64_neon(src: *const u64, even: *mut u64, odd: *mut u64, n: usize) {
+    use core::arch::aarch64::{vld2q_u64, vst1q_u64};
+    let mut i = 0;
+    while i + 2 <= n {
+        let pair = unsafe { vld2q_u64(src.add(i * 2)) };
+        unsafe {
+            vst1q_u64(even.add(i), pair.0);
+            vst1q_u64(odd.add(i), pair.1);
+        }
+        i += 2;
+    }
+    while i < n {
+        unsafe {
+            *even.add(i) = *src.add(i * 2);
+            *odd.add(i) = *src.add(i * 2 + 1);
+        }
+        i += 1;
+    }
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1768,19 +1875,45 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
+    let odd: Vec<Vec<F>> = if low_range_deinterleave_enabled() {
+        let pairs: Vec<(Vec<F>, Vec<F>)> = (0..gates.len())
+            .into_par_iter()
+            .map(|g| {
+                let base = g * half_rows * 2;
+                let (c0, c1) =
+                    deinterleave_challenge_pair(&low[base..base + half_rows * 2], half_rows);
+                let col0 = PolynomialValues::new(c0)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                let col1 = PolynomialValues::new(c1)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                (col0, col1)
+            })
+            .collect();
+        let mut cols = Vec::with_capacity(pairs.len() * 2);
+        for (c0, c1) in pairs {
+            cols.push(c0);
+            cols.push(c1);
+        }
+        cols
+    } else {
+        (0..gates.len() * 2)
+            .into_par_iter()
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values
+            })
+            .collect()
+    };
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(

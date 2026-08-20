@@ -357,6 +357,26 @@ impl SubAssign for GoldilocksField {
     }
 }
 
+impl GoldilocksField {
+    /// Two independent multiplies with interleaved AArch64 `mul`/`umulh`.
+    /// Raw limbs match `(a0 * b0, a1 * b1)` because the paired reducer is
+    /// the same reduction `Mul` uses. Scalar fallback is those two multiplies.
+    #[inline]
+    pub fn mul_pair(a0: Self, b0: Self, a1: Self, b1: Self) -> (Self, Self) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let (r0, r1) = crate::arch::aarch64::neon_goldilocks_field::mul_reduce_pair(
+                a0.0, b0.0, a1.0, b1.0,
+            );
+            (Self(r0), Self(r1))
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            (a0 * b0, a1 * b1)
+        }
+    }
+}
+
 impl Mul for GoldilocksField {
     type Output = Self;
 
