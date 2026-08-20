@@ -49,6 +49,9 @@ anyhow = { workspace = true }
 rayon = { workspace = true }
 circuit = { path = "../circuit", default-features = true }
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.build-dependencies]
+metal = "0.33.0"
+
 [dev-dependencies]
 flate2 = "1.0"
 criterion = { version = "0.5.1", default-features = false }
