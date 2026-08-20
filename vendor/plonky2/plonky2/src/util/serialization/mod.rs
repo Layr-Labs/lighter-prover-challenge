@@ -960,13 +960,27 @@ pub trait Read {
             lut_to_lookups.push(self.read_target_lut()?);
         }
 
-        // Runtime-only, like `generator_watch_counts`: a pure function of `generators`.
-        let generators_defer_until_ready = generators
-            .iter()
-            .all(|generator| generator.0.defers_until_ready());
+        // Runtime-only, like `generator_watch_counts`: pure functions of `generators`.
+        let mut generators_defer_until_ready = true;
+        let mut generator_batch_descriptors = Vec::with_capacity(generators.len());
+        for generator in &generators {
+            let (defers_until_ready, batch_descriptor) = generator.0.scheduling_metadata();
+            generators_defer_until_ready &= defers_until_ready;
+            generator_batch_descriptors.push(batch_descriptor);
+        }
+        let fixed_generator_output_layouts =
+            crate::iop::generator::FixedGeneratorOutputLayouts::build(
+                &generators,
+                &generator_batch_descriptors,
+                &representative_map,
+                common_data.config.num_wires,
+                common_data.degree(),
+            );
 
         Ok(ProverOnlyCircuitData {
             generators,
+            generator_batch_descriptors,
+            fixed_generator_output_layouts,
             generator_indices_by_watches,
             generator_watch_counts,
             generators_defer_until_ready,
@@ -1946,6 +1960,10 @@ pub trait Write {
     ) -> IoResult<()> {
         let ProverOnlyCircuitData {
             generators,
+            // Runtime-only: re-derived from `generators` on read; contributes no bytes.
+            generator_batch_descriptors: _,
+            // Runtime-only: re-derived from generators, representatives and common dimensions.
+            fixed_generator_output_layouts: _,
             generator_indices_by_watches,
             // Runtime-only: reconstructed from `generator_indices_by_watches` on read, so it
             // contributes no bytes and the serialized format is unchanged.

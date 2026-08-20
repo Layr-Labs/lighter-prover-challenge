@@ -1,7 +1,13 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
+#[cfg(target_arch = "aarch64")]
+use core::any::TypeId;
 use core::cmp::min;
 
+#[cfg(target_arch = "aarch64")]
+use plonky2_field::goldilocks_field::GoldilocksField;
+#[cfg(target_arch = "aarch64")]
+use plonky2_field::packable::Packable;
 use plonky2_field::polynomial::PolynomialCoeffs;
 
 use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
@@ -392,6 +398,78 @@ fn prepare_shared_gate_filter_plan<F: RichField + Extendable<D>, const D: usize>
     }
 }
 
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fill_shared_selector_group_filters_goldilocks(
+    selector_col: &[GoldilocksField],
+    group: core::ops::Range<usize>,
+    include_unused_selector: bool,
+    active_gate_plan: &[bool],
+    gate_filters: &mut [GoldilocksField],
+    suffix: &mut [GoldilocksField],
+) {
+    use plonky2_field::packed::PackedField;
+
+    type Wide = <GoldilocksField as Packable>::Packing;
+
+    let batch_size = selector_col.len();
+    debug_assert_eq!(Wide::WIDTH, 4);
+    debug_assert!(!group.is_empty());
+    debug_assert_eq!(batch_size % Wide::WIDTH, 0);
+    debug_assert_eq!(suffix.len(), batch_size);
+    debug_assert_eq!(gate_filters.len(), active_gate_plan.len() * batch_size);
+
+    let selectors = Wide::pack_slice(selector_col);
+    let suffix = Wide::pack_slice_mut(suffix);
+    let first = group.start;
+    Wide::pack_slice_mut(
+        &mut gate_filters[first * batch_size..(first + 1) * batch_size],
+    )
+    .fill(Wide::ONES);
+    for gate in first + 1..group.end {
+        let factor_constant =
+            Wide::from(GoldilocksField::from_canonical_usize(gate - 1));
+        let split = gate * batch_size;
+        let (prefixes, rest) = gate_filters.split_at_mut(split);
+        let previous = Wide::pack_slice(
+            &prefixes[(gate - 1) * batch_size..gate * batch_size],
+        );
+        let current = Wide::pack_slice_mut(&mut rest[..batch_size]);
+        for (current, (&previous, &selector)) in
+            current.iter_mut().zip(previous.iter().zip(selectors))
+        {
+            *current = previous * (factor_constant - selector);
+        }
+    }
+
+    if include_unused_selector {
+        let unused = Wide::from(GoldilocksField::from_canonical_usize(UNUSED_SELECTOR));
+        for (value, &selector) in suffix.iter_mut().zip(selectors) {
+            *value = unused - selector;
+        }
+    } else {
+        suffix.fill(Wide::ONES);
+    }
+
+    for gate in group.clone().rev() {
+        if active_gate_plan[gate] {
+            let output = Wide::pack_slice_mut(
+                &mut gate_filters[gate * batch_size..(gate + 1) * batch_size],
+            );
+            for (filter, &tail) in output.iter_mut().zip(suffix.iter()) {
+                *filter *= tail;
+            }
+        }
+        if gate != first {
+            let factor_constant =
+                Wide::from(GoldilocksField::from_canonical_usize(gate));
+            for (tail, &selector) in suffix.iter_mut().zip(selectors) {
+                *tail *= factor_constant - selector;
+            }
+        }
+    }
+}
+
 /// Computes selected gate filters for one selector group with shared
 /// prefix/suffix products.
 ///
@@ -414,6 +492,39 @@ fn fill_shared_selector_group_filters<F: Field>(
     debug_assert!(!group.is_empty());
     debug_assert_eq!(suffix.len(), batch_size);
     debug_assert_eq!(gate_filters.len(), active_gate_plan.len() * batch_size);
+
+    #[cfg(target_arch = "aarch64")]
+    if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() && batch_size % 4 == 0 {
+        // SAFETY: the TypeId guard proves the exact element type and therefore
+        // preserves every slice's layout, length, and alignment.
+        let selector_col = unsafe {
+            core::slice::from_raw_parts(
+                selector_col.as_ptr().cast::<GoldilocksField>(),
+                selector_col.len(),
+            )
+        };
+        let gate_filters = unsafe {
+            core::slice::from_raw_parts_mut(
+                gate_filters.as_mut_ptr().cast::<GoldilocksField>(),
+                gate_filters.len(),
+            )
+        };
+        let suffix = unsafe {
+            core::slice::from_raw_parts_mut(
+                suffix.as_mut_ptr().cast::<GoldilocksField>(),
+                suffix.len(),
+            )
+        };
+        fill_shared_selector_group_filters_goldilocks(
+            selector_col,
+            group,
+            include_unused_selector,
+            active_gate_plan,
+            gate_filters,
+            suffix,
+        );
+        return;
+    }
 
     let first = group.start;
     gate_filters[first * batch_size..(first + 1) * batch_size].fill(F::ONE);
