@@ -292,15 +292,33 @@ fn ext2_base_scalar_dot_product(
         let (mut lo01, mut hi01) = (0u128, 0u32);
         let (mut lo10, mut hi10) = (0u128, 0u32);
         let (mut lo11, mut hi11) = (0u128, 0u32);
-        for (value_pair, scalar_pair) in values.chunks_exact(2).zip(scalars.chunks_exact(2)) {
+        // stack-34: 4-wide unroll for ILP; same exact 160-bit integer sum, just fewer branches.
+        let mut processed = 0;
+        for (value_quad, scalar_quad) in values.chunks_exact(4).zip(scalars.chunks_exact(4)) {
+            let QuadraticExtension([a00, a10]) = value_quad[0];
+            let QuadraticExtension([a01, a11]) = value_quad[1];
+            let QuadraticExtension([a02, a12]) = value_quad[2];
+            let QuadraticExtension([a03, a13]) = value_quad[3];
+            u160_add_product(&mut lo00, &mut hi00, a00.0, scalar_quad[0].0);
+            u160_add_product(&mut lo10, &mut hi10, a10.0, scalar_quad[0].0);
+            u160_add_product(&mut lo01, &mut hi01, a01.0, scalar_quad[1].0);
+            u160_add_product(&mut lo11, &mut hi11, a11.0, scalar_quad[1].0);
+            u160_add_product(&mut lo00, &mut hi00, a02.0, scalar_quad[2].0);
+            u160_add_product(&mut lo10, &mut hi10, a12.0, scalar_quad[2].0);
+            u160_add_product(&mut lo01, &mut hi01, a03.0, scalar_quad[3].0);
+            u160_add_product(&mut lo11, &mut hi11, a13.0, scalar_quad[3].0);
+            processed += 4;
+        }
+        for (value_pair, scalar_pair) in values[processed..].chunks_exact(2).zip(scalars[processed..].chunks_exact(2)) {
             let QuadraticExtension([a00, a10]) = value_pair[0];
             let QuadraticExtension([a01, a11]) = value_pair[1];
             u160_add_product(&mut lo00, &mut hi00, a00.0, scalar_pair[0].0);
             u160_add_product(&mut lo10, &mut hi10, a10.0, scalar_pair[0].0);
             u160_add_product(&mut lo01, &mut hi01, a01.0, scalar_pair[1].0);
             u160_add_product(&mut lo11, &mut hi11, a11.0, scalar_pair[1].0);
+            processed += 2;
         }
-        if values.len() % 2 != 0 {
+        if processed < values.len() {
             let QuadraticExtension([a0, a1]) = values[values.len() - 1];
             let scalar = scalars[scalars.len() - 1];
             u160_add_product(&mut lo00, &mut hi00, a0.0, scalar.0);
