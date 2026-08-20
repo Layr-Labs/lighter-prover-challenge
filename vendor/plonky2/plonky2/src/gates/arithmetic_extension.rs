@@ -11,6 +11,8 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -57,6 +59,82 @@ impl<const D: usize> ArithmeticExtensionGate<D> {
     }
     pub(crate) const fn wires_ith_output(i: usize) -> Range<usize> {
         4 * D * i + 3 * D..4 * D * i + 4 * D
+    }
+}
+
+#[inline(always)]
+fn uses_quadratic_packed_direct_n32<F: RichField + Extendable<D>, const D: usize>(
+    num_ops: usize,
+    n: usize,
+) -> bool {
+    D == 2 && num_ops == 10 && n == 32 && <<F as Packable>::Packing as PackedField>::WIDTH == 4
+}
+
+/// Exact production D=2/num_ops=10/n=32 packed coefficient accumulator. All other dimensions,
+/// operation counts, batch sizes, packing widths, and scalar tails retain the established
+/// extension-field path below.
+fn eval_quadratic_packed_direct_n32<F: RichField + Extendable<D>, const D: usize>(
+    vars: EvaluationVarsBaseBatch<F>,
+    filters: &[F],
+    combined_gate_constraints: &mut [F],
+) {
+    type Packing<T> = <T as Packable>::Packing;
+    const N: usize = 32;
+    const WIDTH: usize = 4;
+    const PACKS_PER_COLUMN: usize = N / WIDTH;
+    const NUM_OPS: usize = 10;
+    const WIRES_PER_OP: usize = 8;
+    const CONSTRAINTS_PER_OP: usize = 2;
+
+    debug_assert_eq!(D, 2);
+    debug_assert_eq!(vars.len(), N);
+    debug_assert_eq!(Packing::<F>::WIDTH, WIDTH);
+    debug_assert_eq!(filters.len(), N);
+    debug_assert!(combined_gate_constraints.len() >= NUM_OPS * CONSTRAINTS_PER_OP * N);
+
+    // Reinterpret each complete four-point lane group once. Exact prefixes give LLVM fixed
+    // bounds for every indexed load/store below and `PackedField` guarantees the scalar/packed
+    // layout; this is the AArch64 `WideGoldilocksField` path in production.
+    let wires = Packing::<F>::pack_slice(&vars.local_wires[..NUM_OPS * WIRES_PER_OP * N]);
+    let const_0 = Packing::<F>::pack_slice(&vars.local_constants[..N]);
+    let const_1 = Packing::<F>::pack_slice(&vars.local_constants[N..2 * N]);
+    let filters = Packing::<F>::pack_slice(filters);
+    let combined = Packing::<F>::pack_slice_mut(
+        &mut combined_gate_constraints[..NUM_OPS * CONSTRAINTS_PER_OP * N],
+    );
+    let w = Packing::<F>::from(<F as Extendable<D>>::W);
+
+    for op in 0..NUM_OPS {
+        // With D=2, each operation occupies [a0,a1,b0,b1,add0,add1,out0,out1].
+        let m0 = WIRES_PER_OP * PACKS_PER_COLUMN * op;
+        for group in 0..PACKS_PER_COLUMN {
+            let a0 = wires[m0 + group];
+            let a1 = wires[m0 + PACKS_PER_COLUMN + group];
+            let b0 = wires[m0 + 2 * PACKS_PER_COLUMN + group];
+            let b1 = wires[m0 + 3 * PACKS_PER_COLUMN + group];
+            let add0 = wires[m0 + 4 * PACKS_PER_COLUMN + group];
+            let add1 = wires[m0 + 5 * PACKS_PER_COLUMN + group];
+            let out0 = wires[m0 + 6 * PACKS_PER_COLUMN + group];
+            let out1 = wires[m0 + 7 * PACKS_PER_COLUMN + group];
+
+            // Match the raw-safe packed coefficient sequence already used by
+            // `MulExtensionGate`: the first product remains the accumulator and the second
+            // uses the packed multiply-accumulate primitive.
+            let prod0 = (a0 * b0).multiply_accumulate(w * a1, b1);
+            let prod1 = (a0 * b1).multiply_accumulate(a1, b0);
+
+            // Preserve the established operation order exactly. Fusing either sum can change a
+            // valid noncanonical Goldilocks representative even though the field value agrees.
+            let computed0 = prod0 * const_0[group] + add0 * const_1[group];
+            let computed1 = prod1 * const_0[group] + add1 * const_1[group];
+            let constraint0 = out0 - computed0;
+            let constraint1 = out1 - computed1;
+
+            let row0 = (CONSTRAINTS_PER_OP * op) * PACKS_PER_COLUMN + group;
+            combined[row0] = combined[row0].multiply_accumulate(constraint0, filters[group]);
+            let row1 = row0 + PACKS_PER_COLUMN;
+            combined[row1] = combined[row1].multiply_accumulate(constraint1, filters[group]);
+        }
     }
 }
 
@@ -126,6 +204,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         assert!(combined_gate_constraints.len() >= <Self as Gate<F, D>>::num_constraints(self) * n);
+
+        if uses_quadratic_packed_direct_n32::<F, D>(self.num_ops, n) {
+            eval_quadratic_packed_direct_n32::<F, D>(vars_base, filters, combined_gate_constraints);
+            return;
+        }
 
         let wires = vars_base.local_wires;
         let constants = vars_base.local_constants;
@@ -335,9 +418,11 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
 mod tests {
     use anyhow::Result;
 
+    use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::gates::arithmetic_extension::ArithmeticExtensionGate;
+    use crate::field::types::{Field, Field64, PrimeField64};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
 
@@ -356,5 +441,208 @@ mod tests {
         let gate =
             ArithmeticExtensionGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn low_degree_d2() {
+        let gate = ArithmeticExtensionGate::<2>::new_from_config(
+            &CircuitConfig::standard_recursion_config(),
+        );
+        test_low_degree::<GoldilocksField, _, 2>(gate);
+    }
+
+    fn scalar_extension_accumulate_reference<const D: usize>(
+        gate: &ArithmeticExtensionGate<D>,
+        vars: EvaluationVarsBaseBatch<GoldilocksField>,
+        filters: &[GoldilocksField],
+        combined: &mut [GoldilocksField],
+    ) where
+        GoldilocksField: Extendable<D>,
+    {
+        type F = GoldilocksField;
+        let n = vars.len();
+        let wires = vars.local_wires;
+        let const_0 = &vars.local_constants[..n];
+        let const_1 = &vars.local_constants[n..2 * n];
+        let ext = |start: usize, point: usize| {
+            let mut coefficients = [F::ZERO; D];
+            for (d, coefficient) in coefficients.iter_mut().enumerate() {
+                *coefficient = wires[(start + d) * n + point];
+            }
+            <F as Extendable<D>>::Extension::from_basefield_array(coefficients)
+        };
+        let mut scratch = vec![F::ZERO; D * n];
+        for op in 0..gate.num_ops {
+            let m0 = ArithmeticExtensionGate::<D>::wires_ith_multiplicand_0(op).start;
+            let m1 = ArithmeticExtensionGate::<D>::wires_ith_multiplicand_1(op).start;
+            let addend = ArithmeticExtensionGate::<D>::wires_ith_addend(op).start;
+            let output = ArithmeticExtensionGate::<D>::wires_ith_output(op).start;
+            for point in 0..n {
+                let product = ext(m0, point) * ext(m1, point);
+                let computed = product.scalar_mul(const_0[point])
+                    + ext(addend, point).scalar_mul(const_1[point]);
+                let coefficients = (ext(output, point) - computed).to_basefield_array();
+                for (d, coefficient) in coefficients.iter().enumerate() {
+                    scratch[d * n + point] = *coefficient;
+                }
+            }
+            for d in 0..D {
+                batch_multiply_add_inplace(
+                    &mut combined[(D * op + d) * n..][..n],
+                    &scratch[d * n..][..n],
+                    filters,
+                );
+            }
+        }
+    }
+
+    fn arithmetic_raw_value(i: usize) -> GoldilocksField {
+        type F = GoldilocksField;
+        const EDGES: [u64; 11] = [
+            0,
+            1,
+            2,
+            3,
+            (1u64 << 32) - 1,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let edge = i % 29;
+        let raw = if edge < EDGES.len() {
+            EDGES[edge]
+        } else {
+            let mut x = (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^= x >> 29;
+            x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            x ^ (x >> 31)
+        };
+        F::from_noncanonical_u64(raw)
+    }
+
+    fn nonzero_arithmetic_raw_value(i: usize) -> GoldilocksField {
+        type F = GoldilocksField;
+        let value = arithmetic_raw_value(i);
+        if value == F::ZERO {
+            F::from_noncanonical_u64(F::ORDER + 1)
+        } else {
+            value
+        }
+    }
+
+    fn raw_words(values: &[GoldilocksField]) -> Vec<u64> {
+        values.iter().map(|x| x.to_noncanonical_u64()).collect()
+    }
+
+    fn check_arithmetic_accumulate_shapes<const D: usize>()
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        type F = GoldilocksField;
+        let width = <<F as Packable>::Packing as PackedField>::WIDTH;
+
+        for num_ops in [9usize, 10, 11] {
+            let gate = ArithmeticExtensionGate::<D> { num_ops };
+            for n in [31usize, 32, 33] {
+                let production_shape = D == 2 && num_ops == 10 && n == 32 && width == 4;
+                assert_eq!(
+                    uses_quadratic_packed_direct_n32::<F, D>(num_ops, n),
+                    production_shape,
+                    "incorrect dispatch at D={D}, num_ops={num_ops}, n={n}"
+                );
+
+                let wires = (0..4 * D * num_ops * n)
+                    .map(|i| arithmetic_raw_value(i + 0x1000 + 31 * num_ops + 3 * n + D))
+                    .collect::<Vec<_>>();
+                let constants = (0..2 * n)
+                    .map(|i| arithmetic_raw_value(5 * i + 0x2000 + 37 * num_ops + 7 * n + D))
+                    .collect::<Vec<_>>();
+                let filters = (0..n)
+                    .map(|i| arithmetic_raw_value(7 * i + 0x3000 + 41 * num_ops + 11 * n + D))
+                    .collect::<Vec<_>>();
+                // Exercise a true accumulate rather than the easier zero-destination case, and
+                // retain a guard suffix to detect writes past the advertised constraint rows.
+                let initial = (0..D * num_ops * n + 8)
+                    .map(|i| {
+                        nonzero_arithmetic_raw_value(13 * i + 0x4000 + 43 * num_ops + 17 * n + D)
+                    })
+                    .collect::<Vec<_>>();
+                assert!(initial.iter().all(|x| *x != F::ZERO));
+                let hash = HashOut {
+                    elements: core::array::from_fn(|i| {
+                        arithmetic_raw_value(0x5000 + 19 * i + 47 * num_ops + 23 * n + D)
+                    }),
+                };
+                let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &hash);
+                let mut reference = initial.clone();
+                scalar_extension_accumulate_reference(&gate, vars, &filters, &mut reference);
+                let mut candidate = initial;
+                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut candidate);
+                assert_eq!(
+                    candidate, reference,
+                    "canonical mismatch at D={D}, num_ops={num_ops}, n={n}"
+                );
+                assert_eq!(
+                    raw_words(&candidate),
+                    raw_words(&reference),
+                    "raw mismatch at D={D}, num_ops={num_ops}, n={n}"
+                );
+            }
+        }
+    }
+
+    /// The exact production shape takes the packed direct accumulator. Every adjacent operation
+    /// count and batch size, plus D=4, exercises the byte-for-byte generic fallback. Both field
+    /// values and raw Goldilocks representatives must match the independent extension oracle.
+    #[test]
+    fn quadratic_packed_accumulate_matches_extension_oracle_raw_and_canonical() {
+        check_arithmetic_accumulate_shapes::<2>();
+        check_arithmetic_accumulate_shapes::<4>();
+    }
+
+    /// Sabotage control for the independent oracle: reversing `const_0` and `const_1` on the exact
+    /// production shape must be detected with the same adversarial, nonzero-accumulator data.
+    #[test]
+    fn quadratic_packed_accumulate_oracle_detects_reversed_constants() {
+        const D: usize = 2;
+        const NUM_OPS: usize = 10;
+        const N: usize = 32;
+        let gate = ArithmeticExtensionGate::<D> { num_ops: NUM_OPS };
+        let wires = (0..4 * D * NUM_OPS * N)
+            .map(|i| arithmetic_raw_value(i + 0x6100))
+            .collect::<Vec<_>>();
+        let constants = (0..2 * N)
+            .map(|i| arithmetic_raw_value(5 * i + 0x6200))
+            .collect::<Vec<_>>();
+        let mut reversed_constants = constants[N..].to_vec();
+        reversed_constants.extend_from_slice(&constants[..N]);
+        let filters = (0..N)
+            .map(|i| arithmetic_raw_value(7 * i + 0x6300))
+            .collect::<Vec<_>>();
+        let initial = (0..D * NUM_OPS * N)
+            .map(|i| nonzero_arithmetic_raw_value(11 * i + 0x6400))
+            .collect::<Vec<_>>();
+        assert!(initial.iter().all(|x| *x != GoldilocksField::ZERO));
+        let hash = HashOut {
+            elements: core::array::from_fn(|i| arithmetic_raw_value(13 * i + 0x6500)),
+        };
+        let honest_vars = EvaluationVarsBaseBatch::new(N, &constants, &wires, &hash);
+        let reversed_vars = EvaluationVarsBaseBatch::new(N, &reversed_constants, &wires, &hash);
+        let mut honest = initial.clone();
+        scalar_extension_accumulate_reference(&gate, honest_vars, &filters, &mut honest);
+        let mut sabotaged = initial;
+        scalar_extension_accumulate_reference(&gate, reversed_vars, &filters, &mut sabotaged);
+        assert_ne!(
+            sabotaged, honest,
+            "canonical oracle accepted reversed constants"
+        );
+        assert_ne!(
+            raw_words(&sabotaged),
+            raw_words(&honest),
+            "raw oracle accepted reversed constants"
+        );
     }
 }

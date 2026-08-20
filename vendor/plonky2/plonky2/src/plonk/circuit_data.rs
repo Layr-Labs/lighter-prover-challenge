@@ -39,7 +39,10 @@ use crate::gates::selectors::SelectorsInfo;
 use crate::hash::hash_types::{HashOutTarget, MerkleCapTarget, RichField};
 use crate::hash::merkle_tree::MerkleCap;
 use crate::iop::ext_target::ExtensionTarget;
-use crate::iop::generator::{generate_partial_witness, WitnessGeneratorRef};
+use crate::iop::generator::{
+    generate_partial_witness, FixedGeneratorOutputLayouts, GeneratorBatchDescriptor,
+    WitnessGeneratorRef,
+};
 use crate::iop::target::Target;
 use crate::iop::witness::{PartialWitness, PartitionWitness};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -723,6 +726,12 @@ pub struct ProverOnlyCircuitData<
     const D: usize,
 > {
     pub generators: Vec<WitnessGeneratorRef<F, D>>,
+    /// Precomputed opt-in grouped-dispatch metadata, parallel to `generators`.
+    /// Runtime-only: a pure function of `generators`, re-derived on deserialization.
+    pub generator_batch_descriptors: Vec<GeneratorBatchDescriptor>,
+    /// Runtime-only, descriptor-fixed representative layouts for typed target-less generators.
+    /// Entries are conservatively absent unless the exact generator independently opts in.
+    pub fixed_generator_output_layouts: FixedGeneratorOutputLayouts,
     /// Generator indices (within the `Vec` above), indexed by the representative of each target
     /// they watch.
     pub generator_indices_by_watches: GeneratorWatchIndex,
