@@ -2,6 +2,8 @@ use alloc::vec::Vec;
 use core::cmp::{max, min};
 
 use plonky2_maybe_rayon::MaybeParChunksMut;
+#[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+use plonky2_maybe_rayon::IndexedParallelIterator;
 #[cfg(feature = "parallel")]
 use plonky2_maybe_rayon::ParallelIterator;
 use plonky2_util::{log2_strict, reverse_index_bits_in_place};
@@ -9,6 +11,8 @@ use unroll::unroll_for_loops;
 
 #[cfg(target_arch = "aarch64")]
 use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+#[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+use crate::goldilocks_field::GoldilocksField;
 #[cfg(target_arch = "aarch64")]
 use crate::goldilocks_field::mul_16th_root_powers;
 
@@ -38,6 +42,31 @@ impl<P: PackedField> FftTwiddleMul<P> for BaseSubfieldTwiddle {
     fn mul(twiddle: P, value: P) -> P {
         P::mul_fft_base_twiddle(twiddle, value)
     }
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+trait FftCacheTwiddleMul<P: PackedField>:
+    FftTwiddleMul<P> + FftTwiddleMul<WideGoldilocksField>
+{
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+impl<P, M> FftCacheTwiddleMul<P> for M
+where
+    P: PackedField,
+    M: FftTwiddleMul<P> + FftTwiddleMul<WideGoldilocksField>,
+{
+}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "parallel", feature = "std")))]
+trait FftCacheTwiddleMul<P: PackedField>: FftTwiddleMul<P> {}
+
+#[cfg(not(all(target_arch = "aarch64", feature = "parallel", feature = "std")))]
+impl<P, M> FftCacheTwiddleMul<P> for M
+where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
 }
 
 pub type FftRootTable<F> = Vec<Vec<F>>;
@@ -1491,6 +1520,112 @@ fn fft_zero_padded_rate_8_first_layer_block(
     }
 }
 
+/// The rate-8 expansion above with its source and destination separated.
+///
+/// Every source pair produces four packed outputs in a disjoint destination
+/// range, so pair order is immaterial. The arithmetic and per-output operation
+/// order remain identical to [`fft_zero_padded_rate_8_first_layer_block`].
+#[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+#[inline(always)]
+fn fft_zero_padded_rate_8_first_layer_block_from(
+    source: &[GoldilocksField],
+    destination: &mut [WideGoldilocksField],
+) {
+    debug_assert!(source.len() >= 2 && source.len() % 2 == 0);
+    debug_assert_eq!(destination.len(), source.len() * 2);
+
+    for pair in 0..source.len() / 2 {
+        let u = source[pair * 2];
+        let v = source[pair * 2 + 1];
+        let products = mul_16th_root_powers(v);
+        let low = *WideGoldilocksField::from_slice(&products[..4]);
+        let high = *WideGoldilocksField::from_slice(&products[4..]);
+        let u = WideGoldilocksField::from(u);
+        let pair_destination = pair * 4;
+
+        destination[pair_destination] = u + low;
+        destination[pair_destination + 1] = u + high;
+        destination[pair_destination + 2] = u - low;
+        destination[pair_destination + 3] = u - high;
+    }
+}
+
+/// Expand and finish the 2^13-scalar cache blocks in parallel waves.
+///
+/// At the beginning of a wave, `remaining` blocks still have unread live
+/// coefficients in `values[..remaining * NONZERO_PER_BLOCK]`. Output block
+/// `ceil(remaining / 8)` starts at or after that boundary, so every higher
+/// output block has a source-disjoint destination. The join completes that
+/// suffix before the unread prefix shrinks to the next wave. Block zero is the
+/// only self-overlapping block and retains the original backwards expansion.
+#[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+fn fft_zero_padded_rate_8_cache_blocks_parallel<M>(
+    values: &mut [GoldilocksField],
+    root_table: &FftRootTable<GoldilocksField>,
+) where
+    M: FftTwiddleMul<WideGoldilocksField>,
+{
+    const LG_BLOCK_N: usize = 13;
+    const BLOCK_LEN: usize = 1 << LG_BLOCK_N;
+    const NONZERO_PER_BLOCK: usize = BLOCK_LEN >> 3;
+    const GRAIN_BLOCKS: usize = 4;
+
+    debug_assert_eq!(values.len() % BLOCK_LEN, 0);
+    let mut remaining = values.len() / BLOCK_LEN;
+    debug_assert!(remaining > 1);
+
+    while remaining > 1 {
+        let first = (remaining + 7) >> 3;
+        let source_end = remaining * NONZERO_PER_BLOCK;
+        let destination_start = first * BLOCK_LEN;
+        debug_assert!(source_end <= destination_start);
+
+        let (left, right) = values.split_at_mut(destination_start);
+        let source = &left[..source_end];
+        let destination = &mut right[..(remaining - first) * BLOCK_LEN];
+
+        MaybeParChunksMut::par_chunks_mut(destination, GRAIN_BLOCKS * BLOCK_LEN)
+            .enumerate()
+            .for_each(|(task, chunk)| {
+                let first_block = first + task * GRAIN_BLOCKS;
+                debug_assert_eq!(chunk.len() % BLOCK_LEN, 0);
+                for (offset, destination_block) in
+                    chunk.chunks_exact_mut(BLOCK_LEN).enumerate()
+                {
+                    let block = first_block + offset;
+                    let packed_destination =
+                        WideGoldilocksField::pack_slice_mut(destination_block);
+                    fft_zero_padded_rate_8_first_layer_block_from(
+                        &source[block * NONZERO_PER_BLOCK..(block + 1) * NONZERO_PER_BLOCK],
+                        packed_destination,
+                    );
+                    fft_classic_simd_layers::<WideGoldilocksField, M>(
+                        packed_destination,
+                        4,
+                        LG_BLOCK_N,
+                        root_table,
+                    );
+                }
+            });
+        remaining = first;
+    }
+
+    let block_zero = &mut values[..BLOCK_LEN];
+    let packed_block_zero = WideGoldilocksField::pack_slice_mut(block_zero);
+    fft_zero_padded_rate_8_first_layer_block(
+        packed_block_zero,
+        0,
+        NONZERO_PER_BLOCK,
+        0,
+    );
+    fft_classic_simd_layers::<WideGoldilocksField, M>(
+        packed_block_zero,
+        4,
+        LG_BLOCK_N,
+        root_table,
+    );
+}
+
 /// Expand a bit-reversed nonzero prefix and perform its first nontrivial FFT layer in one pass.
 ///
 /// This is called only when each repeated run contains at least one packed vector.
@@ -1526,8 +1661,37 @@ fn fft_zero_padded_cache_blocks<P, M>(
     root_table: &FftRootTable<P::Scalar>,
 ) where
     P: PackedField,
-    M: FftTwiddleMul<P>,
+    M: FftCacheTwiddleMul<P>,
 {
+    #[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+    if r == 3
+        && lg_block_n == 13
+        && values.len() >= (1 << 19)
+        && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
+    {
+        let goldilocks_values = unsafe {
+            // SAFETY: the TypeId comparison proves that `P` is exactly
+            // `WideGoldilocksField`, whose associated Scalar is exactly
+            // `GoldilocksField`. Length and exclusive access are unchanged.
+            core::slice::from_raw_parts_mut(
+                values.as_mut_ptr().cast::<GoldilocksField>(),
+                values.len(),
+            )
+        };
+        let goldilocks_root_table = unsafe {
+            // SAFETY: the same TypeId proof establishes that every scalar in
+            // the nested root-table vectors is a `GoldilocksField`; only the
+            // generic spelling of the shared reference differs.
+            &*(root_table as *const FftRootTable<P::Scalar>
+                as *const FftRootTable<GoldilocksField>)
+        };
+        fft_zero_padded_rate_8_cache_blocks_parallel::<M>(
+            goldilocks_values,
+            goldilocks_root_table,
+        );
+        return;
+    }
+
     let repeat = 1 << r;
     let block_len = 1 << lg_block_n;
     let nonzero_per_block = block_len >> r;
@@ -1597,7 +1761,7 @@ fn prepare_zero_padded_fft<F, M>(
 ) -> usize
 where
     F: Field,
-    M: FftTwiddleMul<<F as Packable>::Packing>,
+    M: FftCacheTwiddleMul<<F as Packable>::Packing>,
 {
     debug_assert!(r > 0 && r <= lg_n);
 
@@ -1647,7 +1811,7 @@ where
 fn fft_classic_with<F, M>(values: &mut [F], r: usize, root_table: &FftRootTable<F>)
 where
     F: Field,
-    M: FftTwiddleMul<F> + FftTwiddleMul<<F as Packable>::Packing>,
+    M: FftTwiddleMul<F> + FftCacheTwiddleMul<<F as Packable>::Packing>,
 {
     let n = values.len();
     let lg_n = log2_strict(n);
@@ -1672,7 +1836,7 @@ where
 fn fft_classic_with_parallel<F, M>(values: &mut [F], r: usize, root_table: &FftRootTable<F>)
 where
     F: Field,
-    M: FftTwiddleMul<F> + FftTwiddleMul<<F as Packable>::Packing>,
+    M: FftTwiddleMul<F> + FftCacheTwiddleMul<<F as Packable>::Packing>,
 {
     let n = values.len();
     let lg_n = log2_strict(n);
@@ -3283,6 +3447,117 @@ mod tests {
                 actual_ifft, expected_ifft,
                 "coset IFFT mismatch at 2^{lg_n}"
             );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+    fn rate_8_cache_blocks_descending_for_test(
+        values: &mut [GoldilocksField],
+        root_table: &FftRootTable<GoldilocksField>,
+    ) {
+        use super::{
+            fft_classic_simd_layers, fft_zero_padded_rate_8_first_layer_block,
+        };
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+
+        const LG_BLOCK_N: usize = 13;
+        const BLOCK_LEN: usize = 1 << LG_BLOCK_N;
+        const NONZERO_PER_BLOCK: usize = BLOCK_LEN >> 3;
+        let packed_block_len = BLOCK_LEN / WideGoldilocksField::WIDTH;
+        let num_blocks = values.len() / BLOCK_LEN;
+        let packed_values = WideGoldilocksField::pack_slice_mut(values);
+
+        // The pre-wavefront production loop, pinned as the raw-word oracle.
+        for block in (0..num_blocks).rev() {
+            let source_start = block * NONZERO_PER_BLOCK;
+            let destination = block * packed_block_len;
+            fft_zero_padded_rate_8_first_layer_block(
+                packed_values,
+                source_start,
+                NONZERO_PER_BLOCK,
+                destination,
+            );
+            fft_classic_simd_layers::<WideGoldilocksField, BaseSubfieldTwiddle>(
+                &mut packed_values[destination..destination + packed_block_len],
+                4,
+                LG_BLOCK_N,
+                root_table,
+            );
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+    fn poisoned_rate_8_storage(n: usize, seed: u64) -> Vec<GoldilocksField> {
+        use crate::types::Field64;
+
+        let live = n >> 3;
+        (0..n)
+            .map(|i| {
+                let i = i as u64;
+                let raw = if i < live as u64 {
+                    match i & 3 {
+                        0 => u64::MAX.wrapping_sub(i.wrapping_mul(97)),
+                        1 => GoldilocksField::ORDER
+                            .wrapping_add(seed)
+                            .wrapping_add(i.wrapping_mul(0x1_0000_0001)),
+                        2 => seed.wrapping_add(i.wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                        _ => (1 << 63) | seed.rotate_left((i & 63) as u32) | i,
+                    }
+                } else {
+                    // The shortcut must overwrite every tail word before use.
+                    // Keep this deliberately different from zero and canonical
+                    // field storage so an accidental read survives comparison.
+                    u64::MAX
+                        .wrapping_sub(seed.rotate_left((i & 63) as u32))
+                        .wrapping_sub(i.wrapping_mul(0xd6e8_feb8_6659_fd93))
+                };
+                GoldilocksField(raw)
+            })
+            .collect()
+    }
+
+    /// The wavefront changes only the order of source/destination-disjoint
+    /// cache blocks. Pin raw representatives (not merely canonical values) at
+    /// both scored transform sizes and across the relevant Rayon pool widths.
+    /// Noncanonical live coefficients exercise every reduction correction;
+    /// poisoned tails prove the write-before-read invariant.
+    #[cfg(all(target_arch = "aarch64", feature = "parallel", feature = "std"))]
+    #[test]
+    fn rate_8_cache_block_wavefront_matches_descending_raw_words() {
+        use super::fft_zero_padded_rate_8_cache_blocks_parallel;
+        use plonky2_maybe_rayon::rayon::ThreadPoolBuilder;
+
+        for lg_n in [19usize, 21] {
+            let n = 1 << lg_n;
+            let input = poisoned_rate_8_storage(n, 0xa076_1d64_78bd_642f ^ n as u64);
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let mut expected = input.clone();
+            rate_8_cache_blocks_descending_for_test(&mut expected, &roots);
+
+            for pool_size in [1usize, 2, 8, 14] {
+                let pool = ThreadPoolBuilder::new()
+                    .num_threads(pool_size)
+                    .build()
+                    .unwrap();
+                let mut actual = input.clone();
+                pool.install(|| {
+                    fft_zero_padded_rate_8_cache_blocks_parallel::<BaseSubfieldTwiddle>(
+                        &mut actual,
+                        &roots,
+                    )
+                });
+
+                if let Some(index) = actual
+                    .iter()
+                    .zip(&expected)
+                    .position(|(actual, expected)| actual.0 != expected.0)
+                {
+                    assert_eq!(
+                        actual[index].0, expected[index].0,
+                        "raw word mismatch at 2^{lg_n}, pool {pool_size}, index {index}"
+                    );
+                }
+            }
         }
     }
 

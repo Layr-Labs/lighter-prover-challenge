@@ -1,6 +1,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
 use core::any::Any;
+#[cfg(target_arch = "aarch64")]
+use core::any::TypeId;
 use core::fmt::{Debug, Error, Formatter};
 use core::hash::{Hash, Hasher};
 use core::ops::Range;
@@ -12,6 +14,12 @@ use serde::{Serialize, Serializer};
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+#[cfg(target_arch = "aarch64")]
+use crate::field::goldilocks_field::GoldilocksField;
+#[cfg(target_arch = "aarch64")]
+use crate::field::packable::Packable;
+#[cfg(target_arch = "aarch64")]
+use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::gates::selectors::UNUSED_SELECTOR;
 use crate::gates::util::StridedConstraintConsumer;
@@ -91,6 +99,77 @@ pub enum U32QuotientGate {
 pub enum InterleavePairGate {
     Interleave { num_ops: usize },
     UninterleaveToU32 { num_ops: usize },
+}
+
+#[inline(never)]
+fn compute_gate_filters_goldilocks<F: Field>(
+    selector_col: &[F],
+    row: usize,
+    group_range: Range<usize>,
+    include_unused_selector: bool,
+    filters: &mut Vec<F>,
+) {
+    let batch_size = selector_col.len();
+    #[cfg(target_arch = "aarch64")]
+    if TypeId::of::<F>() == TypeId::of::<GoldilocksField>() && batch_size % 4 == 0 {
+        type Wide = <GoldilocksField as Packable>::Packing;
+
+        debug_assert_eq!(Wide::WIDTH, 4);
+        if filters.len() != batch_size {
+            filters.resize(batch_size, F::ZERO);
+        }
+        // SAFETY: the TypeId guard proves the exact element type and therefore
+        // preserves both slices' layout, length, and alignment.
+        let selectors = unsafe {
+            core::slice::from_raw_parts(
+                selector_col.as_ptr().cast::<GoldilocksField>(),
+                batch_size,
+            )
+        };
+        let filters = unsafe {
+            core::slice::from_raw_parts_mut(
+                filters.as_mut_ptr().cast::<GoldilocksField>(),
+                batch_size,
+            )
+        };
+        let selectors = Wide::pack_slice(selectors);
+        let filters = Wide::pack_slice_mut(filters);
+        let mut factors = group_range
+            .filter(|&i| i != row)
+            .chain(include_unused_selector.then_some(UNUSED_SELECTOR));
+        if let Some(i) = factors.next() {
+            let k = Wide::from(GoldilocksField::from_canonical_usize(i));
+            for (filter, &selector) in filters.iter_mut().zip(selectors) {
+                *filter = k - selector;
+            }
+        } else {
+            filters.fill(Wide::ONES);
+        }
+        for i in factors {
+            let k = Wide::from(GoldilocksField::from_canonical_usize(i));
+            for (filter, &selector) in filters.iter_mut().zip(selectors) {
+                *filter *= k - selector;
+            }
+        }
+        return;
+    }
+
+    let mut factors = group_range
+        .filter(|&i| i != row)
+        .chain(include_unused_selector.then_some(UNUSED_SELECTOR));
+    filters.clear();
+    if let Some(i) = factors.next() {
+        let k = F::from_canonical_usize(i);
+        filters.extend(selector_col.iter().map(|&s| k - s));
+    } else {
+        filters.resize(batch_size, F::ONE);
+    }
+    for i in factors {
+        let k = F::from_canonical_usize(i);
+        for (filter, &s) in filters.iter_mut().zip(selector_col) {
+            *filter *= k - s;
+        }
+    }
 }
 
 /// A custom gate.
@@ -260,22 +339,13 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         // order, as the per-point `compute_filter` — identical field values
         // without the per-point strided views.
         let selector_col = &vars_batch.local_constants[selector_index * batch_size..][..batch_size];
-        let mut factors = group_range
-            .filter(|&i| i != row)
-            .chain((num_selectors > 1).then_some(UNUSED_SELECTOR));
-        filters.clear();
-        if let Some(i) = factors.next() {
-            let k = F::from_canonical_usize(i);
-            filters.extend(selector_col.iter().map(|&s| k - s));
-        } else {
-            filters.resize(batch_size, F::ONE);
-        }
-        for i in factors {
-            let k = F::from_canonical_usize(i);
-            for (filter, &s) in filters.iter_mut().zip(selector_col) {
-                *filter *= k - s;
-            }
-        }
+        compute_gate_filters_goldilocks(
+            selector_col,
+            row,
+            group_range,
+            num_selectors > 1,
+            filters,
+        );
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
         self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
     }
