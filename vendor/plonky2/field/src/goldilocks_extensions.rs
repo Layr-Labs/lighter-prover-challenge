@@ -777,6 +777,28 @@ pub fn ext2_fri_fold_arity16_batch(
 /// representative may differ (both forms produce sub-2^64 representatives
 /// that later consumers treat value-wise, and proof serialization
 /// canonicalizes every limb).
+/// Env-gated switch for the NEON `u160_add_product_pair` pairing in
+/// `ext2_base_scalar_dot_slots`. The optimization is ON by default; setting
+/// `LIGHTER_DISABLE_FRI_DOT_NEON=1` rolls back to two scalar
+/// `u160_add_product` calls per term. Only the exact value `1` disables,
+/// matching the `LIGHTER_DISABLE_POW_QUAD` convention.
+#[cfg(feature = "std")]
+#[inline]
+#[allow(dead_code)] // only called on aarch64-apple targets
+fn fri_dot_neon_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_DISABLE_FRI_DOT_NEON").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+const fn fri_dot_neon_enabled() -> bool {
+    true
+}
+
 pub fn ext2_base_scalar_dot_slots(
     out: &mut [QuadraticExtension<GoldilocksField>],
     start: usize,
@@ -799,20 +821,51 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
+    // The two limb accumulators (lo0/hi0 for limb0, lo1/hi1 for limb1) are
+    // independent, so on Apple AArch64 the existing `u160_add_product_pair`
+    // fuses both 64x64->160 accumulations in one asm block for ILP. The pair
+    // routine produces the exact same 160-bit integers as two separate
+    // `u160_add_product` calls (same `lo += a*b` with carry propagation,
+    // interleaved), so `reduce160` at the end sees identical inputs and the
+    // raw limbs are bit-identical to the scalar path.
+    let neon = cfg!(all(target_arch = "aarch64", target_vendor = "apple"))
+        && fri_dot_neon_enabled();
     for (i, o) in out.iter_mut().enumerate() {
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
         for &(p, QuadraticExtension([b0, b1])) in &full {
             // SAFETY: every slice in `full` has length exactly `out.len()`.
             let c = unsafe { p.get_unchecked(i).0 };
-            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+            if neon {
+                #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+                u160_add_product_pair(&mut lo0, &mut hi0, b0.0, c, &mut lo1, &mut hi1, b1.0, c);
+                #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+                {
+                    let _ = (b0, b1);
+                    u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                    u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                }
+            } else {
+                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+            }
         }
         for &(p, QuadraticExtension([b0, b1])) in &partial {
             if i < p.len() {
                 let c = p[i].0;
-                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                if neon {
+                    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+                    u160_add_product_pair(&mut lo0, &mut hi0, b0.0, c, &mut lo1, &mut hi1, b1.0, c);
+                    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+                    {
+                        let _ = (b0, b1);
+                        u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                        u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                    }
+                } else {
+                    u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                    u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                }
             }
         }
         // SAFETY: the accumulator bound documented above — below
@@ -1845,6 +1898,163 @@ mod tests {
         let first_unsafe_worst_case = BigUint::from(u64::from(u32::MAX) + 1) * max_product;
         assert!(max_safe_sum < reduce160_limit);
         assert!(first_unsafe_worst_case >= reduce160_limit);
+    }
+
+    /// Differential for the NEON `u160_add_product_pair` wiring in
+    /// `ext2_base_scalar_dot_slots`. The pair routine produces the exact
+    /// same 160-bit integers as two independent `u160_add_product` calls
+    /// (same `lo += a*b` with carry propagation, interleaved for ILP), so
+    /// `reduce160` sees identical inputs and the raw limbs are bit-identical
+    /// to the scalar path. The reference rebuilds the same accumulator
+    /// structure with the scalar `u160_add_product` only. Inputs mix
+    /// canonical, `ORDER + limb`, and `u64::MAX` noncanonical representatives,
+    /// and exercise both the full-length and partial-length polynomial
+    /// branches.
+    #[test]
+    fn ext2_base_scalar_dot_slots_neon_matches_scalar_raw() {
+        use crate::goldilocks_extensions::ext2_base_scalar_dot_slots;
+
+        let p = GF::ORDER;
+        let raw_specials = [0u64, 1, 2, p - 2, p - 1, p, p + 1, (1 << 32), u64::MAX - 1, u64::MAX];
+
+        let mut state = 0x0A5C_3F7E_91B2_D486u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        let scalar_slots = |out: &mut [Q2],
+                             start: usize,
+                             polys: &[&[GF]],
+                             powers: &[Q2]| {
+            let end = start + out.len();
+            for (i, o) in out.iter_mut().enumerate() {
+                let (mut lo0, mut hi0) = (0u128, 0u32);
+                let (mut lo1, mut hi1) = (0u128, 0u32);
+                for (&p, &QuadraticExtension([b0, b1])) in polys.iter().zip(powers) {
+                    if p.len() >= end {
+                        // SAFETY: p.len() >= end > i, so start + i is in range.
+                        let c = unsafe { p.get_unchecked(start + i).0 };
+                        super::u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                        super::u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                    } else if p.len() > start && start + i < p.len() {
+                        let c = p[start + i].0;
+                        super::u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                        super::u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                    }
+                }
+                *o = QuadraticExtension([
+                    unsafe { crate::goldilocks_field::reduce160(lo0, hi0) },
+                    unsafe { crate::goldilocks_field::reduce160(lo1, hi1) },
+                ]);
+            }
+        };
+
+        let mut case = 0usize;
+        let configs = [
+            (1usize, 1usize, 0usize, 1usize),  // 1 slot, 1 poly, start 0, all full
+            (4, 1, 0, 1),
+            (4, 3, 0, 3),
+            (8, 5, 2, 5),   // start offset, all full
+            (8, 5, 2, 3),   // some partial (one poly shorter)
+            (16, 7, 0, 7),
+            (16, 7, 4, 7),  // start offset
+            (17, 9, 0, 9),
+            (33, 11, 0, 11),
+            (65, 13, 1, 13),
+        ];
+        for (n_slots, n_polys, start, n_full) in configs {
+            let slot_len = n_slots;
+            let powers: Vec<Q2> = (0..n_polys)
+                .map(|i| {
+                    let a0 = if i < raw_specials.len() {
+                        raw_specials[i]
+                    } else {
+                        next()
+                    };
+                    let a1 = if i < raw_specials.len() {
+                        raw_specials[raw_specials.len() - 1 - i]
+                    } else {
+                        next()
+                    };
+                    QuadraticExtension([GoldilocksField(a0), GoldilocksField(a1)])
+                })
+                .collect();
+            let polys: Vec<Vec<GF>> = (0..n_polys)
+                .map(|j| {
+                    let len = if j < n_full {
+                        start + slot_len
+                    } else {
+                        // a partial-length polynomial: covers start but not end
+                        start + (slot_len / 2).max(1)
+                    };
+                    (0..len)
+                        .map(|k| {
+                            GoldilocksField(if k < raw_specials.len() {
+                                raw_specials[(k + j) % raw_specials.len()]
+                            } else {
+                                next()
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            let poly_refs: Vec<&[GF]> = polys.iter().map(|p| p.as_slice()).collect();
+            let mut actual = vec![Q2::ZERO; slot_len];
+            ext2_base_scalar_dot_slots(&mut actual, start, &poly_refs, &powers);
+            let mut expected = vec![Q2::ZERO; slot_len];
+            scalar_slots(&mut expected, start, &poly_refs, &powers);
+            assert_eq!(actual.len(), expected.len(), "length for case {case}");
+            for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                for limb in 0..2 {
+                    assert_eq!(
+                        a.0[limb].0, e.0[limb].0,
+                        "raw limb {limb} mismatch at slot {k} for case {case} (slots={slot_len} polys={n_polys} start={start} full={n_full})"
+                    );
+                }
+            }
+            case += 1;
+        }
+
+        // Random sweep with noncanonical representatives and ragged lengths.
+        for _ in 0..4000 {
+            let slot_len = (next() as usize % 40) + 1;
+            let n_polys = (next() as usize % 16) + 1;
+            let start = (next() as usize % 8).min(slot_len);
+            let powers: Vec<Q2> = (0..n_polys)
+                .map(|_| QuadraticExtension([GoldilocksField(next()), GoldilocksField(next())]))
+                .collect();
+            let polys: Vec<Vec<GF>> = (0..n_polys)
+                .map(|_| {
+                    // Mix full, partial, and skip (too short for start) polynomials.
+                    let kind = next() % 3;
+                    let len = if kind == 0 {
+                        start + slot_len
+                    } else if kind == 1 {
+                        start + (next() as usize % (slot_len + 1))
+                    } else {
+                        next() as usize % (start + 1)
+                    };
+                    (0..len).map(|_| GoldilocksField(next())).collect()
+                })
+                .collect();
+            let poly_refs: Vec<&[GF]> = polys.iter().map(|p| p.as_slice()).collect();
+            let mut actual = vec![Q2::ZERO; slot_len];
+            ext2_base_scalar_dot_slots(&mut actual, start, &poly_refs, &powers);
+            let mut expected = vec![Q2::ZERO; slot_len];
+            scalar_slots(&mut expected, start, &poly_refs, &powers);
+            for (k, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                for limb in 0..2 {
+                    assert_eq!(
+                        a.0[limb].0, e.0[limb].0,
+                        "raw limb {limb} mismatch at slot {k} for random case {case}"
+                    );
+                }
+            }
+            case += 1;
+        }
     }
 
     #[test]

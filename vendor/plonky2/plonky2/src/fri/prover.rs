@@ -19,6 +19,7 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
+use crate::hash::merkle_proofs::MerkleProof;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
@@ -28,6 +29,27 @@ use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
 
 const FRI_FOLD_ARITY16_BATCH_WIDTH: usize = 8;
+
+/// Env-gated switch for the reusable leaf buffer in `fri_prover_query_round`.
+/// The optimization is ON by default; setting
+/// `LIGHTER_DISABLE_LEAF_REUSE=1` rolls back to the original `leaf_vec` path
+/// (one fresh allocation per initial tree per query round). Only the exact
+/// value `1` disables, matching the `LIGHTER_DISABLE_POW_QUAD` convention.
+#[cfg(feature = "std")]
+#[inline]
+fn leaf_reuse_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_DISABLE_LEAF_REUSE").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+const fn leaf_reuse_enabled() -> bool {
+    true
+}
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -623,10 +645,48 @@ fn fri_prover_query_round<
     fri_params: &FriParams,
 ) -> FriQueryRound<F, C::Hasher, D> {
     let mut query_steps = Vec::new();
-    let initial_proof = initial_merkle_trees
-        .iter()
-        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
-        .collect::<Vec<_>>();
+    let initial_proof = if leaf_reuse_enabled() {
+        // Reusable leaf buffer: borrow each row-major leaf via `get` (no copy
+        // on borrow) and move the buffer's owned allocation into the proof,
+        // then re-capacitate it for the next tree. The leaf VALUES are
+        // identical to `leaf_vec`; only the allocation strategy changes (the
+        // buffer's capacity is reused across row-major trees within this
+        // query round instead of a fresh `to_vec` allocation per tree).
+        // `MerkleTree::get` is row-major only and panics on the column-major
+        // (poly-major) layout that LDE commits are produced in here, so
+        // column-major trees fall back to the original `leaf_vec` path. The
+        // proof struct still owns its leaf data either way, so the emitted
+        // proof is byte-identical to the all-`leaf_vec` path.
+        let max_leaf_width = initial_merkle_trees
+            .iter()
+            .map(|t| t.leaf_width())
+            .max()
+            .unwrap_or(0);
+        // Lazily sized: stays empty (no allocation) when every initial tree is
+        // column-major, which is the production LDE-commit layout here.
+        let mut leaf_buf: Vec<F> = Vec::new();
+        let mut proof: Vec<(Vec<F>, MerkleProof<F, C::Hasher>)> =
+            Vec::with_capacity(initial_merkle_trees.len());
+        for t in initial_merkle_trees {
+            let owned = match &t.leaves {
+                crate::hash::merkle_tree::MerkleLeaves::Rows { .. } => {
+                    leaf_buf.clear();
+                    leaf_buf.extend_from_slice(t.get(x_index));
+                    let owned = core::mem::take(&mut leaf_buf);
+                    leaf_buf.reserve(max_leaf_width);
+                    owned
+                }
+                _ => t.leaf_vec(x_index),
+            };
+            proof.push((owned, t.prove(x_index)));
+        }
+        proof
+    } else {
+        initial_merkle_trees
+            .iter()
+            .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
+            .collect::<Vec<_>>()
+    };
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
         let evals = unflatten(tree.get(x_index >> arity_bits));
@@ -870,5 +930,95 @@ mod tests {
         let min_leading_zeros = config.proof_of_work_bits + (64 - F::order().bits()) as u32;
         assert!(response.to_canonical_u64().leading_zeros() >= min_leading_zeros);
         assert_eq!(challenger.get_n_challenges(16), replay.get_n_challenges(16));
+    }
+
+    /// Differential for the reusable leaf buffer in `fri_prover_query_round`.
+    /// The optimized path borrows each leaf via `MerkleTree::get` and moves a
+    /// reused buffer into the proof instead of allocating a fresh `Vec` per
+    /// tree via `leaf_vec`. The leaf VALUES are identical, so the emitted
+    /// proof is byte-identical. This test asserts that equivalence on raw
+    /// `u64` limbs for several row-major trees of varying leaf width, mixing
+    /// canonical, `ORDER + limb`, and `u64::MAX` noncanonical leaf entries,
+    /// and over multiple query indices.
+    #[test]
+    fn fri_query_round_reusable_leaf_buf_matches_leaf_vec_raw() {
+        use crate::hash::merkle_tree::MerkleTree;
+
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let p = F::ORDER;
+        let raw_specials = [0u64, 1, 2, p - 2, p - 1, p, p + 1, u64::MAX - 1, u64::MAX];
+
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // Build several row-major trees of differing leaf width and count.
+        let tree_specs = [
+            (1usize << 6, 1usize, 0usize),  // 64 leaves, width 1, cap 0
+            (1 << 6, 4, 4),
+            (1 << 7, 7, 3),
+            (1 << 7, 12, 2),
+            (1 << 8, 20, 4),
+        ];
+        for (n_leaves, width, cap_height) in tree_specs {
+            let leaves: Vec<Vec<F>> = (0..n_leaves)
+                .map(|i| {
+                    (0..width)
+                        .map(|j| {
+                            let idx = (i.wrapping_mul(31) ^ j) as usize;
+                            let raw = if idx % 3 == 0 {
+                                raw_specials[idx % raw_specials.len()]
+                            } else {
+                                next()
+                            };
+                            F::from_noncanonical_u64(raw)
+                        })
+                        .collect()
+                })
+                .collect();
+            let tree = MerkleTree::<F, H>::new(leaves.clone(), cap_height);
+
+            // The reusable-buffer extraction, mirroring the production path.
+            let reusable = |x_index: usize| -> Vec<(Vec<F>, _)> {
+                let max_leaf_width = width;
+                let mut leaf_buf: Vec<F> = Vec::new();
+                let mut proof: Vec<(Vec<F>, _)> = Vec::with_capacity(1);
+                leaf_buf.clear();
+                leaf_buf.extend_from_slice(tree.get(x_index));
+                let owned = core::mem::take(&mut leaf_buf);
+                leaf_buf.reserve(max_leaf_width);
+                proof.push((owned, tree.prove(x_index)));
+                proof
+            };
+
+            // Probe several indices, including boundaries.
+            for &x_index in &[0usize, 1, n_leaves / 2, n_leaves - 1] {
+                let orig = tree.leaf_vec(x_index);
+                let reused = reusable(x_index);
+                assert_eq!(reused.len(), 1, "tree spec ({n_leaves},{width},{cap_height}) x={x_index}");
+                assert_eq!(
+                    reused[0].0.len(),
+                    orig.len(),
+                    "owned length for tree spec ({n_leaves},{width},{cap_height}) x={x_index}"
+                );
+                for (k, (a, e)) in reused[0].0.iter().zip(orig.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_noncanonical_u64(),
+                        e.to_noncanonical_u64(),
+                        "raw limb {k} mismatch for tree spec ({n_leaves},{width},{cap_height}) x={x_index}"
+                    );
+                }
+                // The borrow itself must agree with `leaf_vec` byte for byte.
+                assert_eq!(tree.get(x_index), orig.as_slice(), "get vs leaf_vec for x={x_index}");
+            }
+        }
     }
 }
