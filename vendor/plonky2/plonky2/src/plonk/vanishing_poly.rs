@@ -1850,6 +1850,12 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
             }
         }
         let gate = &common_data.gates[i];
+        // A gate with no constraints contributes nothing to `constraints_batch`
+        // -- its accumulate zips over zero rows -- but building its selector
+        // filter still does work that no consumer observes.
+        if gate.0.num_constraints() == 0 {
+            continue;
+        }
         if shared_gate_filter_plan[i] {
             let batch_size = vars_batch.len();
             let filter = &shared_gate_filters[i * batch_size..(i + 1) * batch_size];

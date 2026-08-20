@@ -591,9 +591,32 @@ unsafe fn gl_sub_neon(
 /// vectorising it would cost more than it saves -- and goes through the same
 /// paired `NeonGoldilocksField` assembly the generic path uses. Only `t`
 /// crosses the register files.
+///
+/// Every layer the production dispatch reaches has `lg_half_m >= 2` (the caller
+/// only enters here at or above the packed width), so the body below is the
+/// small-shape fallback and the 4-wide kernel is what actually runs. The size
+/// guard that used to keep 2^13 cache-blocked slices on the 2-wide body is
+/// gone: with the 4-wide kernel walking one pointer per stream it is faster at
+/// that shape too (see `fft_classic_simd_single_layer_neon_w4`).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fft_classic_simd_single_layer_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    if lg_half_m >= 2 {
+        return fft_classic_simd_single_layer_neon_w4(values, lg_half_m, omega_row);
+    }
+    fft_classic_simd_single_layer_neon_w2(values, lg_half_m, omega_row)
+}
+
+/// The 2-wide body of [`fft_classic_simd_single_layer_neon`], reachable only
+/// for `lg_half_m < 2`. Kept as its own symbol so the raw-word differential
+/// against the 4-wide kernel compares two implementations rather than one.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
-fn fft_classic_simd_single_layer_neon(
+fn fft_classic_simd_single_layer_neon_w2(
     values: &mut [crate::goldilocks_field::GoldilocksField],
     lg_half_m: usize,
     omega_row: &[crate::goldilocks_field::GoldilocksField],
@@ -602,13 +625,6 @@ fn fft_classic_simd_single_layer_neon(
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
 
     const EPSILON: u64 = (1 << 32) - 1;
-    // Full-array passes carry enough independent work for the 4-wide issue
-    // schedule to pay (+3-4% at 14 threads); the 2^13 cache-blocked slices
-    // measured as a tie, so they keep this proven 2-wide body. The lg guard
-    // also keeps the w4 fallback (which returns here) from recursing.
-    if values.len() >= (1 << 14) && lg_half_m >= 2 {
-        return fft_classic_simd_single_layer_neon_w4(values, lg_half_m, omega_row);
-    }
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
@@ -680,6 +696,9 @@ fn fft_classic_simd_single_layer_neon(
 /// loud at one check per call, exactly like the generic single-layer body.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
+// Off the production dispatch; reached only by its raw-word differentials and
+// the kernel benches, so it is dead in a plain library build.
+#[allow(dead_code)]
 fn fft_classic_simd_two_layers_neon(
     values: &mut [crate::goldilocks_field::GoldilocksField],
     lg_half_m: usize,
@@ -748,6 +767,9 @@ fn fft_classic_simd_two_layers_neon(
 /// Falls back to the 2-wide kernel when a row is too short.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
+// Off the production dispatch; reached only by its raw-word differentials and
+// the kernel benches, so it is dead in a plain library build.
+#[allow(dead_code)]
 fn fft_classic_simd_two_layers_neon_w4(
     values: &mut [crate::goldilocks_field::GoldilocksField],
     lg_half_m: usize,
@@ -949,6 +971,22 @@ fn fft_classic_simd_three_layers_neon(
 
 /// 4-wide variant of the single-layer kernel: two independent pair-muls per
 /// iteration. Same values, same raw words, wider issue window.
+///
+/// The three streams — the `u` half, the `v` half, the twiddle row — are walked
+/// as pointers rather than indexed off `values` and `omega_row`. That is worth
+/// stating because it is the whole measured difference between this and the
+/// indexed form it replaced: indexing derives the two adjacent `v` words from
+/// two unrelated bases, so LLVM emits `ldr` + `add` + `ldr` where one `ldp`
+/// does, and cannot fold the induction into post-indexed accesses. Pointer
+/// walking gets `ldp`/`ldp`/`ldp q, q` in and `stp q, q` out, 82 instructions
+/// per 8 element-layers against 85, and measures **-3%** on the 2^19 deep
+/// layers, **-3%** on the 2^16 IFFT layers and **-2%** on 2^13 cache-blocked
+/// slices (12 threads, arms interleaved in one loop, min of 35 reps).
+///
+/// A shorter-carry-chain vector add (predicting the second overflow from `sum`
+/// instead of measuring it from `sum + EPSILON`, so the two corrections issue
+/// in parallel) was measured on top of this and is **exactly flat** — the
+/// kernel is not short of dependency slack — so `gl_add_neon` stays.
 #[cfg(target_arch = "aarch64")]
 #[inline(never)]
 fn fft_classic_simd_single_layer_neon_w4(
@@ -958,49 +996,63 @@ fn fft_classic_simd_single_layer_neon_w4(
 ) {
     use core::arch::aarch64::*;
     use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+    use crate::goldilocks_field::GoldilocksField;
 
     const EPSILON: u64 = (1 << 32) - 1;
     if lg_half_m < 2 {
-        return fft_classic_simd_single_layer_neon(values, lg_half_m, omega_row);
+        return fft_classic_simd_single_layer_neon_w2(values, lg_half_m, omega_row);
     }
     let half = 1usize << lg_half_m;
     let m = half << 1;
-    debug_assert!(omega_row.len() >= half);
+    // One check per call rather than per butterfly, exactly as the generic
+    // body slices its twiddle row: a short row must fail loudly instead of
+    // silently reading past it.
+    assert!(omega_row.len() >= half);
+    let n = values.len();
     let base = values.as_mut_ptr().cast::<u64>();
+    let wbase = omega_row.as_ptr().cast::<u64>();
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
-        while k + m <= values.len() {
+        while k + m <= n {
+            // SAFETY: `k + m <= n` and `j + 4 <= half`, so every access below
+            // is inside `values[k .. k + m]`; the twiddle pointer stays inside
+            // `omega_row[..half]` by the same bound and the assert above.
+            // `GoldilocksField` is `#[repr(transparent)]` over `u64`.
+            let mut pu = base.add(k);
+            let mut pv = base.add(k + half);
+            let mut pw = wbase;
             let mut j = 0;
             while j + 4 <= half {
-                let vx = NeonGoldilocksField([
-                    *values.get_unchecked(k + half + j),
-                    *values.get_unchecked(k + half + j + 1),
-                ]);
+                let vx =
+                    NeonGoldilocksField([GoldilocksField(*pv), GoldilocksField(*pv.add(1))]);
                 let vy = NeonGoldilocksField([
-                    *values.get_unchecked(k + half + j + 2),
-                    *values.get_unchecked(k + half + j + 3),
+                    GoldilocksField(*pv.add(2)),
+                    GoldilocksField(*pv.add(3)),
                 ]);
-                let wx = NeonGoldilocksField([
-                    *omega_row.get_unchecked(j),
-                    *omega_row.get_unchecked(j + 1),
-                ]);
+                let wx =
+                    NeonGoldilocksField([GoldilocksField(*pw), GoldilocksField(*pw.add(1))]);
                 let wy = NeonGoldilocksField([
-                    *omega_row.get_unchecked(j + 2),
-                    *omega_row.get_unchecked(j + 3),
+                    GoldilocksField(*pw.add(2)),
+                    GoldilocksField(*pw.add(3)),
                 ]);
                 let tx = wx * vx;
                 let ty = wy * vy;
                 let tvx = vcombine_u64(vcreate_u64(tx.0[0].0), vcreate_u64(tx.0[1].0));
                 let tvy = vcombine_u64(vcreate_u64(ty.0[0].0), vcreate_u64(ty.0[1].0));
-                let ux = vld1q_u64(base.add(k + j));
-                let uy = vld1q_u64(base.add(k + j + 2));
-                vst1q_u64(base.add(k + j), gl_add_neon(ux, tvx, eps));
-                vst1q_u64(base.add(k + j + 2), gl_add_neon(uy, tvy, eps));
-                vst1q_u64(base.add(k + half + j), gl_sub_neon(ux, tvx, eps));
-                vst1q_u64(base.add(k + half + j + 2), gl_sub_neon(uy, tvy, eps));
+                let ux = vld1q_u64(pu);
+                let uy = vld1q_u64(pu.add(2));
+                vst1q_u64(pu, gl_add_neon(ux, tvx, eps));
+                vst1q_u64(pu.add(2), gl_add_neon(uy, tvy, eps));
+                vst1q_u64(pv, gl_sub_neon(ux, tvx, eps));
+                vst1q_u64(pv.add(2), gl_sub_neon(uy, tvy, eps));
+                pu = pu.add(4);
+                pv = pv.add(4);
+                pw = pw.add(4);
                 j += 4;
             }
+            // `half` is a power of two and at least 4 here, so this tail never
+            // runs; kept so the kernel is correct for any shape.
             while j < half {
                 let t = omega_row[j] * values[k + half + j];
                 let u = values[k + j];
@@ -1267,23 +1319,7 @@ fn fft_classic_simd_fused_two_layers_with<P, M>(
     }
 }
 
-/// Base-field ranges at or above this many scalars take consecutive layers
-/// two at a time through the fused pair-column kernel. Below it — every 2^13
-/// cache-blocked slice and every smaller transform — the single-layer
-/// schedule measures as fast or faster, so it stays.
-///
-/// Was 2^19 when the fused kernel was 2-wide (below that it measured as a
-/// tie). With the 4-wide kernel, fused pairs win at 2^16 full arrays too:
-/// 14-thread contended, the 2^16 IFFT schedule runs +8.6% as 4-wide fused
-/// pairs vs the previous 2-wide singles (+4.4% vs 4-wide singles), so the
-/// gate now admits the 136+20 wires/zs IFFT columns and the 2^17 chain-step
-/// deep layers. 2^13 slices still measure as a tie and keep single layers.
-#[cfg(target_arch = "aarch64")]
-const FUSED_PAIR_MIN_SCALARS: usize = 1 << 16;
-
-/// Run FFT stages `start..end`, one whole-buffer pass each — except that
-/// base-field ranges streaming at least `FUSED_PAIR_MIN_SCALARS` take the
-/// stages two at a time, one whole-buffer pass per PAIR.
+/// Run FFT stages `start..end`, one whole-buffer pass each.
 ///
 /// A packed-width radix-4 traversal fusing stage pairs used to drive these
 /// layers, on the reasoning that it halved whole-array memory passes. For
@@ -1294,27 +1330,51 @@ const FUSED_PAIR_MIN_SCALARS: usize = 1 << 16;
 /// packed values plus three twiddle vectors live and spilled while the
 /// Goldilocks multiply ran in scalar registers.
 ///
-/// Full-array passes are a different regime. Measured per element-layer
-/// (min of >=500 interleaved reps, bit-identical arms), the single-layer
-/// kernel costs 0.50 ns on a cache-resident 2^13 slice but 0.57-0.59 ns on
-/// 2^19/2^21 full arrays — deep layers pair elements across multi-MiB
-/// strides and stream multi-MiB twiddle rows, and every pass repays that.
-/// The pair-column two-layer fusion (which fits in registers; see its doc)
-/// holds ~0.50 ns at every measured size and depth: +14% at the 2^19 tail,
-/// +17% at 2^21, two-layer microshapes +2% (lg_half_m=4) rising
-/// monotonically to +20% (lg_half_m=19). Below 2^19 scalars it measures as
-/// a tie, so the gate keeps those ranges — in particular every in-block
-/// call — on the proven single-layer path, and a trailing odd layer runs
-/// as a single exactly as before.
+/// Full-array passes were then thought to be a different regime, and a
+/// register-resident pair-column fusion (`fft_classic_simd_two_layers_neon_w4`)
+/// drove every base-field range of at least 2^16 scalars: the LDE deep layers
+/// 13..18 as three fused passes, and the whole 2^16 wires/zs IFFT.
+/// **Re-measured, that gate was a regression at every shape it covered**, and
+/// it is retired here — every stage is one pass again.
+///
+/// The re-measurement, because it reverses a documented one. Both schedules
+/// run inside a single thread's loop on the same buffer in palindromic order,
+/// each pass timed on its own, reported as the per-thread minimum aggregated
+/// as the median over threads; three whole-bench repetitions at 1, 6, 12 and
+/// 14 threads, host at loadavg 50-160 throughout. Same butterflies, same
+/// twiddles, raw-word-identical arms. ns per element-layer:
+///
+/// | schedule | fused pairs | single layers | delta |
+/// |---|---|---|---|
+/// | LDE deep 13..18 on 2^19 | 0.459 / 0.458 / 0.462 | 0.407 / 0.407 / 0.408 | **-11.3%** |
+/// | IFFT 4..16 on 2^16 | 0.448 / 0.448 / 0.453 | 0.410 / 0.411 / 0.414 | **-8.5%** |
+/// | in-block 4..12 on 2^13 | 0.429 | 0.402 | -6.3% |
+///
+/// The sign is the same at every thread count and every repetition, and the
+/// spread between repetitions is under 1.5% where the effect is 8-11%. The
+/// superseded measurement was taken with `ilp_kernel_bench_mt`, which times
+/// each arm in a *separate* 1.5-second run and reports the aggregate rate;
+/// on this host consecutive runs of one arm differ by up to 4x, which is
+/// larger than the effect being measured.
+///
+/// What the fused kernel actually costs is visible in its compiled loop: it
+/// spills (`ldr` from the frame inside the hot loop), keeps four data and
+/// three twiddle streams live, and pays 8 scalar `GoldilocksField` add/sub
+/// with their rare-carry branches for the C/D stage-1 butterflies — 314
+/// instructions per 32 element-layers against 82 per 8, i.e. 9.8 against
+/// 10.25 per element-layer for a schedule that is 12% slower. Fewer
+/// instructions, more spilling: the memory pass it removes was never the
+/// binding constraint. Measured on the same runs, a pure read-and-write
+/// sweep of the same buffers costs **14-15%** of either schedule (24% for the
+/// cache-blocked slices), so both are far from the traffic floor.
+///
+/// The kernels stay in the file off the dispatch, the way
+/// `fft_classic_simd_three_layers_neon` is kept, with their raw-word
+/// differentials; restoring the schedule is re-adding the arm.
 ///
 /// The twiddle marker `M` rides on this structure: it is chosen once per
 /// transform by the dispatch entry and resolved statically inside each layer,
 /// so it adds no live register and no per-butterfly branch to any kernel.
-/// The fused arm is guarded on exact `WideGoldilocksField` identity the same
-/// way the single-layer fast path is; reaching it proves the scalar type is
-/// `GoldilocksField`, whose `mul_fft_base_twiddle` is the full multiplication,
-/// so both markers denote the same product and the arm is untouched by the
-/// twiddle specialization.
 #[inline(always)]
 fn fft_classic_simd_layers<P, M>(
     packed_values: &mut [P],
@@ -1326,62 +1386,6 @@ fn fft_classic_simd_layers<P, M>(
     M: FftTwiddleMul<P>,
 {
     let lg_packed_width = log2_strict(P::WIDTH);
-
-    #[cfg(target_arch = "aarch64")]
-    if start + 2 <= end
-        && (packed_values.len() << lg_packed_width) >= FUSED_PAIR_MIN_SCALARS
-        && core::any::TypeId::of::<P>()
-            == core::any::TypeId::of::<
-                crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
-            >()
-    {
-        let mut lg_half_m = start;
-        {
-            // SAFETY: the `TypeId` compare proves `P` is exactly
-            // `WideGoldilocksField`, hence `P::Scalar` is exactly
-            // `GoldilocksField`. `WideGoldilocksField` is
-            // `#[repr(transparent)]` over `[NeonGoldilocksField; 2]`, itself
-            // `#[repr(transparent)]` over `[GoldilocksField; 2]`, so the
-            // packed slice is exactly `4 * len` contiguous scalars with the
-            // same alignment, and the rows already hold that scalar type.
-            // Only the generic spelling of the types differs at this point.
-            let scalars = unsafe {
-                core::slice::from_raw_parts_mut(
-                    packed_values
-                        .as_mut_ptr()
-                        .cast::<crate::goldilocks_field::GoldilocksField>(),
-                    packed_values.len() * P::WIDTH,
-                )
-            };
-            while lg_half_m + 2 <= end {
-                let w1_row = unsafe {
-                    let row = &root_table[lg_half_m];
-                    core::slice::from_raw_parts(
-                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
-                        row.len(),
-                    )
-                };
-                let w2_row = unsafe {
-                    let row = &root_table[lg_half_m + 1];
-                    core::slice::from_raw_parts(
-                        row.as_ptr().cast::<crate::goldilocks_field::GoldilocksField>(),
-                        row.len(),
-                    )
-                };
-                fft_classic_simd_two_layers_neon_w4(scalars, lg_half_m, w1_row, w2_row);
-                lg_half_m += 2;
-            }
-        }
-        if lg_half_m < end {
-            fft_classic_simd_single_layer_with::<P, M>(
-                packed_values,
-                lg_half_m,
-                lg_packed_width,
-                root_table,
-            );
-        }
-        return;
-    }
 
     for lg_half_m in start..end {
         fft_classic_simd_single_layer_with::<P, M>(
@@ -1446,6 +1450,54 @@ fn fft_zero_padded_first_layer_block_with<P, M>(
 {
     debug_assert!(nonzero_len >= 2);
 
+    // Rate-8 base-field fast path — the only shape any production LDE reaches
+    // (`rate_bits = 3`, so `repeat = 8` and `packed_repeat = 2`). Guarded on
+    // exact type identity, like `fft_classic_simd_single_layer_with`'s.
+    //
+    // The twiddle marker `M` is deliberately not referenced by this arm.
+    // Reaching it proves `P::Scalar` is exactly `GoldilocksField`, whose
+    // `mul_fft_base_twiddle` is the default full multiplication, so both
+    // markers denote the same product here.
+    #[cfg(target_arch = "aarch64")]
+    if packed_repeat == 2
+        && core::any::TypeId::of::<P>()
+            == core::any::TypeId::of::<
+                crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
+            >()
+    {
+        // SAFETY: the `TypeId` compare proves `P` is exactly
+        // `WideGoldilocksField`, hence `P::Scalar` is exactly
+        // `GoldilocksField`. `WideGoldilocksField` is `#[repr(transparent)]`
+        // over `[NeonGoldilocksField; 2]`, itself `#[repr(transparent)]` over
+        // `[GoldilocksField; 2]`, so both slices are exactly `4 * len`
+        // contiguous scalars with the same alignment. Only the generic
+        // spelling of the types differs at this point.
+        let scalars = unsafe {
+            core::slice::from_raw_parts_mut(
+                packed_values
+                    .as_mut_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                packed_values.len() * P::WIDTH,
+            )
+        };
+        let omega_row = unsafe {
+            core::slice::from_raw_parts(
+                omega_table
+                    .as_ptr()
+                    .cast::<crate::goldilocks_field::GoldilocksField>(),
+                omega_table.len() * P::WIDTH,
+            )
+        };
+        fft_zero_padded_rate_8_first_layer_block_neon(
+            scalars,
+            source_start,
+            nonzero_len,
+            destination * P::WIDTH,
+            omega_row,
+        );
+        return;
+    }
+
     // Expanding backwards ensures that every source pair is read before an earlier destination
     // can overwrite it. Destinations are vector-aligned because repeat >= the packed width.
     for pair in (0..nonzero_len / 2).rev() {
@@ -1488,6 +1540,91 @@ fn fft_zero_padded_rate_8_first_layer_block(
         packed_values[pair_destination + 1] = u + high;
         packed_values[pair_destination + 2] = u - low;
         packed_values[pair_destination + 3] = u - high;
+    }
+}
+
+/// The rate-8 expansion block with the butterfly reductions in vector
+/// registers instead of lane-wise scalar ones.
+///
+/// Same butterflies, same twiddles, same reverse-pair order as the generic
+/// `fft_zero_padded_first_layer_block_with` body, through the same primitives:
+/// paired `NeonGoldilocksField` multiplies and `gl_add_neon`/`gl_sub_neon`,
+/// each documented word-for-word identical to scalar `Add`/`Sub`. Every raw
+/// `GoldilocksField.0` word is identical, not merely congruent.
+///
+/// What changes is which add runs. The generic body reaches
+/// `WideGoldilocksField`'s `Add`/`Sub`, which are lane-wise scalar
+/// `GoldilocksField` operators: four per packed operation, each about five
+/// instructions *plus a rarely-taken branch* for the second carry. The vector
+/// forms do two lanes in seven straight-line instructions and no branch. The
+/// eight layer-3 twiddles are also loop-invariant across the whole block and
+/// are held live rather than reloaded from `omega_table` per source pair.
+///
+/// Measured -8.5% to -9.1% on the production expansion (2^16 prefix into 64
+/// blocks of 2^13, three whole-bench repetitions at 12 threads), and -10% to
+/// -13% at 1, 6 and 14 threads. It is the same 3.2%-of-busy leaf that
+/// `fft_zero_padded_rate_8_first_layer_block` failed to move by trading the
+/// multiply for shifts: the multiply was never the expensive half.
+///
+/// A pure read-and-write sweep of the same blocks costs 27-29% of this
+/// schedule, so the expansion is not traffic-bound either.
+///
+/// The products go through `mul_reduce_pair_keep` rather than
+/// `NeonGoldilocksField`'s `Mul`: the eight twiddles and the source word are
+/// each an operand of four products, and the compact multiply clobbers its
+/// operands, so the ordinary form spends fifteen register copies per iteration
+/// keeping them alive. That is a further -4.1% to -4.2%; see that function's
+/// doc for why it is not the default.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_zero_padded_rate_8_first_layer_block_neon(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    source_start: usize,
+    nonzero_len: usize,
+    destination: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::mul_reduce_pair_keep;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    debug_assert!(nonzero_len >= 2);
+    // One check per block instead of per element, as elsewhere in this file:
+    // a short twiddle row or a destination that does not fit must fail loudly.
+    assert!(omega_row.len() >= 8);
+    assert!(source_start + nonzero_len <= values.len());
+    assert!(destination + (nonzero_len / 2) * 16 <= values.len());
+
+    let base = values.as_mut_ptr().cast::<u64>();
+    let w: [u64; 8] = core::array::from_fn(|i| omega_row[i].0);
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        for pair in (0..nonzero_len / 2).rev() {
+            // SAFETY: the two asserts above bound the source pair and the
+            // sixteen destination words inside `values`; `GoldilocksField` is
+            // `#[repr(transparent)]` over `u64`.
+            let src = base.add(source_start + pair * 2);
+            let u = *src;
+            let v = *src.add(1);
+            let (t0, t1) = mul_reduce_pair_keep(w[0], v, w[1], v);
+            let (t2, t3) = mul_reduce_pair_keep(w[2], v, w[3], v);
+            let (t4, t5) = mul_reduce_pair_keep(w[4], v, w[5], v);
+            let (t6, t7) = mul_reduce_pair_keep(w[6], v, w[7], v);
+            let uv = vdupq_n_u64(u);
+            let a0 = vcombine_u64(vcreate_u64(t0), vcreate_u64(t1));
+            let a1 = vcombine_u64(vcreate_u64(t2), vcreate_u64(t3));
+            let a2 = vcombine_u64(vcreate_u64(t4), vcreate_u64(t5));
+            let a3 = vcombine_u64(vcreate_u64(t6), vcreate_u64(t7));
+            let dst = base.add(destination + pair * 16);
+            vst1q_u64(dst, gl_add_neon(uv, a0, eps));
+            vst1q_u64(dst.add(2), gl_add_neon(uv, a1, eps));
+            vst1q_u64(dst.add(4), gl_add_neon(uv, a2, eps));
+            vst1q_u64(dst.add(6), gl_add_neon(uv, a3, eps));
+            vst1q_u64(dst.add(8), gl_sub_neon(uv, a0, eps));
+            vst1q_u64(dst.add(10), gl_sub_neon(uv, a1, eps));
+            vst1q_u64(dst.add(12), gl_sub_neon(uv, a2, eps));
+            vst1q_u64(dst.add(14), gl_sub_neon(uv, a3, eps));
+        }
     }
 }
 
@@ -3370,8 +3507,12 @@ mod tests {
     #[test]
     #[cfg(target_arch = "aarch64")]
     fn w4_kernels_match_w2_raw_words() {
+        // The 2-wide single-layer body is addressed directly rather than
+        // through `fft_classic_simd_single_layer_neon`: that entry now
+        // delegates to the 4-wide kernel for every `lg_half_m >= 2`, so going
+        // through it would compare the 4-wide kernel with itself.
         use super::{
-            fft_classic_simd_single_layer_neon, fft_classic_simd_single_layer_neon_w4,
+            fft_classic_simd_single_layer_neon_w2, fft_classic_simd_single_layer_neon_w4,
             fft_classic_simd_two_layers_neon, fft_classic_simd_two_layers_neon_w4,
         };
         let mut state = 0x243F_6A88_85A3_08D3u64;
@@ -3405,7 +3546,7 @@ mod tests {
             let values: Vec<GoldilocksField> =
                 (0..single_len).map(|_| GoldilocksField(next())).collect();
             let mut a = values.clone();
-            fft_classic_simd_single_layer_neon(&mut a, lg_half_m, &w1);
+            fft_classic_simd_single_layer_neon_w2(&mut a, lg_half_m, &w1);
             let mut b = values.clone();
             fft_classic_simd_single_layer_neon_w4(&mut b, lg_half_m, &w1);
             assert_eq!(
@@ -3727,6 +3868,390 @@ mod tests {
                 mean(&w4_rates),
                 100.0 * (mean(&w4_rates) - mean(&w2_rates)) / mean(&w2_rates)
             );
+        }
+    }
+
+    /// Verbatim copy of the generic zero-padded expansion block body, kept as
+    /// the oracle for the NEON specialization that now intercepts it at the
+    /// production shape.
+    ///
+    /// `inline(always)` because the body it copies was `inline(always)` into
+    /// `fft_zero_padded_cache_blocks`: without it the bench's base arm reads
+    /// about 25% pessimistic and overstates the specialization.
+    #[inline(always)]
+    fn generic_packed_expansion<P: PackedField>(
+        packed_values: &mut [P],
+        source_start: usize,
+        nonzero_len: usize,
+        destination: usize,
+        packed_repeat: usize,
+        omega_table: &[P],
+    ) {
+        for pair in (0..nonzero_len / 2).rev() {
+            let source = source_start + pair * 2;
+            let u = packed_values[source / P::WIDTH].as_slice()[source % P::WIDTH];
+            let v = packed_values[(source + 1) / P::WIDTH].as_slice()[(source + 1) % P::WIDTH];
+            let u = P::from(u);
+            let v = P::from(v);
+            let pair_destination = destination + pair * 2 * packed_repeat;
+            for j in 0..packed_repeat {
+                let t = omega_table[j] * v;
+                packed_values[pair_destination + j] = u + t;
+                packed_values[pair_destination + packed_repeat + j] = u - t;
+            }
+        }
+    }
+
+    /// The NEON rate-8 expansion block must reproduce the generic packed
+    /// block's raw `u64` words, not merely its field elements.
+    ///
+    /// The generic body is no longer reachable at this shape — the dispatch in
+    /// `fft_zero_padded_first_layer_block_with` intercepts it — so the oracle
+    /// is a verbatim copy of it, the same way
+    /// `neon_single_layer_matches_generic_raw_words` keeps its own copy.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn rate_8_expansion_neon_matches_generic_packed_raw_words() {
+        use super::fft_zero_padded_rate_8_first_layer_block_neon;
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+        use crate::types::Field64;
+
+        type P = WideGoldilocksField;
+        // Non-canonical words throughout, so both carry corrections in the
+        // butterfly and a non-canonical twiddle row are exercised.
+        let seed = |n: usize| -> Vec<GoldilocksField> {
+            (0..n)
+                .map(|i| {
+                    let x = 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i as u64 + 1);
+                    GoldilocksField(match i % 6 {
+                        0 => x,
+                        1 => u64::MAX - (i as u64),
+                        2 => GoldilocksField::ORDER + (i as u64 % 1000),
+                        3 => x | 0xFFFF_FFFF_0000_0000,
+                        4 => (i as u64) % 3,
+                        _ => x ^ 0xFFFF_FFFF_FFFF_0000,
+                    })
+                })
+                .collect()
+        };
+
+        // Production block geometry (`lg_block_n = 13`, `r = 3`) out of each
+        // live LDE size, plus the unblocked whole-buffer shape.
+        for (lg_n, lg_block_n) in [(19usize, 13usize), (17, 13), (16, 13), (13, 13), (6, 6)] {
+            let n = 1usize << lg_n;
+            let block_len = 1usize << lg_block_n;
+            let nonzero_per_block = block_len >> 3;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let mut expected = seed(n);
+            let mut actual = expected.clone();
+            for block in (0..n / block_len).rev() {
+                generic_packed_expansion::<P>(
+                    P::pack_slice_mut(&mut expected),
+                    block * nonzero_per_block,
+                    nonzero_per_block,
+                    block * block_len / P::WIDTH,
+                    2,
+                    P::pack_slice(&roots[3]),
+                );
+                fft_zero_padded_rate_8_first_layer_block_neon(
+                    &mut actual,
+                    block * nonzero_per_block,
+                    nonzero_per_block,
+                    block * block_len,
+                    &roots[3],
+                );
+            }
+            for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(a.0, e.0, "raw word mismatch at 2^{lg_n} index {i}");
+            }
+        }
+    }
+
+    /// The retired fused-pair schedule and the shipped single-layer schedule
+    /// must agree on raw words at the shapes where the gate used to fire.
+    ///
+    /// This is the differential that keeps the retirement reversible: it says
+    /// the choice between the two is a pure timing decision, so re-adding the
+    /// arm cannot change a proof.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn retired_fused_pair_schedule_matches_single_layers_raw_words() {
+        use super::{fft_classic_simd_single_layer_neon, fft_classic_simd_two_layers_neon_w4};
+
+        let mut state = 0x243F_6A88_85A3_08D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            match state & 7 {
+                0 => state | 0xFFFF_FFFF_0000_0000,
+                1 => u64::MAX - (state >> 56),
+                _ => state,
+            }
+        };
+        // (buffer, first layer, layer count): the LDE deep tail at 2^19, the
+        // 2^16 wires/zs IFFT range, and a shallow range for the odd shapes.
+        for (lg_n, start, layers) in [(19usize, 13usize, 6usize), (16, 4, 12), (13, 2, 4)] {
+            let n = 1usize << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(n);
+            let values: Vec<GoldilocksField> = (0..n).map(|_| GoldilocksField(next())).collect();
+
+            let mut fused = values.clone();
+            let mut lg = start;
+            while lg + 2 <= start + layers {
+                fft_classic_simd_two_layers_neon_w4(&mut fused, lg, &roots[lg], &roots[lg + 1]);
+                lg += 2;
+            }
+            let mut singles = values;
+            for lg in start..start + layers {
+                fft_classic_simd_single_layer_neon(&mut singles, lg, &roots[lg]);
+            }
+            assert_eq!(
+                singles.iter().map(|x| x.0).collect::<Vec<_>>(),
+                fused.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "schedule mismatch at 2^{lg_n}, layers {start}..{}",
+                start + layers
+            );
+        }
+    }
+
+    /// Read-and-write sweep with no arithmetic: the memory-traffic control for
+    /// [`schedule_bench_mt`]. Touches every word once and cannot be dead-stored
+    /// away, and being a swap it preserves the multiset of words so the kernels
+    /// that follow still see production-like operands.
+    #[cfg(target_arch = "aarch64")]
+    fn mem_floor_pass(values: &mut [GoldilocksField]) {
+        use core::arch::aarch64::*;
+        let n = values.len();
+        let base = values.as_mut_ptr().cast::<u64>();
+        unsafe {
+            let mut i = 0;
+            while i + 4 <= n {
+                let a = vld1q_u64(base.add(i));
+                let b = vld1q_u64(base.add(i + 2));
+                vst1q_u64(base.add(i), b);
+                vst1q_u64(base.add(i + 2), a);
+                i += 4;
+            }
+        }
+    }
+
+    /// Contended A/B of the shipped layer schedules against the ones they
+    /// replaced, on the production shapes. This is the measurement that
+    /// retired the fused-pair gate and promoted the NEON expansion; it is kept
+    /// so both decisions can be re-derived rather than believed.
+    ///
+    /// Protocol, for a host that runs at loadavg 50-250: every variant of a
+    /// group runs *inside one thread's loop* on the same buffer, in a
+    /// palindromic order so no variant systematically follows the same
+    /// predecessor, each pass timed on its own. The reported statistic is the
+    /// per-thread minimum, aggregated as the median over threads. A preempted
+    /// pass inflates one sample and the minimum discards it; a slow kernel
+    /// inflates every sample. `ilp_kernel_bench_mt`'s protocol — one 1.5 s run
+    /// per arm, aggregate rate — cannot resolve these effects on this host:
+    /// consecutive runs of a single arm differ by up to 4x.
+    ///
+    /// Every group carries a `memfloor` variant so the traffic share of each
+    /// schedule is measured rather than argued.
+    ///
+    /// Run: cargo test -p plonky2_field --release -- --ignored --nocapture schedule_bench_mt
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "aarch64")]
+    fn schedule_bench_mt() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use super::{
+            fft_classic_simd_single_layer_neon, fft_classic_simd_single_layer_neon_w2,
+            fft_classic_simd_two_layers_neon_w4, fft_zero_padded_rate_8_first_layer_block_neon,
+        };
+        use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
+
+        let threads: usize = std::env::var("FFTK_THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+        let reps: usize = std::env::var("FFTK_REPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(35);
+        let roots = Arc::new(fft_root_table::<GoldilocksField>(1usize << 19));
+
+        // Returns element-layers covered, so every variant of a group reports
+        // the same denominator.
+        let pass = |variant: usize,
+                    data: &mut [GoldilocksField],
+                    roots: &FftRootTable<GoldilocksField>|
+         -> u64 {
+            let n = data.len();
+            match variant {
+                // --- group A: LDE deep layers 13..18 on 2^19 ---
+                0 => {
+                    for lg in [13usize, 15, 17] {
+                        fft_classic_simd_two_layers_neon_w4(data, lg, &roots[lg], &roots[lg + 1]);
+                    }
+                    6 * n as u64
+                }
+                1 => {
+                    for lg in 13usize..19 {
+                        fft_classic_simd_single_layer_neon(data, lg, &roots[lg]);
+                    }
+                    6 * n as u64
+                }
+                2 => {
+                    for _ in 0..3 {
+                        mem_floor_pass(data);
+                    }
+                    6 * n as u64
+                }
+                // --- group B: 2^16 wires/zs IFFT layers 4..16 ---
+                3 => {
+                    let mut lg = 4usize;
+                    while lg + 2 <= 16 {
+                        fft_classic_simd_two_layers_neon_w4(data, lg, &roots[lg], &roots[lg + 1]);
+                        lg += 2;
+                    }
+                    12 * n as u64
+                }
+                4 => {
+                    for lg in 4usize..16 {
+                        fft_classic_simd_single_layer_neon(data, lg, &roots[lg]);
+                    }
+                    12 * n as u64
+                }
+                5 => {
+                    for _ in 0..6 {
+                        mem_floor_pass(data);
+                    }
+                    12 * n as u64
+                }
+                // --- group C: LDE in-block layers 4..12 on 2^13 slices ---
+                6 | 7 => {
+                    for block in data.chunks_exact_mut(1 << 13) {
+                        for lg in 4usize..13 {
+                            if variant == 6 {
+                                fft_classic_simd_single_layer_neon_w2(block, lg, &roots[lg]);
+                            } else {
+                                fft_classic_simd_single_layer_neon(block, lg, &roots[lg]);
+                            }
+                        }
+                    }
+                    9 * n as u64
+                }
+                8 => {
+                    for block in data.chunks_exact_mut(1 << 13) {
+                        for _ in 0..9 {
+                            mem_floor_pass(block);
+                        }
+                    }
+                    9 * n as u64
+                }
+                // --- group D: rate-8 expansion into 2^13 blocks ---
+                _ => {
+                    let block_len = 1usize << 13;
+                    let nonzero_per_block = block_len >> 3;
+                    for block in (0..n / block_len).rev() {
+                        match variant {
+                            9 => generic_packed_expansion::<WideGoldilocksField>(
+                                WideGoldilocksField::pack_slice_mut(data),
+                                block * nonzero_per_block,
+                                nonzero_per_block,
+                                block * block_len / 4,
+                                2,
+                                WideGoldilocksField::pack_slice(&roots[3]),
+                            ),
+                            10 => fft_zero_padded_rate_8_first_layer_block_neon(
+                                data,
+                                block * nonzero_per_block,
+                                nonzero_per_block,
+                                block * block_len,
+                                &roots[3],
+                            ),
+                            _ => mem_floor_pass(
+                                &mut data[block * block_len..(block + 1) * block_len],
+                            ),
+                        }
+                    }
+                    n as u64
+                }
+            }
+        };
+
+        let run = |lg_buf: usize, variants: &'static [usize]| -> Vec<Vec<f64>> {
+            let mut handles = Vec::new();
+            for t in 0..threads {
+                let roots = roots.clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut data: Vec<GoldilocksField> = (0..1usize << lg_buf)
+                        .map(|i| {
+                            GoldilocksField(
+                                0x9E37_79B9_7F4A_7C15u64.wrapping_mul(((t << 19) + i) as u64 + 1),
+                            )
+                        })
+                        .collect();
+                    let mut best = vec![f64::MAX; variants.len()];
+                    let mut order: Vec<usize> = (0..variants.len()).collect();
+                    order.extend((0..variants.len()).rev());
+                    for _ in 0..reps {
+                        for &a in &order {
+                            let s = Instant::now();
+                            let el = pass(variants[a], &mut data, &roots);
+                            let ns = s.elapsed().as_secs_f64() * 1e9 / el as f64;
+                            if ns < best[a] {
+                                best[a] = ns;
+                            }
+                        }
+                    }
+                    best
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        };
+
+        println!("threads={threads} reps={reps}; ns per element-layer, lower is better");
+        for (group, lg_buf, variants, labels) in [
+            (
+                "A: LDE deep 13..18, 2^19",
+                19usize,
+                &[0usize, 1, 2][..],
+                &["fused pairs (retired)", "single layers (shipped)", "memfloor"][..],
+            ),
+            (
+                "B: IFFT 4..16, 2^16",
+                16,
+                &[3, 4, 5][..],
+                &["fused pairs (retired)", "single layers (shipped)", "memfloor"][..],
+            ),
+            (
+                "C: LDE in-block 4..12, 2^13 slices of 2^19",
+                19,
+                &[6, 7, 8][..],
+                &["2-wide (superseded)", "4-wide (shipped)", "memfloor"][..],
+            ),
+            (
+                "D: rate-8 expansion, 2^19",
+                19,
+                &[9, 10, 11][..],
+                &["generic packed (superseded)", "neon (shipped)", "memfloor"][..],
+            ),
+        ] {
+            let per_thread = run(lg_buf, variants);
+            println!("  {group}");
+            let mut base_med = f64::NAN;
+            for (a, label) in labels.iter().enumerate() {
+                let mut col: Vec<f64> = per_thread.iter().map(|r| r[a]).collect();
+                col.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                let med = col[col.len() / 2];
+                if a == 0 {
+                    base_med = med;
+                }
+                println!(
+                    "    {label:28} med {med:6.3}  min {:6.3}  {:+6.2}% vs first",
+                    col[0],
+                    100.0 * (med - base_med) / base_med
+                );
+            }
         }
     }
 

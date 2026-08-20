@@ -2502,6 +2502,36 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// serializes any unexpected second caller onto the classic path.
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
+/// Dedicated workers for the one serialized streamed-column fill. The caller
+/// exposes at most eight independent columns, but the process-wide pool also
+/// carries every other in-flight proof; putting this critical batch in its own
+/// registry prevents it from waiting behind unrelated quotient/FRI tasks.
+/// There is still exactly one fill in flight because [`STREAMED_BUFFERS`] is
+/// held across the whole build.
+#[cfg(feature = "parallel")]
+static STREAMED_FILL_POOL: LazyLock<Option<plonky2_maybe_rayon::rayon::ThreadPool>> =
+    LazyLock::new(|| {
+        plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .thread_name(|index| format!("streamed-fill-{index}"))
+            .start_handler(|_| mark_streamed_fill_thread())
+            .build()
+            .ok()
+    });
+
+#[cfg(feature = "parallel")]
+fn mark_streamed_fill_thread() {
+    // `QOS_CLASS_USER_INITIATED` from <sys/qos.h>. Best-effort: failure leaves
+    // the worker at the default class, which is the old scheduling behavior.
+    type QosClass = u32;
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(qos_class: QosClass, relative_priority: i32) -> i32;
+    }
+    unsafe {
+        let _ = pthread_set_qos_class_self_np(0x19, 0);
+    }
+}
+
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
 /// LDE columns `[8g, 8g + slices.len())` directly in the shared buffer, and
 /// the GPU absorbs each group while the CPU fills the next. Only used inside
@@ -2614,6 +2644,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // ambiguous whether that time is CPU work or GPU queue wait.
             #[cfg(feature = "diagnostic_profile")]
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
+            #[cfg(feature = "parallel")]
+            if let Some(pool) = STREAMED_FILL_POOL.as_ref() {
+                pool.install(|| fill_group(group, &mut slices));
+            } else {
+                fill_group(group, &mut slices);
+            }
+            #[cfg(not(feature = "parallel"))]
             fill_group(group, &mut slices);
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {

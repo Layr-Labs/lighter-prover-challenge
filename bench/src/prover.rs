@@ -3,7 +3,7 @@
 // Redraw marker r18 (same-account archive-dedup convention; inert, declared in note)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -243,6 +243,26 @@ fn mark_thread_utility() {
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_utility() {}
 
+/// Transaction proofs currently executing in this worker. Chain proofs use a
+/// small latency-critical pool while this is nonzero, then return to the full
+/// global pool for the uncontended drain.
+static TX_PROOFS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+static CHAIN_PROOF_POOL: LazyLock<Option<rayon::ThreadPool>> = LazyLock::new(|| {
+    let threads = std::env::var("LIGHTER_CHAIN_POOL_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| (1..=8).contains(&value))
+        .unwrap_or(5);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .stack_size(PROVER_THREAD_STACK_BYTES)
+        .thread_name(|index| format!("chain-proof-{index}"))
+        .start_handler(|_| mark_spine_thread_latency_critical())
+        .build()
+        .ok()
+});
+
 enum ChainState<'scope> {
     Ready(Proof),
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
@@ -431,7 +451,15 @@ fn chain_step_proof<'a>(
                 feeder,
             )
         })?;
-        BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        if TX_PROOFS_IN_FLIGHT.load(Ordering::Acquire) != 0 {
+            if let Some(pool) = CHAIN_PROOF_POOL.as_ref() {
+                pool.install(|| BlockTxChainCircuit::prove_prepared(pending, chain_data))
+            } else {
+                BlockTxChainCircuit::prove_prepared(pending, chain_data)
+            }
+        } else {
+            BlockTxChainCircuit::prove_prepared(pending, chain_data)
+        }
     })();
     // This step is no longer part of the runnable backlog (see the matching
     // spine_backlog_add(1) at all spawn sites).
@@ -717,6 +745,7 @@ fn prove_path(
             }
 
             let witness = current_witness;
+            TX_PROOFS_IN_FLIGHT.fetch_add(1, Ordering::Release);
             let proof_handle = std::thread::Builder::new()
                 .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
@@ -724,7 +753,9 @@ fn prove_path(
                     // These threads hold the single GPU buffer set across
                     // submit/wait/readback; see mark_thread_user_initiated.
                     mark_thread_user_initiated();
-                    prove_tx_witness(path, current_chunk_index, tx_data, witness)
+                    let proof = prove_tx_witness(path, current_chunk_index, tx_data, witness);
+                    TX_PROOFS_IN_FLIGHT.fetch_sub(1, Ordering::Release);
+                    proof
                 })
                 .expect("transaction proof pipeline thread must start");
 

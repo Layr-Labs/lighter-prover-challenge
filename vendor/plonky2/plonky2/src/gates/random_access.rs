@@ -87,6 +87,52 @@ fn accumulate_constraint_direct<F: Field>(
     }
 }
 
+/// One level of the selector fold, `out[p] = x[p] + b[p] * (y[p] - x[p])`,
+/// evaluated in the field's preferred packing over the maximal prefix.
+///
+/// The fold is the whole cost of a wide `RandomAccessGate`: bits=6 spends 63 of
+/// its 69 multiplies per point here, for a single constraint row. Scalar, it
+/// ran at 1.22 ns per base-multiply-equivalent against 0.62-0.66 for every
+/// other CPU-resident quotient gate.
+///
+/// The packed form is raw-limb identical, not merely field-equal.
+/// `WideGoldilocksField` is two `NeonGoldilocksField` lane pairs whose add and
+/// sub are the scalar per-lane operations verbatim, and whose multiply is
+/// `mul_reduce_pair`, documented to compute bit-for-bit the same intermediates
+/// -- and therefore the same non-canonical `u64` representative -- as the
+/// scalar `reduce128`. The ragged tail keeps the scalar operation, matching
+/// `accumulate_constraint_direct`'s own packed/leftover split.
+#[inline]
+fn fold_level<F: Field>(xs: &[F], ys: &[F], b: &[F], out: &mut [F]) {
+    let n = out.len();
+    debug_assert_eq!(xs.len(), n);
+    debug_assert_eq!(ys.len(), n);
+    debug_assert!(b.len() >= n);
+
+    type Packing<F> = <F as Packable>::Packing;
+    let width = Packing::<F>::WIDTH;
+    let packed_len = n - n % width;
+    if packed_len != 0 {
+        let out_packed = Packing::<F>::pack_slice_mut(&mut out[..packed_len]);
+        let xs_packed = Packing::<F>::pack_slice(&xs[..packed_len]);
+        let ys_packed = Packing::<F>::pack_slice(&ys[..packed_len]);
+        let b_packed = Packing::<F>::pack_slice(&b[..packed_len]);
+        for (((o, &x), &y), &bit) in out_packed
+            .iter_mut()
+            .zip(xs_packed)
+            .zip(ys_packed)
+            .zip(b_packed)
+        {
+            *o = x + bit * (y - x);
+        }
+    }
+    for p in packed_len..n {
+        let x = xs[p];
+        let y = ys[p];
+        out[p] = x + b[p] * (y - x);
+    }
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> RandomAccessGate<F, D> {
     const fn new(num_copies: usize, bits: usize, num_extra_constants: usize) -> Self {
         Self {
@@ -333,15 +379,35 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
         // so only its `vec_size / 2` output columns need scratch storage. The
         // former path zero-filled and copied all `vec_size` input columns here,
         // then immediately consumed and discarded that mirror.
-        let item_count = (vec_size / 2) * n;
-        // The ranked shape is bits=4 over a 32-point batch: eight folded
-        // columns fit exactly here. Larger generic shapes retain heap storage.
-        let mut items_stack = [MaybeUninit::<F>::uninit(); 8 * 32];
+        //
+        // The remaining levels alternate between the two halves of this buffer
+        // instead of shrinking in place. In-place, the store to column `k` and
+        // the loads at columns `2k` and `2k + 1` come from one `&mut [F]`, so
+        // the point loop cannot be expressed in the field's packing at all --
+        // `pack_slice` and `pack_slice_mut` cannot both borrow it. Splitting
+        // the buffer once makes each level's source and destination provably
+        // disjoint, which is what lets `fold_level` below run packed.
+        //
+        // `hi` takes a level's `vec_size / 2` outputs and `lo` the next
+        // level's, so the pair is `3 * vec_size / 4` columns wide. Each is
+        // exactly the width its producing level fills -- the first level writes
+        // `vec_size / 2` columns and the second `vec_size / 4` -- so neither is
+        // ever a slice over memory no level has written. Both are empty for
+        // `bits == 0`, and `lo` is also empty for `bits == 1`, where the loop
+        // that would fill it never runs and nothing reads it.
+        let hi_count = (vec_size / 2) * n;
+        let lo_count = (vec_size / 4) * n;
+        // The ranked offload leaves bits=6 here (48 columns at a 32-point
+        // batch), which exceeds any sane stack reservation and took a heap
+        // buffer before this change too -- the split costs no extra
+        // allocation, only a wider one. bits=4 with four copies, the next
+        // shape down, still fits.
+        let mut items_stack = [MaybeUninit::<F>::uninit(); 12 * 32];
         let mut items_heap;
-        let items_uninit: &mut [MaybeUninit<F>] = if item_count <= items_stack.len() {
-            &mut items_stack[..item_count]
+        let items_uninit: &mut [MaybeUninit<F>] = if hi_count + lo_count <= items_stack.len() {
+            &mut items_stack[..hi_count + lo_count]
         } else {
-            items_heap = vec![MaybeUninit::uninit(); item_count];
+            items_heap = vec![MaybeUninit::uninit(); hi_count + lo_count];
             &mut items_heap
         };
 
@@ -377,48 +443,62 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
             // each pair based on the corresponding bit. Build the first level
             // straight from the wire columns; this performs the same field
             // expression in the same order as the mirror-backed reference.
+            //
+            // SAFETY: `MaybeUninit<F>` has the same layout and alignment as
+            // `F`. Both halves are sized to exactly the number of columns the
+            // level that produces them writes, so each is fully initialized
+            // before it is first read: the first level writes all of `hi`
+            // whenever `bits != 0`, the second writes all of `lo` whenever
+            // `bits > 1`, and both are empty in the cases where those levels
+            // do not run.
+            let (hi_uninit, lo_uninit) = items_uninit.split_at_mut(hi_count);
+            let hi = unsafe {
+                core::slice::from_raw_parts_mut(hi_uninit.as_mut_ptr().cast::<F>(), hi_count)
+            };
+            let lo = unsafe {
+                core::slice::from_raw_parts_mut(lo_uninit.as_mut_ptr().cast::<F>(), lo_count)
+            };
             if self.bits != 0 {
                 let b = col(self.wire_bit(0, copy));
                 for k in 0..vec_size / 2 {
                     let xs = col(self.wire_list_item(2 * k, copy));
                     let ys = col(self.wire_list_item(2 * k + 1, copy));
-                    for p in 0..n {
-                        let x = xs[p];
-                        let y = ys[p];
-                        items_uninit[k * n + p].write(x + b[p] * (y - x));
-                    }
+                    fold_level(xs, ys, b, &mut hi[k * n..][..n]);
                 }
             }
-            // SAFETY: With zero index bits the slice is empty. Otherwise the
-            // first selector level initialized every element exactly once;
-            // `MaybeUninit<F>` has the same layout and alignment as `F`.
-            let items = unsafe {
-                core::slice::from_raw_parts_mut(items_uninit.as_mut_ptr().cast::<F>(), item_count)
-            };
             let mut level_size = vec_size / 2;
+            let mut source_is_hi = true;
             for i in 1..self.bits {
                 let b = col(self.wire_bit(i, copy));
+                let (source, destination): (&[F], &mut [F]) = if source_is_hi {
+                    (hi, lo)
+                } else {
+                    (lo, hi)
+                };
                 for k in 0..level_size / 2 {
-                    for p in 0..n {
-                        let x = items[2 * k * n + p];
-                        let y = items[(2 * k + 1) * n + p];
-                        items[k * n + p] = x + b[p] * (y - x);
-                    }
+                    // Cut the two source columns out of one slice so the
+                    // borrow checker sees them as reads while `destination`
+                    // stays a disjoint write.
+                    let (head, tail) = source.split_at((2 * k + 1) * n);
+                    let xs = &head[(2 * k) * n..][..n];
+                    let ys = &tail[..n];
+                    fold_level(xs, ys, b, &mut destination[k * n..][..n]);
                 }
                 level_size /= 2;
+                source_is_hi = !source_is_hi;
             }
+            let selected: &[F] = if self.bits == 0 {
+                col(self.wire_list_item(0, copy))
+            } else if source_is_hi {
+                &hi[..n]
+            } else {
+                &lo[..n]
+            };
             let claimed_element = col(self.wire_claimed_element(copy));
             accumulate_constraint_direct(
                 &mut combined_gate_constraints[row * n..][..n],
                 filters,
-                |p| {
-                    let selected = if self.bits == 0 {
-                        col(self.wire_list_item(0, copy))[p]
-                    } else {
-                        items[p]
-                    };
-                    selected - claimed_element[p]
-                },
+                |p| selected[p] - claimed_element[p],
             );
             row += 1;
         }
@@ -688,6 +768,65 @@ mod tests {
         type C = PoseidonGoldilocksConfig;
         type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(RandomAccessGate::new(4, 4, 1))
+    }
+
+    /// Companion to `CosetInterpolationGate`'s microbenchmark, on the shape the
+    /// ranked offload leaves on the CPU (bits=6, one copy, two extra
+    /// constants). Both arms run in one process over one set of buffers; the
+    /// materialized reference is the control, because no change to the
+    /// accumulate path touches it.
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn random_access_accumulate_microbench() {
+        use core::time::Duration;
+        use std::time::Instant;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+
+        let n = 32;
+        let iters = 5_000;
+        let gate = RandomAccessGate::<F, D>::new(1, 6, 2);
+        let num_wires = <RandomAccessGate<F, D> as Gate<F, D>>::num_wires(&gate);
+        let num_constants = <RandomAccessGate<F, D> as Gate<F, D>>::num_constants(&gate);
+        let num_constraints = <RandomAccessGate<F, D> as Gate<F, D>>::num_constraints(&gate);
+
+        let wires_batch: Vec<F> = (0..num_wires * n).map(|_| F::rand()).collect();
+        let constants_batch: Vec<F> = (0..num_constants.max(1) * n).map(|_| F::rand()).collect();
+        let filters: Vec<F> = (0..n).map(|_| F::rand()).collect();
+        let public_inputs_hash = HashOut::<F>::ZERO;
+        let vars_batch = EvaluationVarsBaseBatch::new(
+            n,
+            &constants_batch,
+            &wires_batch,
+            &public_inputs_hash,
+        );
+
+        let mut combined = vec![F::ZERO; num_constraints * n];
+        let start = Instant::now();
+        for _ in 0..iters {
+            let res = gate.eval_unfiltered_base_batch(vars_batch);
+            for (acc, row) in combined.chunks_exact_mut(n).zip(res.chunks_exact(n)) {
+                batch_multiply_add_inplace(acc, row, &filters);
+            }
+        }
+        let reference: Duration = start.elapsed();
+        let reference_sink = combined[0];
+
+        let mut combined = vec![F::ZERO; num_constraints * n];
+        let start = Instant::now();
+        for _ in 0..iters {
+            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut combined);
+        }
+        let fused: Duration = start.elapsed();
+        assert_eq!(reference_sink, combined[0], "paths diverged");
+
+        println!(
+            "{:>10.3}us/iter -> {:>10.3}us/iter ({:.2}x)  RandomAccessGate(bits=6, copies=1)",
+            reference.as_secs_f64() * 1e6 / iters as f64,
+            fused.as_secs_f64() * 1e6 / iters as f64,
+            reference.as_secs_f64() / fused.as_secs_f64(),
+        );
     }
 
     #[test]
