@@ -27,6 +27,13 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Retain recurring allocations above jemalloc's default 8 MiB oversize threshold and
+// concentrate the short-lived proving workers in eight arenas. This changes only
+// allocation placement/purge timing; proof values and serialization are unaffected.
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8; 31] = b"oversize_threshold:0,narenas:8\0";
+
 // jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
 // mapped long enough for the next identically-shaped allocation to reuse them.
 //
