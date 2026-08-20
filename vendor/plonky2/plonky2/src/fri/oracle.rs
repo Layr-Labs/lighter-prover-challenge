@@ -374,6 +374,18 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         &polynomial.coeffs,
                                         &coset_powers,
                                     );
+                                    // Trailing zero-pad of a rate-padded FFT is a dead store:
+                                    // `fft_in_place_with_options(destination, Some(rate_bits), ..)`
+                                    // routes through `prepare_zero_padded_fft`, which reverse-permutes
+                                    // only the live `[..degree]` prefix and then writes every slot in
+                                    // the high region itself
+                                    // (`values[i*repeat..(i+1)*repeat].fill(value)`). The prior
+                                    // contents of `destination[degree..]` are never read, so clearing
+                                    // them first is pure overhead repeated for every LDE column of
+                                    // every proof. Drop the pre-fill for the rate-padded case
+                                    // (rate_bits > 0 && degree >= 2); the `rate_bits == 0 || degree < 2`
+                                    // shapes still zero explicitly because their FFT does not own the
+                                    // high region.
                                     if rate_bits == 0 || degree < 2 {
                                         destination[degree..].fill(F::ZERO);
                                     }
@@ -1490,6 +1502,38 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::Sample;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+    #[test]
+    fn zero_pad_prefill_is_dead_store_for_rate_padded_fft() {
+        // Removing `destination[degree..].fill(F::ZERO)` before a rate-padded
+        // FFT must change nothing: `prepare_zero_padded_fft` writes every slot
+        // in the high region itself, so its prior contents are irrelevant.
+        use crate::field::fft::fft_in_place_with_options;
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+        type F = GoldilocksField;
+        let mut rng = StdRng::seed_from_u64(0x5eed_0000);
+        for degree in [256usize, 512, 1024, 2048] {
+            for rate_bits in [1usize, 2, 3, 4] {
+                let coeffs: Vec<F> = (0..degree).map(|_| F::sample(&mut rng)).collect();
+                // with explicit zero-pad pre-fill
+                let mut with_fill = coeffs.clone();
+                with_fill.resize(degree << rate_bits, F::ZERO);
+                with_fill[degree..].fill(F::ZERO);
+                fft_in_place_with_options(&mut with_fill, Some(rate_bits), None);
+                // without: leave high region as arbitrary non-zero poison
+                let mut no_fill = coeffs.clone();
+                no_fill.resize(degree << rate_bits, F::from_canonical_u64(u64::MAX));
+                fft_in_place_with_options(&mut no_fill, Some(rate_bits), None);
+                assert_eq!(with_fill, no_fill, "degree={degree} rate={rate_bits}");
+                // and it must agree with the reference straight FFT of the padded poly
+                let mut reference = coeffs.clone();
+                reference.resize(degree << rate_bits, F::ZERO);
+                fft_in_place_with_options(&mut reference, Some(rate_bits), None);
+                assert_eq!(with_fill, reference, "degree={degree} rate={rate_bits} ref");
+            }
+        }
+    }
+
 
     #[test]
     fn shared_coset_powers_match_per_polynomial_shifts() {
