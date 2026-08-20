@@ -1175,17 +1175,43 @@ fn dif_layer_neon_ext2(
     lg_half_m: usize,
     omega: &[GoldilocksField],
 ) {
-    use crate::field::extension::quadratic::NeonGoldilocksField;
+    use crate::field::extension::quadratic::{NeonGoldilocksField, WideGoldilocksField};
 
     let half = 1usize << lg_half_m;
     let m = half << 1;
     for block in values.chunks_exact_mut(m) {
         let (low, high) = block.split_at_mut(half);
-        for j in 0..half {
+        let mut j = 0;
+        while j + 2 <= half {
+            let u0 = low[j].0;
+            let u1 = low[j + 1].0;
+            let v0 = high[j].0;
+            let v1 = high[j + 1].0;
+            let w0 = omega[j];
+            let w1 = omega[j + 1];
+
+            let u_wide = *WideGoldilocksField::from_slice(&[u0[0], u0[1], u1[0], u1[1]]);
+            let v_wide = *WideGoldilocksField::from_slice(&[v0[0], v0[1], v1[0], v1[1]]);
+            let w_wide = *WideGoldilocksField::from_slice(&[w0, w0, w1, w1]);
+
+            let add_res = u_wide + v_wide;
+            let sub_res = (u_wide - v_wide) * w_wide;
+            let add_wide = add_res.as_slice();
+            let sub_wide = sub_res.as_slice();
+
+            low[j] = QuadraticExtension([add_wide[0], add_wide[1]]);
+            low[j + 1] = QuadraticExtension([add_wide[2], add_wide[3]]);
+            high[j] = QuadraticExtension([sub_wide[0], sub_wide[1]]);
+            high[j + 1] = QuadraticExtension([sub_wide[2], sub_wide[3]]);
+
+            j += 2;
+        }
+        if j < half {
             let u = NeonGoldilocksField(low[j].0);
             let v = NeonGoldilocksField(high[j].0);
             low[j] = QuadraticExtension((u + v).0);
             high[j] = QuadraticExtension(((u - v) * omega[j]).0);
+            j += 1;
         }
     }
 }
@@ -1219,8 +1245,29 @@ fn dif_expand_block_neon_ext2(
 ) {
     assert_eq!(source.len(), destination.len());
     assert_eq!(source.len(), twiddles.len());
-    for ((destination, &source), &twiddle) in destination.iter_mut().zip(source).zip(twiddles) {
-        *destination = dif_mul_base_ext2(source, twiddle);
+    use crate::field::extension::quadratic::WideGoldilocksField;
+
+    let len = source.len();
+    let mut j = 0;
+    while j + 2 <= len {
+        let s0 = source[j].0;
+        let s1 = source[j + 1].0;
+        let w0 = twiddles[j];
+        let w1 = twiddles[j + 1];
+
+        let s_wide = *WideGoldilocksField::from_slice(&[s0[0], s0[1], s1[0], s1[1]]);
+        let w_wide = *WideGoldilocksField::from_slice(&[w0, w0, w1, w1]);
+
+        let prod = s_wide * w_wide;
+        let prod_slice = prod.as_slice();
+
+        destination[j] = QuadraticExtension([prod_slice[0], prod_slice[1]]);
+        destination[j + 1] = QuadraticExtension([prod_slice[2], prod_slice[3]]);
+
+        j += 2;
+    }
+    if j < len {
+        destination[j] = dif_mul_base_ext2(source[j], twiddles[j]);
     }
 }
 

@@ -11,6 +11,8 @@ use crate::types::{Field, Sample};
 
 #[cfg(target_arch = "aarch64")]
 pub use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+#[cfg(target_arch = "aarch64")]
+pub use crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(bound = "")]
