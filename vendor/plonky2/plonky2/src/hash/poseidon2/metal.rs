@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "8c151bf4386e5e9546e62acde58d3c5094aba1a0b7b36c00bbf70597ac290462";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -1034,6 +1034,53 @@ impl<F: RichField> MetalColumns<F> {
             slice::from_raw_parts_mut(self.base as *mut F, self.rows * self.cols)
         };
         Some(values.chunks_exact_mut(self.rows).collect())
+    }
+
+    /// Rewrites every stored word as its canonical representative, in place.
+    ///
+    /// This is the CPU stand-in for the write-back
+    /// `poseidon2_hash_leaves_colmajor` performs under its
+    /// `canonicalize_in_place` flag. A retained store is read afterwards by
+    /// `poseidon2_gate_quotient`, which uses the
+    /// `gl_add_canonical_rhs`/`gl_sub_canonical_rhs` forms; those do exactly
+    /// one +-EPSILON limb fold and are bit-identical to the general forms only
+    /// while every right operand is below the field order. The GPU hash
+    /// establishes that invariant on the accepted path; the declined path has
+    /// nothing that would, so it calls this.
+    ///
+    /// Residue-exact and idempotent. For the Goldilocks order
+    /// `p = 2^64 - 2^32 + 1`, any `u64` at or above `p` lands in
+    /// `[0, 2^32 - 1)` after a single subtraction, so one conditional fold is
+    /// the whole reduction -- the same statement (and the same code)
+    /// `PrimeField64::to_canonical_u64` makes. Subtracting `p` cannot move a
+    /// residue, and a second pass finds nothing to do.
+    fn canonicalize_stored_values(&self) {
+        // Only the 8-byte Goldilocks field is stored as its raw u64
+        // representative; nothing else has a `p` to fold against, and no
+        // quotient kernel runs for it.
+        if F::ORDER != 0xffff_ffff_0000_0001 || size_of::<F>() != size_of::<u64>() {
+            return;
+        }
+        let order = F::ORDER;
+        // SAFETY: the same binding the streamed absorb path uses to fill this
+        // buffer through a shared reference (`columns.buffer.contents()` cast
+        // to a column pointer, see `build_merkle_tree_shared_streamed`). The
+        // shared-storage contents are foreign memory reached through a raw
+        // pointer rather than through the `&self` borrow, and every u64 bit
+        // pattern is a valid `F`. Called only where the GPU write-back would
+        // otherwise have run: the build has already declined or already
+        // finished waiting on its command buffers, so no kernel is reading the
+        // buffer, and the store has not yet been handed to `shared_columns()`.
+        let words = unsafe {
+            slice::from_raw_parts_mut(self.buffer.contents().cast::<u64>(), self.rows * self.cols)
+        };
+        words.par_chunks_mut(STAGING_CHUNK).for_each(|chunk| {
+            for word in chunk {
+                if *word >= order {
+                    *word -= order;
+                }
+            }
+        });
     }
 }
 
@@ -2692,6 +2739,18 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
+        // The only return in this function that leaves *filled* columns behind:
+        // every group's fill ran, and the absorb passes that did complete wrote
+        // their canonical values back over part of the store. The one caller
+        // refills it and then enters `build_merkle_tree_shared`, which carries
+        // the invariant either way, so this is belt and braces -- but it costs a
+        // single pass on a path that has just lost a command buffer, and it
+        // keeps the rule "no `MetalColumns` with meaningful contents leaves this
+        // module noncanonical" true without a cross-function argument. Every
+        // earlier return above is reached before `fill_group` has written
+        // anything, so their stores hold only pool residue the caller
+        // overwrites; folding those would be a multi-GiB pass over dead data.
+        columns.canonicalize_stored_values();
         return None;
     }
 
@@ -2725,7 +2784,35 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     ))
 }
 
+/// Hashes a retained shared column store on the GPU, carrying the canonical
+/// store invariant across every decline.
+///
+/// A `None` here is not the end of the commitment: `MerkleTree::new_column_store`
+/// hashes the very same buffer on the CPU instead and keeps it as the tree's
+/// leaves, so `shared_columns()` still hands it to the quotient kernels, and
+/// `poseidon2_gate_quotient` still reads it with the canonical-right-operand
+/// arithmetic. On the accepted path the leaf kernel's `canonicalize_in_place`
+/// write-back establishes that invariant; on the declined path nothing else
+/// does, because plonky2's Goldilocks is deliberately non-canonicalizing
+/// (`GoldilocksField(pub u64)`, compared through `to_canonical_u64`) and the
+/// CPU FFT that filled this store is free to leave any representative behind.
+///
+/// So the decline carries it: one linear conditional fold over a buffer the CPU
+/// Merkle hash is about to read in full anyway, and which the CPU hash is blind
+/// to (every leaf goes through `hash_or_noop`, which canonicalizes). Written as
+/// a wrapper around the routing body so no future early return can skip it.
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
+    columns: &MetalColumns<F>,
+    cap_height: usize,
+) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    let built = build_merkle_tree_shared_on_gpu(columns, cap_height);
+    if built.is_none() {
+        columns.canonicalize_stored_values();
+    }
+    built
+}
+
+fn build_merkle_tree_shared_on_gpu<F: RichField>(
     columns: &MetalColumns<F>,
     cap_height: usize,
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
@@ -3866,6 +3953,10 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
+                // The last butterfly stage above ran with `canonicalize` set,
+                // so `column_buffer` already holds canonical values; there is
+                // nothing for the leaf kernel to store back.
+                set_u32(leaf_encoder, 6, 0);
                 dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
@@ -4130,6 +4221,10 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
+            // The last butterfly stage above ran with `canonicalize` set, so
+            // `column_buffer` already holds canonical values; there is nothing
+            // for the leaf kernel to store back.
+            set_u32(leaf_encoder, 6, 0);
             dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
@@ -4342,11 +4437,21 @@ impl MetalShared {
                 size_of::<u32>() as NSUInteger,
                 (&leaf_count_u32 as *const u32).cast::<c_void>(),
             );
-            if matches!(&source, LeafSource::Columns(_) | LeafSource::Shared(_)) {
+            if !matches!(&source, LeafSource::Rows(_)) {
                 encoder.set_bytes(
                     5,
                     size_of::<u32>() as NSUInteger,
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
+                );
+                // Store the canonicalized inputs back only for the retained
+                // shared store, which the quotient kernels read afterwards. A
+                // `Columns` source is hashed out of the pooled staging buffer,
+                // which nothing reads again.
+                let canonicalize_in_place = u32::from(matches!(&source, LeafSource::Shared(_)));
+                encoder.set_bytes(
+                    6,
+                    size_of::<u32>() as NSUInteger,
+                    (&canonicalize_in_place as *const u32).cast::<c_void>(),
                 );
             }
             dispatch(encoder, leaf_pipeline, leaf_count);
@@ -4665,7 +4770,7 @@ mod tests {
             ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
             ("ntt_stage", &[0, 1, 2, 3, 4]),
             ("ifft_finalize", &[0, 1, 2, 3]),
-            ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5]),
+            ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5, 6]),
             ("poseidon2_hash_parents", &[0, 1, 2, 3]),
             ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
         ];
@@ -7296,6 +7401,133 @@ kernel void goldilocks_mul_bench_native(
         }
     }
 
+    /// The *declined* shared build must leave the retained store canonical.
+    ///
+    /// `MerkleTree::new_column_store` keeps the same `ColumnStore::Shared`
+    /// buffer as the commitment's leaves when `build_merkle_tree_shared`
+    /// returns `None`, hashes it on the CPU, and hands it back out of
+    /// `shared_columns()` -- which is exactly the buffer
+    /// `poseidon2_gate_quotient` reads with `gl_add_canonical_rhs` /
+    /// `gl_sub_canonical_rhs`. Nothing on that path canonicalizes it except the
+    /// fold `build_merkle_tree_shared` performs before declining.
+    ///
+    /// The decline is *forced*, not hoped for: `gpu_worthwhile` is asserted
+    /// false for every shape below, so `build_merkle_tree_shared` returns at its
+    /// first guard on every run, GPU up or not. None of these shapes is the
+    /// `1 << 17` serial-critical exemption, and all are far under the
+    /// exclusive-phase cutoff too, so a concurrently set `EXCLUSIVE_GPU_PHASE`
+    /// cannot admit them either. `level_digests.is_none()` then pins at runtime
+    /// that the CPU fallback -- not the GPU builder -- produced the tree.
+    ///
+    /// The differential against the same tree built from an `Owned` store of the
+    /// untouched noncanonical values is the value-exactness check: the `Owned`
+    /// arm is not folded, so equal caps and digests mean the fold moved
+    /// representatives only, never a residue.
+    #[test]
+    fn declined_shared_build_leaves_the_retained_store_canonical() {
+        use crate::hash::merkle_tree::{ColumnStore, MerkleTree};
+
+        let mut rng = StdRng::seed_from_u64(0x4445_434c_494e_45);
+        let context = CONTEXT.as_ref().unwrap_or_else(|error| panic!("{error}"));
+
+        // 4 columns exercises the `hash_or_noop` leaf (which copies canonical
+        // limbs straight into the digest), 5 and 16 the real sponge; 136 is the
+        // wires width, at the `GATHER_MAX_WIDTH` boundary of the CPU fallback.
+        for (cols, rows, cap_height) in [
+            (4usize, 256usize, 0usize),
+            (5, 256, 3),
+            (16, 512, 4),
+            (136, 256, 2),
+        ] {
+            assert!(
+                !gpu_worthwhile(cols, rows, cap_height),
+                "{cols}x{rows} cap {cap_height} must be below the GPU cutoff, \
+                 otherwise this test never reaches the decline path"
+            );
+
+            // The boundary representatives `diverted_cpu_tree_matches_shared_gpu_tree`
+            // uses, including `ORDER`, `ORDER + 1` and `u64::MAX`.
+            let columns: Vec<Vec<GoldilocksField>> = (0..cols)
+                .map(|column| {
+                    (0..rows)
+                        .map(|row| {
+                            let raw = match (column * rows + row) & 7 {
+                                0 => 0,
+                                1 => 1,
+                                2 => GoldilocksField::ORDER - 1,
+                                3 => GoldilocksField::ORDER,
+                                4 => GoldilocksField::ORDER + 1,
+                                5 => u64::MAX,
+                                _ => rng.next_u64(),
+                            };
+                            GoldilocksField(raw)
+                        })
+                        .collect()
+                })
+                .collect();
+            assert!(
+                columns
+                    .iter()
+                    .flatten()
+                    .any(|value| value.0 >= GoldilocksField::ORDER),
+                "the fixture must contain noncanonical representatives"
+            );
+
+            let mut shared = context
+                .allocate_columns::<GoldilocksField>(rows, cols)
+                .unwrap();
+            shared
+                .columns_mut()
+                .unwrap()
+                .into_iter()
+                .zip(&columns)
+                .for_each(|(destination, source)| destination.copy_from_slice(source));
+
+            let tree = MerkleTree::<GoldilocksField, Poseidon2Hash>::new_column_store(
+                ColumnStore::Shared(shared),
+                cap_height,
+            );
+            assert!(
+                tree.level_digests.is_none(),
+                "{cols}x{rows} must have been hashed by the CPU fallback, not the GPU builder"
+            );
+
+            let retained = tree
+                .shared_columns()
+                .expect("a declined build must retain the shared store as the tree's leaves");
+            for (column, source) in columns.iter().enumerate() {
+                let stored = retained.col(column);
+                for (row, expected) in source.iter().enumerate() {
+                    assert!(
+                        stored[row].0 < GoldilocksField::ORDER,
+                        "{cols}x{rows}: column {column} row {row} left noncanonical \
+                         ({}) for poseidon2_gate_quotient to read",
+                        stored[row].0
+                    );
+                    assert_eq!(
+                        stored[row].to_canonical_u64(),
+                        expected.to_canonical_u64(),
+                        "{cols}x{rows}: column {column} row {row} changed residue"
+                    );
+                }
+            }
+
+            // Same CPU fallback, same values, but an `Owned` store -- which the
+            // fold never touches, so it hashes the raw noncanonical limbs.
+            let reference =
+                MerkleTree::<GoldilocksField, Poseidon2Hash>::new_columns(columns, cap_height);
+            assert!(reference.level_digests.is_none());
+            assert_eq!(
+                tree.cap, reference.cap,
+                "{cols}x{rows}: canonicalizing the store moved the cap"
+            );
+            assert_eq!(
+                tree.digests, reference.digests,
+                "{cols}x{rows}: canonicalizing the store moved a digest"
+            );
+        }
+    }
+
     #[test]
     fn shared_column_hash_matches_staged_full_tree_and_paths() {
         let mut rng = StdRng::seed_from_u64(0x5348_4152_4544);
@@ -7341,6 +7573,16 @@ kernel void goldilocks_mul_bench_native(
                     .build(LeafSource::Shared(&shared), cols, rows, cap_height)
                     .unwrap();
 
+                // The columns above deliberately include `ORDER`, `ORDER + 1`
+                // and `u64::MAX`. Hashing a shared store must leave it
+                // canonical: `poseidon2_gate_quotient` reads exactly this
+                // buffer and its canonical-right-operand arithmetic is unsound
+                // without that.
+                assert!(
+                    shared.raw().iter().all(|&value| value < GoldilocksField::ORDER),
+                    "shared-column hashing must establish the canonical MetalColumns invariant"
+                );
+
                 assert_tree_raw_eq(&direct, &staged, cols, cap_height);
                 assert_all_paths_raw_eq(&direct, &staged, rows, cap_height);
             }
@@ -7375,12 +7617,23 @@ kernel void goldilocks_mul_bench_native(
             cap_height,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    // Half the columns are filled with noncanonical
+                    // representatives, so the in-place canonicalization the
+                    // absorb pass performs is actually exercised.
+                    let value = (group * 8 + index + 1) as u64;
+                    let raw = if index & 1 == 0 { value } else { F::ORDER + value };
+                    destination.fill(F::from_noncanonical_u64(raw));
                 }
             },
         )
         .expect("streamed tree");
         assert!(streamed.0.nodes.is_shared());
+        // The absorb pass is what establishes the canonical MetalColumns
+        // invariant on the streamed commitment path.
+        for column in 0..cols {
+            assert!(columns.col(column)[0].0 < F::ORDER);
+            assert!(columns.col(column)[rows - 1].0 < F::ORDER);
+        }
 
         let classic = context
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
