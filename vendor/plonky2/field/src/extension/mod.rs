@@ -223,9 +223,15 @@ pub fn flatten<F, const D: usize>(l: &[F::Extension]) -> Vec<F>
 where
     F: Field + Extendable<D>,
 {
-    l.iter()
-        .flat_map(|x| x.to_basefield_array().to_vec())
-        .collect()
+    // `to_basefield_array` already returns `[F; D]` on the stack. The previous
+    // `.to_vec()` heap-allocated a D-limb buffer per element, copied the same
+    // words, then dropped it. `extend_from_slice` writes those stack limbs
+    // into the single output allocation.
+    let mut out = Vec::with_capacity(l.len() * D);
+    for x in l {
+        out.extend_from_slice(&x.to_basefield_array());
+    }
+    out
 }
 
 /// Batch every D-sized chunks into extension field elements.
@@ -234,7 +240,95 @@ where
     F: Field + Extendable<D>,
 {
     debug_assert_eq!(l.len() % D, 0);
-    l.chunks_exact(D)
-        .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
-        .collect()
+    // `chunks_exact(D)` already yields `&[F]` of length D. The previous
+    // `c.to_vec().try_into()` heap-allocated that D-limb chunk, copied it,
+    // then immediately converted to `[F; D]`. `TryFrom<&[F]>` copies onto
+    // the stack; `F: Copy` is required by `Field`.
+    let mut out = Vec::with_capacity(l.len() / D);
+    for c in l.chunks_exact(D) {
+        let arr: [F; D] = c.try_into().expect("chunks_exact(D) yields length D");
+        out.push(F::Extension::from_basefield_array(arr));
+    }
+    out
+}
+
+#[cfg(test)]
+mod flatten_unflatten_tests {
+    use super::{flatten, unflatten, FieldExtension};
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::{Field, Field64, PrimeField64};
+
+    type F = GoldilocksField;
+    type FE = QuadraticExtension<F>;
+    const D: usize = 2;
+
+    fn raw(values: &[F]) -> Vec<u64> {
+        values.iter().map(PrimeField64::to_noncanonical_u64).collect()
+    }
+
+    fn raw_ext(values: &[FE]) -> Vec<[u64; D]> {
+        values
+            .iter()
+            .map(|x| {
+                let a: [F; D] = x.to_basefield_array();
+                [a[0].to_noncanonical_u64(), a[1].to_noncanonical_u64()]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flatten_unflatten_roundtrip_preserves_noncanonical_limbs() {
+        let limbs = [
+            F::ZERO,
+            F::ONE,
+            F::from_noncanonical_u64(F::ORDER),
+            F::from_noncanonical_u64(F::ORDER + 1),
+            F::from_noncanonical_u64(u64::MAX),
+            F::from_canonical_u64(3),
+        ];
+        let ext: Vec<FE> = limbs
+            .chunks_exact(D)
+            .map(|c| FE::from_basefield_array([c[0], c[1]]))
+            .collect();
+        let flat = flatten::<F, D>(&ext);
+        assert_eq!(raw(&flat), raw(&limbs));
+        let restored = unflatten::<F, D>(&flat);
+        assert_eq!(raw_ext(&restored), raw_ext(&ext));
+        assert_eq!(raw(&flatten::<F, D>(&restored)), raw(&limbs));
+    }
+
+    #[test]
+    fn unflatten_matches_explicit_stack_from_basefield_array() {
+        let limbs: Vec<F> = (0..16u64)
+            .map(|i| F::from_noncanonical_u64(F::ORDER.wrapping_add(i.wrapping_mul(0x9e37))))
+            .collect();
+        let expected: Vec<FE> = limbs
+            .chunks_exact(D)
+            .map(|c| {
+                let arr: [F; D] = c.try_into().unwrap();
+                FE::from_basefield_array(arr)
+            })
+            .collect();
+        let actual = unflatten::<F, D>(&limbs);
+        assert_eq!(raw_ext(&actual), raw_ext(&expected));
+    }
+
+    #[test]
+    fn flatten_matches_explicit_to_basefield_array_concat() {
+        let ext: Vec<FE> = (0..7u64)
+            .map(|i| {
+                FE::from_basefield_array([
+                    F::from_noncanonical_u64(F::ORDER + i),
+                    F::from_noncanonical_u64(u64::MAX - i),
+                ])
+            })
+            .collect();
+        let mut expected = Vec::new();
+        for x in &ext {
+            expected.extend_from_slice(&<FE as FieldExtension<D>>::to_basefield_array(x));
+        }
+        let actual = flatten::<F, D>(&ext);
+        assert_eq!(raw(&actual), raw(&expected));
+    }
 }
