@@ -1645,6 +1645,34 @@ kernel void range_check_gate_quotient(
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
 }
 
+// Search one contiguous FRI grinding batch. Each thread evaluates exactly the
+// duplex permutation the CPU challenger would evaluate after overwriting the
+// witness input lane. The host replays any returned witness through the normal
+// challenger, so this kernel changes only where candidates are tested.
+kernel void fri_pow_search(
+    constant ulong* common_state [[buffer(0)]],
+    device atomic_uint* winner [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant ulong& candidate_base [[buffer(3)]],
+    constant uint& witness_input_pos [[buffer(4)]],
+    constant uint& candidate_count [[buffer(5)]],
+    constant uint& leading_zero_bits [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= candidate_count) {
+        return;
+    }
+    ulong state[12];
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = common_state[i];
+    }
+    state[witness_input_pos] = candidate_base + (ulong)gid;
+    poseidon2(state, parameters);
+    ulong response = gl_canonicalize(state[7]);
+    if (clz(response) >= leading_zero_bits) {
+        atomic_fetch_min_explicit(winner, gid, memory_order_relaxed);
+    }
+}
+
 kernel void poseidon2_hash_leaves(
     const device ulong* leaves [[buffer(0)]],
     device ulong* hashes [[buffer(1)]],
@@ -1797,6 +1825,45 @@ kernel void poseidon2_hash_leaves_colmajor(
         uint chunk_size = min(8u, leaf_width - offset);
         for (uint i = 0; i < chunk_size; ++i) {
             state[i] = gl_canonicalize(leaves[(ulong)(offset + i) * leaf_count + gid]);
+        }
+        poseidon2(state, parameters);
+    }
+    for (uint i = 0; i < 4; ++i) {
+        output[i] = gl_canonicalize(state[i]);
+    }
+}
+
+// FRI's ext2 codeword is retained as two natural-order NTT columns, but one
+// arity-16 Merkle leaf contains sixteen bit-reversed evaluations with the two
+// limbs interleaved. Thread `gid` is the natural reduced-domain index; the
+// leaf and the sixteen local positions are independent bit reversals.
+kernel void fri_ext2_hash_leaves_colmajor(
+    const device ulong* values [[buffer(0)]],
+    device ulong* hashes [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_count [[buffer(3)]],
+    constant uint& log_leaf_count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+
+    uint out_row = log_leaf_count == 0
+        ? gid
+        : (reverse_bits(gid) >> (32 - log_leaf_count));
+    device ulong* output = hashes + (ulong)out_row * 4;
+    ulong state[12] = { 0 };
+    const uint local_bitrev[16] = {
+        0, 8, 4, 12, 2, 10, 6, 14,
+        1, 9, 5, 13, 3, 11, 7, 15
+    };
+    ulong lde_size = (ulong)leaf_count * 16UL;
+    for (uint group = 0; group < 4; ++group) {
+        for (uint lane = 0; lane < 4; ++lane) {
+            uint j = group * 4 + lane;
+            ulong row = (ulong)gid + (ulong)local_bitrev[j] * leaf_count;
+            state[2 * lane] = gl_canonicalize(values[row]);
+            state[2 * lane + 1] = gl_canonicalize(values[lde_size + row]);
         }
         poseidon2(state, parameters);
     }

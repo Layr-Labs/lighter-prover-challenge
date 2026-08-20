@@ -19,7 +19,9 @@ use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::fri::FriParams;
 use crate::fri::proof::FriProof;
-use crate::fri::prover::fri_proof_with_initial_order;
+use crate::fri::prover::{
+    fri_proof_with_initial_order, fri_proof_with_prebuilt_first_tree,
+};
 use crate::fri::structure::{FriBatchInfo, FriInstanceInfo};
 use crate::hash::hash_types::RichField;
 use crate::hash::merkle_tree::{ColumnStore, MerkleLeaves, MerkleTree};
@@ -40,6 +42,16 @@ pub const SALT_SIZE: usize = 4;
 /// stream, which is the ranked critical path. Keep off; hashing-only GPU
 /// trees (`new_columns`) remain on.
 const GPU_NTT_COMMITMENTS: bool = false;
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[inline]
+fn gpu_fri_r0_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_DISABLE_GPU_FRI_R0")
+            != Some(std::ffi::OsString::from("1"))
+    })
+}
 
 /// Output layout for [`PolynomialBatch::fill_lde_batch`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -672,6 +684,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     }
                 }
             }
+            MerkleLeaves::FriExt2Columns { .. } => {
+                unreachable!("FRI ext2 leaves are never polynomial-batch oracles")
+            }
         }
     }
 
@@ -708,6 +723,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         out[ci * n + k] = value;
                     }
                 }
+            }
+            MerkleLeaves::FriExt2Columns { .. } => {
+                unreachable!("FRI ext2 leaves are never polynomial-batch oracles")
             }
         }
     }
@@ -922,6 +940,55 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // prefix, and the fold consumes only `[..live_chunks * arity]`, which is
         // `<= read_bound`. Same pattern as the promoted `lde_values` fast path.
         unsafe { lde_final_poly.coeffs.set_len(lde_len) };
+
+        // Opportunistic r0 FRI commitment: the polynomial has exactly one
+        // live rate-8 coefficient domain, so its two ext2 limbs can use the
+        // existing Metal NTT and a dedicated arity-16 leaf kernel. The
+        // Admission is nonblocking; an occupied singleton buffer, unavailable
+        // optional pipeline, or backend failure falls through to the unchanged
+        // CPU DIF. Global queue idleness protects the critical GPU stream.
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        if D == 2
+            && gpu_fri_r0_enabled()
+            && first_arity == 16
+            && fri_params.config.rate_bits == 3
+            && live_coeffs.is_power_of_two()
+            && core::mem::size_of::<F::Extension>() == core::mem::size_of::<[F; 2]>()
+            && core::mem::align_of::<F::Extension>() == core::mem::align_of::<[F; 2]>()
+        {
+            // SAFETY: D=2 plus identical size/alignment proves the production
+            // extension representation is two adjacent base-field limbs. The
+            // backend independently type-checks the Goldilocks base field.
+            let coefficient_limbs = unsafe {
+                core::slice::from_raw_parts(
+                    lde_final_poly.coeffs.as_ptr().cast::<[F; 2]>(),
+                    live_coeffs,
+                )
+            };
+            if let Some((columns, level_digests, cap)) =
+                C::Hasher::try_build_fri_ext2_commitment_from_coeffs(
+                    coefficient_limbs,
+                    fri_params.config.rate_bits,
+                    fri_params.config.cap_height,
+                )
+            {
+                let first_tree = MerkleTree::<F, C::Hasher>::from_prebuilt_fri_ext2_columns(
+                    columns,
+                    level_digests,
+                    cap,
+                );
+                return fri_proof_with_prebuilt_first_tree::<F, C, D>(
+                    &oracles.iter().map(|oracle| &oracle.merkle_tree).collect::<Vec<_>>(),
+                    lde_final_poly,
+                    first_tree,
+                    challenger,
+                    fri_params,
+                    final_poly_coeff_len,
+                    max_num_query_steps,
+                    timing,
+                );
+            }
+        }
         let lde_final_values = timed!(
             timing,
             "perform final FFT",
