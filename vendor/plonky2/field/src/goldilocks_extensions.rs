@@ -752,6 +752,82 @@ pub fn ext2_fri_fold_arity16_batch(
     }
 }
 
+#[inline(always)]
+fn ext2_base_scalar_dot_slot(
+    slot: usize,
+    full: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+    partial: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+) -> QuadraticExtension<GoldilocksField> {
+    let (mut lo0, mut hi0) = (0u128, 0u32);
+    let (mut lo1, mut hi1) = (0u128, 0u32);
+    for &(p, QuadraticExtension([b0, b1])) in full {
+        // SAFETY: every slice in `full` spans the complete output block.
+        let c = unsafe { p.get_unchecked(slot).0 };
+        u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+        u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+    }
+    for &(p, QuadraticExtension([b0, b1])) in partial {
+        if let Some(c) = p.get(slot) {
+            u160_add_product(&mut lo0, &mut hi0, b0.0, c.0);
+            u160_add_product(&mut lo1, &mut hi1, b1.0, c.0);
+        }
+    }
+    // SAFETY: the accumulator bound documented on the public entry point is
+    // far below `reduce160`'s precondition.
+    QuadraticExtension([
+        unsafe { reduce160(lo0, hi0) },
+        unsafe { reduce160(lo1, hi1) },
+    ])
+}
+
+#[cfg(any(
+    test,
+    all(target_arch = "aarch64", target_vendor = "apple")
+))]
+#[inline(always)]
+fn ext2_base_scalar_dot_slot_pair(
+    slot: usize,
+    full: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+    partial: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    let (mut lo00, mut hi00) = (0u128, 0u32);
+    let (mut lo01, mut hi01) = (0u128, 0u32);
+    let (mut lo10, mut hi10) = (0u128, 0u32);
+    let (mut lo11, mut hi11) = (0u128, 0u32);
+
+    for &(p, QuadraticExtension([b0, b1])) in full {
+        // SAFETY: paired callers provide `slot + 1 < out.len()`, and every
+        // slice in `full` has exactly `out.len()` elements.
+        let c0 = unsafe { p.get_unchecked(slot).0 };
+        let c1 = unsafe { p.get_unchecked(slot + 1).0 };
+        u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+        u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+        u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+        u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+    }
+    for &(p, QuadraticExtension([b0, b1])) in partial {
+        if let Some(c0) = p.get(slot) {
+            u160_add_product(&mut lo00, &mut hi00, b0.0, c0.0);
+            u160_add_product(&mut lo01, &mut hi01, b1.0, c0.0);
+        }
+        if let Some(c1) = p.get(slot + 1) {
+            u160_add_product(&mut lo10, &mut hi10, b0.0, c1.0);
+            u160_add_product(&mut lo11, &mut hi11, b1.0, c1.0);
+        }
+    }
+
+    [
+        QuadraticExtension([
+            unsafe { reduce160(lo00, hi00) },
+            unsafe { reduce160(lo01, hi01) },
+        ]),
+        QuadraticExtension([
+            unsafe { reduce160(lo10, hi10) },
+            unsafe { reduce160(lo11, hi11) },
+        ]),
+    ]
+}
+
 /// For each output slot `i`, compute
 /// `out[i] = sum_j powers[j].scalar_mul(polys[j][start + i])`
 /// over every polynomial long enough to reach that slot, delaying modular
@@ -783,6 +859,9 @@ pub fn ext2_base_scalar_dot_slots(
     polys: &[&[GoldilocksField]],
     powers: &[QuadraticExtension<GoldilocksField>],
 ) {
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    const PAIR_THRESHOLD: usize = 16;
+
     assert_eq!(polys.len(), powers.len());
     assert!(polys.len() < 1 << 24);
     let end = start + out.len();
@@ -799,29 +878,24 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
-    for (i, o) in out.iter_mut().enumerate() {
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
-            // SAFETY: every slice in `full` has length exactly `out.len()`.
-            let c = unsafe { p.get_unchecked(i).0 };
-            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    if full.len() + partial.len() > PAIR_THRESHOLD {
+        let paired_len = out.len() & !1;
+        let mut pairs = out.chunks_exact_mut(2);
+        for (pair_index, destination) in pairs.by_ref().enumerate() {
+            let values =
+                ext2_base_scalar_dot_slot_pair(pair_index * 2, &full, &partial);
+            destination.copy_from_slice(&values);
         }
-        for &(p, QuadraticExtension([b0, b1])) in &partial {
-            if i < p.len() {
-                let c = p[i].0;
-                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
-            }
+        if let Some(tail) = pairs.into_remainder().first_mut() {
+            *tail = ext2_base_scalar_dot_slot(paired_len, &full, &partial);
         }
-        // SAFETY: the accumulator bound documented above — below
-        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
-        // precondition.
-        *o = QuadraticExtension([
-            unsafe { reduce160(lo0, hi0) },
-            unsafe { reduce160(lo1, hi1) },
-        ]);
+        return;
+    }
+
+    for (slot, value) in out.iter_mut().enumerate() {
+        *value = ext2_base_scalar_dot_slot(slot, &full, &partial);
     }
 }
 
@@ -1195,6 +1269,8 @@ pub(crate) fn ext5_mul(a: [u64; 5], b: [u64; 5]) -> [GoldilocksField; 5] {
 #[cfg(test)]
 mod dot_slot_coverage_tests {
     use super::*;
+    use crate::extension::FieldExtension;
+    use crate::types::Field64;
 
     /// Q4: the composition accumulator is allocated uninitialized because
     /// `ext2_base_scalar_dot_slots` assigns *every* output slot. Poison the
@@ -1264,6 +1340,135 @@ mod dot_slot_coverage_tests {
             "poison sweep failed to notice a skipped slot"
         );
     }
+
+    #[test]
+    fn paired_dot_slots_match_scalar_raw_for_dense_and_ragged_inputs() {
+        let edge = [
+            GoldilocksField::ZERO,
+            GoldilocksField::ONE,
+            GoldilocksField(GoldilocksField::ORDER - 1),
+            GoldilocksField(GoldilocksField::ORDER),
+            GoldilocksField(GoldilocksField::ORDER + 1),
+            GoldilocksField(u64::MAX),
+        ];
+
+        for descriptor_count in [16usize, 17, 32, 239, 256] {
+            let polys = (0..descriptor_count)
+                .map(|poly| {
+                    let len = match poly % 7 {
+                        0 => 0,
+                        1 => 7,
+                        2 => 18,
+                        3 => 31,
+                        4 => 64,
+                        5 => 65,
+                        _ => 96,
+                    };
+                    (0..len)
+                        .map(|slot| edge[(poly * 17 + slot * 11 + 3) % edge.len()])
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let slices = polys.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let powers = (0..descriptor_count)
+                .map(|i| {
+                    QuadraticExtension([
+                        edge[(i * 5 + 1) % edge.len()],
+                        edge[(i * 13 + 4) % edge.len()],
+                    ])
+                })
+                .collect::<Vec<_>>();
+
+            for (start, len) in [
+                (0usize, 1usize),
+                (0, 2),
+                (3, 7),
+                (8, 18),
+                (31, 5),
+                (64, 3),
+                (96, 5),
+            ] {
+                let end = start + len;
+                let mut full = Vec::new();
+                let mut partial = Vec::new();
+                for (&poly, &power) in slices.iter().zip(&powers) {
+                    if poly.len() >= end {
+                        full.push((&poly[start..end], power));
+                    } else if poly.len() > start {
+                        partial.push((&poly[start..], power));
+                    }
+                }
+                let expected = (0..len)
+                    .map(|slot| ext2_base_scalar_dot_slot(slot, &full, &partial))
+                    .collect::<Vec<_>>();
+                let mut actual = vec![
+                    QuadraticExtension([
+                        GoldilocksField(u64::MAX),
+                        GoldilocksField(u64::MAX),
+                    ]);
+                    len
+                ];
+                ext2_base_scalar_dot_slots(&mut actual, start, &slices, &powers);
+                assert_eq!(
+                    actual
+                        .iter()
+                        .map(|value| [value.0[0].0, value.0[1].0])
+                        .collect::<Vec<_>>(),
+                    expected
+                        .iter()
+                        .map(|value| [value.0[0].0, value.0[1].0])
+                        .collect::<Vec<_>>(),
+                    "raw mismatch for descriptors={descriptor_count}, range={start}..{end}",
+                );
+                let generic = (0..len)
+                    .map(|slot| {
+                        let mut value = QuadraticExtension::ZERO;
+                        for (&poly, &power) in slices.iter().zip(&powers) {
+                            if let Some(&coefficient) = poly.get(start + slot) {
+                                value += <QuadraticExtension<GoldilocksField> as FieldExtension<
+                                    2,
+                                >>::scalar_mul(&power, coefficient);
+                            }
+                        }
+                        value
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    actual, generic,
+                    "field mismatch for descriptors={descriptor_count}, range={start}..{end}",
+                );
+
+                if full.len() + partial.len() > 16 {
+                    let mut paired_direct = Vec::with_capacity(len);
+                    let paired_len = len & !1;
+                    for slot in (0..paired_len).step_by(2) {
+                        paired_direct.extend_from_slice(&ext2_base_scalar_dot_slot_pair(
+                            slot, &full, &partial,
+                        ));
+                    }
+                    if paired_len != len {
+                        paired_direct.push(ext2_base_scalar_dot_slot(
+                            paired_len,
+                            &full,
+                            &partial,
+                        ));
+                    }
+                    assert_eq!(
+                        paired_direct
+                            .iter()
+                            .map(|value| [value.0[0].0, value.0[1].0])
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|value| [value.0[0].0, value.0[1].0])
+                            .collect::<Vec<_>>(),
+                        "direct paired mismatch for descriptors={descriptor_count}, range={start}..{end}",
+                    );
+                }
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
