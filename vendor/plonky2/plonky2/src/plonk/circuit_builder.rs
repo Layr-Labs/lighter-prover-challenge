@@ -1462,13 +1462,26 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
-        let generators_defer_until_ready = self
-            .generators
-            .iter()
-            .all(|generator| generator.0.defers_until_ready());
+        let mut generators_defer_until_ready = true;
+        let mut generator_batch_descriptors = Vec::with_capacity(self.generators.len());
+        for generator in &self.generators {
+            let (defers_until_ready, batch_descriptor) = generator.0.scheduling_metadata();
+            generators_defer_until_ready &= defers_until_ready;
+            generator_batch_descriptors.push(batch_descriptor);
+        }
+        let fixed_generator_output_layouts =
+            crate::iop::generator::FixedGeneratorOutputLayouts::build(
+                &self.generators,
+                &generator_batch_descriptors,
+                &forest.parents,
+                common.config.num_wires,
+                common.degree(),
+            );
 
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
             generators: self.generators,
+            generator_batch_descriptors,
+            fixed_generator_output_layouts,
             generator_indices_by_watches,
             generator_watch_counts,
             generators_defer_until_ready,
