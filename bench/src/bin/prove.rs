@@ -27,6 +27,10 @@ use plonky2::fri::oracle::PolynomialBatch;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(not(target_env = "msvc"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: &[u8] = b"retain:true,dirty_decay_ms:-1,muzzy_decay_ms:-1\0";
+
 // jemalloc runs with its default decay periods (dirty 10 s): freed pages stay
 // mapped long enough for the next identically-shaped allocation to reuse them.
 //
@@ -41,6 +45,26 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 // shapes 50+ times per worker, and with decay disabled every one of those
 // cycles madvises the pages away and then re-faults them zeroed on the next
 // step. Allocator page retention changes no computed value.
+//
+// Retention audit (30 s / 1 ms `sample` of the unstripped release worker on
+// the public fixture): 53,463 of 318,027 thread samples (~17%) sit at
+// `__psynch_mutexwait` inside the jemalloc deallocation path
+// (`_rjem_je_sdallocx_default` -> `_rjem_je_large_dalloc` ->
+// `_rjem_je_extent_dalloc_wrapper` -> `_rjem_je_extent_dalloc_mmap` ->
+// `_rjem_je_pages_unmap`, plus `_rjem_je_arena_decay`). The cause is macOS's
+// jemalloc default `retain:false`: every large extent freed past the dirty
+// cache is munmap(2)ed under the arena mutex, and the same multi-hundred-MB
+// shapes are re-mmap(2)ed and zero-faulted dozens of times per block. This
+// build pins `retain:true` (freed extents stay as reserved virtual memory and
+// are handed back without leaving the arena lock or the kernel) and
+// `dirty_decay_ms:-1` / `muzzy_decay_ms:-1` (no purge at all: pages stay
+// mapped-and-dirty until process exit). The worker proves exactly one
+// fixture and exits through `_exit(2)`, the kernel reclaims everything
+// wholesale, and the harness runs one worker per host at a time, so there is
+// no residency pressure to bound the retained pool: peak RSS is bounded by
+// the peak live set (~9 GiB measured at window depth 6), far below both the
+// 48 GiB ranked host and the 18 GiB development machine. No computed value
+// changes: allocator page reuse policy is invisible to proof bytes.
 // Keep the promoted writer path while exercising a second submission from that baseline.
 // The serialized proof measures ~196 KB at the ranked circuit shapes, so the
 // prior 2 MiB buffer over-reserved ~10x. 512 KiB still holds the whole proof in
