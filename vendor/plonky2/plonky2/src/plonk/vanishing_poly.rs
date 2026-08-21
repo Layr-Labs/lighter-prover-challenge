@@ -779,9 +779,12 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+/// `beta * point + (wire + gamma)`. Callers form `wire + gamma` once and
+/// reuse it for the numerator (`point = k_j * x`) and denominator
+/// (`point = sigma`) factors of the same challenge.
 #[inline(always)]
-fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
-    wire.multiply_accumulate(beta, point) + gamma
+fn permutation_factor_fma<F: Field>(wire_plus_gamma: F, beta: F, point: F) -> F {
+    wire_plus_gamma.multiply_accumulate(beta, point)
 }
 
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
@@ -1015,10 +1018,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod.push(permutation_factor_fma(wire, beta_k_0, x, gamma_0));
-                        den_prod.push(permutation_factor_fma(wire, beta_0, sigma, gamma_0));
-                        num_prod_second.push(permutation_factor_fma(wire, beta_k_1, x, gamma_1));
-                        den_prod_second.push(permutation_factor_fma(wire, beta_1, sigma, gamma_1));
+                        let wire_plus_gamma_0 = wire + gamma_0;
+                        let wire_plus_gamma_1 = wire + gamma_1;
+                        num_prod.push(permutation_factor_fma(wire_plus_gamma_0, beta_k_0, x));
+                        den_prod.push(permutation_factor_fma(wire_plus_gamma_0, beta_0, sigma));
+                        num_prod_second
+                            .push(permutation_factor_fma(wire_plus_gamma_1, beta_k_1, x));
+                        den_prod_second
+                            .push(permutation_factor_fma(wire_plus_gamma_1, beta_1, sigma));
                     }
                 }
                 for j in j_start + 1..j_end {
@@ -1030,10 +1037,14 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let wire = wire_col[k];
                         let sigma = sigma_col[k];
                         let x = xs_batch[k];
-                        num_prod[k] *= permutation_factor_fma(wire, beta_k_0, x, gamma_0);
-                        den_prod[k] *= permutation_factor_fma(wire, beta_0, sigma, gamma_0);
-                        num_prod_second[k] *= permutation_factor_fma(wire, beta_k_1, x, gamma_1);
-                        den_prod_second[k] *= permutation_factor_fma(wire, beta_1, sigma, gamma_1);
+                        let wire_plus_gamma_0 = wire + gamma_0;
+                        let wire_plus_gamma_1 = wire + gamma_1;
+                        num_prod[k] *= permutation_factor_fma(wire_plus_gamma_0, beta_k_0, x);
+                        den_prod[k] *= permutation_factor_fma(wire_plus_gamma_0, beta_0, sigma);
+                        num_prod_second[k] *=
+                            permutation_factor_fma(wire_plus_gamma_1, beta_k_1, x);
+                        den_prod_second[k] *=
+                            permutation_factor_fma(wire_plus_gamma_1, beta_1, sigma);
                     }
                 }
 
@@ -1070,8 +1081,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let sigma_col = &s_sigmas_cols[j_start * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j_start];
                         for k in 0..n {
-                            num_prod.push(wire_col[k] + beta_k_i * xs_batch[k] + gamma);
-                            den_prod.push(wire_col[k] + beta * sigma_col[k] + gamma);
+                            let wire_plus_gamma = wire_col[k] + gamma;
+                            num_prod.push(permutation_factor_fma(
+                                wire_plus_gamma,
+                                beta_k_i,
+                                xs_batch[k],
+                            ));
+                            den_prod.push(permutation_factor_fma(
+                                wire_plus_gamma,
+                                beta,
+                                sigma_col[k],
+                            ));
                         }
                     }
                     for j in j_start + 1..j_end {
@@ -1079,8 +1099,17 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
                         let sigma_col = &s_sigmas_cols[j * n..][..n];
                         let beta_k_i = beta_k_is[i * num_routed_wires + j];
                         for k in 0..n {
-                            num_prod[k] *= wire_col[k] + beta_k_i * xs_batch[k] + gamma;
-                            den_prod[k] *= wire_col[k] + beta * sigma_col[k] + gamma;
+                            let wire_plus_gamma = wire_col[k] + gamma;
+                            num_prod[k] *= permutation_factor_fma(
+                                wire_plus_gamma,
+                                beta_k_i,
+                                xs_batch[k],
+                            );
+                            den_prod[k] *= permutation_factor_fma(
+                                wire_plus_gamma,
+                                beta,
+                                sigma_col[k],
+                            );
                         }
                     }
 
@@ -1186,14 +1215,13 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
             }
 
             numerator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
+                let wire_plus_gamma = vars.local_wires[j] + gammas[i];
                 let beta_k_i = beta_k_is[i * num_routed_wires + j];
-                wire_value + beta_k_i * x + gammas[i]
+                permutation_factor_fma(wire_plus_gamma, beta_k_i, x)
             }));
             denominator_values.extend((0..num_routed_wires).map(|j| {
-                let wire_value = vars.local_wires[j];
-                let s_sigma = s_sigmas[j];
-                wire_value + betas[i] * s_sigma + gammas[i]
+                let wire_plus_gamma = vars.local_wires[j] + gammas[i];
+                permutation_factor_fma(wire_plus_gamma, betas[i], s_sigmas[j])
             }));
 
             // The partial products considered for this iteration of `i`.
