@@ -11,7 +11,7 @@ use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, cached_fft_root_table, fft_in_place_with_options,
-    fft_in_place_with_options_parallel,
+    fft_in_place_with_options_parallel, ifft_borrowed,
 };
 use crate::field::goldilocks_extensions::ext2_mul_add;
 use crate::field::goldilocks_field::GoldilocksField;
@@ -469,6 +469,231 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             rate_bits,
             blinding,
             even_columns: EvenColumns::default(),
+        }
+    }
+
+    /// Wires-commitment path: IFFT each group of eight columns inside the
+    /// streamed LDE fill so the first GPU absorb starts after 8 IFFTs instead
+    /// of after every wire column. Coeffs, LDE values, and tree bytes match
+    /// `ifft_all` then [`Self::from_coeffs_with_even_companion`]. Ranked
+    /// circuits are non-ZK; blinding uses the historical all-IFFT path.
+    pub fn from_wire_columns_with_even_companion(
+        wire_values: &mut [Vec<F>],
+        num_routed_wires: usize,
+        rate_bits: usize,
+        blinding: bool,
+        cap_height: usize,
+        timing: &mut TimingTree,
+        fft_root_table: Option<&FftRootTable<F>>,
+        want_even_companion: bool,
+    ) -> Self {
+        let ifft_column = |j: usize, column: &mut Vec<F>| -> PolynomialCoeffs<F> {
+            if j < num_routed_wires {
+                ifft_borrowed(column)
+            } else {
+                PolynomialValues::new(core::mem::take(column)).ifft()
+            }
+        };
+        let ifft_all = |columns: &mut [Vec<F>]| -> Vec<PolynomialCoeffs<F>> {
+            columns
+                .par_iter_mut()
+                .enumerate()
+                .map(|(j, column)| ifft_column(j, column))
+                .collect()
+        };
+
+        if blinding {
+            let polynomials = timed!(
+                timing,
+                "compute wire polynomials (IFFT)",
+                ifft_all(wire_values)
+            );
+            return Self::from_coeffs_with_even_companion(
+                polynomials,
+                rate_bits,
+                blinding,
+                cap_height,
+                timing,
+                fft_root_table,
+                want_even_companion,
+            );
+        }
+
+        #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+        {
+            let polynomials = timed!(
+                timing,
+                "compute wire polynomials (IFFT)",
+                ifft_all(wire_values)
+            );
+            return Self::from_coeffs_with_even_companion(
+                polynomials,
+                rate_bits,
+                false,
+                cap_height,
+                timing,
+                fft_root_table,
+                want_even_companion,
+            );
+        }
+
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        {
+            let n = wire_values.len();
+            let degree = wire_values[0].len();
+            let lde_len = degree << rate_bits;
+            if let Some(mut columns) =
+                C::Hasher::try_allocate_merkle_tree_columns(n, lde_len, cap_height)
+            {
+                let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
+                    crate::hash::poseidon2::metal::allocate_plain_columns::<F>(n, lde_len / 2)
+                } else {
+                    None
+                };
+                let even_ptrs: Option<Vec<usize>> = even_companion.as_mut().and_then(|companion| {
+                    companion
+                        .columns_mut()
+                        .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
+                });
+                let even_ptrs = &even_ptrs;
+                let half_len = lde_len / 2;
+                let copy_even = |_column: usize, _destination: &[F]| {
+                    if let Some(ptrs) = even_ptrs {
+                        let out = unsafe {
+                            core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
+                        };
+                        for (k, slot) in out.iter_mut().enumerate() {
+                            *slot = _destination[2 * k];
+                        }
+                    }
+                };
+                let copy_even = &copy_even;
+                let wires = std::sync::Mutex::new(wire_values);
+                let polys = std::sync::Mutex::new(
+                    (0..n)
+                        .map(|_| PolynomialCoeffs::new(Vec::new()))
+                        .collect::<Vec<_>>(),
+                );
+                let streamed = {
+                    let coset_powers =
+                        crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+                    C::Hasher::try_build_merkle_tree_column_store_streamed(
+                        &columns,
+                        cap_height,
+                        &|group, destinations: &mut [&mut [F]]| {
+                            let start = group * 8;
+                            let chunk = destinations.len();
+                            let computed: Vec<PolynomialCoeffs<F>> = {
+                                let mut cols = wires.lock().unwrap_or_else(|p| p.into_inner());
+                                cols[start..start + chunk]
+                                    .par_iter_mut()
+                                    .enumerate()
+                                    .map(|(k, column)| ifft_column(start + k, column))
+                                    .collect()
+                            };
+                            destinations.par_iter_mut().enumerate().for_each(
+                                |(k, destination)| {
+                                    let polynomial = &computed[k];
+                                    assert_eq!(
+                                        polynomial.len(),
+                                        degree,
+                                        "Polynomial degrees inconsistent"
+                                    );
+                                    batch_multiply_into(
+                                        &mut destination[..degree],
+                                        &polynomial.coeffs,
+                                        &coset_powers,
+                                    );
+                                    if rate_bits == 0 || degree < 2 {
+                                        destination[degree..].fill(F::ZERO);
+                                    }
+                                    fft_in_place_with_options(
+                                        destination,
+                                        Some(rate_bits),
+                                        fft_root_table,
+                                    );
+                                    copy_even(start + k, destination);
+                                },
+                            );
+                            let mut guard = polys.lock().unwrap_or_else(|p| p.into_inner());
+                            for (k, c) in computed.into_iter().enumerate() {
+                                guard[start + k] = c;
+                            }
+                        },
+                    )
+                };
+                let mut polynomials = polys.into_inner().unwrap_or_else(|p| p.into_inner());
+                if let Some((level_digests, cap)) = streamed {
+                    let merkle_tree = timed!(
+                        timing,
+                        "build Merkle tree",
+                        MerkleTree::from_prebuilt_columns(columns, level_digests, cap)
+                    );
+                    return Self {
+                        polynomials,
+                        merkle_tree,
+                        degree_log: log2_strict(degree),
+                        rate_bits,
+                        blinding: false,
+                        even_columns: EvenColumns::from_ready(even_companion),
+                    };
+                }
+                let mut cols = wires.into_inner().unwrap_or_else(|p| p.into_inner());
+                for (j, slot) in polynomials.iter_mut().enumerate() {
+                    if slot.len() != degree {
+                        *slot = ifft_column(j, &mut cols[j]);
+                    }
+                }
+                let initialized = timed!(
+                    timing,
+                    "FFT + blinding",
+                    Self::fill_lde_column_store(
+                        &mut columns,
+                        &polynomials,
+                        rate_bits,
+                        fft_root_table,
+                        copy_even,
+                    )
+                );
+                if initialized {
+                    let merkle_tree = timed!(
+                        timing,
+                        "build Merkle tree",
+                        MerkleTree::new_column_store(columns, cap_height)
+                    );
+                    return Self {
+                        polynomials,
+                        merkle_tree,
+                        degree_log: log2_strict(degree),
+                        rate_bits,
+                        blinding: false,
+                        even_columns: EvenColumns::from_ready(even_companion),
+                    };
+                }
+                return Self::from_coeffs_with_even_companion(
+                    polynomials,
+                    rate_bits,
+                    false,
+                    cap_height,
+                    timing,
+                    fft_root_table,
+                    want_even_companion,
+                );
+            }
+            let polynomials = timed!(
+                timing,
+                "compute wire polynomials (IFFT)",
+                ifft_all(wire_values)
+            );
+            Self::from_coeffs_with_even_companion(
+                polynomials,
+                rate_bits,
+                false,
+                cap_height,
+                timing,
+                fft_root_table,
+                want_even_companion,
+            )
         }
     }
 

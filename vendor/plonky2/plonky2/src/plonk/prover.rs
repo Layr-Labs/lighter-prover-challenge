@@ -213,36 +213,53 @@ where
     // place; routed columns are IFFT'd from the borrowed witness column
     // (`ifft_borrowed` fuses the former clone with the FFT's initial
     // bit-reversal gather), so no witness column is copied.
+    //
+    // Default: IFFT each streamed group of eight columns *inside* the LDE
+    // fill so the first GPU absorb starts after 8 IFFTs, not after every
+    // wire. `LIGHTER_WIRE_IFFT_STREAM=0` restores IFFT-all then commit.
     let num_routed_wires = common_data.config.num_routed_wires;
-    let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
-        timing,
-        "compute wire polynomials (IFFT)",
-        witness
-            .wire_values
-            .par_iter_mut()
-            .enumerate()
-            .map(|(j, column)| {
-                if j < num_routed_wires {
-                    ifft_borrowed(column)
-                } else {
-                    PolynomialValues::new(core::mem::take(column)).ifft()
-                }
-            })
-            .collect()
-    );
-
+    let wires_blinding = config.zero_knowledge && PlonkOracle::WIRES.blinding;
     let wires_commitment = timed!(
         timing,
         "compute wires commitment",
-        PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
-            wires_coeffs,
-            config.fri_config.rate_bits,
-            config.zero_knowledge && PlonkOracle::WIRES.blinding,
-            config.fri_config.cap_height,
-            timing,
-            prover_data.fft_root_table.as_deref(),
-            wires_even_companion_wanted(common_data),
-        )
+        if wire_ifft_stream_enabled() && !wires_blinding {
+            PolynomialBatch::<F, C, D>::from_wire_columns_with_even_companion(
+                &mut witness.wire_values,
+                num_routed_wires,
+                config.fri_config.rate_bits,
+                wires_blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_deref(),
+                wires_even_companion_wanted(common_data),
+            )
+        } else {
+            let wires_coeffs: Vec<PolynomialCoeffs<F>> = timed!(
+                timing,
+                "compute wire polynomials (IFFT)",
+                witness
+                    .wire_values
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(j, column)| {
+                        if j < num_routed_wires {
+                            ifft_borrowed(column)
+                        } else {
+                            PolynomialValues::new(core::mem::take(column)).ifft()
+                        }
+                    })
+                    .collect()
+            );
+            PolynomialBatch::<F, C, D>::from_coeffs_with_even_companion(
+                wires_coeffs,
+                config.fri_config.rate_bits,
+                wires_blinding,
+                config.fri_config.cap_height,
+                timing,
+                prover_data.fft_root_table.as_deref(),
+                wires_even_companion_wanted(common_data),
+            )
+        }
     );
 
     let mut challenger = Challenger::<F, C::Hasher>::new();
@@ -1742,6 +1759,81 @@ fn combine_low_range_quotient<F: RichField>(
     }
 }
 
+/// `LIGHTER_WIRE_IFFT_STREAM=0` restores IFFT-all-then-commit for wires.
+/// Default on: IFFT each eight-column group inside the streamed LDE fill.
+fn wire_ifft_stream_enabled() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        return *ENABLED.get_or_init(|| {
+            !std::env::var_os("LIGHTER_WIRE_IFFT_STREAM").is_some_and(|v| v == "0")
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        false
+    }
+}
+
+/// `LIGHTER_LOW_RANGE_DEINTERLEAVE=0` keeps the per-challenge strided gather;
+/// default on. Layout-only: both paths feed the same IFFT/FFT the same values.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn low_range_deinterleave_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_LOW_RANGE_DEINTERLEAVE").is_some_and(|v| v == "0")
+    })
+}
+
+/// Splits one gate's interleaved `[c0, c1, c0, c1, ...]` half-domain block into
+/// two contiguous challenge columns. Value-exact vs the strided
+/// `low[base + k * 2 + c]` gather.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn deinterleave_challenge_pair<F: RichField>(src: &[F], half_rows: usize) -> (Vec<F>, Vec<F>) {
+    debug_assert_eq!(src.len(), half_rows * 2);
+    let mut even = vec![F::ZERO; half_rows];
+    let mut odd = vec![F::ZERO; half_rows];
+    if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() == 8 {
+        // SAFETY: production Goldilocks is `repr(transparent)` over `u64`.
+        // `src`/`even`/`odd` are distinct allocations of the advertised lengths.
+        unsafe {
+            deinterleave_u64_neon(
+                src.as_ptr().cast::<u64>(),
+                even.as_mut_ptr().cast::<u64>(),
+                odd.as_mut_ptr().cast::<u64>(),
+                half_rows,
+            );
+        }
+    } else {
+        for k in 0..half_rows {
+            even[k] = src[k * 2];
+            odd[k] = src[k * 2 + 1];
+        }
+    }
+    (even, odd)
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+unsafe fn deinterleave_u64_neon(src: *const u64, even: *mut u64, odd: *mut u64, n: usize) {
+    use core::arch::aarch64::{vld2q_u64, vst1q_u64};
+    let mut i = 0;
+    while i + 2 <= n {
+        let pair = unsafe { vld2q_u64(src.add(i * 2)) };
+        unsafe {
+            vst1q_u64(even.add(i), pair.0);
+            vst1q_u64(odd.add(i), pair.1);
+        }
+        i += 2;
+    }
+    while i < n {
+        unsafe {
+            *even.add(i) = *src.add(i * 2);
+            *odd.add(i) = *src.add(i * 2 + 1);
+        }
+        i += 1;
+    }
+}
+
 /// Extends the per-gate half-domain sums to the odd rows and applies the
 /// selector filters, producing the same point-major `[row * 2 + challenge]`
 /// layout as a full-domain range job. See [`LowDegreeRangeGate`].
@@ -1768,19 +1860,45 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
+    let odd: Vec<Vec<F>> = if low_range_deinterleave_enabled() {
+        let pairs: Vec<(Vec<F>, Vec<F>)> = (0..gates.len())
+            .into_par_iter()
+            .map(|g| {
+                let base = g * half_rows * 2;
+                let (c0, c1) =
+                    deinterleave_challenge_pair(&low[base..base + half_rows * 2], half_rows);
+                let col0 = PolynomialValues::new(c0)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                let col1 = PolynomialValues::new(c1)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                (col0, col1)
+            })
+            .collect();
+        let mut cols = Vec::with_capacity(pairs.len() * 2);
+        for (c0, c1) in pairs {
+            cols.push(c0);
+            cols.push(c1);
+        }
+        cols
+    } else {
+        (0..gates.len() * 2)
+            .into_par_iter()
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values
+            })
+            .collect()
+    };
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(

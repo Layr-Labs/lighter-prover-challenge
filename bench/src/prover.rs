@@ -1,6 +1,7 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 // Redraw marker r18 (same-account archive-dedup convention; inert, declared in note)
+// last-chance: v1 + per-group wire IFFT inside streamed LDE (not a v1-control).
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
