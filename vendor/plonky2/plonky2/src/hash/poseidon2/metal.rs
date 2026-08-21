@@ -326,6 +326,17 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
 /// isolated 1<<18 experiment (2a2b1a07, 6.75) scored during a degraded host
 /// window and is treated as contaminated evidence.
 const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
+/// Mid-band cutoff used only while the serialized GPU stream is completely
+/// idle (`GPU_JOBS_IN_FLIGHT == 0`), between the exclusive-phase floor and the
+/// pipelined default above. The measured GPU/CPU break-even is ~131k
+/// permutations, so the 2^18-band trees (524,288-leaf width-8 shapes at
+/// 524,272 permutations sit 16 below the default gate) hash ~2x faster on the
+/// GPU — but only when admitting them cannot enqueue behind in-flight work on
+/// the single buffer set. An idle-stream read costs one relaxed atomic load
+/// and keeps every busy-interval decision identical to the promoted routing;
+/// either outcome hashes the same tree, so the benign-race property of
+/// `GPU_JOBS_IN_FLIGHT` carries over unchanged.
+const IDLE_STREAM_MIN_GPU_PERMUTATIONS: usize = 1 << 17;
 /// Lower routing threshold used only while an exclusive serial proving phase
 /// is active (see [`set_exclusive_gpu_phase`]). During the pre-execution and
 /// final block proofs nothing else can contend for the serialized GPU stream,
@@ -1702,8 +1713,22 @@ fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bo
     };
     let parent_permutations = leaf_count - (1usize << cap_height);
     let exclusive = EXCLUSIVE_GPU_PHASE.load(core::sync::atomic::Ordering::Relaxed);
+    // Mid-band admission (between the exclusive-phase floor and the pipelined
+    // default): the measured GPU/CPU break-even is ~131k permutations, so the
+    // 2^18-band shapes (e.g. 2^18-leaf width-8 trees at 524,272 permutations —
+    // 16 below the 1 << 19 gate) hash ~2x faster on the GPU. Lowering the
+    // cutoff unconditionally is the documented priority-inversion regression:
+    // a mid tree that enqueues behind in-flight chunk work on the single
+    // serialized buffer set hands back its hashing win as acquisition wait.
+    // Gating on an empty stream keeps every busy-interval routing decision
+    // exactly the promoted one and only changes the idle intervals, where the
+    // GPU wins unconditionally. The count is a heuristic read before this
+    // build registers itself; either outcome hashes the identical tree, so
+    // races are benign (see GPU_JOBS_IN_FLIGHT).
     let min_permutations = if exclusive {
         EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS
+    } else if GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        IDLE_STREAM_MIN_GPU_PERMUTATIONS
     } else {
         MIN_GPU_PERMUTATIONS
     };
