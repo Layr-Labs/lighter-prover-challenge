@@ -777,6 +777,93 @@ pub fn ext2_fri_fold_arity16_batch(
 /// representative may differ (both forms produce sub-2^64 representatives
 /// that later consumers treat value-wise, and proof serialization
 /// canonicalizes every limb).
+/// Scalar dot product for one output slot: walks the fully-covering
+/// descriptors unchecked, then the boundary-length descriptors checked.
+/// This is the historical per-slot body, extracted verbatim so the paired
+/// kernel below can delegate its ragged tail without duplicating the
+/// accumulation order.
+#[inline(always)]
+fn ext2_base_scalar_dot_slot(
+    slot: usize,
+    out_slot: &mut QuadraticExtension<GoldilocksField>,
+    full: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+    partial: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+) {
+    let (mut lo0, mut hi0) = (0u128, 0u32);
+    let (mut lo1, mut hi1) = (0u128, 0u32);
+    for &(p, QuadraticExtension([b0, b1])) in full {
+        // SAFETY: every slice in `full` has length exactly the output length.
+        let c = unsafe { p.get_unchecked(slot).0 };
+        u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+        u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+    }
+    for &(p, QuadraticExtension([b0, b1])) in partial {
+        if slot < p.len() {
+            let c = p[slot].0;
+            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+        }
+    }
+    // SAFETY: the accumulator bound documented above — below
+    // `polys.len() * 2^128 < 2^152` — is far under reduce160's
+    // precondition.
+    *out_slot = QuadraticExtension([
+        unsafe { reduce160(lo0, hi0) },
+        unsafe { reduce160(lo1, hi1) },
+    ]);
+}
+
+/// Two adjacent output slots in one descriptor traversal. Each slot keeps
+/// its own two independent exact 160-bit accumulators fed in the same
+/// descriptor order as [`ext2_base_scalar_dot_slot`]; pairing only shares
+/// the power load and the coefficient cache line across the two slots and
+/// gives the core two independent multiply/carry dependency chains.
+///
+/// SAFETY (`base`, `base + 1`): the caller pairs only slots strictly below
+/// the dense-region length, which every slice in `full` covers by
+/// construction and every slice in `partial` covers because the region was
+/// clipped to the shortest partial's end.
+#[inline(always)]
+fn ext2_base_scalar_dot_dense_pair(
+    base: usize,
+    out_pair: &mut [QuadraticExtension<GoldilocksField>],
+    full: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+    partial: &[(&[GoldilocksField], QuadraticExtension<GoldilocksField>)],
+) {
+    debug_assert_eq!(out_pair.len(), 2);
+    let ((mut lo00, mut hi00), (mut lo01, mut hi01)) = ((0u128, 0u32), (0u128, 0u32));
+    let ((mut lo10, mut hi10), (mut lo11, mut hi11)) = ((0u128, 0u32), (0u128, 0u32));
+    for &(p, QuadraticExtension([b0, b1])) in full {
+        // SAFETY: every slice in `full` has length exactly the output length,
+        // and `base + 1` is below the dense-region length.
+        let c0 = unsafe { p.get_unchecked(base).0 };
+        let c1 = unsafe { p.get_unchecked(base + 1).0 };
+        u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+        u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+        u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+        u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+    }
+    for &(p, QuadraticExtension([b0, b1])) in partial {
+        // SAFETY: the dense region ends at or before every partial slice's
+        // end, so both indices are in bounds.
+        let c0 = unsafe { p.get_unchecked(base).0 };
+        let c1 = unsafe { p.get_unchecked(base + 1).0 };
+        u160_add_product(&mut lo00, &mut hi00, b0.0, c0);
+        u160_add_product(&mut lo01, &mut hi01, b1.0, c0);
+        u160_add_product(&mut lo10, &mut hi10, b0.0, c1);
+        u160_add_product(&mut lo11, &mut hi11, b1.0, c1);
+    }
+    // SAFETY: same accumulator bound as the scalar slot.
+    out_pair[0] = QuadraticExtension([
+        unsafe { reduce160(lo00, hi00) },
+        unsafe { reduce160(lo01, hi01) },
+    ]);
+    out_pair[1] = QuadraticExtension([
+        unsafe { reduce160(lo10, hi10) },
+        unsafe { reduce160(lo11, hi11) },
+    ]);
+}
+
 pub fn ext2_base_scalar_dot_slots(
     out: &mut [QuadraticExtension<GoldilocksField>],
     start: usize,
@@ -799,29 +886,33 @@ pub fn ext2_base_scalar_dot_slots(
             partial.push((&p[start..], pw));
         }
     }
-    for (i, o) in out.iter_mut().enumerate() {
-        let (mut lo0, mut hi0) = (0u128, 0u32);
-        let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
-            // SAFETY: every slice in `full` has length exactly `out.len()`.
-            let c = unsafe { p.get_unchecked(i).0 };
-            u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-            u160_add_product(&mut lo1, &mut hi1, b1.0, c);
-        }
-        for &(p, QuadraticExtension([b0, b1])) in &partial {
-            if i < p.len() {
-                let c = p[i].0;
-                u160_add_product(&mut lo0, &mut hi0, b0.0, c);
-                u160_add_product(&mut lo1, &mut hi1, b1.0, c);
-            }
-        }
-        // SAFETY: the accumulator bound documented above — below
-        // `polys.len() * 2^128 < 2^152` — is far under reduce160's
-        // precondition.
-        *o = QuadraticExtension([
-            unsafe { reduce160(lo0, hi0) },
-            unsafe { reduce160(lo1, hi1) },
-        ]);
+    // Adjacent-slot pairing. Slots below the dense-region length are served
+    // two at a time; the remaining tail keeps the scalar walk. The dense
+    // region reaches the full output range when no boundary-length
+    // descriptor exists, and otherwise stops at the shortest boundary
+    // descriptor's end — every slot before that point is covered by every
+    // descriptor, dense or not, so pairing survives ragged batches instead
+    // of falling back to all-scalar.
+    const PAIR_MIN_DESCRIPTORS: usize = 16;
+    let dense_len = if full.len() + partial.len() > PAIR_MIN_DESCRIPTORS {
+        // Boundary slices are stored relative to `start`, so the shortest
+        // boundary end is already output-relative; with no boundary
+        // descriptor the whole output range is dense.
+        partial
+            .iter()
+            .map(|(p, _)| p.len())
+            .min()
+            .unwrap_or(out.len())
+            .min(out.len())
+    } else {
+        0
+    };
+    let pairs = dense_len / 2;
+    for (k, pair_out) in out[..pairs * 2].chunks_exact_mut(2).enumerate() {
+        ext2_base_scalar_dot_dense_pair(k * 2, pair_out, &full, &partial);
+    }
+    for (i, o) in out[pairs * 2..].iter_mut().enumerate() {
+        ext2_base_scalar_dot_slot(pairs * 2 + i, o, &full, &partial);
     }
 }
 
@@ -1263,6 +1354,158 @@ mod dot_slot_coverage_tests {
                 .any(|o| o.0[0].0 == POISON.0[0].0 && o.0[1].0 == POISON.0[1].0),
             "poison sweep failed to notice a skipped slot"
         );
+    }
+
+    /// Independent scalar reference: the historical per-slot walk, spelled
+    /// separately from both production helpers so a shared mistake cannot
+    /// cancel out.
+    fn scalar_reference(
+        start: usize,
+        polys: &[&[GoldilocksField]],
+        powers: &[QuadraticExtension<GoldilocksField>],
+        len: usize,
+    ) -> Vec<QuadraticExtension<GoldilocksField>> {
+        let end = start + len;
+        (0..len)
+            .map(|i| {
+                let mut lo0 = 0u128;
+                let mut hi0 = 0u32;
+                let mut lo1 = 0u128;
+                let mut hi1 = 0u32;
+                for (&p, &QuadraticExtension([b0, b1])) in polys.iter().zip(powers) {
+                    if start + i < p.len() {
+                        let c = p[start + i].0;
+                        super::u160_add_product(&mut lo0, &mut hi0, b0.0, c);
+                        super::u160_add_product(&mut lo1, &mut hi1, b1.0, c);
+                    }
+                }
+                QuadraticExtension([
+                    unsafe { crate::goldilocks_field::reduce160(lo0, hi0) },
+                    unsafe { crate::goldilocks_field::reduce160(lo1, hi1) },
+                ])
+            })
+            .collect()
+    }
+
+    /// Raw-limb differential across the pairing dispatch: descriptor counts
+    /// straddling the 16-descriptor threshold, even and odd output lengths,
+    /// zero and nonzero starts, ragged boundary descriptors ending before,
+    /// inside, and at the end of the requested range, and raw words that
+    /// exercise non-canonical Goldilocks representatives.
+    #[test]
+    fn dot_slots_paired_dispatch_matches_scalar_reference() {
+        const POISON: QuadraticExtension<GoldilocksField> =
+            QuadraticExtension([GoldilocksField(u64::MAX), GoldilocksField(u64::MAX)]);
+        let edge = [
+            0u64,
+            1,
+            0xffff_ffff_ffff_fffe,
+            0xffff_ffff_ffff_ffff,
+            0x7fff_ffff_ffff_ffff,
+        ];
+        let word = |n: usize| edge[(n * 7 + 3) % edge.len()];
+        for &num_polys in &[15usize, 16, 17, 32] {
+            // Lengths straddle the requested ranges so the batch mixes
+            // fully-covering descriptors with boundary descriptors that end
+            // before, inside, and just past each range.
+            let lengths: Vec<usize> = (0..num_polys)
+                .map(|j| match j % 5 {
+                    0 => 0,
+                    1 => 5,
+                    2 => 33,
+                    3 => 64,
+                    _ => 200,
+                })
+                .collect();
+            let polys: Vec<Vec<GoldilocksField>> = lengths
+                .iter()
+                .enumerate()
+                .map(|(j, &len)| {
+                    (0..len)
+                        .map(|i| GoldilocksField(word(i + j * 101)))
+                        .collect()
+                })
+                .collect();
+            let powers: Vec<QuadraticExtension<GoldilocksField>> = (0..num_polys)
+                .map(|j| {
+                    QuadraticExtension([
+                        GoldilocksField(word(10_000 + j)),
+                        GoldilocksField(word(20_000 + j)),
+                    ])
+                })
+                .collect();
+            let slices: Vec<&[GoldilocksField]> = polys.iter().map(|p| p.as_slice()).collect();
+            for &(start, len) in &[
+                (0usize, 32usize),
+                (0, 33),
+                (1, 31),
+                (16, 17),
+                (32, 32),
+                (60, 8),
+                (100, 24),
+                (150, 50),
+                (200, 16),
+            ] {
+                let mut out = vec![POISON; len];
+                ext2_base_scalar_dot_slots(&mut out, start, &slices, &powers);
+                let expected = scalar_reference(start, &slices, &powers, len);
+                for (i, (actual, want)) in out.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        (actual.0[0].0, actual.0[1].0),
+                        (want.0[0].0, want.0[1].0),
+                        "raw-limb mismatch at slot {i} of range {start}..{} \
+                         with {num_polys} descriptors",
+                        start + len
+                    );
+                }
+            }
+        }
+    }
+
+    /// Direct paired-helper differential: exercises the paired kernel and
+    /// its scalar tail handoff on descriptor lists that satisfy the dense
+    /// precondition, independent of the production dispatch threshold.
+    #[test]
+    fn dense_pair_helper_matches_scalar_slots() {
+        let word = |n: usize| ((n * 7 + 3) % 5) as u64;
+        for &num_polys in &[4usize, 9] {
+            let polys: Vec<Vec<GoldilocksField>> = (0..num_polys)
+                .map(|j| (0..48).map(|i| GoldilocksField(word(i + j * 61))).collect())
+                .collect();
+            let powers: Vec<QuadraticExtension<GoldilocksField>> = (0..num_polys)
+                .map(|j| {
+                    QuadraticExtension([
+                        GoldilocksField(word(500 + j)),
+                        GoldilocksField(word(900 + j)),
+                    ])
+                })
+                .collect();
+            let slices: Vec<&[GoldilocksField]> = polys.iter().map(|p| p.as_slice()).collect();
+            let full: Vec<_> = slices
+                .iter()
+                .zip(&powers)
+                .map(|(&p, &pw)| (&p[..32], pw))
+                .collect();
+            let mut out = vec![
+                QuadraticExtension([GoldilocksField(0), GoldilocksField(0)]);
+                8
+            ];
+            for k in 0..4 {
+                super::ext2_base_scalar_dot_dense_pair(k * 2, &mut out[k * 2..k * 2 + 2], &full, &[]);
+            }
+            let mut reference = vec![
+                QuadraticExtension([GoldilocksField(0), GoldilocksField(0)]);
+                8
+            ];
+            super::ext2_base_scalar_dot_slots(&mut reference, 0, &slices, &powers);
+            for i in 0..8 {
+                assert_eq!(
+                    (out[i].0[0].0, out[i].0[1].0),
+                    (reference[i].0[0].0, reference[i].0[1].0),
+                    "paired helper mismatch at slot {i}"
+                );
+            }
+        }
     }
 }
 
