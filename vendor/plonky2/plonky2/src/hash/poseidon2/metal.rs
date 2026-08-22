@@ -2509,6 +2509,13 @@ static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 /// for large wide trees, where the overlap converts the previously serial
 /// CPU-FFT-then-GPU-hash commitment into max(FFT, hash) + one pass.
 ///
+/// Contended-stream fill-ahead: when `GPU_JOBS_IN_FLIGHT > 0` at entry, every
+/// column group is filled (Rayon, disjoint ranges) *before* taking
+/// [`GpuJobGuard`], so the CPU LDE overlaps the in-flight job's queue wait;
+/// the subsequent absorb+parent burst then holds the serialized stream for
+/// absorb time only. Idle entry keeps the classic per-group fill/absorb
+/// overlap.
+///
 /// Value-exact: the fill closure runs the same `batch_multiply_into` +
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
 /// exactly the corresponding loop iteration of `poseidon2_hash_leaves_colmajor`
@@ -2564,6 +2571,37 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
 
+    let groups = leaf_width.div_ceil(8);
+    let base = columns.buffer.contents().cast::<F>();
+
+    // Contended-stream fill-ahead: when another Metal job already owns the
+    // serialized queue, the ~62 ms CPU LDE fill would otherwise sit *inside*
+    // GpuJobGuard and extend everyone else's queue wait. Fill every column
+    // group first (disjoint ranges → Rayon-safe), overlapping the wait for
+    // the in-flight job; then take the stream for absorb+parent only. Idle
+    // streams keep the classic fill/absorb overlap (max(fill, hash)).
+    let gpu_busy =
+        GPU_JOBS_IN_FLIGHT.load(core::sync::atomic::Ordering::Relaxed) > 0;
+    if gpu_busy {
+        #[cfg(feature = "diagnostic_profile")]
+        let _fill = crate::util::profile::span("streamed_fill", "fill_ahead_all");
+        (0..groups).into_par_iter().for_each(|group| {
+            let col_start = group * 8;
+            let chunk = (leaf_width - col_start).min(8);
+            // SAFETY: each group owns a disjoint `chunk * leaf_count` range of
+            // the shared column buffer; groups never overlap.
+            let mut slices: Vec<&mut [F]> = (0..chunk)
+                .map(|k| unsafe {
+                    slice::from_raw_parts_mut(
+                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        leaf_count,
+                    )
+                })
+                .collect();
+            fill_group(group, &mut slices);
+        });
+    }
+
     let job = GpuJobGuard::begin();
     let mut buffers = STREAMED_BUFFERS.lock().ok()?;
     let needs_new = buffers.as_ref().map_or(true, |(state, output)| {
@@ -2585,11 +2623,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
-    // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
-    let groups = leaf_width.div_ceil(8);
-    let base = columns.buffer.contents().cast::<F>();
+    // Group-wise absorb. Idle path: CPU fill of group g+1 overlaps the GPU's
+    // absorption of group g. Contended fill-ahead path: columns are already
+    // filled, so this loop is absorb-only and holds the serialized stream for
+    // strictly less wall time.
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
@@ -2597,7 +2634,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     for group in 0..groups {
         let col_start = group * 8;
         let chunk = (leaf_width - col_start).min(8);
-        {
+        if !gpu_busy {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
             // whose pass was already committed, after their fill completed.
@@ -2685,10 +2722,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
-        command_buffer.wait_until_completed();
-        command_buffer.status() == MTLCommandBufferStatus::Completed
-    });
+    // FIFO queue: waiting on the last committed buffer implies every earlier
+    // absorb finished. Avoids N scheduler wakeups after an absorb-only burst.
+    let last = absorb_commands.last()?;
+    last.wait_until_completed();
+    let all_ok = last.status() == MTLCommandBufferStatus::Completed;
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
