@@ -1,9 +1,8 @@
-// Redraw marker 655
-// Bumped only to obtain a fresh submission hash: the ranked score is a draw
-// from a strongly bimodal runner pool (~27% of draws land in the fast band),
-// so an unchanged tree cannot be re-sampled — the service dedupes identical
-// submissions. Changes no executable behavior; the previous authors used the
-// same convention and their markers reached 573.
+// Redraw marker 656
+// Parent-ladder CPU suffix @128: Metal parent dispatches stop once ≤128 child
+// digests remain; Poseidon2 two-to-one (quad) finishes 128→64→32→16 on CPU.
+// Also refreshes the submission hash (bimodal pool / dedupe); prior markers
+// reached 573.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

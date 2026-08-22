@@ -21,10 +21,13 @@ use metal::{
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
 
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, RichField};
 use crate::hash::merkle_tree::{DigestStore, LevelOrderDigests};
 use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MATRIX_DIAG_12_U64};
+use crate::hash::poseidon2::hash::Poseidon2Hash;
+use crate::plonk::config::Hasher;
 
 #[cfg(feature = "diagnostic_profile")]
 static PROFILE_COMMAND_SEQUENCE: std::sync::atomic::AtomicU64 =
@@ -2644,10 +2647,10 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
                 let output_resource: &metal::ResourceRef = output_buffer;
-                if child_count > cap_count {
+                if child_count > metal_parent_gpu_floor(cap_count) {
                     encoder.set_compute_pipeline_state(&context.parent_pipeline);
                 }
-                while child_count > cap_count {
+                while child_count > metal_parent_gpu_floor(cap_count) {
                     // Every parent level reads the output written by the
                     // preceding dispatch; preserve both the leaf-to-parent and
                     // the parent-to-parent hazard.
@@ -2712,6 +2715,11 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         });
     let completed = core::mem::replace(output_buffer, replacement);
     drop(buffers);
+    // Finish the top parent levels on CPU once the GPU ladder stopped early.
+    let nodes_u64 = unsafe {
+        slice::from_raw_parts_mut(completed.contents().cast::<u64>(), total_node_count * 4)
+    };
+    finish_parent_ladder_cpu_suffix(nodes_u64, &mut level_offsets, leaf_count, cap_height);
     let nodes = MetalDigests::with_buffer(
         completed,
         Arc::clone(&context.digest_output_pool),
@@ -3532,13 +3540,30 @@ impl MetalShared {
         &self,
         set: &mut BufferSet,
         output_len: usize,
-        level_offsets: Vec<usize>,
+        mut level_offsets: Vec<usize>,
         leaf_count: usize,
         cap_height: usize,
     ) -> Result<TreeReadback<'_, F>, String> {
         let output_bytes = output_len
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
+        // Finish the top parent levels on CPU into the completed shared buffer
+        // before detach / staging so Detached and Ready both see the full tree.
+        {
+            let output = set
+                .output
+                .as_ref()
+                .ok_or_else(|| "completed output buffer missing".to_string())?;
+            let nodes = unsafe {
+                slice::from_raw_parts_mut(output.contents().cast::<u64>(), output_len)
+            };
+            finish_parent_ladder_cpu_suffix(
+                nodes,
+                &mut level_offsets,
+                leaf_count,
+                cap_height,
+            );
+        }
         if let Some(output) = self.try_detach_completed_output(set, output_bytes)? {
             return Ok(TreeReadback::Detached {
                 output,
@@ -3872,7 +3897,7 @@ impl MetalShared {
                 let mut level_offset = 0usize;
                 let mut child_count = lde_size;
                 level_offsets.push(level_offset);
-                while child_count > cap_count {
+                while child_count > metal_parent_gpu_floor(cap_count) {
                     let parent_count = child_count / 2;
                     let child_offset = level_offset;
                     level_offset += child_count * 4;
@@ -4136,7 +4161,7 @@ impl MetalShared {
             let mut level_offset = 0usize;
             let mut child_count = lde_size;
             level_offsets.push(level_offset);
-            while child_count > cap_count {
+            while child_count > metal_parent_gpu_floor(cap_count) {
                 let parent_count = child_count / 2;
                 let child_offset = level_offset;
                 level_offset += child_count * 4;
@@ -4355,10 +4380,10 @@ impl MetalShared {
             let mut child_count = leaf_count;
             level_offsets.push(level_offset);
             let output_resource: &metal::ResourceRef = output_buffer;
-            if child_count > cap_count {
+            if child_count > metal_parent_gpu_floor(cap_count) {
                 encoder.set_compute_pipeline_state(&self.parent_pipeline);
             }
-            while child_count > cap_count {
+            while child_count > metal_parent_gpu_floor(cap_count) {
                 // Every parent level reads the output written by the preceding
                 // dispatch. Keep the whole tree in one compute encoder while
                 // preserving the leaf-to-parent and parent-to-parent hazards.
@@ -4417,6 +4442,88 @@ impl MetalShared {
             leaf_count,
             cap_height,
         )
+    }
+}
+
+/// Stop Metal parent dispatches once this many child digests remain; finish
+/// the suffix on CPU. Cap is usually 16; 128→64→32→16 is 112 hashes.
+const METAL_PARENT_CPU_SUFFIX_CHILDREN: usize = 128;
+
+fn metal_parent_gpu_floor(cap_count: usize) -> usize {
+    cap_count.max(METAL_PARENT_CPU_SUFFIX_CHILDREN)
+}
+
+fn hash_parent_level_cpu(
+    nodes: &mut [u64],
+    child_offset: usize,
+    parent_offset: usize,
+    parent_count: usize,
+) {
+    // Children and parents are disjoint in the flat buffer
+    // (`parent_offset = child_offset + child_count * 4`).
+    let (child_side, parent_side) = nodes.split_at_mut(parent_offset);
+    let children = &child_side[child_offset..];
+    debug_assert_eq!(children.len(), parent_count * 8);
+
+    type F = GoldilocksField;
+    type H = Poseidon2Hash;
+
+    let read_hash = |limbs: &[u64], off: usize| -> HashOut<F> {
+        HashOut {
+            elements: core::array::from_fn(|j| F::from_canonical_u64(limbs[off + j])),
+        }
+    };
+    let write_hash = |dst: &mut [u64], hash: HashOut<F>| {
+        for (slot, elt) in dst.iter_mut().zip(hash.elements.iter()) {
+            *slot = elt.to_canonical_u64();
+        }
+    };
+
+    let mut i = 0usize;
+    while i + 4 <= parent_count {
+        let base = i * 8;
+        let parents = <H as Hasher<F>>::two_to_one_quad([
+            (read_hash(children, base), read_hash(children, base + 4)),
+            (read_hash(children, base + 8), read_hash(children, base + 12)),
+            (read_hash(children, base + 16), read_hash(children, base + 20)),
+            (read_hash(children, base + 24), read_hash(children, base + 28)),
+        ]);
+        for (p, parent) in parents.into_iter().enumerate() {
+            write_hash(&mut parent_side[(i + p) * 4..(i + p) * 4 + 4], parent);
+        }
+        i += 4;
+    }
+    while i < parent_count {
+        let base = i * 8;
+        let parent = <H as Hasher<F>>::two_to_one(
+            read_hash(children, base),
+            read_hash(children, base + 4),
+        );
+        write_hash(&mut parent_side[i * 4..i * 4 + 4], parent);
+        i += 1;
+    }
+}
+
+fn finish_parent_ladder_cpu_suffix(
+    nodes: &mut [u64],
+    level_offsets: &mut Vec<usize>,
+    leaf_count: usize,
+    cap_height: usize,
+) {
+    let cap_count = 1usize << cap_height;
+    if level_offsets.is_empty() {
+        return;
+    }
+    let mut child_count = leaf_count >> (level_offsets.len() - 1);
+    let mut level_offset = *level_offsets.last().unwrap();
+    while child_count > cap_count {
+        debug_assert!(child_count.is_power_of_two());
+        let parent_count = child_count / 2;
+        let child_offset = level_offset;
+        level_offset += child_count * 4;
+        level_offsets.push(level_offset);
+        hash_parent_level_cpu(nodes, child_offset, level_offset, parent_count);
+        child_count = parent_count;
     }
 }
 
