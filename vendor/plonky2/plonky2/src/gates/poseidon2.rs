@@ -610,8 +610,16 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> SimpleGenerator<F
         debug_assert!(swap_value == F::ZERO || swap_value == F::ONE);
 
         let (deltas, do_swap) = swap_deltas(&state, swap_value);
-        for i in 0..4 {
-            out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), deltas[i])?;
+        // `WIRE_SWAP == 0` makes every delta identically zero. `PartitionWitness`
+        // already yields `F::ZERO` for unset representatives at `full_witness`
+        // (bitmap-guarded uninit slots), so the four `set_wire` stores are dead
+        // work on hashing-majority rows. ONE / non-Boolean arms still write.
+        // Witness-generator deletion of dead Poseidon2 wires, not the closed
+        // permutation-argument fixed-wire mask.
+        if swap_value != F::ZERO {
+            for i in 0..4 {
+                out_buffer.set_wire(local_wire(Poseidon2Gate::<F, D>::wire_delta(i)), deltas[i])?;
+            }
         }
 
         if do_swap {
@@ -1250,8 +1258,9 @@ mod tests {
     }
 
     /// End-to-end through the real generator: for each Boolean `WIRE_SWAP`
-    /// value, every `delta` and `output` wire the generator writes must equal
-    /// the reference permutation applied to the (conditionally swapped) inputs.
+    /// value, every `delta` and `output` wire must equal the reference
+    /// permutation applied to the (conditionally swapped) inputs.
+    /// Swap-zero deltas may be left unset; this test treats unset as `F::ZERO`.
     #[test]
     fn generated_deltas_and_outputs_for_both_swap_values() {
         const D: usize = 2;
@@ -1307,11 +1316,24 @@ mod tests {
             for i in 0..4 {
                 let expected =
                     swap_value * (permutation_inputs[i + 4] - permutation_inputs[i]);
-                let got = witness.get_wire(Wire {
-                    row,
-                    column: Gate::wire_delta(i),
-                });
+                let got = witness
+                    .try_get_wire(Wire {
+                        row,
+                        column: Gate::wire_delta(i),
+                    })
+                    .unwrap_or(F::ZERO);
                 assert_eq!(got.0, expected.0, "delta {i} for swap = {swap_value}");
+                if swap_value == F::ZERO {
+                    assert!(
+                        witness
+                            .try_get_wire(Wire {
+                                row,
+                                column: Gate::wire_delta(i),
+                            })
+                            .is_none(),
+                        "swap-zero delta {i} should stay unset"
+                    );
+                }
             }
             for i in 0..WIDTH {
                 let got = witness.get_wire(Wire {
