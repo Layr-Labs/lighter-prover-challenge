@@ -11,6 +11,7 @@ use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
 
 pub(crate) mod context_tree;
+pub mod deinterleave;
 pub(crate) mod partial_products;
 #[cfg(feature = "diagnostic_profile")]
 pub mod profile;
