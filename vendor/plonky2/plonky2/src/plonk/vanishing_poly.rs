@@ -876,35 +876,18 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         // partial-product traversal from the CPU without moving a transcript
         // barrier or changing an alpha exponent.
         assert_eq!(permutation_gate_scales.len(), num_challenges);
-        if num_challenges == 2 {
-            let alpha0 = alphas[0];
-            let alpha1 = alphas[1];
-            let gate_scale0 = permutation_gate_scales[0];
-            let gate_scale1 = permutation_gate_scales[1];
-            for k in 0..n {
-                let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-                let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-                let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
-                let idx = k * 2;
-                let val0 = res_out[idx];
-                let val1 = res_out[idx + 1];
-                res_out[idx] = z1_0 + z1_1 * alpha0 + val0 * gate_scale0;
-                res_out[idx + 1] = z1_0 + z1_1 * alpha1 + val1 * gate_scale1;
-            }
-        } else {
-            for k in 0..n {
-                let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
-                let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
-                let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
-                let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
-                for ((&alpha, &gate_scale), value) in alphas
-                    .iter()
-                    .zip(permutation_gate_scales)
-                    .zip(point.iter_mut())
-                {
-                    let gate_terms = *value * gate_scale;
-                    *value = z1_0 + z1_1 * alpha + gate_terms;
-                }
+        for k in 0..n {
+            let l_0_x = z_h_on_coset.eval_l_0(indices_batch[k], xs_batch[k]);
+            let z1_0 = l_0_x * zs_partial_products_cols[k].sub_one();
+            let z1_1 = l_0_x * zs_partial_products_cols[n + k].sub_one();
+            let point = &mut res_out[k * num_challenges..(k + 1) * num_challenges];
+            for ((&alpha, &gate_scale), value) in alphas
+                .iter()
+                .zip(permutation_gate_scales)
+                .zip(point.iter_mut())
+            {
+                let gate_terms = *value * gate_scale;
+                *value = z1_0 + z1_1 * alpha + gate_terms;
             }
         }
         return;

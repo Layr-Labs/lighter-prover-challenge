@@ -239,10 +239,7 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
 
         type GoldilocksExt2 = QuadraticExtension<GoldilocksField>;
         if TypeId::of::<F::Extension>() == TypeId::of::<GoldilocksExt2>() {
-            let folded_len = terms.len() / 16;
-            let mut folded: Vec<F::Extension> = Vec::with_capacity(folded_len);
-            // SAFETY: ext2_fri_fold_arity16_batch initializes every element below.
-            unsafe { folded.set_len(folded_len) };
+            let mut folded = vec![F::Extension::ZERO; terms.len() / 16];
             // SAFETY: TypeId equality proves all three element types exactly.
             let terms_ext2 = unsafe {
                 core::slice::from_raw_parts(

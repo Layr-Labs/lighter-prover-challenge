@@ -1341,6 +1341,18 @@ fn range_quotient_split_enabled() -> bool {
     *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT").is_some_and(|v| v == "0"))
 }
 
+/// `LIGHTER_LOW_RANGE_DEINTERLEAVE=0` restores the scalar stride-2 gather in
+/// [`extend_and_combine_low_range_quotient`]. Default on: the gather is
+/// value-identical `vld2q_u64` deinterleave of the interleaved `[c0,c1,...]`
+/// half-domain output, then the same IFFT/FFT pair as before.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn low_range_deinterleave_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_LOW_RANGE_DEINTERLEAVE").is_some_and(|v| v == "0")
+    })
+}
+
 /// Whether the wires commitment should retain its compact even-row companion
 /// for the half-domain quotient split: only where the split runs (Metal, no
 /// lookups, two challenges) and only for the pipelined 2^19-row LDE shapes
@@ -1768,50 +1780,51 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let src = &low[base..base + half_rows * 2];
-            let mut values: Vec<F> = Vec::with_capacity(half_rows);
-            unsafe { values.set_len(half_rows); }
-            if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+    let odd: Vec<Vec<F>> = if low_range_deinterleave_enabled() {
+        // One sequential pass over each gate's interleaved [c0,c1,...] block,
+        // then the same IFFT/FFT pair the scalar gather ran per challenge.
+        // Indexed collect keeps (g0c0, g0c1, g1c0, ...) so combine sees the
+        // identical column order. LIGHTER_LOW_RANGE_DEINTERLEAVE=0 is the
+        // gather below, in the same binary.
+        let per_gate: Vec<(Vec<F>, Vec<F>)> = (0..gates.len())
+            .into_par_iter()
+            .map(|g| {
+                let base = g * half_rows * 2;
+                let src = &low[base..base + half_rows * 2];
+                let mut c0 = Vec::<F>::with_capacity(half_rows);
+                let mut c1 = Vec::<F>::with_capacity(half_rows);
                 unsafe {
-                    use core::arch::aarch64::*;
-                    let mut src_base = src.as_ptr() as *const u64;
-                    let mut dst_ptr = values.as_mut_ptr() as *mut u64;
-                    let chunks = half_rows / 4;
-                    for _ in 0..chunks {
-                        let val = vld2q_u64(src_base);
-                        let val2 = vld2q_u64(src_base.add(4));
-                        if c == 0 {
-                            vst1q_u64(dst_ptr, val.0);
-                            vst1q_u64(dst_ptr.add(2), val2.0);
-                        } else {
-                            vst1q_u64(dst_ptr, val.1);
-                            vst1q_u64(dst_ptr.add(2), val2.1);
-                        }
-                        src_base = src_base.add(8);
-                        dst_ptr = dst_ptr.add(4);
-                    }
-                    let remainder = half_rows % 4;
-                    for i in 0..remainder {
-                        *dst_ptr.add(i) = *src_base.add(i * 2 + c);
-                    }
+                    c0.set_len(half_rows);
+                    c1.set_len(half_rows);
                 }
-            } else {
-                for (k, out) in values.iter_mut().enumerate() {
-                    *out = src[k * 2 + c];
-                }
-            }
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
+                crate::util::deinterleave::deinterleave_pairs(src, &mut c0, &mut c1);
+                let o0 = PolynomialValues::new(c0)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                let o1 = PolynomialValues::new(c1)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                (o0, o1)
+            })
+            .collect();
+        per_gate.into_iter().flat_map(|(a, b)| [a, b]).collect()
+    } else {
+        (0..gates.len() * 2)
+            .into_par_iter()
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values
+            })
+            .collect()
+    };
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(
@@ -3371,92 +3384,39 @@ fn compute_quotient_polys<
         // GPU accumulation pass and point-major scatter pass into one walk:
         // CPU quotient pages are now read once and never dirtied again.
         // validator population; this comment changes no executable behavior.
-        const MERGE_CHUNK_POINTS: usize = 512;
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let pos_vals = gpu_poseidon_values;
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let rng_vals = gpu_range_values;
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let rng_low_vals = gpu_range_low_values.as_deref();
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let perm_vals = gpu_permutation_values;
-
-        if num_challenges == 2 && column_ptrs.len() == 2 {
-            let col0 = &column_ptrs[0];
-            let col1 = &column_ptrs[1];
-            quotient_values
-                .par_chunks(MERGE_CHUNK_POINTS * 2)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base_point = chunk_idx * MERGE_CHUNK_POINTS;
-                    for (offset, cpu_pair) in chunk.chunks_exact(2).enumerate() {
-                        let i = base_point + offset;
-                        let denominator_inv = z_h_on_coset.eval_inverse(i);
-                        let start = i * 2;
-                        let mut v0 = cpu_pair[0];
-                        let mut v1 = cpu_pair[1];
-                        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                        {
-                            if let Some(values) = pos_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
-                            if let Some(values) = rng_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
-                            if let Some(values) = rng_low_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
-                            if let Some(values) = perm_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
+        quotient_values
+            .par_chunks_exact(num_challenges)
+            .enumerate()
+            .for_each(|(i, cpu_values)| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                let start = i * num_challenges;
+                for (challenge, (&cpu, column)) in
+                    cpu_values.iter().zip(column_ptrs).enumerate()
+                {
+                    let mut value = cpu;
+                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                    {
+                        if let Some(values) = gpu_poseidon_values {
+                            value += values[start + challenge];
                         }
-                        v0 = v0 * denominator_inv;
-                        v1 = v1 * denominator_inv;
-                        unsafe {
-                            *col0.0.add(i) = v0;
-                            *col1.0.add(i) = v1;
+                        if let Some(values) = gpu_range_values {
+                            value += values[start + challenge];
+                        }
+                        if let Some(values) = &gpu_range_low_values {
+                            value += values[start + challenge];
+                        }
+                        if let Some(values) = gpu_permutation_values {
+                            value += values[start + challenge];
                         }
                     }
-                });
-        } else {
-            quotient_values
-                .par_chunks(MERGE_CHUNK_POINTS * num_challenges)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base_point = chunk_idx * MERGE_CHUNK_POINTS;
-                    for (offset, cpu_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                        let i = base_point + offset;
-                        let denominator_inv = z_h_on_coset.eval_inverse(i);
-                        let start = i * num_challenges;
-                        for (challenge, (&cpu, column)) in
-                            cpu_values.iter().zip(column_ptrs).enumerate()
-                        {
-                            let mut value = cpu;
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                if let Some(values) = pos_vals {
-                                    value += values[start + challenge];
-                                }
-                                if let Some(values) = rng_vals {
-                                    value += values[start + challenge];
-                                }
-                                if let Some(values) = rng_low_vals {
-                                    value += values[start + challenge];
-                                }
-                                if let Some(values) = perm_vals {
-                                    value += values[start + challenge];
-                                }
-                            }
-                            let value = value * denominator_inv;
-                            unsafe { *column.0.add(i) = value };
-                        }
-                    }
-                });
-        }
+                    // Single `1/Z_H` scaling for the summed contributions; see
+                    // the deferral note at the batch loop above.
+                    let value = value * denominator_inv;
+                    // SAFETY: point `i` is owned by this parallel iteration,
+                    // and every (challenge, point) destination is written once.
+                    unsafe { *column.0.add(i) = value };
+                }
+            });
     } else {
         // CPU-only path: parallel scatter of the interleaved point-major
         // buffer into the per-challenge columns.
@@ -3765,6 +3725,30 @@ mod quotient_layout_tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn deinterleave_pairs_matches_strided_challenge_gather() {
+        let half = 1024usize;
+        let gates = 3usize;
+        let mut low = Vec::with_capacity(gates * half * 2);
+        for i in 0..gates * half * 2 {
+            low.push(F::from_canonical_u64(i as u64 * 13 + 7));
+        }
+        for g in 0..gates {
+            let base = g * half * 2;
+            let mut c0 = vec![F::ZERO; half];
+            let mut c1 = vec![F::ZERO; half];
+            crate::util::deinterleave::deinterleave_pairs(
+                &low[base..base + half * 2],
+                &mut c0,
+                &mut c1,
+            );
+            for k in 0..half {
+                assert_eq!(c0[k], low[base + k * 2], "g={g} k={k} c0");
+                assert_eq!(c1[k], low[base + k * 2 + 1], "g={g} k={k} c1");
+            }
+        }
+    }
 
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
