@@ -174,6 +174,9 @@ unsafe impl PackedField for WideGoldilocksField {
     const WIDTH: usize = 4;
     const ZEROS: Self = Self([NeonGoldilocksField::ZEROS; 2]);
     const ONES: Self = Self([NeonGoldilocksField::ONES; 2]);
+    // `NeonGoldilocksField::{add,mul}` delegates addition to the scalar implementation and its
+    // paired multiplication assembly reproduces scalar `reduce128` bit for bit.
+    const RAW_MUL_ADD_EQUIVALENT: bool = true;
 
     #[inline]
     fn from_slice(slice: &[Self::Scalar]) -> &Self {
@@ -352,6 +355,45 @@ mod tests {
         }
     }
 
+    /// Certification for `PackedField::RAW_MUL_ADD_EQUIVALENT`. Goldilocks `PartialEq`
+    /// canonicalises, so compare the stored limbs rather than field values.
+    #[test]
+    fn mul_add_match_scalar_raw_representatives() {
+        fn raw_lanes(value: WideGoldilocksField) -> [u64; 4] {
+            core::array::from_fn(|lane| value.as_slice()[lane].0)
+        }
+
+        let values = boundary_values();
+        for i in 0..values.len() {
+            for j in 0..values.len() {
+                let a: [GoldilocksField; 4] =
+                    core::array::from_fn(|lane| values[(i + 2 * lane) % values.len()]);
+                let b: [GoldilocksField; 4] =
+                    core::array::from_fn(|lane| values[(j + 3 * lane) % values.len()]);
+                let scalar = values[(i + j) % values.len()];
+                let packed_a = *WideGoldilocksField::from_slice(&a);
+                let packed_b = *WideGoldilocksField::from_slice(&b);
+
+                assert_eq!(
+                    raw_lanes(packed_a + packed_b),
+                    core::array::from_fn(|lane| (a[lane] + b[lane]).0),
+                );
+                assert_eq!(
+                    raw_lanes(packed_a * packed_b),
+                    core::array::from_fn(|lane| (a[lane] * b[lane]).0),
+                );
+                assert_eq!(
+                    raw_lanes(packed_a + scalar),
+                    core::array::from_fn(|lane| (a[lane] + scalar).0),
+                );
+                assert_eq!(
+                    raw_lanes(scalar * packed_a),
+                    core::array::from_fn(|lane| (scalar * a[lane]).0),
+                );
+            }
+        }
+    }
+
     #[test]
     fn fused_reduction_matches_scalar_boundary_products() {
         let values = boundary_values();
@@ -399,17 +441,18 @@ mod tests {
             GoldilocksField(s)
         };
 
-        let mut check = |acc: [GoldilocksField; 4],
-                         x: [GoldilocksField; 4],
-                         y: [GoldilocksField; 4]| {
-            let packed = WideGoldilocksField::from_slice(&acc)
-                .multiply_accumulate(*WideGoldilocksField::from_slice(&x), *WideGoldilocksField::from_slice(&y));
-            let got: [u64; 4] = core::array::from_fn(|lane| raw(packed.as_slice()[lane]));
-            let want: [u64; 4] = core::array::from_fn(|lane| {
-                raw(Field::multiply_accumulate(&acc[lane], x[lane], y[lane]))
-            });
-            assert_eq!(got, want, "acc={acc:?} x={x:?} y={y:?}");
-        };
+        let check =
+            |acc: [GoldilocksField; 4], x: [GoldilocksField; 4], y: [GoldilocksField; 4]| {
+                let packed = WideGoldilocksField::from_slice(&acc).multiply_accumulate(
+                    *WideGoldilocksField::from_slice(&x),
+                    *WideGoldilocksField::from_slice(&y),
+                );
+                let got: [u64; 4] = core::array::from_fn(|lane| raw(packed.as_slice()[lane]));
+                let want: [u64; 4] = core::array::from_fn(|lane| {
+                    raw(Field::multiply_accumulate(&acc[lane], x[lane], y[lane]))
+                });
+                assert_eq!(got, want, "acc={acc:?} x={x:?} y={y:?}");
+            };
 
         // Every boundary triple, rotated across lanes so each lane sees a
         // different combination (and therefore a different borrow/carry mix).

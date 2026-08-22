@@ -46,6 +46,11 @@ where
     const ZEROS: Self;
     const ONES: Self;
 
+    /// Whether lane-wise packed addition and multiplication, including scalar broadcasts, return
+    /// the same raw scalar representatives as the corresponding scalar operations. This is false
+    /// unless a backend explicitly certifies the stronger property than field-value equality.
+    const RAW_MUL_ADD_EQUIVALENT: bool = false;
+
     fn from_slice(slice: &[Self::Scalar]) -> &Self;
     fn from_slice_mut(slice: &mut [Self::Scalar]) -> &mut Self;
     fn as_slice(&self) -> &[Self::Scalar];
