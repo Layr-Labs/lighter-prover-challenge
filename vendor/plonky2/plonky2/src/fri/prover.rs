@@ -21,7 +21,7 @@ use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
-use crate::plonk::config::{GenericConfig, Hasher};
+use crate::plonk::config::{FriPowSearchResult, GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
 use crate::timed;
 use crate::util::timing::TimingTree;
@@ -466,6 +466,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
 
 const POW_LANES: usize = 4;
 const POW_QUAD_DISABLE_ENV: &str = "LIGHTER_DISABLE_POW_QUAD";
+const POW_METAL_DISABLE_ENV: &str = "LIGHTER_DISABLE_POW_METAL";
 
 /// The four-lane path is the delivery default. Only the exact diagnostic value
 /// `LIGHTER_DISABLE_POW_QUAD=1` selects the scalar control; missing, empty,
@@ -491,6 +492,30 @@ const fn pow_quad_enabled() -> bool {
     true
 }
 
+/// Metal search is opportunistic and default-on. Only the exact diagnostic
+/// value `LIGHTER_DISABLE_POW_METAL=1` bypasses it. Unsupported targets and a
+/// busy/unavailable backend return immediately to the unchanged CPU search.
+#[cfg(feature = "std")]
+#[inline]
+fn pow_metal_enabled_from_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn pow_metal_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        pow_metal_enabled_from_env_value(std::env::var_os(POW_METAL_DISABLE_ENV).as_deref())
+    })
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+const fn pow_metal_enabled() -> bool {
+    false
+}
+
 /// Returns the candidates in one four-lane PoW group and the number of active
 /// lanes. Inactive tail lanes repeat `start` and are never considered valid.
 ///
@@ -499,19 +524,81 @@ const fn pow_quad_enabled() -> bool {
 /// forming `max_candidate + 1`, which would overflow when the inclusive upper
 /// bound is `u64::MAX`.
 #[inline]
-fn pow_candidate_quad(quad_index: u64, max_candidate: u64) -> ([u64; POW_LANES], usize) {
-    debug_assert!(quad_index <= max_candidate / POW_LANES as u64);
-    let start = quad_index * POW_LANES as u64;
+fn pow_candidate_quad_from(
+    first_candidate: u64,
+    quad_index: u64,
+    max_candidate: u64,
+) -> ([u64; POW_LANES], usize) {
+    debug_assert!(first_candidate <= max_candidate);
+    debug_assert!(quad_index <= (max_candidate - first_candidate) / POW_LANES as u64);
+    let start = first_candidate + quad_index * POW_LANES as u64;
     let remaining = max_candidate - start;
     if remaining >= (POW_LANES - 1) as u64 {
         ([start, start + 1, start + 2, start + 3], POW_LANES)
     } else {
         let active_lanes = remaining as usize + 1;
         let mut candidates = [start; POW_LANES];
-        for (lane, candidate) in candidates.iter_mut().enumerate().take(active_lanes).skip(1) {
+        for (lane, candidate) in candidates
+            .iter_mut()
+            .enumerate()
+            .take(active_lanes)
+            .skip(1)
+        {
             *candidate = start + lane as u64;
         }
         (candidates, active_lanes)
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn pow_candidate_quad(quad_index: u64, max_candidate: u64) -> ([u64; POW_LANES], usize) {
+    pow_candidate_quad_from(0, quad_index, max_candidate)
+}
+
+fn fri_pow_cpu_search<F: RichField, H: Hasher<F>>(
+    duplex_intermediate_state: H::Permutation,
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+    first_candidate: u64,
+    max_candidate: u64,
+) -> Option<u64> {
+    if first_candidate > max_candidate {
+        return None;
+    }
+
+    if pow_quad_enabled() {
+        let quad_count = (max_candidate - first_candidate) / POW_LANES as u64 + 1;
+        (0..quad_count)
+            .into_par_iter()
+            .map(|quad_index| {
+                let (candidates, active_lanes) =
+                    pow_candidate_quad_from(first_candidate, quad_index, max_candidate);
+                let mut duplex_states = [duplex_intermediate_state; POW_LANES];
+                for (duplex_state, candidate) in duplex_states.iter_mut().zip(candidates) {
+                    duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                }
+                H::Permutation::permute_quad(&mut duplex_states);
+
+                (0..active_lanes).find_map(|lane| {
+                    let pow_response = duplex_states[lane].squeeze().iter().last().unwrap();
+                    let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                    (leading_zeros >= min_leading_zeros).then_some(candidates[lane])
+                })
+            })
+            .find_any(Option::is_some)
+            .flatten()
+    } else {
+        (first_candidate..=max_candidate)
+            .into_par_iter()
+            .find_any(|&candidate| {
+                let mut duplex_state = duplex_intermediate_state;
+                duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+                duplex_state.permute();
+                let pow_response = duplex_state.squeeze().iter().last().unwrap();
+                let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
+                leading_zeros >= min_leading_zeros
+            })
     }
 }
 
@@ -551,37 +638,53 @@ pub(crate) fn fri_proof_of_work<
     duplex_intermediate_state.set_from_slice(&challenger.input_buffer, 0);
 
     let max_candidate = F::NEG_ONE.to_canonical_u64();
-    let pow_witness = if pow_quad_enabled() {
-        (0..=max_candidate / POW_LANES as u64)
-            .into_par_iter()
-            .map(|quad_index| {
-                let (candidates, active_lanes) = pow_candidate_quad(quad_index, max_candidate);
-                let mut duplex_states = [duplex_intermediate_state; POW_LANES];
-                for (duplex_state, candidate) in duplex_states.iter_mut().zip(candidates) {
-                    duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-                }
-                <C::Hasher as Hasher<F>>::Permutation::permute_quad(&mut duplex_states);
-
-                (0..active_lanes).find_map(|lane| {
-                    let pow_response = duplex_states[lane].squeeze().iter().last().unwrap();
-                    let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-                    (leading_zeros >= min_leading_zeros).then_some(candidates[lane])
-                })
-            })
-            .find_any(Option::is_some)
-            .flatten()
+    let metal_result = if pow_metal_enabled() {
+        C::Hasher::try_find_fri_pow_witness(
+            duplex_intermediate_state,
+            witness_input_pos,
+            min_leading_zeros,
+            max_candidate,
+        )
     } else {
-        (0..=max_candidate).into_par_iter().find_any(|&candidate| {
-            let mut duplex_state = duplex_intermediate_state;
-            duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-            duplex_state.permute();
-            let pow_response = duplex_state.squeeze().iter().last().unwrap();
-            let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
-            leading_zeros >= min_leading_zeros
-        })
-    }
-    .map(F::from_canonical_u64)
-    .expect("Proof of work failed. This is highly unlikely!");
+        None
+    };
+    let pow_candidate = match metal_result {
+        Some(FriPowSearchResult::Found(candidate)) => {
+            #[cfg(feature = "diagnostic_profile")]
+            crate::util::profile::counter("fri_pow", "Found", 1);
+            let candidate = candidate.to_canonical_u64();
+            assert!(candidate <= max_candidate, "specialized PoW witness is out of range");
+            Some(candidate)
+        }
+        // Every smaller candidate was checked by the backend. A command error
+        // reports the start of its failed window, while busy/unsupported paths
+        // report `None` and therefore retain the exact zero-start CPU search.
+        Some(FriPowSearchResult::ResumeAt(first_candidate)) => {
+            #[cfg(feature = "diagnostic_profile")]
+            crate::util::profile::counter("fri_pow", "Resume", 1);
+            fri_pow_cpu_search::<F, C::Hasher>(
+                duplex_intermediate_state,
+                witness_input_pos,
+                min_leading_zeros,
+                first_candidate,
+                max_candidate,
+            )
+        }
+        None => {
+            #[cfg(feature = "diagnostic_profile")]
+            crate::util::profile::counter("fri_pow", "None", 1);
+            fri_pow_cpu_search::<F, C::Hasher>(
+                duplex_intermediate_state,
+                witness_input_pos,
+                min_leading_zeros,
+                0,
+                max_candidate,
+            )
+        }
+    };
+    let pow_witness = pow_candidate
+        .map(F::from_canonical_u64)
+        .expect("Proof of work failed. This is highly unlikely!");
 
     // Recompute pow_response using our normal Challenger code, and make sure it matches.
     challenger.observe_element(pow_witness);
@@ -655,7 +758,7 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::fri::reduction_strategies::FriReductionStrategy;
-    use crate::plonk::config::Poseidon2GoldilocksConfig;
+    use crate::plonk::config::{Poseidon2GoldilocksConfig, PoseidonGoldilocksConfig};
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
@@ -827,6 +930,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pow_candidate_quad_resumes_without_gaps_or_overflow() {
+        for (first_candidate, max_candidate) in [
+            (0, 0),
+            (3, 13),
+            (17, 37),
+            (u64::MAX - 10, u64::MAX),
+        ] {
+            let quad_count = (max_candidate - first_candidate) / POW_LANES as u64 + 1;
+            let actual = (0..quad_count)
+                .flat_map(|quad_index| {
+                    let (candidates, active_lanes) = pow_candidate_quad_from(
+                        first_candidate,
+                        quad_index,
+                        max_candidate,
+                    );
+                    candidates.into_iter().take(active_lanes)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                (first_candidate..=max_candidate).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_pow_fallback_honors_exact_resume_bound() {
+        type F = GoldilocksField;
+        type H = <Poseidon2GoldilocksConfig as GenericConfig<2>>::Hasher;
+        let state = <H as Hasher<F>>::Permutation::default();
+        for first_candidate in [0, 1, 17, F::NEG_ONE.to_canonical_u64()] {
+            assert_eq!(
+                fri_pow_cpu_search::<F, H>(state, 0, 0, first_candidate, first_candidate),
+                Some(first_candidate),
+            );
+        }
+        assert_eq!(fri_pow_cpu_search::<F, H>(state, 0, 0, 8, 7), None);
+    }
+
+    #[test]
+    fn unsupported_hasher_leaves_the_full_cpu_fallback_selected() {
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<2>>::F;
+        type H = <C as GenericConfig<2>>::Hasher;
+        assert_eq!(
+            H::try_find_fri_pow_witness(
+                <H as Hasher<F>>::Permutation::default(),
+                0,
+                0,
+                F::NEG_ONE.to_canonical_u64(),
+            ),
+            None,
+        );
+    }
+
     #[cfg(feature = "std")]
     #[test]
     fn pow_quad_is_default_on_and_only_exact_one_disables() {
@@ -837,6 +996,21 @@ mod tests {
         for value in ["", "0", "01", "true", " 1", "1 "] {
             assert!(
                 pow_quad_enabled_from_env_value(Some(OsStr::new(value))),
+                "unexpectedly disabled by {value:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn pow_metal_is_default_on_and_only_exact_one_disables() {
+        use std::ffi::OsStr;
+
+        assert!(pow_metal_enabled_from_env_value(None));
+        assert!(!pow_metal_enabled_from_env_value(Some(OsStr::new("1"))));
+        for value in ["", "0", "01", "true", " 1", "1 "] {
+            assert!(
+                pow_metal_enabled_from_env_value(Some(OsStr::new(value))),
                 "unexpectedly disabled by {value:?}"
             );
         }
