@@ -1341,12 +1341,32 @@ fn range_quotient_split_enabled() -> bool {
     *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT").is_some_and(|v| v == "0"))
 }
 
-/// Whether the wires commitment should retain its compact even-row companion
-/// for the half-domain quotient split: only where the split runs (Metal, no
-/// lookups, two challenges) and only for the pipelined 2^19-row LDE shapes
-/// where the quotient kernel dominates (`LIGHTER_QSPLIT_MIN_LDE_BITS`
-/// overrides the floor).
-fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
+/// Read the split quotient's even rows without an eager CPU companion.
+/// `LIGHTER_QSPLIT_DIRECT_EVEN=0` restores the legacy CPU-filled compact path.
+/// With direct-even enabled, the default GPU gather below creates a compact
+/// prefix just in time; disabling only the gather restores step-2 direct reads.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn range_quotient_direct_even_rows_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT_DIRECT_EVEN").is_some_and(|v| v == "0"))
+}
+
+/// Materialize the admitted low gates' wire prefix with one Metal dispatch,
+/// then consume it at `step = 1` in the same command buffer. Default on.
+/// `LIGHTER_QSPLIT_GPU_GATHER=0` is the same-binary direct-even rollback;
+/// combine it with `LIGHTER_QSPLIT_DIRECT_EVEN=0` for the legacy CPU companion.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn range_quotient_gpu_gather_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT_GPU_GATHER").is_some_and(|v| v == "0"))
+}
+
+/// Whether the half-domain split is useful for this circuit shape. Keep this
+/// independent of the row-storage choice: direct-even must preserve the same
+/// d16-only production admission the compact companion enforced implicitly.
+fn range_quotient_split_shape_wanted<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
 ) -> bool {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
@@ -1381,6 +1401,23 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
             && common_data.config.num_challenges == 2
             && lde_bits >= min_bits
             && lde_bits <= max_bits
+    }
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    {
+        let _ = common_data;
+        false
+    }
+}
+
+/// Whether the wires commitment should retain its compact even-row companion.
+/// The companion is only the rollback path; direct-even reads the same rows
+/// from the full retained columns without allocating the copy.
+fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
+    common_data: &CommonCircuitData<F, D>,
+) -> bool {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    {
+        range_quotient_split_shape_wanted(common_data) && !range_quotient_direct_even_rows_enabled()
     }
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     {
@@ -2366,32 +2403,30 @@ fn start_gpu_range_check_gate_quotient<
     // other row; the rest keep the full-domain filtered dispatch. Falls back
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
-    let even_wires = wires_commitment.even_columns.get();
-    if let (true, Some(even_wires)) = (
-        range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
-        even_wires,
-    ) {
-        // Circuit-fixed constants/sigmas live in a deserialized Metal store
-        // with no companion. Fill their compact even rows only after the
-        // wires/shape admission succeeds; all other paths have no consumer
-        // for this cache. The shader strides both buffers by `wires.rows`, so
-        // admitted constant readers still receive matching compact columns.
-        let even_constants = prover_data
-            .constants_sigmas_commitment
-            .even_columns
-            .get_or_fill_even_rows(constants);
-        // Without a constants companion, kinds that read gate constants
-        // stay on the full-domain dispatch (the kernel would otherwise
-        // index `col * half_rows + k` into a full-stride store).
-        let reads_constants = |kind: &U32QuotientKind| {
-            matches!(
-                kind,
-                U32QuotientKind::Equality { .. }
-                    | U32QuotientKind::BaseAddition { .. }
-                    | U32QuotientKind::RandomAccess { num_extra_constants: 1.., .. }
-            )
-        };
-        let split_constant_readers = even_constants.is_some();
+    let direct_even_rows = range_quotient_direct_even_rows_enabled();
+    let gpu_gather = direct_even_rows && range_quotient_gpu_gather_enabled();
+    let compact_even_wires = wires_commitment.even_columns.get();
+    if range_quotient_split_shape_wanted(common_data)
+        && quotient_rows % 2 == 0
+        && quotient_rows >= 4
+        && step == 1
+        && (direct_even_rows || compact_even_wires.is_some())
+    {
+        // The default path gathers only the low gates' used wire prefix on
+        // Metal immediately before quotient evaluation. The gather and compact
+        // step-1 reads share one command buffer. The first env rollback reads
+        // the full store at step 2; the second retains the legacy CPU companion.
+        let even_constants = (!direct_even_rows)
+            .then(|| {
+                prover_data
+                    .constants_sigmas_commitment
+                    .even_columns
+                    .get_or_fill_even_rows(constants)
+            })
+            .flatten();
+        // Constants keep their own physical stride and step, so every
+        // low-degree kind can read full-store even rows while gathered wires
+        // use compact step-1 rows. Legacy still uses its cached companion.
         let mut low_groups = Vec::new();
         let mut low_gates = Vec::new();
         let mut high_specs = Vec::new();
@@ -2413,7 +2448,7 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         for (spec, &degree) in u32_specs.iter().zip(&u32_spec_degrees) {
-            if degree <= 4 && (split_constant_readers || !reads_constants(&spec.kind)) {
+            if degree <= 4 {
                 let mut alone = spec.clone();
                 alone.group = spec.gate_index..spec.gate_index + 1;
                 alone.include_unused_selector = false;
@@ -2429,15 +2464,48 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         if !low_groups.is_empty() {
-            if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
-                even_wires,
-                even_constants.unwrap_or(constants),
-                quotient_rows / 2,
-                1,
-                &low_groups,
-                alphas,
-                alpha_offset,
-            ) {
+            let low = if gpu_gather {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi_gather_even(
+                    wires,
+                    constants,
+                    quotient_rows / 2,
+                    &low_groups,
+                    alphas,
+                    alpha_offset,
+                )
+                .or_else(|| {
+                    crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                        wires,
+                        constants,
+                        quotient_rows / 2,
+                        2,
+                        &low_groups,
+                        alphas,
+                        alpha_offset,
+                    )
+                })
+            } else if direct_even_rows {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                    wires,
+                    constants,
+                    quotient_rows / 2,
+                    2,
+                    &low_groups,
+                    alphas,
+                    alpha_offset,
+                )
+            } else {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                    compact_even_wires.expect("split admission checked compact wires"),
+                    even_constants.unwrap_or(constants),
+                    quotient_rows / 2,
+                    1,
+                    &low_groups,
+                    alphas,
+                    alpha_offset,
+                )
+            };
+            if let Some(low) = low {
                 let high = if high_specs.is_empty() && high_u32_specs.is_empty() {
                     None
                 } else {

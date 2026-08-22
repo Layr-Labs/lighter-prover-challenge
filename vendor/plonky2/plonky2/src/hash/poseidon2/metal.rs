@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "7ae0076668f5007f47177c3848b03e9d09657840ae127da7609fd3ba8b10b3d0";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -309,7 +309,7 @@ fn build_pipeline(
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -317,6 +317,7 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "ntt_prepare",
     "ntt_stage",
     "ifft_finalize",
+    "gather_even_columns",
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
     "permutation_quotient",
@@ -377,6 +378,7 @@ struct MetalShared {
     ntt_prepare_pipeline: ComputePipelineState,
     ntt_stage_pipeline: ComputePipelineState,
     ifft_finalize_pipeline: ComputePipelineState,
+    gather_even_pipeline: ComputePipelineState,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
     /// Small, nonblocking cache for completed gate-quotient output buffers.
@@ -423,6 +425,9 @@ pub(crate) struct RangeCheckGateQuotientJob<F> {
     output: Option<Buffer>,
     output_pool: Arc<Mutex<QuotientOutputPool>>,
     len: usize,
+    /// Keeps a just-in-time compact wire prefix out of the column pool until
+    /// the command buffer that gathers and consumes it has completed.
+    _gathered_wires: Option<MetalColumns<F>>,
     #[cfg(test)]
     failure_observer: Option<Arc<RangeQuotientFailureObserver>>,
     _job: GpuJobGuard,
@@ -2024,6 +2029,9 @@ struct RangeQuotientDispatchArgs {
     metadata: Vec<u32>,
     alpha_powers: Vec<u64>,
     alpha_stride: usize,
+    /// The kernels use gate-local layouts that all start at wire column zero.
+    /// Gathering this maximum prefix is sufficient for every metadata record.
+    wire_columns: usize,
 }
 
 fn range_quotient_shape_ok<F: RichField>(
@@ -2097,11 +2105,10 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
-    // The wires store may be a compact even-row copy. The kernel indexes
-    // both buffers with `lde_rows = wires.rows` (`col * wires.rows + row`).
-    // Constant-reading gates therefore require a matching even-row constants
-    // companion; selector-only / unfiltered gates tolerate a taller full
-    // store (`constants.rows >= wires.rows`) because they do not load it.
+    // The wires store may be a compact even-row copy (`step = 1`) or the
+    // retained full store sampled in place (`step = 2`). Constants have an
+    // independent physical stride/step, so a compact wire dispatch can safely
+    // read the retained full constants store at its even rows.
     if groups.is_empty()
         || F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
@@ -2131,11 +2138,94 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
         quotient_rows,
         step,
         &dispatches,
+        false,
     ) {
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!(
                 "Metal RangeCheck gate quotient (multi) unavailable; using CPU path: {error}"
+            );
+            None
+        }
+    }
+}
+
+/// Just-in-time compact twin of [`start_range_check_gate_quotient_multi`].
+/// `full_wires[j][2*k]` is gathered on Metal into a prefix-sized companion,
+/// then consumed with `step = 1` in the same command buffer. Groups must be
+/// unfiltered. Constants stay in their retained full store and use their own
+/// physical stride and step, so constant-reading gates need no second gather.
+pub(crate) fn start_range_check_gate_quotient_multi_gather_even<F: RichField>(
+    full_wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    groups: &[(Vec<RangeCheckQuotientSpec>, Vec<U32QuotientSpec>)],
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<RangeCheckGateQuotientJob<F>> {
+    let unfiltered = |selector: usize,
+                      gate: usize,
+                      group: &core::ops::Range<usize>,
+                      include_unused: bool| {
+        selector < constants.cols
+            && !include_unused
+            && group.start == gate
+            && group.end == gate.saturating_add(1)
+    };
+    if groups.is_empty()
+        || F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || alphas.len() != 2
+        || quotient_rows == 0
+        || quotient_rows.checked_mul(2) != Some(full_wires.rows)
+        || constants.rows < quotient_rows
+        || full_wires.rows > u32::MAX as usize
+        || quotient_rows > u32::MAX as usize
+        || groups.iter().any(|(specs, u32_specs)| {
+            specs.iter().any(|spec| {
+                !unfiltered(
+                    spec.selector_column,
+                    spec.gate_index,
+                    &spec.group,
+                    spec.include_unused_selector,
+                )
+            }) || u32_specs.iter().any(|spec| {
+                !unfiltered(
+                    spec.selector_column,
+                    spec.gate_index,
+                    &spec.group,
+                    spec.include_unused_selector,
+                )
+            })
+        })
+    {
+        return None;
+    }
+    let mut dispatches = Vec::with_capacity(groups.len());
+    for (specs, u32_specs) in groups {
+        let args = build_range_quotient_dispatch_args(
+            full_wires,
+            constants,
+            specs,
+            u32_specs,
+            alphas,
+            alpha_offset,
+        )?;
+        dispatches.push((args, specs.len(), u32_specs.len()));
+    }
+    let context = shared_context()?;
+    match context.start_range_check_gate_quotient_multi(
+        full_wires,
+        constants,
+        quotient_rows,
+        2,
+        &dispatches,
+        true,
+    ) {
+        Ok(job) => Some(job),
+        Err(error) => {
+            log::warn!(
+                "Metal RangeCheck even-row gather unavailable; using direct/CPU path: {error}"
             );
             None
         }
@@ -2164,6 +2254,7 @@ fn build_range_quotient_dispatch_args<F: RichField>(
     }
 
     let mut alpha_stride = 0usize;
+    let mut wire_columns = 0usize;
     let mut metadata = Vec::with_capacity(spec_count * SPEC_WORDS);
     for spec in specs {
         if spec.bit_size == 0 || spec.bit_size > 64 || spec.num_ops == 0 {
@@ -2184,6 +2275,7 @@ fn build_range_quotient_dispatch_args<F: RichField>(
         {
             return None;
         }
+        wire_columns = wire_columns.max(wire_count);
         alpha_stride = alpha_stride.max(num_constraints);
         metadata.extend([
             spec.selector_column as u32,
@@ -2397,6 +2489,7 @@ fn build_range_quotient_dispatch_args<F: RichField>(
         {
             return None;
         }
+        wire_columns = wire_columns.max(wire_count);
         alpha_stride = alpha_stride.max(num_constraints);
         metadata.extend([
             spec.selector_column as u32,
@@ -2433,6 +2526,7 @@ fn build_range_quotient_dispatch_args<F: RichField>(
         metadata,
         alpha_powers,
         alpha_stride,
+        wire_columns,
     })
 }
 
@@ -2962,17 +3056,17 @@ impl MetalShared {
             //
             //     range_check_gate_quotient   679 ms
             //     poseidon2_gate_quotient     601 ms
-            //     the six required kernels    491 ms and below
+            //     the six original required kernels  491 ms and below
             //
-            // Lowering all eight in parallel takes 886 ms against 474 ms for the
-            // six required ones, because the two extra kernels both raise the
-            // maximum and add contention on MTLCompilerService. Building them
-            // off the blocking path instead leaves the context ready in 838 ms
+            // Lowering all eight measured kernels in parallel took 886 ms against
+            // 474 ms for the six original required ones, because the two gate
+            // kernels both raise the maximum and add compiler-service contention.
+            // Building them off the blocking path instead leaves the context ready in 838 ms
             // rather than 1270 ms, and they land shortly after, long before the
             // first quotient evaluation of a proof asks for them.
             //
-            // Started below, once the required six have finished, so they do not
-            // simply move their MTLCompilerService contention onto the path they
+            // Started below, once the blocking pipelines have finished, so they do
+            // not simply move their MTLCompilerService contention onto the path they
             // are being taken off.
             let (
                 leaf_pipeline,
@@ -2981,6 +3075,7 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
+                gather_even_pipeline,
             ) = std::thread::scope(|scope| {
                 let leaf = scope.spawn(required("poseidon2_hash_leaves", "leaf"));
                 let leaf_colmajor =
@@ -2989,6 +3084,7 @@ impl MetalShared {
                 let ntt_prepare = scope.spawn(required("ntt_prepare", "ntt prepare"));
                 let ntt_stage = scope.spawn(required("ntt_stage", "ntt stage"));
                 let ifft_finalize = scope.spawn(required("ifft_finalize", "ifft finalize"));
+                let gather_even = scope.spawn(required("gather_even_columns", "even-row gather"));
                 // A panic inside a pipeline build is a bug, not a runtime
                 // condition; propagate it rather than papering over it.
                 (
@@ -3006,6 +3102,9 @@ impl MetalShared {
                     ifft_finalize
                         .join()
                         .expect("ifft finalize pipeline thread panicked"),
+                    gather_even
+                        .join()
+                        .expect("even-row gather pipeline thread panicked"),
                 )
             });
             // Everything the context blocks on is now built; the four optional
@@ -3028,6 +3127,7 @@ impl MetalShared {
             let ntt_prepare_pipeline = ntt_prepare_pipeline?;
             let ntt_stage_pipeline = ntt_stage_pipeline?;
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
+            let gather_even_pipeline = gather_even_pipeline?;
 
             spawn_optional_pipelines(&device, &library, archive.as_ref());
 
@@ -3051,6 +3151,7 @@ impl MetalShared {
                 ntt_prepare_pipeline,
                 ntt_stage_pipeline,
                 ifft_finalize_pipeline,
+                gather_even_pipeline,
                 parameters,
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
@@ -3216,6 +3317,8 @@ impl MetalShared {
             set_u32(encoder, 8, alpha_stride as u32);
             set_u32(encoder, 9, range_count as u32);
             set_u32(encoder, 10, u32_count as u32);
+            set_u32(encoder, 11, constants.rows as u32);
+            set_u32(encoder, 12, step as u32);
             dispatch(encoder, pipeline, quotient_rows);
             encoder.end_encoding();
             #[cfg(feature = "diagnostic_profile")]
@@ -3242,6 +3345,7 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
+            _gathered_wires: None,
             #[cfg(test)]
             failure_observer,
             _job: job_guard,
@@ -3254,6 +3358,13 @@ impl MetalShared {
     /// `[k * quotient_rows, (k + 1) * quotient_rows)` (point-major, two
     /// challenge words per row) of one shared output buffer. All dispatches
     /// are encoded in one command buffer, so `finish` waits once.
+    ///
+    /// With `gather_even`, `wires` is the full store and `step == 2`. A first
+    /// compute encoder gathers only the wire-column prefix the dispatches use
+    /// into a half-height store. A second encoder consumes it with `step == 1`.
+    /// Encoder order within one command buffer is the dependency: no CPU wait
+    /// is needed, and a gather failure is reported by the same `finish` that
+    /// guards the quotient output.
     fn start_range_check_gate_quotient_multi<F: RichField>(
         &self,
         wires: &MetalColumns<F>,
@@ -3261,16 +3372,38 @@ impl MetalShared {
         quotient_rows: usize,
         step: usize,
         dispatches: &[(RangeQuotientDispatchArgs, usize, usize)],
+        gather_even: bool,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
+        let mut gather_columns = 0usize;
         for (args, range_count, u32_count) in dispatches {
             if args.metadata.len() != (range_count + u32_count) * 10
                 || args.alpha_powers.len() != args.alpha_stride * 2
+                || args.wire_columns == 0
+                || args.wire_columns > wires.cols
             {
                 return Err("invalid RangeCheck quotient metadata".to_string());
             }
+            gather_columns = gather_columns.max(args.wire_columns);
         }
+        if constants.rows % quotient_rows != 0 {
+            return Err("invalid RangeCheck constant stride".to_string());
+        }
+        let constant_step = constants.rows / quotient_rows;
+        if constant_step == 0 || constant_step > u32::MAX as usize {
+            return Err("invalid RangeCheck constant step".to_string());
+        }
+        let gathered_wires = if gather_even {
+            if step != 2 || quotient_rows.checked_mul(2) != Some(wires.rows) {
+                return Err("invalid even-row gather shape".to_string());
+            }
+            Some(self.allocate_columns(quotient_rows, gather_columns)?)
+        } else {
+            None
+        };
+        let low_wires = gathered_wires.as_ref().unwrap_or(wires);
+        let low_step = if gather_even { 1 } else { step };
         let slice_len = quotient_rows
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
@@ -3285,13 +3418,36 @@ impl MetalShared {
         let job_guard = GpuJobGuard::begin();
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
+            if let Some(gathered) = &gathered_wires {
+                let gather_encoder = command_buffer.new_compute_command_encoder();
+                gather_encoder.set_compute_pipeline_state(&self.gather_even_pipeline);
+                gather_encoder.set_buffer(0, Some(&wires.buffer), 0);
+                gather_encoder.set_buffer(1, Some(&gathered.buffer), 0);
+                set_u32(gather_encoder, 2, wires.rows as u32);
+                set_u32(gather_encoder, 3, quotient_rows as u32);
+                set_u32(gather_encoder, 4, gather_columns as u32);
+                dispatch2d(
+                    gather_encoder,
+                    &self.gather_even_pipeline,
+                    quotient_rows,
+                    gather_columns,
+                );
+                gather_encoder.end_encoding();
+            }
+
+            // A distinct encoder gives Metal an explicit tracked-resource
+            // boundary between the gathered writes and quotient reads. Both
+            // encoders are in this command buffer, so submission cannot be
+            // interleaved and completion covers the whole dependency chain.
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
+            encoder.set_buffer(0, Some(&low_wires.buffer), 0);
             encoder.set_buffer(1, Some(&constants.buffer), 0);
-            set_u32(encoder, 5, wires.rows as u32);
+            set_u32(encoder, 5, low_wires.rows as u32);
             set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
+            set_u32(encoder, 7, low_step as u32);
+            set_u32(encoder, 11, constants.rows as u32);
+            set_u32(encoder, 12, constant_step as u32);
             for (k, (args, range_count, u32_count)) in dispatches.iter().enumerate() {
                 encoder.set_buffer(2, Some(&output), (k * slice_bytes) as NSUInteger);
                 encoder.set_bytes(
@@ -3313,7 +3469,11 @@ impl MetalShared {
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
                 command_buffer,
-                "range_u32_quotient_split",
+                if gather_even {
+                    "range_u32_quotient_split_gather"
+                } else {
+                    "range_u32_quotient_split"
+                },
                 (quotient_rows * dispatches.len()) as u64,
             );
             command_buffer.commit();
@@ -3326,6 +3486,7 @@ impl MetalShared {
             output: Some(output),
             output_pool: Arc::clone(&self.quotient_output_pool),
             len,
+            _gathered_wires: gathered_wires,
             #[cfg(test)]
             failure_observer,
             _job: job_guard,
@@ -4660,7 +4821,11 @@ mod tests {
                 "permutation_quotient",
                 &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             ),
-            ("range_check_gate_quotient", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            ("gather_even_columns", &[0, 1, 2, 3, 4]),
+            (
+                "range_check_gate_quotient",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            ),
             ("poseidon2_hash_leaves", &[0, 1, 2, 3, 4]),
             ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
             ("ntt_stage", &[0, 1, 2, 3, 4]),
@@ -4722,7 +4887,7 @@ mod tests {
             regions += 1;
         }
         assert_eq!(
-            regions, 19,
+            regions, 20,
             "the number of production dispatch sites changed; each one is audited \
              above, so update this count deliberately rather than by reflex."
         );
@@ -4968,6 +5133,7 @@ mod tests {
             output: Some(completed_output),
             output_pool: Arc::clone(&pool),
             len: 8,
+            _gathered_wires: None,
             failure_observer: None,
             _job: GpuJobGuard::begin(),
             _phantom: PhantomData,
@@ -5480,6 +5646,171 @@ mod tests {
                     actual.to_canonical_u64(),
                     expected.to_canonical_u64(),
                     "RangeCheck gate quotient mismatch at word {i}, step {step}"
+                );
+            }
+        }
+    }
+
+    /// Compare every raw word across the three same-binary split inputs:
+    /// direct step-2 reads, the legacy CPU companion, and the fused Metal
+    /// gather + step-1 path. All three cover a gate-local constant load; the
+    /// gather path also verifies its prefix-sized wire payload.
+    #[test]
+    fn metal_range_multi_gather_direct_and_compact_match_raw() {
+        type F = GoldilocksField;
+        const FULL_ROWS: usize = 128;
+        const HALF_ROWS: usize = FULL_ROWS / 2;
+        const WIRE_COLUMNS: usize = 40;
+        const CONSTANT_COLUMNS: usize = 4;
+
+        let context = shared_context().expect("Metal context must initialize");
+        let mut full_wires = context
+            .allocate_columns::<F>(FULL_ROWS, WIRE_COLUMNS)
+            .expect("full wire columns must allocate");
+        let mut full_constants = context
+            .allocate_columns::<F>(FULL_ROWS, CONSTANT_COLUMNS)
+            .expect("full constant columns must allocate");
+        let mut rng = StdRng::seed_from_u64(0xd1ec_7e2e_0000_0002);
+        for column in full_wires.columns_mut().expect("unique full wires") {
+            for value in column {
+                *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            }
+        }
+        for column in full_constants
+            .columns_mut()
+            .expect("unique full constants")
+        {
+            for value in column {
+                *value = F::from_canonical_u64(rng.next_u64() % F::ORDER);
+            }
+        }
+
+        let mut compact_wires = context
+            .allocate_columns::<F>(HALF_ROWS, WIRE_COLUMNS)
+            .expect("compact wire columns must allocate");
+        for (column, destination) in compact_wires
+            .columns_mut()
+            .expect("unique compact wires")
+            .into_iter()
+            .enumerate()
+        {
+            let source = full_wires.col(column);
+            for (k, value) in destination.iter_mut().enumerate() {
+                *value = source[2 * k];
+            }
+        }
+        let mut compact_constants = context
+            .allocate_columns::<F>(HALF_ROWS, CONSTANT_COLUMNS)
+            .expect("compact constant columns must allocate");
+        for (column, destination) in compact_constants
+            .columns_mut()
+            .expect("unique compact constants")
+            .into_iter()
+            .enumerate()
+        {
+            let source = full_constants.col(column);
+            for (k, value) in destination.iter_mut().enumerate() {
+                *value = source[2 * k];
+            }
+        }
+
+        let groups = vec![
+            (
+                vec![RangeCheckQuotientSpec {
+                    selector_column: 0,
+                    gate_index: 3,
+                    group: 3..4,
+                    include_unused_selector: false,
+                    num_ops: 4,
+                    bit_size: 16,
+                }],
+                Vec::new(),
+            ),
+            (
+                Vec::new(),
+                vec![U32QuotientSpec {
+                    selector_column: 1,
+                    gate_index: 7,
+                    group: 7..8,
+                    include_unused_selector: false,
+                    num_ops: 4,
+                    kind: U32QuotientKind::Equality { constant_column: 2 },
+                }],
+            ),
+        ];
+        let alphas = [F::from_canonical_u64(7), F::from_canonical_u64(11)];
+        let direct_job = start_range_check_gate_quotient_multi(
+            &full_wires,
+            &full_constants,
+            HALF_ROWS,
+            2,
+            &groups,
+            &alphas,
+            13,
+        )
+        .expect("direct-even multi job must start");
+        let direct = direct_job
+            .finish()
+            .expect("direct-even multi job must finish");
+        let compact_job = start_range_check_gate_quotient_multi(
+            &compact_wires,
+            &compact_constants,
+            HALF_ROWS,
+            1,
+            &groups,
+            &alphas,
+            13,
+        )
+        .expect("compact multi job must start");
+        let compact = compact_job
+            .finish()
+            .expect("compact multi job must finish");
+        let gathered_job = start_range_check_gate_quotient_multi_gather_even(
+            &full_wires,
+            &full_constants,
+            HALF_ROWS,
+            &groups,
+            &alphas,
+            13,
+        )
+        .expect("fused even-row gather job must start");
+        let gathered_wires = gathered_job
+            ._gathered_wires
+            .as_ref()
+            .expect("gather job must retain its compact wires");
+        assert_eq!(gathered_wires.rows(), HALF_ROWS);
+        assert_eq!(gathered_wires.cols(), 4 * (1 + 16usize.div_ceil(2)));
+        let gathered = gathered_job
+            .finish()
+            .expect("fused even-row gather job must finish");
+
+        assert_eq!(direct.len(), compact.len());
+        for (i, (&direct, &compact)) in direct.iter().zip(compact.iter()).enumerate() {
+            assert_eq!(
+                direct.to_canonical_u64(),
+                compact.to_canonical_u64(),
+                "direct-even and compact multi outputs differ at word {i}",
+            );
+        }
+        assert_eq!(gathered.len(), direct.len());
+        for (i, (&gathered, &direct)) in gathered.iter().zip(direct).enumerate() {
+            assert_eq!(
+                gathered.to_canonical_u64(),
+                direct.to_canonical_u64(),
+                "Metal-gather and direct-even outputs differ at word {i}",
+            );
+        }
+        for column in 0..gathered_wires.cols() {
+            for (row, (&gathered, &legacy)) in gathered_wires
+                .col(column)
+                .iter()
+                .zip(compact_wires.col(column))
+                .enumerate()
+            {
+                assert_eq!(
+                    gathered.to_canonical_u64(),
+                    legacy.to_canonical_u64(),
+                    "Metal and CPU companions differ at column {column}, row {row}",
                 );
             }
         }

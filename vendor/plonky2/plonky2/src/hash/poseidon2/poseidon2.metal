@@ -870,6 +870,25 @@ inline ulong random_access_select_8(
     return items[0];
 }
 
+// Materialize the even rows of a column-major store once so the much
+// heavier split quotient can read compact, contiguous columns. The host only
+// gathers the wire prefix referenced by the admitted low-degree gates.
+kernel void gather_even_columns(
+    const device ulong* full [[buffer(0)]],
+    device ulong* even [[buffer(1)]],
+    constant uint& full_rows [[buffer(2)]],
+    constant uint& half_rows [[buffer(3)]],
+    constant uint& column_count [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    uint row = gid.x;
+    uint column = gid.y;
+    if (row >= half_rows || column >= column_count) {
+        return;
+    }
+    even[(ulong)column * half_rows + row] =
+        full[(ulong)column * full_rows + (ulong)row * 2UL];
+}
+
 kernel void range_check_gate_quotient(
     const device ulong* wires [[buffer(0)]],
     const device ulong* constants [[buffer(1)]],
@@ -882,12 +901,15 @@ kernel void range_check_gate_quotient(
     constant uint& alpha_stride [[buffer(8)]],
     constant uint& range_count [[buffer(9)]],
     constant uint& u32_count [[buffer(10)]],
+    constant uint& constant_lde_rows [[buffer(11)]],
+    constant uint& constant_step [[buffer(12)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= quotient_rows) {
         return;
     }
 
     uint source_row = gid * step;
+    uint constant_source_row = gid * constant_step;
     ulong total[2] = { 0, 0 };
     for (uint range_index = 0; range_index < range_count; ++range_index) {
         constant uint* spec = metadata + range_index * 10u;
@@ -900,7 +922,7 @@ kernel void range_check_gate_quotient(
         uint num_aux = spec[6];
         uint final_limb_range = spec[7];
 
-        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
+        ulong selector = constants[(ulong)selector_column * constant_lde_rows + constant_source_row];
         ulong filter = 1;
         for (uint i = group_start; i < group_end; ++i) {
             if (i != gate_index) {
@@ -974,7 +996,7 @@ kernel void range_check_gate_quotient(
         // Overflow weight of the recomposed word: 2^16, 2^32 or 2^48.
         ulong word_base = 1UL << (2u * result_limbs);
 
-        ulong selector = constants[(ulong)selector_column * lde_rows + source_row];
+        ulong selector = constants[(ulong)selector_column * constant_lde_rows + constant_source_row];
         ulong filter = 1;
         for (uint i = group_start; i < group_end; ++i) {
             if (i != gate_index) {
@@ -1421,7 +1443,7 @@ kernel void range_check_gate_quotient(
             // Raw local constants follow all gate and lookup selectors.
             for (uint i = 0; i < num_extra_constants; ++i) {
                 ulong local_constant = constants[
-                    ((ulong)constant_base + i) * lde_rows + source_row];
+                    ((ulong)constant_base + i) * constant_lde_rows + constant_source_row];
                 ulong extra_wire = wires[
                     (extra_wire_base + i) * lde_rows + source_row];
                 range_check_gate_emit(
@@ -1472,7 +1494,7 @@ kernel void range_check_gate_quotient(
             // The addend slot carries the constants column holding the gate's
             // first constant, its "one" value.
             uint constant_column = num_addends;
-            ulong const_0 = constants[(ulong)constant_column * lde_rows + source_row];
+            ulong const_0 = constants[(ulong)constant_column * constant_lde_rows + constant_source_row];
             for (uint op = 0; op < num_ops; ++op) {
                 ulong routed_base = (ulong)op * 3u;
                 ulong x = wires[(routed_base + 0u) * lde_rows + source_row];
@@ -1552,8 +1574,8 @@ kernel void range_check_gate_quotient(
             // The addend-count slot carries the first of its two raw constant
             // columns, immediately after the selector prefix.
             uint constant_base = num_addends;
-            ulong const_0 = constants[(ulong)constant_base * lde_rows + source_row];
-            ulong const_1 = constants[((ulong)constant_base + 1u) * lde_rows + source_row];
+            ulong const_0 = constants[(ulong)constant_base * constant_lde_rows + constant_source_row];
+            ulong const_1 = constants[((ulong)constant_base + 1u) * constant_lde_rows + constant_source_row];
             for (uint op = 0; op < num_ops; ++op) {
                 ulong wire_base = (ulong)op * 3u;
                 ulong addend_0 = wires[(wire_base + 0u) * lde_rows + source_row];
