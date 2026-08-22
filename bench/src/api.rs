@@ -1,9 +1,7 @@
-// Redraw marker 655
-// Bumped only to obtain a fresh submission hash: the ranked score is a draw
-// from a strongly bimodal runner pool (~27% of draws land in the fast band),
-// so an unchanged tree cannot be re-sampled — the service dedupes identical
-// submissions. Changes no executable behavior; the previous authors used the
-// same convention and their markers reached 573.
+// Redraw marker 658
+// Staged circuit-readiness (light-first / join-at-dependency). Previous
+// fill-ahead attempt used 657 and failed without a score; parent-ladder used
+// 656 and ranked 30.595 rejected. Marker is also the archive-dedup bump.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

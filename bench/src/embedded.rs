@@ -21,7 +21,7 @@ use circuit::embed::deserialize_embedded;
 use circuit::types::config::{C, D, F};
 use plonky2::plonk::circuit_data::CircuitData;
 
-use crate::api::{Circuits, Proof};
+use crate::api::{Circuits, HEAVY_TX_MODE, HEAVY_TX_PER_PROOF, PathCircuits, Proof};
 
 static PRE_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pre.embed"));
 static HEAVY_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy_tx.embed"));
@@ -29,9 +29,43 @@ static HEAVY_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/heavy
 static LIGHT_TX_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_tx.embed"));
 static LIGHT_CHAIN_BLOB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/light_chain.embed"));
 
+/// Light transaction + chain blobs. The scored startup path loads this pair
+/// first and starts the light proving pipeline as soon as it is ready; the
+/// heavy pair is independent and joins only at its consumers.
+pub(crate) struct LightEmbeddedCircuits {
+    pub(crate) light_tx: (BlockTxTarget, CircuitData<F, C, D>),
+    pub(crate) light_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    pub(crate) dummy_light_proof: Proof,
+}
+
+/// Heavy transaction + chain blobs. Loaded *after* the light pair so their
+/// GPU `constants_sigmas` rebuild overlaps light proving rather than sitting
+/// on the all-four aggregate join that used to gate the whole pipeline.
+pub(crate) struct HeavyEmbeddedCircuits {
+    pub(crate) heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
+    pub(crate) heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
+    pub(crate) dummy_heavy_proof: Proof,
+}
+
+impl HeavyEmbeddedCircuits {
+    /// Build-from-scratch fallback used only when the embedded heavy blobs
+    /// fail after the light pair has already been consumed. Matches the
+    /// historical `Circuits::load` heavy half.
+    pub(crate) fn from_build() -> Self {
+        let path = PathCircuits::new(HEAVY_TX_PER_PROOF, HEAVY_TX_MODE);
+        Self {
+            heavy_tx: (path.tx_target, path.tx_data),
+            heavy_chain: (path.chain_target, path.chain_data),
+            dummy_heavy_proof: path.dummy_proof,
+        }
+    }
+}
+
 /// The four startup circuits that do not participate in pre-execution. Keeping
 /// this separate lets the worker start the pre-execution proof from its already
-/// decoded circuit while these independent blobs load in parallel.
+/// decoded circuit while these independent blobs load in parallel. The scored
+/// path no longer waits on this aggregate; [`Circuits::from_embedded`] and the
+/// build-fallback still use it.
 pub(crate) struct RemainingEmbeddedCircuits {
     heavy_tx: (BlockTxTarget, CircuitData<F, C, D>),
     heavy_chain: (BlockTxChainTarget, CircuitData<F, C, D>),
@@ -88,41 +122,58 @@ impl Circuits {
         load_blob::<BlockPreExecutionTarget>("pre", PRE_BLOB)
     }
 
-    /// Loads every embedded circuit except pre-execution. This is public to
-    /// the worker startup path only; normal callers should keep using
-    /// [`Self::load`].
-    pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingEmbeddedCircuits> {
-        let (heavy, light) = rayon::join(
-            || {
-                rayon::join(
-                    || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
-                )
-            },
-            || {
-                rayon::join(
-                    || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
-                    || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
-                )
-            },
+    /// Loads the light transaction and chain blobs (and the light dummy
+    /// proof). The scored worker joins this pair before starting the light
+    /// proving pipeline; it does *not* wait for the heavy pair.
+    pub(crate) fn load_light_embedded() -> anyhow::Result<LightEmbeddedCircuits> {
+        let (light_tx, light_chain) = rayon::join(
+            || load_blob::<BlockTxTarget>("light_tx", LIGHT_TX_BLOB),
+            || load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB),
         );
-        let (heavy_tx, heavy_chain) = (heavy.0?, heavy.1?);
-        let (light_tx, light_chain) = (light.0?, light.1?);
-
-        let dummy_heavy_proof: Proof =
-            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
-                .expect("embedded heavy chain dummy proof is invalid");
         let dummy_light_proof: Proof =
             bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
                 .expect("embedded light chain dummy proof is invalid");
-
-        Ok(RemainingEmbeddedCircuits {
-            heavy_tx,
-            heavy_chain,
-            light_tx,
-            light_chain,
-            dummy_heavy_proof,
+        Ok(LightEmbeddedCircuits {
+            light_tx: light_tx?,
+            light_chain: light_chain?,
             dummy_light_proof,
+        })
+    }
+
+    /// Loads the heavy transaction and chain blobs (and the heavy dummy
+    /// proof). The scored worker starts this only after the light pair is
+    /// ready, so the GPU commitment rebuild overlaps light proving.
+    pub(crate) fn load_heavy_embedded() -> anyhow::Result<HeavyEmbeddedCircuits> {
+        let (heavy_tx, heavy_chain) = rayon::join(
+            || load_blob::<BlockTxTarget>("heavy_tx", HEAVY_TX_BLOB),
+            || load_blob::<BlockTxChainTarget>("heavy_chain", HEAVY_CHAIN_BLOB),
+        );
+        let dummy_heavy_proof: Proof =
+            bincode::deserialize(include_bytes!("../dummy-heavy-chain-proof.bin"))
+                .expect("embedded heavy chain dummy proof is invalid");
+        Ok(HeavyEmbeddedCircuits {
+            heavy_tx: heavy_tx?,
+            heavy_chain: heavy_chain?,
+            dummy_heavy_proof,
+        })
+    }
+
+    /// Loads every embedded circuit except pre-execution. Used by
+    /// [`Self::from_embedded`] (value-equality / fallback) which still wants
+    /// the four blobs in parallel. The scored worker uses
+    /// [`Self::load_light_embedded`] then [`Self::load_heavy_embedded`]
+    /// staged instead.
+    pub(crate) fn load_remaining_embedded() -> anyhow::Result<RemainingEmbeddedCircuits> {
+        let (heavy, light) = rayon::join(Self::load_heavy_embedded, Self::load_light_embedded);
+        let heavy = heavy?;
+        let light = light?;
+        Ok(RemainingEmbeddedCircuits {
+            heavy_tx: heavy.heavy_tx,
+            heavy_chain: heavy.heavy_chain,
+            light_tx: light.light_tx,
+            light_chain: light.light_chain,
+            dummy_heavy_proof: heavy.dummy_heavy_proof,
+            dummy_light_proof: light.dummy_light_proof,
         })
     }
 
@@ -236,8 +287,7 @@ mod tests {
             "{name}: sigmas[777] diverges"
         );
         assert!(
-            rebuilt_data.prover_only.generators.len()
-                == embedded_data.prover_only.generators.len(),
+            rebuilt_data.prover_only.generators.len() == embedded_data.prover_only.generators.len(),
             "{name}: generator count diverges"
         );
         for index in [0, 1000, rebuilt_data.prover_only.generators.len() - 1] {

@@ -18,8 +18,8 @@ use api::{
     Circuits, HEAVY_TX_PER_PROOF, LIGHT_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES,
     PUBLIC_HEAVY_TX_COUNT, PUBLIC_LIGHT_TX_COUNT,
 };
-use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::block::Block;
+use circuit::block_pre_execution_constraints::Circuit as _;
 use circuit::types::config::{C, F};
 use plonky2::fri::oracle::PolynomialBatch;
 
@@ -116,7 +116,9 @@ fn main() {
             match Circuits::load_pre() {
                 Ok(loaded) => loaded,
                 Err(error) => {
-                    log::warn!("embedded pre circuit unavailable ({error:#}); building from scratch");
+                    log::warn!(
+                        "embedded pre circuit unavailable ({error:#}); building from scratch"
+                    );
                     let pre =
                         circuit::block_pre_execution_constraints::BlockPreExecutionCircuit::define(
                             circuit::types::config::CIRCUIT_CONFIG,
@@ -127,18 +129,20 @@ fn main() {
         },
     );
     // The pre-execution witness is pure block-derived data (no circuit
-    // dependency), and the remaining four circuit blobs take ~5x longer to
-    // load than it takes to compute. Load the blobs on a scoped thread while
-    // the main thread derives the pre-execution witness, then start the pre
-    // proof the moment its witness exists — the pre proof runs underneath the
-    // tail of the blob loads instead of waiting for them to finish first.
+    // dependency). Historically the remaining four circuit blobs all joined
+    // before the tx/chain pipeline, even though the 49-chunk light path only
+    // needs the light pair and is the run's terminal constraint. Load the
+    // LIGHT pair on a scoped thread while the main thread derives the
+    // pre-execution witness, then start the pre proof the moment its witness
+    // exists. Join the light pair (not the heavy pair) with the pre proof,
+    // start light proving, and overlap HEAVY loads with that pipeline.
     // Value-exact: no quantity is computed differently, only in parallel.
-    let (pre_handle, remaining) = std::thread::scope(|scope| {
-        let remaining_handle = scope.spawn(|| {
+    let (pre_handle, light) = std::thread::scope(|scope| {
+        let light_handle = scope.spawn(|| {
             #[cfg(feature = "diagnostic_profile")]
-            let _span = plonky2::util::profile::span("startup", "remaining_circuit_loads");
+            let _span = plonky2::util::profile::span("startup", "light_circuit_loads");
             (!std::env::var_os("LIGHTER_BUILD_CIRCUITS").is_some_and(|v| v == "1"))
-                .then(Circuits::load_remaining_embedded)
+                .then(Circuits::load_light_embedded)
         });
         let pre_exec = {
             #[cfg(feature = "diagnostic_profile")]
@@ -177,17 +181,18 @@ fn main() {
             })
             .expect("pre-execution startup thread must start");
         #[cfg(feature = "diagnostic_profile")]
-        let _remaining_wait =
-            plonky2::util::profile::span("wait", "remaining_circuit_loads_join");
-        let remaining = remaining_handle
+        let _light_wait = plonky2::util::profile::span("wait", "light_circuit_loads_join");
+        let light = light_handle
             .join()
             .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-        (pre_handle, remaining)
+        (pre_handle, light)
     });
     // The pre circuit is owned by the startup proof until it completes; only
-    // the other four blobs are loaded above (loading all five here would
-    // deserialize the same pre circuit twice on the scored critical path).
-    // Keep the forced-build mode's established behavior unchanged.
+    // the light pair is loaded above (loading all five here would deserialize
+    // the same pre circuit twice on the scored critical path). Heavy blobs
+    // start after this join so their GPU commitment rebuild overlaps light
+    // proving rather than the all-four aggregate wait. Keep the forced-build
+    // mode's established behavior unchanged.
     #[cfg(feature = "diagnostic_profile")]
     let _pre_wait = plonky2::util::profile::span("wait", "pre_execution_join");
     let (pre_target, pre_data, pre_proof) = pre_handle
@@ -195,20 +200,35 @@ fn main() {
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     #[cfg(feature = "diagnostic_profile")]
     drop(_pre_wait);
-    let circuits = match remaining {
-        Some(Ok(remaining)) => remaining.into_circuits((pre_target, pre_data)),
-        Some(Err(error)) => {
-            log::warn!(
-                "embedded remaining circuits unavailable ({error:#}); building from scratch"
-            );
-            Circuits::load()
-        }
-        None => Circuits::load(),
-    };
     let proof = {
         #[cfg(feature = "diagnostic_profile")]
         let _span = plonky2::util::profile::span("orchestration", "block_pipeline");
-        prover::prove_block_after_pre(block, circuits, pre_proof)
+        match light {
+            Some(Ok(light)) => {
+                // Light pair + pre-proof are ready. Start heavy loads now so
+                // their from_values GPU trees overlap the light path's first
+                // CPU witness; the pipeline joins them only at the heavy-path
+                // and block-circuit consumers.
+                let heavy_handle = std::thread::Builder::new()
+                    .name("heavy-circuit-load".into())
+                    .spawn(Circuits::load_heavy_embedded)
+                    .expect("heavy circuit load thread must start");
+                prover::prove_block_after_pre_staged(
+                    block,
+                    (pre_target, pre_data),
+                    pre_proof,
+                    light,
+                    heavy_handle,
+                )
+            }
+            Some(Err(error)) => {
+                log::warn!(
+                    "embedded light circuits unavailable ({error:#}); building from scratch"
+                );
+                prover::prove_block_after_pre(block, Circuits::load(), pre_proof)
+            }
+            None => prover::prove_block_after_pre(block, Circuits::load(), pre_proof),
+        }
     };
     #[cfg(feature = "diagnostic_profile")]
     let _output_span = plonky2::util::profile::span("output", "serialize_and_flush_proof");
