@@ -28,6 +28,13 @@ pub struct ZeroPolyOnCoset<F: Field> {
     /// `(self.n * (x - F::ONE)).inverse()`, the value [`Self::eval_l_0`] computes without the
     /// table.
     l_0_denominator_inverses: Option<Arc<Vec<F>>>,
+    /// Optional precomputed full `L_0(x) = Z_H(x) / (n * (x - 1))` values for every point of
+    /// the coset, indexed by `i in 0..n * rate`. Entry `i` must be bit-identical to
+    /// `self.eval(i) * l_0_denominator_inverses[i]` — the exact product [`Self::eval_l_0`]
+    /// forms when only the denominator table is attached — so attaching this table turns
+    /// every `eval_l_0` call into a single table load. Like the denominator table, the
+    /// values depend only on `(n, rate, g)`.
+    l_0_values: Option<Arc<Vec<F>>>,
 }
 
 impl<F: Field> ZeroPolyOnCoset<F> {
@@ -44,6 +51,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
             evals,
             inverses,
             l_0_denominator_inverses: None,
+            l_0_values: None,
         }
     }
 
@@ -52,6 +60,14 @@ impl<F: Field> ZeroPolyOnCoset<F> {
     /// computing the per-point field inversion.
     pub fn with_l_0_denominator_inverses(mut self, table: Arc<Vec<F>>) -> Self {
         self.l_0_denominator_inverses = Some(table);
+        self
+    }
+
+    /// Attaches a precomputed table of full `L_0(x)` values (see the field docs for the exact
+    /// contract). With this table attached, [`Self::eval_l_0`] is a single table load; the
+    /// denominator-inverses table, if also present, is ignored by that path.
+    pub fn with_l_0_values(mut self, table: Arc<Vec<F>>) -> Self {
+        self.l_0_values = Some(table);
         self
     }
 
@@ -78,6 +94,10 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 
     /// Returns `L_0(x) = Z_H(x)/(n * (x - 1))` with `x = w^i`.
     pub fn eval_l_0(&self, i: usize, x: F) -> F {
+        if let Some(table) = &self.l_0_values {
+            // The table entry is bit-identical to the product below, so the load replaces it.
+            return table[i];
+        }
         if let Some(table) = &self.l_0_denominator_inverses {
             // The table entry is bit-identical to the expression below, so the product is too.
             return self.eval(i) * table[i];

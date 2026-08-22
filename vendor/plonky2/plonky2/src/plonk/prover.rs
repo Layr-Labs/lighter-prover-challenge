@@ -2719,12 +2719,13 @@ fn compute_quotient_polys<
     // computed once per circuit shape for the process and shared across proofs. Each cached
     // entry is bit-identical to the per-point inversion it replaces.
     #[cfg(feature = "std")]
-    let z_h_on_coset = z_h_on_coset.with_l_0_denominator_inverses(
-        l_0_table_cache::l_0_denominator_inverses::<F>(
-            common_data.degree_bits(),
-            quotient_degree_bits,
-        ),
-    );
+    // The full-value table subsumes the denominator-inverse table: `eval_l_0` becomes a
+    // single lookup instead of a Z_H lookup plus a multiply, per point per challenge per
+    // proof. Entries are bit-identical to the product they replace.
+    let z_h_on_coset = z_h_on_coset.with_l_0_values(l_0_table_cache::l_0_values::<F>(
+        common_data.degree_bits(),
+        quotient_degree_bits,
+    ));
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -4251,6 +4252,38 @@ mod l_0_table_cache {
             .collect()
     }
 
+    /// Builds the full `L_0(x) = Z_H(x) * (n * (x - 1))^-1` table with, per entry, exactly
+    /// the product `evals[i] * denominator_inverses[i]` that `eval_l_0` forms on the
+    /// denominator-table path: the same two operands in the same multiplication order, so
+    /// every entry is bit-identical to the value it replaces. Entries are independent, so
+    /// the parallel map changes nothing.
+    fn build_values<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
+        let zero_poly =
+            crate::field::zero_poly_coset::ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+        let denominators = build::<F>(degree_bits, quotient_degree_bits);
+        denominators
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, inverse)| zero_poly.eval(i) * inverse)
+            .collect()
+    }
+
+    pub(super) fn l_0_values<F: Field>(
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+    ) -> Arc<Vec<F>> {
+        let key = (TypeId::of::<F>(), degree_bits, quotient_degree_bits);
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(entry) = cache.lock().unwrap().get(&key) {
+            return Arc::clone(entry).downcast::<Vec<F>>().unwrap();
+        }
+        let table: Arc<Vec<F>> = Arc::new(build_values::<F>(degree_bits, quotient_degree_bits));
+        let mut guard = cache.lock().unwrap();
+        let entry = guard
+            .entry(key)
+            .or_insert_with(|| table as Arc<dyn Any + Send + Sync>);
+        Arc::clone(entry).downcast::<Vec<F>>().unwrap()
+    }
     pub(super) fn l_0_denominator_inverses<F: Field>(
         degree_bits: usize,
         quotient_degree_bits: usize,
@@ -4456,6 +4489,38 @@ mod l_0_table_tests {
                     table[i].0, legacy.0,
                     "entry {i} of table ({degree_bits}, {quotient_degree_bits})"
                 );
+            }
+        }
+    }
+
+    /// The full-value table must be raw-identical to both the denominator-table path and
+    /// the uncached computation, over every point of a nontrivial shape, including
+    /// noncanonical representatives.
+    #[test]
+    fn eval_l_0_values_table_matches_denominator_table_raw() {
+        type F = GoldilocksField;
+        for (degree_bits, quotient_degree_bits) in [(4usize, 2usize), (6, 3), (9, 2)] {
+            let plain = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+            let with_denominators = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits)
+                .with_l_0_denominator_inverses(l_0_denominator_inverses::<F>(
+                    degree_bits,
+                    quotient_degree_bits,
+                ));
+            let with_values = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits)
+                .with_l_0_values(l_0_values::<F>(degree_bits, quotient_degree_bits));
+            let points = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
+            for (i, &x) in points.iter().enumerate() {
+                // Exercise a noncanonical representative of the same field value.
+                let x_noncanonical = if i == 0 {
+                    F::from_noncanonical_u64(F::ORDER + 1)
+                } else {
+                    x
+                };
+                let uncached = plain.eval_l_0(i, x).to_noncanonical_u64();
+                let denominators = with_denominators.eval_l_0(i, x_noncanonical).to_noncanonical_u64();
+                let values = with_values.eval_l_0(i, x_noncanonical).to_noncanonical_u64();
+                assert_eq!(uncached, denominators, "denominator table at ({degree_bits}, {quotient_degree_bits}, {i})");
+                assert_eq!(uncached, values, "values table at ({degree_bits}, {quotient_degree_bits}, {i})");
             }
         }
     }
