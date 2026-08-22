@@ -175,6 +175,34 @@ impl<T: Copy> LevelOrderDigests<T> {
             .collect()
     }
 
+    /// Batch of [`Self::prove_siblings`]. Each level is gathered once: the
+    /// needed sibling indices are sorted so reads walk that level's contiguous
+    /// digest slice in address order, then results are scattered back into
+    /// caller query order. Sibling values are index-for-index identical to
+    /// calling [`Self::prove_siblings`] per query.
+    pub(crate) fn prove_siblings_batch(&self, leaf_indices: &[usize]) -> Vec<Vec<T>> {
+        let n = leaf_indices.len();
+        let num_layers = self.level_offsets.len().saturating_sub(1);
+        let mut proofs: Vec<Vec<T>> = (0..n).map(|_| Vec::with_capacity(num_layers)).collect();
+        if n == 0 || num_layers == 0 {
+            return proofs;
+        }
+
+        // 28 FRI queries is typical; sorting this tiny permutation per level is
+        // cheaper than a random walk across a 2^18-2^22 digest level.
+        let mut order: Vec<usize> = (0..n).collect();
+        for level in 0..num_layers {
+            order.sort_unstable_by_key(|&k| (leaf_indices[k] >> level) ^ 1);
+            let base = self.level_offsets[level];
+            let end = self.level_offsets[level + 1];
+            let level_nodes = &self.nodes[base..end];
+            for &k in &order {
+                proofs[k].push(level_nodes[(leaf_indices[k] >> level) ^ 1]);
+            }
+        }
+        proofs
+    }
+
     /// Materializes the interleaved recursive-subtree layout documented on
     /// [`MerkleTree::digests`]. Cold path; only serialization needs it.
     pub fn to_interleaved(&self) -> Vec<T> {
@@ -743,6 +771,30 @@ pub(crate) fn merkle_tree_prove<F: RichField, H: Hasher<F>>(
         .collect()
 }
 
+/// Batch of [`merkle_tree_prove`]. Queries are opened in sorted leaf-index
+/// order so nearby leaves share a cap-subtree digest slice (the interleaved
+/// layout stores each cap-subtree contiguously), then scattered back into
+/// caller query order. Values match one-at-a-time `merkle_tree_prove`.
+pub(crate) fn merkle_tree_prove_batch<F: RichField, H: Hasher<F>>(
+    leaf_indices: &[usize],
+    leaves_len: usize,
+    cap_height: usize,
+    digests: &[H::Hash],
+) -> Vec<Vec<H::Hash>> {
+    let n = leaf_indices.len();
+    let num_layers = log2_strict(leaves_len) - cap_height;
+    let mut proofs: Vec<Vec<H::Hash>> = (0..n).map(|_| Vec::with_capacity(num_layers)).collect();
+    if n == 0 {
+        return proofs;
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_unstable_by_key(|&k| leaf_indices[k]);
+    for &k in &order {
+        proofs[k] = merkle_tree_prove::<F, H>(leaf_indices[k], leaves_len, cap_height, digests);
+    }
+    proofs
+}
+
 impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
     /// Returns the natural-order, column-major Metal leaf storage when this
     /// commitment retained its LDE in a shared GPU-visible buffer.
@@ -1068,6 +1120,73 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
 
         MerkleProof { siblings }
     }
+
+    /// Batch of [`Self::prove`]. Sibling digests are gathered level-at-a-time
+    /// (or in sorted leaf order for the interleaved CPU layout) so many FRI
+    /// queries share a sequential walk of each Merkle level. Returned proofs
+    /// are in the same order as `leaf_indices` and bit-identical to mapping
+    /// [`Self::prove`] over that slice.
+    pub fn prove_batch(&self, leaf_indices: &[usize]) -> Vec<MerkleProof<F, H>> {
+        let cap_height = log2_strict(self.cap.len());
+        let sibling_vecs = match &self.level_digests {
+            Some(levels) => {
+                debug_assert_eq!(
+                    levels.level_offsets.len() - 1,
+                    log2_strict(self.num_leaves) - cap_height
+                );
+                levels.prove_siblings_batch(leaf_indices)
+            }
+            None => merkle_tree_prove_batch::<F, H>(
+                leaf_indices,
+                self.num_leaves,
+                cap_height,
+                &self.digests,
+            ),
+        };
+        sibling_vecs
+            .into_iter()
+            .map(|siblings| MerkleProof { siblings })
+            .collect()
+    }
+
+    /// Batch of [`Self::leaf_vec`]. For column-major LDEs, each column is
+    /// gathered once with the query rows sorted in natural order (so the
+    /// `reverse_bits` scatter becomes a monotonic walk of that column). For
+    /// row-major leaves, rows are copied in sorted leaf-index order. Returned
+    /// vectors match `leaf_indices` order, value-identical to per-query
+    /// [`Self::leaf_vec`].
+    pub fn leaf_vec_batch(&self, indices: &[usize]) -> Vec<Vec<F>> {
+        let n = indices.len();
+        match &self.leaves {
+            MerkleLeaves::Rows { data, width } => {
+                let mut out: Vec<Vec<F>> = (0..n).map(|_| Vec::new()).collect();
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_unstable_by_key(|&k| indices[k]);
+                for &k in &order {
+                    let i = indices[k];
+                    out[k] = data[i * width..(i + 1) * width].to_vec();
+                }
+                out
+            }
+            MerkleLeaves::Columns { columns, log_rows } => {
+                let num_cols = columns.num_cols();
+                let naturals: Vec<usize> = indices
+                    .iter()
+                    .map(|&i| crate::util::reverse_bits(i, *log_rows))
+                    .collect();
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_unstable_by_key(|&k| naturals[k]);
+                let mut out: Vec<Vec<F>> = (0..n).map(|_| Vec::with_capacity(num_cols)).collect();
+                for j in 0..num_cols {
+                    let col = columns.col(j);
+                    for &k in &order {
+                        out[k].push(col[naturals[k]]);
+                    }
+                }
+                out
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1079,7 +1198,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::field::extension::Extendable;
     use crate::hash::merkle_proofs::verify_merkle_proof_to_cap;
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::config::{GenericConfig, Hasher, PoseidonGoldilocksConfig};
 
     pub(crate) fn random_data<F: RichField>(n: usize, k: usize) -> Vec<Vec<F>> {
         (0..n).map(|_| F::rand_vec(k)).collect()
@@ -1221,6 +1340,77 @@ pub(crate) mod tests {
             for i in (0..n).step_by(((n / 8) + 1).max(1)) {
                 let proof = tree.prove(i);
                 verify_merkle_proof_to_cap(tree.leaf_vec(i), i, &tree.cap, &proof).unwrap();
+            }
+        }
+    }
+
+    /// Batch openings must be raw-limb identical to the serial path, including
+    /// duplicate indices, unsorted query order, and both leaf layouts.
+    #[test]
+    fn prove_and_leaf_batch_match_serial() {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let raw_hash = |h: &<H as Hasher<F>>::Hash| -> Vec<u64> {
+            h.elements.iter().map(|e| e.to_noncanonical_u64()).collect()
+        };
+        let raw_leaf = |leaf: &[F]| -> Vec<u64> {
+            leaf.iter().map(|e| e.to_noncanonical_u64()).collect()
+        };
+
+        for &(width, log_n, cap_height) in &[
+            (4usize, 4usize, 1usize),
+            (7, 6, 2),
+            (16, 8, 4),
+            (33, 7, 2),
+        ] {
+            let n = 1usize << log_n;
+            let columns: Vec<Vec<F>> = (0..width).map(|_| F::rand_vec(n)).collect();
+            let col_tree = MerkleTree::<F, H>::new_columns(columns, cap_height);
+            let rows: Vec<Vec<F>> = (0..n).map(|i| col_tree.leaf_vec(i)).collect();
+            let row_tree = MerkleTree::<F, H>::new(rows, cap_height);
+
+            let queries = [
+                0usize,
+                n - 1,
+                n / 3,
+                1,
+                n / 2,
+                n / 3,
+                (n / 5) * 2,
+                n.saturating_sub(2),
+            ];
+
+            for tree in [&col_tree, &row_tree] {
+                let batch_proofs = tree.prove_batch(&queries);
+                let batch_leaves = tree.leaf_vec_batch(&queries);
+                assert_eq!(batch_proofs.len(), queries.len());
+                assert_eq!(batch_leaves.len(), queries.len());
+                for (q, (&idx, (proof, leaf))) in queries
+                    .iter()
+                    .zip(batch_proofs.iter().zip(batch_leaves.iter()))
+                    .enumerate()
+                {
+                    let serial_proof = tree.prove(idx);
+                    let serial_leaf = tree.leaf_vec(idx);
+                    assert_eq!(
+                        serial_proof.siblings.len(),
+                        proof.siblings.len(),
+                        "sibling count q={q} idx={idx}"
+                    );
+                    for (s, (a, b)) in serial_proof
+                        .siblings
+                        .iter()
+                        .zip(&proof.siblings)
+                        .enumerate()
+                    {
+                        assert_eq!(raw_hash(a), raw_hash(b), "sibling q={q} layer={s}");
+                    }
+                    assert_eq!(raw_leaf(&serial_leaf), raw_leaf(leaf), "leaf q={q} idx={idx}");
+                    verify_merkle_proof_to_cap(leaf.clone(), idx, &tree.cap, proof).unwrap();
+                }
             }
         }
     }

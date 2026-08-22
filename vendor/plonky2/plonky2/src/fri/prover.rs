@@ -19,6 +19,7 @@ use crate::fri::proof::{FriInitialTreeProof, FriProof, FriQueryRound, FriQuerySt
 use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
+use crate::hash::merkle_proofs::MerkleProof;
 use crate::hash::merkle_tree::MerkleTree;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
@@ -602,12 +603,82 @@ fn fri_prover_query_rounds<
     n: usize,
     fri_params: &FriParams,
 ) -> Vec<FriQueryRound<F, C::Hasher, D>> {
-    challenger
+    // Transcript order is unchanged: challenges are drawn sequentially first,
+    // and the returned query-round vector is in that same order. Internal
+    // sibling/leaf gathers may reorder *work* (sorted per Merkle level) but
+    // not the proof stream.
+    let x_indices: Vec<usize> = challenger
         .get_n_challenges(fri_params.config.num_query_rounds)
-        .into_par_iter()
-        .map(|rand| {
-            let x_index = rand.to_canonical_u64() as usize % n;
-            fri_prover_query_round::<F, C, D>(initial_merkle_trees, trees, x_index, fri_params)
+        .into_iter()
+        .map(|rand| rand.to_canonical_u64() as usize % n)
+        .collect();
+    let nq = x_indices.len();
+
+    let initial_openings: Vec<(Vec<Vec<F>>, Vec<MerkleProof<F, C::Hasher>>)> =
+        initial_merkle_trees
+            .par_iter()
+            .map(|t| (t.leaf_vec_batch(&x_indices), t.prove_batch(&x_indices)))
+            .collect();
+
+    let mut initial_by_query: Vec<Vec<(Vec<F>, MerkleProof<F, C::Hasher>)>> =
+        (0..nq)
+            .map(|_| Vec::with_capacity(initial_merkle_trees.len()))
+            .collect();
+    for (leaves, proofs) in initial_openings {
+        for (q, (leaf, proof)) in leaves.into_iter().zip(proofs).enumerate() {
+            initial_by_query[q].push((leaf, proof));
+        }
+    }
+
+    let mut round_indices = x_indices.clone();
+    let fri_index_sets: Vec<Vec<usize>> = fri_params
+        .reduction_arity_bits
+        .iter()
+        .map(|&arity_bits| {
+            let leaves: Vec<usize> = round_indices.iter().map(|&x| x >> arity_bits).collect();
+            for x in &mut round_indices {
+                *x >>= arity_bits;
+            }
+            leaves
+        })
+        .collect();
+    debug_assert_eq!(fri_index_sets.len(), trees.len());
+
+    let fri_openings: Vec<(
+        Vec<Vec<F::Extension>>,
+        Vec<MerkleProof<F, C::Hasher>>,
+    )> = trees
+        .par_iter()
+        .enumerate()
+        .map(|(i, tree)| {
+            let leaf_indices = &fri_index_sets[i];
+            let evals = tree
+                .leaf_vec_batch(leaf_indices)
+                .into_iter()
+                .map(|leaf| unflatten(&leaf))
+                .collect::<Vec<_>>();
+            let proofs = tree.prove_batch(leaf_indices);
+            (evals, proofs)
+        })
+        .collect();
+
+    let mut steps_by_query: Vec<Vec<FriQueryStep<F, C::Hasher, D>>> =
+        (0..nq).map(|_| Vec::with_capacity(trees.len())).collect();
+    for (evals, proofs) in fri_openings {
+        for (q, (evals, merkle_proof)) in evals.into_iter().zip(proofs).enumerate() {
+            steps_by_query[q].push(FriQueryStep {
+                evals,
+                merkle_proof,
+            });
+        }
+    }
+
+    (0..nq)
+        .map(|q| FriQueryRound {
+            initial_trees_proof: FriInitialTreeProof {
+                evals_proofs: core::mem::take(&mut initial_by_query[q]),
+            },
+            steps: core::mem::take(&mut steps_by_query[q]),
         })
         .collect()
 }
@@ -870,5 +941,86 @@ mod tests {
         let min_leading_zeros = config.proof_of_work_bits + (64 - F::order().bits()) as u32;
         assert!(response.to_canonical_u64().leading_zeros() >= min_leading_zeros);
         assert_eq!(challenger.get_n_challenges(16), replay.get_n_challenges(16));
+    }
+
+    /// Sorted/batched openings must match the historical per-query walk,
+    /// including duplicate indices, so proofs stay bit-identical.
+    #[test]
+    fn query_round_batch_matches_serial() {
+        const D: usize = 2;
+        type C = Poseidon2GoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type H = <C as GenericConfig<D>>::Hasher;
+
+        let n = 32usize;
+        let cap_height = 2;
+        let arity_bits = 2usize;
+        let arity = 1 << arity_bits;
+        let initial_a = MerkleTree::<F, H>::new(
+            (0..n)
+                .map(|i| {
+                    vec![
+                        F::from_canonical_usize(i),
+                        F::from_canonical_usize(i + 3),
+                    ]
+                })
+                .collect(),
+            cap_height,
+        );
+        let initial_b = MerkleTree::<F, H>::new(
+            (0..n)
+                .map(|i| vec![F::from_canonical_usize(i * 5 + 1), F::from_canonical_usize(9)])
+                .collect(),
+            cap_height,
+        );
+        let fri_n = n >> arity_bits;
+        let leaf_width = arity * D;
+        let fri_tree = MerkleTree::<F, H>::new_flat(
+            (0..fri_n * leaf_width)
+                .map(|i| F::from_canonical_usize(i + 11))
+                .collect(),
+            leaf_width,
+            cap_height,
+        );
+        let fri_params = FriParams {
+            config: FriConfig {
+                rate_bits: 3,
+                cap_height,
+                proof_of_work_bits: 1,
+                reduction_strategy: FriReductionStrategy::ConstantArityBits(arity_bits, 5),
+                num_query_rounds: 8,
+            },
+            hiding: false,
+            degree_bits: 2,
+            reduction_arity_bits: vec![arity_bits],
+        };
+        let x_indices = [0usize, 1, 7, 16, 31, 7, 20, 4];
+        let initial = [&initial_a, &initial_b];
+        let trees = [fri_tree];
+
+        let serial: Vec<_> = x_indices
+            .iter()
+            .map(|&x| fri_prover_query_round::<F, C, D>(&initial, &trees, x, &fri_params))
+            .collect();
+
+        let batch_initial: Vec<_> = initial
+            .iter()
+            .map(|t| (t.leaf_vec_batch(&x_indices), t.prove_batch(&x_indices)))
+            .collect();
+        let fri_indices: Vec<usize> = x_indices.iter().map(|&x| x >> arity_bits).collect();
+        let batch_fri_leaves = trees[0].leaf_vec_batch(&fri_indices);
+        let batch_fri_proofs = trees[0].prove_batch(&fri_indices);
+
+        for (q, round) in serial.iter().enumerate() {
+            for (t, (leaves, proofs)) in batch_initial.iter().enumerate() {
+                assert_eq!(round.initial_trees_proof.evals_proofs[t].0, leaves[q]);
+                assert_eq!(
+                    round.initial_trees_proof.evals_proofs[t].1.siblings,
+                    proofs[q].siblings
+                );
+            }
+            assert_eq!(round.steps[0].evals, unflatten::<F, D>(&batch_fri_leaves[q]));
+            assert_eq!(round.steps[0].merkle_proof.siblings, batch_fri_proofs[q].siblings);
+        }
     }
 }
