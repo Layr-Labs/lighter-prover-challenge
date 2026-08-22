@@ -1774,7 +1774,33 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let g = t / 2;
             let c = t % 2;
             let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+            let src = &low[base..base + half_rows * 2];
+            let mut values: Vec<F> = Vec::with_capacity(half_rows);
+            unsafe { values.set_len(half_rows); }
+            if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+                let src_ptr = src.as_ptr() as *const u64;
+                let dst_ptr = values.as_mut_ptr() as *mut u64;
+                unsafe {
+                    let mut s = src_ptr.add(c);
+                    let mut d = dst_ptr;
+                    let chunks = half_rows / 4;
+                    for _ in 0..chunks {
+                        *d = *s;
+                        *d.add(1) = *s.add(2);
+                        *d.add(2) = *s.add(4);
+                        *d.add(3) = *s.add(6);
+                        d = d.add(4);
+                        s = s.add(8);
+                    }
+                    for i in (chunks * 4)..half_rows {
+                        *dst_ptr.add(i) = *src_ptr.add(i * 2 + c);
+                    }
+                }
+            } else {
+                for (k, out) in values.iter_mut().enumerate() {
+                    *out = src[k * 2 + c];
+                }
+            }
             PolynomialValues::new(values)
                 .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
                 .fft()
@@ -3340,37 +3366,42 @@ fn compute_quotient_polys<
         // GPU accumulation pass and point-major scatter pass into one walk:
         // CPU quotient pages are now read once and never dirtied again.
         // validator population; this comment changes no executable behavior.
+        const MERGE_CHUNK_POINTS: usize = 512;
         quotient_values
-            .par_chunks_exact(num_challenges)
+            .par_chunks(MERGE_CHUNK_POINTS * num_challenges)
             .enumerate()
-            .for_each(|(i, cpu_values)| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                let start = i * num_challenges;
-                for (challenge, (&cpu, column)) in
-                    cpu_values.iter().zip(column_ptrs).enumerate()
-                {
-                    let mut value = cpu;
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            .for_each(|(chunk_idx, chunk)| {
+                let base_point = chunk_idx * MERGE_CHUNK_POINTS;
+                for (offset, cpu_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                    let i = base_point + offset;
+                    let denominator_inv = z_h_on_coset.eval_inverse(i);
+                    let start = i * num_challenges;
+                    for (challenge, (&cpu, column)) in
+                        cpu_values.iter().zip(column_ptrs).enumerate()
                     {
-                        if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge];
+                        let mut value = cpu;
+                        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                        {
+                            if let Some(values) = gpu_poseidon_values {
+                                value += values[start + challenge];
+                            }
+                            if let Some(values) = gpu_range_values {
+                                value += values[start + challenge];
+                            }
+                            if let Some(values) = &gpu_range_low_values {
+                                value += values[start + challenge];
+                            }
+                            if let Some(values) = gpu_permutation_values {
+                                value += values[start + challenge];
+                            }
                         }
-                        if let Some(values) = gpu_range_values {
-                            value += values[start + challenge];
-                        }
-                        if let Some(values) = &gpu_range_low_values {
-                            value += values[start + challenge];
-                        }
-                        if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge];
-                        }
+                        // Single `1/Z_H` scaling for the summed contributions; see
+                        // the deferral note at the batch loop above.
+                        let value = value * denominator_inv;
+                        // SAFETY: point `i` is owned by this parallel iteration,
+                        // and every (challenge, point) destination is written once.
+                        unsafe { *column.0.add(i) = value };
                     }
-                    // Single `1/Z_H` scaling for the summed contributions; see
-                    // the deferral note at the batch loop above.
-                    let value = value * denominator_inv;
-                    // SAFETY: point `i` is owned by this parallel iteration,
-                    // and every (challenge, point) destination is written once.
-                    unsafe { *column.0.add(i) = value };
                 }
             });
     } else {
