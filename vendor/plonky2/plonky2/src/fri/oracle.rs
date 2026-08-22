@@ -360,10 +360,11 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                     C::Hasher::try_build_merkle_tree_column_store_streamed(
                         &columns,
                         cap_height,
-                        &|group, destinations: &mut [&mut [F]]| {
+                        &|col_start, destinations: &mut [&mut [F]]| {
                             destinations.par_iter_mut().enumerate().for_each(
                                 |(k, destination)| {
-                                    let polynomial = &polys[group * 8 + k];
+                                    let col_idx = col_start + k;
+                                    let polynomial = &polys[col_idx];
                                     assert_eq!(
                                         polynomial.len(),
                                         degree,
@@ -382,7 +383,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
+                                    copy_even(col_idx, destination);
                                 },
                             );
                         },
