@@ -146,9 +146,7 @@ fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
         let src = full.col(j);
         debug_assert_eq!(src.len(), half * 2);
         debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
-        }
+        crate::util::deinterleave::copy_even_indices(src, dest);
     });
     Some(companion)
 }
@@ -347,9 +345,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         let out = unsafe {
                             core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
                         };
-                        for (k, slot) in out.iter_mut().enumerate() {
-                            *slot = _destination[2 * k];
-                        }
+                        crate::util::deinterleave::copy_even_indices(_destination, out);
                     }
                 };
                 let copy_even = &copy_even;

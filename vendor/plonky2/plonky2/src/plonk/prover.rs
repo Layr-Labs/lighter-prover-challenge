@@ -1341,6 +1341,18 @@ fn range_quotient_split_enabled() -> bool {
     *ENABLED.get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT").is_some_and(|v| v == "0"))
 }
 
+/// `LIGHTER_LOW_RANGE_DEINTERLEAVE=0` restores the scalar stride-2 gather in
+/// [`extend_and_combine_low_range_quotient`]. Default on: the gather is
+/// value-identical `vld2q_u64` deinterleave of the interleaved `[c0,c1,...]`
+/// half-domain output, then the same IFFT/FFT pair as before.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn low_range_deinterleave_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_LOW_RANGE_DEINTERLEAVE").is_some_and(|v| v == "0")
+    })
+}
+
 /// Whether the wires commitment should retain its compact even-row companion
 /// for the half-domain quotient split: only where the split runs (Metal, no
 /// lookups, two challenges) and only for the pipelined 2^19-row LDE shapes
@@ -1768,19 +1780,51 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
-        .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
-            let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
-        })
-        .collect();
+    let odd: Vec<Vec<F>> = if low_range_deinterleave_enabled() {
+        // One sequential pass over each gate's interleaved [c0,c1,...] block,
+        // then the same IFFT/FFT pair the scalar gather ran per challenge.
+        // Indexed collect keeps (g0c0, g0c1, g1c0, ...) so combine sees the
+        // identical column order. LIGHTER_LOW_RANGE_DEINTERLEAVE=0 is the
+        // gather below, in the same binary.
+        let per_gate: Vec<(Vec<F>, Vec<F>)> = (0..gates.len())
+            .into_par_iter()
+            .map(|g| {
+                let base = g * half_rows * 2;
+                let src = &low[base..base + half_rows * 2];
+                let mut c0 = Vec::<F>::with_capacity(half_rows);
+                let mut c1 = Vec::<F>::with_capacity(half_rows);
+                unsafe {
+                    c0.set_len(half_rows);
+                    c1.set_len(half_rows);
+                }
+                crate::util::deinterleave::deinterleave_pairs(src, &mut c0, &mut c1);
+                let o0 = PolynomialValues::new(c0)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                let o1 = PolynomialValues::new(c1)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values;
+                (o0, o1)
+            })
+            .collect();
+        per_gate.into_iter().flat_map(|(a, b)| [a, b]).collect()
+    } else {
+        (0..gates.len() * 2)
+            .into_par_iter()
+            .map(|t| {
+                let g = t / 2;
+                let c = t % 2;
+                let base = g * half_rows * 2;
+                let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values
+            })
+            .collect()
+    };
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(
@@ -3681,6 +3725,30 @@ mod quotient_layout_tests {
     const D: usize = 2;
     type C = PoseidonGoldilocksConfig;
     type F = <C as GenericConfig<D>>::F;
+
+    #[test]
+    fn deinterleave_pairs_matches_strided_challenge_gather() {
+        let half = 1024usize;
+        let gates = 3usize;
+        let mut low = Vec::with_capacity(gates * half * 2);
+        for i in 0..gates * half * 2 {
+            low.push(F::from_canonical_u64(i as u64 * 13 + 7));
+        }
+        for g in 0..gates {
+            let base = g * half * 2;
+            let mut c0 = vec![F::ZERO; half];
+            let mut c1 = vec![F::ZERO; half];
+            crate::util::deinterleave::deinterleave_pairs(
+                &low[base..base + half * 2],
+                &mut c0,
+                &mut c1,
+            );
+            for k in 0..half {
+                assert_eq!(c0[k], low[base + k * 2], "g={g} k={k} c0");
+                assert_eq!(c1[k], low[base + k * 2 + 1], "g={g} k={k} c1");
+            }
+        }
+    }
 
     fn small_circuit() -> (CircuitData<F, C, D>, PartialWitness<F>) {
         let config = CircuitConfig::standard_recursion_config();
