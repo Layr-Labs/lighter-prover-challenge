@@ -1,5 +1,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
+#[cfg(all(feature = "parallel", feature = "std"))]
+use plonky2_maybe_rayon::rayon;
 use core::iter::zip;
 
 use anyhow::{anyhow, Result};
@@ -468,7 +470,14 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         let mut wire_values: Vec<Vec<F>> = (0..num_wires)
             .map(|_| Vec::with_capacity(degree))
             .collect();
-        let num_chunks = 16.min(degree.max(1));
+        // Each chunk owns a segment of every output column. More chunks than
+        // Rayon workers only adds segment-vector construction and task
+        // bookkeeping; cap at the existing 16-way ceiling while matching the
+        // active pool below it. The serial build keeps one contiguous chunk.
+        #[cfg(all(feature = "parallel", feature = "std"))]
+        let num_chunks = rayon::current_num_threads().clamp(1, 16).min(degree.max(1));
+        #[cfg(not(all(feature = "parallel", feature = "std")))]
+        let num_chunks = 1;
         let chunk_rows = degree.div_ceil(num_chunks);
         {
             let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
