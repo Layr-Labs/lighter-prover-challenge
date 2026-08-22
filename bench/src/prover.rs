@@ -1,6 +1,7 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 // Redraw marker r18 (same-account archive-dedup convention; inert, declared in note)
+// Absorb-only retry marker GPT56-r1 (inert; transparent ranked resample)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
