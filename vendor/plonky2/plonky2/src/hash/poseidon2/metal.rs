@@ -1301,6 +1301,10 @@ enum TreeReadback<'a, F: RichField> {
         level_offsets: Vec<usize>,
         leaf_count: usize,
         cap_height: usize,
+        /// `Some` when the caller deferred `wait_until_completed` so the
+        /// singleton buffer set can be released during GPU execution.
+        /// `None` when the wait already happened while the set was held.
+        command_buffer: Option<CommandBuffer>,
         marker: PhantomData<F>,
     },
 }
@@ -1328,6 +1332,25 @@ fn tree_from_metal_digests<F: RichField>(
 }
 
 impl<F: RichField> TreeReadback<'_, F> {
+    /// Completes a deferred GPU wait. No-op for `Ready` and for detaches
+    /// that already waited while holding the set.
+    fn wait_gpu(&mut self) -> Result<(), String> {
+        let Self::Detached { command_buffer, .. } = self else {
+            return Ok(());
+        };
+        let Some(command_buffer) = command_buffer.take() else {
+            return Ok(());
+        };
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(format!(
+                "command buffer ended with status {:?}",
+                command_buffer.status()
+            ));
+        }
+        Ok(())
+    }
+
     fn finish(self) -> (LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>) {
         match self {
             Self::Ready(tree) => tree,
@@ -1337,8 +1360,14 @@ impl<F: RichField> TreeReadback<'_, F> {
                 level_offsets,
                 leaf_count,
                 cap_height,
+                command_buffer,
                 marker: _,
             } => {
+                debug_assert!(
+                    command_buffer.is_none(),
+                    "wait_gpu must run before finish on a deferred detach"
+                );
+                let _ = command_buffer;
                 let node_count = 2 * leaf_count - (1usize << cap_height);
                 assert_eq!(output_len, node_count * 4);
                 tree_from_metal_digests(
@@ -1672,10 +1701,13 @@ fn spine_urgent() -> bool {
 }
 
 /// Number of Merkle builds currently occupying the serialized GPU stream
-/// (from buffer acquisition through `wait_until_completed`). Routing reads
-/// this to decide whether a small serial-path tree would enqueue behind
-/// in-flight work; the count is a heuristic only — either routing outcome
-/// hashes the identical tree, so races are benign.
+/// (from *successful* buffer-set acquisition through `wait_until_completed`).
+/// The guard is not taken while blocked on the set: that wait does not use
+/// the GPU, and counting it as in-flight diverted stream-eligible chunk
+/// trees onto the singleton set the spine is waiting for. Routing still
+/// reads the count to decide whether a small serial-path tree would enqueue
+/// behind in-flight work; races are benign because either outcome hashes
+/// the identical tree.
 static GPU_JOBS_IN_FLIGHT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
@@ -3546,6 +3578,7 @@ impl MetalShared {
                 level_offsets,
                 leaf_count,
                 cap_height,
+                command_buffer: None,
                 marker: PhantomData,
             });
         }
@@ -4213,12 +4246,16 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Metal Merkle output size overflow")?;
 
-        let job = GpuJobGuard::begin();
         // Spine trees (the 2^17 serial-critical shapes, same predicate as
         // gpu_worthwhile) jump queued chunk-tree waiters for the single set —
         // but only while the chain is actually the laggard (see SPINE_BACKLOG).
         let spine = leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent();
+        // Acquire before occupying GPU_JOBS_IN_FLIGHT. The condvar wait does
+        // not use the GPU; counting it as in-flight was a wasteful station
+        // hold that made stream-eligible chunk trees pile onto this same set
+        // and stall the spine they were meant to stay off of.
         let mut set = self.acquire_set_priority(spine)?;
+        let job = GpuJobGuard::begin();
         let result = self.build_with_set(
             &mut set,
             source,
@@ -4231,8 +4268,17 @@ impl MetalShared {
             output_bytes,
         );
         self.release_set(set);
+        let mut result = result?;
+        // Shared-column trees (the chain-spine 2^17 shape) detach their digest
+        // output at commit and defer wait_until_completed until after release.
+        // That deletes the ~GPU-hash hold of the singleton set — jason871110's
+        // ~13.5 ms/step excess chain-spine station hold — without a second
+        // buffer set: the next waiter can acquire, encode, and FIFO-commit
+        // while this command buffer runs. Staging builds still waited inside
+        // build_with_set (their input buffer is GPU-live).
+        result.wait_gpu()?;
         drop(job);
-        Ok(result?.finish())
+        Ok(result.finish())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4401,6 +4447,26 @@ impl MetalShared {
             command_buffer.commit();
             command_buffer.to_owned()
         });
+
+        // Shared-column builds bind the retained column store, not `set.input`.
+        // After commit the only GPU-live pooled buffer is `set.output`. Detach
+        // it and return without waiting so `build` can release the singleton
+        // set during GPU execution. Staging builds keep the historical wait
+        // while holding: overwriting `set.input` before completion would race
+        // the in-flight leaf kernel.
+        if matches!(&source, LeafSource::Shared(_)) {
+            if let Some(output) = self.try_detach_completed_output(set, output_bytes)? {
+                return Ok(TreeReadback::Detached {
+                    output,
+                    output_len,
+                    level_offsets,
+                    leaf_count,
+                    cap_height,
+                    command_buffer: Some(command_buffer),
+                    marker: PhantomData,
+                });
+            }
+        }
 
         command_buffer.wait_until_completed();
         if command_buffer.status() != MTLCommandBufferStatus::Completed {
