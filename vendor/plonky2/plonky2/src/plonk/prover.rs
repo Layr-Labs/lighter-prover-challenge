@@ -1774,7 +1774,33 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let g = t / 2;
             let c = t % 2;
             let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+            let src = &low[base..base + half_rows * 2];
+            let mut values: Vec<F> = Vec::with_capacity(half_rows);
+            unsafe { values.set_len(half_rows); }
+            if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+                let src_ptr = src.as_ptr() as *const u64;
+                let dst_ptr = values.as_mut_ptr() as *mut u64;
+                unsafe {
+                    let mut s = src_ptr.add(c);
+                    let mut d = dst_ptr;
+                    let chunks = half_rows / 4;
+                    for _ in 0..chunks {
+                        *d = *s;
+                        *d.add(1) = *s.add(2);
+                        *d.add(2) = *s.add(4);
+                        *d.add(3) = *s.add(6);
+                        d = d.add(4);
+                        s = s.add(8);
+                    }
+                    for i in (chunks * 4)..half_rows {
+                        *dst_ptr.add(i) = *src_ptr.add(i * 2 + c);
+                    }
+                }
+            } else {
+                for (k, out) in values.iter_mut().enumerate() {
+                    *out = src[k * 2 + c];
+                }
+            }
             PolynomialValues::new(values)
                 .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
                 .fft()
