@@ -10,8 +10,8 @@ use crate::field::batch_util::batch_multiply_into;
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
-    FftRootTable, cached_fft_root_table, fft_in_place_with_options,
-    fft_in_place_with_options_parallel,
+    FftRootTable, GROUPED_IFFT_WIDTH, cached_fft_root_table, fft_in_place_with_options,
+    fft_in_place_with_options_parallel, ifft_grouped_in_place,
 };
 use crate::field::goldilocks_extensions::ext2_mul_add;
 use crate::field::goldilocks_field::GoldilocksField;
@@ -221,11 +221,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             }
         }
 
-        let coeffs = timed!(
-            timing,
-            "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
-        );
+        // Parallelize disjoint column groups only. `ifft_grouped_in_place`
+        // intentionally performs its shared stage/index/twiddle walk serially
+        // within each group, so this remains the sole Rayon layer. A short
+        // final group and every unsupported shape take the literal legacy
+        // per-column IFFT fallback inside the helper.
+        let mut values = values;
+        timed!(timing, "IFFT", {
+            values
+                .par_chunks_mut(GROUPED_IFFT_WIDTH)
+                .for_each(ifft_grouped_in_place);
+        });
+        let coeffs = values
+            .into_iter()
+            .map(|value| PolynomialCoeffs::new(value.values))
+            .collect::<Vec<_>>();
 
         Self::from_coeffs(
             coeffs,

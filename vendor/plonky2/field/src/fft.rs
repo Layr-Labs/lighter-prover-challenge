@@ -271,6 +271,88 @@ pub fn ifft<F: Field>(poly: PolynomialValues<F>) -> PolynomialCoeffs<F> {
     ifft_with_options(poly, None, None)
 }
 
+/// Fixed CPU column group used by [`ifft_grouped_in_place`]. Four lanes keep
+/// the shared stage/index walk small enough to avoid adding a second level of
+/// worker-pool parallelism to callers that already parallelize column groups.
+pub const GROUPED_IFFT_WIDTH: usize = 4;
+
+/// Transform a small, same-shaped group of value columns in place.
+///
+/// The eligible path walks each FFT stage, block, index, and twiddle once and
+/// then applies that exact butterfly to each independent lane. It is serial
+/// inside the group: callers may parallelize *groups*, but must not nest a
+/// second Rayon traversal here. Every lane uses the legacy IFFT's bit-reverse,
+/// twiddle dispatch, butterfly arithmetic, coefficient reversal, and `1/n`
+/// normalization order. Unsupported groups deliberately take the literal
+/// existing per-column [`ifft`] path by moving each backing vector, so tails,
+/// mixed lengths, zero/one lengths, and invalid non-power-of-two shapes keep
+/// their prior behavior (including any prior panic).
+pub fn ifft_grouped_in_place<F: Field>(columns: &mut [PolynomialValues<F>]) {
+    let supported = columns.len() == GROUPED_IFFT_WIDTH
+        && columns
+            .first()
+            .is_some_and(|first| first.len() > 1 && first.len().is_power_of_two())
+        && columns
+            .iter()
+            .all(|column| column.len() == columns[0].len());
+    if !supported {
+        for column in columns {
+            let values = core::mem::take(&mut column.values);
+            column.values = ifft(PolynomialValues::new(values)).coeffs;
+        }
+        return;
+    }
+
+    let n = columns[0].len();
+    let lg_n = log2_strict(n);
+    let n_inv = F::inverse_2exp(lg_n);
+    for column in columns.iter_mut() {
+        reverse_index_bits_in_place(&mut column.values);
+    }
+
+    #[cfg(feature = "std")]
+    let root_table = root_table_cache::get::<F>(lg_n);
+    #[cfg(not(feature = "std"))]
+    let root_table = fft_root_table::<F>(n);
+
+    let use_general_twiddle = lg_n == F::TWO_ADICITY;
+    for lg_half_m in 0..lg_n {
+        let half_m = 1 << lg_half_m;
+        let m = half_m << 1;
+        let roots = &root_table[lg_half_m];
+        for block_start in (0..n).step_by(m) {
+            for index in 0..half_m {
+                let twiddle = roots[index];
+                for column in columns.iter_mut() {
+                    let values = &mut column.values[block_start..block_start + m];
+                    let u = values[index];
+                    let v = values[half_m + index];
+                    let t = if use_general_twiddle {
+                        twiddle * v
+                    } else {
+                        F::mul_fft_base_twiddle(twiddle, v)
+                    };
+                    values[index] = u + t;
+                    values[half_m + index] = u - t;
+                }
+            }
+        }
+    }
+
+    for column in columns.iter_mut() {
+        let values = &mut column.values;
+        values[0] *= n_inv;
+        values[n / 2] *= n_inv;
+        for index in 1..(n / 2) {
+            let reverse_index = n - index;
+            let coeffs_index = values[reverse_index] * n_inv;
+            let coeffs_reverse_index = values[index] * n_inv;
+            values[index] = coeffs_index;
+            values[reverse_index] = coeffs_reverse_index;
+        }
+    }
+}
+
 pub fn ifft_with_options<F: Field>(
     poly: PolynomialValues<F>,
     zero_factor: Option<usize>,
@@ -2779,7 +2861,10 @@ mod tests {
     use plonky2_util::{log2_ceil, log2_strict, reverse_index_bits_in_place};
     use unroll::unroll_for_loops;
 
-    use super::{BaseSubfieldTwiddle, FftTwiddleMul, GeneralTwiddle};
+    use super::{
+        BaseSubfieldTwiddle, FftTwiddleMul, GROUPED_IFFT_WIDTH, GeneralTwiddle,
+        ifft_grouped_in_place,
+    };
     use crate::extension::quadratic::QuadraticExtension;
     use crate::fft::{
         FftRootTable, fft, fft_classic, fft_classic_parallel, fft_in_place_with_options,
@@ -3885,6 +3970,120 @@ mod tests {
         fft_in_place_with_options(&mut serial, Some(3), None);
         fft_in_place_with_options_parallel(&mut parallel, Some(3), None);
         assert_eq!(parallel, serial, "packed base-field public entry diverged");
+    }
+
+    fn grouped_ifft_fixture(width: usize, len: usize) -> Vec<PolynomialValues<GoldilocksField>> {
+        use crate::types::Field64;
+
+        (0..width)
+            .map(|column| {
+                let mut state = 0x9E37_79B9_7F4A_7C15u64
+                    ^ (column as u64).wrapping_mul(0xD1B5_4A32_D192_ED03);
+                let mut values = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        GoldilocksField(state)
+                    })
+                    .collect::<Vec<_>>();
+                if !values.is_empty() {
+                    values[0] = GoldilocksField(GoldilocksField::ORDER);
+                }
+                if values.len() > 1 {
+                    values[1] = GoldilocksField(u64::MAX);
+                }
+                PolynomialValues::new(values)
+            })
+            .collect()
+    }
+
+    fn raw_columns(columns: &[PolynomialValues<GoldilocksField>]) -> Vec<Vec<u64>> {
+        use crate::types::PrimeField64;
+
+        columns
+            .iter()
+            .map(|column| {
+                column
+                    .values
+                    .iter()
+                    .map(GoldilocksField::to_noncanonical_u64)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn legacy_ifft_raw(columns: &[PolynomialValues<GoldilocksField>]) -> Vec<Vec<u64>> {
+        use crate::types::PrimeField64;
+
+        columns
+            .iter()
+            .cloned()
+            .map(ifft)
+            .map(|column| {
+                column
+                    .coeffs
+                    .iter()
+                    .map(GoldilocksField::to_noncanonical_u64)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouped_ifft_matches_legacy_raw_words_with_full_group_and_tails() {
+        for tail in 0..GROUPED_IFFT_WIDTH {
+            let mut actual = grouped_ifft_fixture(GROUPED_IFFT_WIDTH + tail, 1 << 6);
+            let expected = legacy_ifft_raw(&actual);
+
+            for group in actual.chunks_mut(GROUPED_IFFT_WIDTH) {
+                ifft_grouped_in_place(group);
+            }
+
+            assert_eq!(
+                raw_columns(&actual),
+                expected,
+                "raw coefficient or column order diverged for tail {tail}"
+            );
+        }
+    }
+
+    #[test]
+    fn grouped_ifft_minimum_and_mixed_length_fallback_match_legacy_raw_words() {
+        let mut minimum = grouped_ifft_fixture(GROUPED_IFFT_WIDTH, 1);
+        let expected_minimum = legacy_ifft_raw(&minimum);
+        ifft_grouped_in_place(&mut minimum);
+        assert_eq!(raw_columns(&minimum), expected_minimum);
+
+        let mut mixed = grouped_ifft_fixture(GROUPED_IFFT_WIDTH, 1 << 5);
+        mixed[1] = grouped_ifft_fixture(1, 1 << 6).pop().unwrap();
+        let expected_mixed = legacy_ifft_raw(&mixed);
+        ifft_grouped_in_place(&mut mixed);
+        assert_eq!(raw_columns(&mixed), expected_mixed);
+    }
+
+    #[test]
+    #[should_panic]
+    fn grouped_ifft_zero_length_preserves_legacy_failure() {
+        let mut columns = (0..GROUPED_IFFT_WIDTH)
+            .map(|_| PolynomialValues::<GoldilocksField> { values: Vec::new() })
+            .collect::<Vec<_>>();
+        ifft_grouped_in_place(&mut columns);
+    }
+
+    #[test]
+    #[should_panic]
+    fn grouped_ifft_non_power_of_two_preserves_legacy_failure() {
+        let mut columns = (0..GROUPED_IFFT_WIDTH)
+            .map(|column| PolynomialValues {
+                values: vec![
+                    GoldilocksField(column as u64),
+                    GoldilocksField(0xFFFF_FFFF_0000_0001),
+                    GoldilocksField(u64::MAX),
+                ],
+            })
+            .collect::<Vec<_>>();
+        ifft_grouped_in_place(&mut columns);
     }
 
 }
