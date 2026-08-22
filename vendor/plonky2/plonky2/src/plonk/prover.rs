@@ -581,6 +581,24 @@ pub fn paired_permutation_batch_count() -> usize {
     PAIRED_PERMUTATION_BATCHES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the production quotient-degree-eight permutation pass consumes the
+/// fixed-wire bitset one byte (one quotient chunk) at a time. The old per-wire
+/// bit lookup is retained as a same-binary rollback and for every other shape.
+#[inline]
+fn permutation_chunk_masks_wanted() -> bool {
+    #[cfg(feature = "std")]
+    {
+        static WANTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *WANTED.get_or_init(|| {
+            std::env::var_os("PLONKY2_PERMUTATION_CHUNK_MASKS").is_none_or(|value| value != "0")
+        })
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        true
+    }
+}
+
 #[inline]
 fn divide_chunk_products<F: Field>(
     numerator_products: &mut [F],
@@ -655,6 +673,31 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
 ) -> Vec<Vec<PolynomialValues<F>>> {
+    two_challenge_wires_permutation_partial_products_and_zs_with_chunk_masks(
+        witness,
+        betas,
+        beta_k_is,
+        gammas,
+        prover_data,
+        common_data,
+        permutation_chunk_masks_wanted(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn two_challenge_wires_permutation_partial_products_and_zs_with_chunk_masks<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    chunk_masks_requested: bool,
+) -> Vec<Vec<PolynomialValues<F>>> {
     debug_assert_eq!(betas.len(), 2);
     debug_assert_eq!(gammas.len(), 2);
     let degree = common_data.quotient_degree_factor;
@@ -667,6 +710,17 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+    // At the production shape each quotient-degree chunk is exactly one byte
+    // of the row-major fixed-wire bitset (80 routed wires, degree eight). Read
+    // that byte once instead of repeating a bounds check, byte load, shift and
+    // branch for every routed wire. Other shapes and the rollback retain the
+    // exact per-wire loop.
+    let use_chunk_masks = degree == 8
+        && num_routed_wires.is_multiple_of(8)
+        && subgroup.len().checked_mul(num_routed_wires).is_some_and(|positions| {
+            prover_data.fixed_routed_wires.len() >= positions.div_ceil(8)
+        })
+        && chunk_masks_requested;
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
@@ -712,24 +766,68 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                             let mut numerator_1 = F::ONE;
                             let mut denominator_0 = F::ONE;
                             let mut denominator_1 = F::ONE;
-                            for j in start..end {
-                                // A singleton routed copy component maps this position to itself:
-                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
-                                // therefore identical for both challenges and cancel symbolically,
-                                // including when that common factor evaluates to zero. Check the
-                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
-                                if fixed_routed_wire(
-                                    &prover_data.fixed_routed_wires,
-                                    routed_base + j,
-                                ) {
-                                    continue;
+                            macro_rules! accumulate_wire {
+                                ($j:expr) => {{
+                                    let j = $j;
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }};
+                            }
+
+                            if use_chunk_masks {
+                                // `routed_base`, `start`, and the chunk width are all byte-aligned.
+                                // A zero byte is the common all-active case; 0xff is all fixed. Only
+                                // a mixed byte pays for bit enumeration, which still visits active
+                                // columns in increasing order and preserves every field operation.
+                                let fixed =
+                                    prover_data.fixed_routed_wires[(routed_base + start) >> 3];
+                                match fixed {
+                                    0 => {
+                                        accumulate_wire!(start);
+                                        accumulate_wire!(start + 1);
+                                        accumulate_wire!(start + 2);
+                                        accumulate_wire!(start + 3);
+                                        accumulate_wire!(start + 4);
+                                        accumulate_wire!(start + 5);
+                                        accumulate_wire!(start + 6);
+                                        accumulate_wire!(start + 7);
+                                    }
+                                    u8::MAX => {}
+                                    _ => {
+                                        macro_rules! accumulate_active {
+                                            ($bit:expr) => {
+                                                if fixed & (1 << $bit) == 0 {
+                                                    accumulate_wire!(start + $bit);
+                                                }
+                                            };
+                                        }
+                                        accumulate_active!(0);
+                                        accumulate_active!(1);
+                                        accumulate_active!(2);
+                                        accumulate_active!(3);
+                                        accumulate_active!(4);
+                                        accumulate_active!(5);
+                                        accumulate_active!(6);
+                                        accumulate_active!(7);
+                                    }
                                 }
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                            } else {
+                                for j in start..end {
+                                    // A singleton routed copy component maps this position to
+                                    // itself, so its factors cancel symbolically even when zero.
+                                    // This is the exact pre-chunk-mask rollback loop.
+                                    if fixed_routed_wire(
+                                        &prover_data.fixed_routed_wires,
+                                        routed_base + j,
+                                    ) {
+                                        continue;
+                                    }
+                                    accumulate_wire!(j);
+                                }
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -4507,6 +4605,7 @@ mod permutation_pairing_tests {
     use super::{
         all_wires_permutation_partial_products, paired_permutation_batch_count,
         two_challenge_wires_permutation_partial_products_and_zs,
+        two_challenge_wires_permutation_partial_products_and_zs_with_chunk_masks,
         wires_permutation_partial_products_and_zs,
     };
     use crate::plonk::permutation_argument::fixed_routed_wire;
@@ -4906,13 +5005,35 @@ mod permutation_pairing_tests {
             + gammas[0];
         assert!(numerator.is_zero() && denominator.is_zero());
 
-        let paired = two_challenge_wires_permutation_partial_products_and_zs(
+        assert!(data.prover_only.fixed_routed_wires.contains(&0));
+        assert!(data.prover_only.fixed_routed_wires.contains(&u8::MAX));
+        assert!(data
+            .prover_only
+            .fixed_routed_wires
+            .iter()
+            .any(|&byte| byte != 0 && byte != u8::MAX));
+        let legacy = two_challenge_wires_permutation_partial_products_and_zs_with_chunk_masks(
             &witness,
             &betas,
             &beta_k_is,
             &gammas,
             &data.prover_only,
             &data.common,
+            false,
+        );
+        let paired = two_challenge_wires_permutation_partial_products_and_zs_with_chunk_masks(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+            true,
+        );
+        assert_eq!(
+            raw_limbs(&paired),
+            raw_limbs(&legacy),
+            "chunk masks changed a raw permutation-product limb",
         );
         for challenge in 0..2 {
             let reference = naive_reference(
@@ -4933,4 +5054,5 @@ mod permutation_pairing_tests {
             }
         }
     }
+
 }
