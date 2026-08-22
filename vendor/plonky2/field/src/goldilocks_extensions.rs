@@ -579,6 +579,13 @@ pub fn ext2_mul_add(
 /// - c1 < 16 * 2 * 2^128 = 2^133.
 ///
 /// Both coefficients therefore satisfy `reduce160`'s bound with ample room.
+///
+/// `powers[0]` is identically `beta^0 = ONE = [1, 0]`, so the four
+/// widening products for `i = 0` are `a0*1`, `a1*0`, `a0*0`, `a1*1`.
+/// Two of those are zero and the other two copy the term limbs. Seed
+/// the delayed-reduction accumulators with those copies and skip the
+/// four multiplies. Integer accumulators after the remaining fifteen
+/// terms are bit-identical to folding all sixteen products.
 #[inline(always)]
 #[unroll_for_loops]
 fn ext2_dot_product_arity16(
@@ -586,12 +593,16 @@ fn ext2_dot_product_arity16(
     powers: &[QuadraticExtension<GoldilocksField>; 16],
 ) -> QuadraticExtension<GoldilocksField> {
     const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+    debug_assert_eq!(powers[0].0[0].0, 1u64);
+    debug_assert_eq!(powers[0].0[1].0, 0u64);
 
-    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    // powers[0] = [1, 0] -> c0 += a0, c1 += a1, no W-product.
+    let QuadraticExtension([t0, t1]) = terms[0];
+    let (mut c0_plain_lo, mut c0_plain_hi) = (t0.0 as u128, 0u32);
     let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
-    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (t1.0 as u128, 0u32);
 
-    for i in 0..16 {
+    for i in 1..16 {
         let QuadraticExtension([a0, a1]) = terms[i];
         let QuadraticExtension([b0, b1]) = powers[i];
         u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, a0.0, b0.0);
@@ -683,14 +694,21 @@ fn ext2_dot_product_arity16_pair(
     powers: &[QuadraticExtension<GoldilocksField>; 16],
 ) -> [QuadraticExtension<GoldilocksField>; 2] {
     const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
-    let (mut p0_lo, mut p0_hi) = (0u128, 0u32);
-    let (mut w0_lo, mut w0_hi) = (0u128, 0u32);
-    let (mut c1_0_lo, mut c1_0_hi) = (0u128, 0u32);
-    let (mut p1_lo, mut p1_hi) = (0u128, 0u32);
-    let (mut w1_lo, mut w1_hi) = (0u128, 0u32);
-    let (mut c1_1_lo, mut c1_1_hi) = (0u128, 0u32);
+    debug_assert_eq!(powers[0].0[0].0, 1u64);
+    debug_assert_eq!(powers[0].0[1].0, 0u64);
 
-    for i in 0..16 {
+    // Same identity-power peel as `ext2_dot_product_arity16`: skip the
+    // eight widening products (four per row) of `beta^0 = [1, 0]`.
+    let QuadraticExtension([a00, a01]) = terms0[0];
+    let QuadraticExtension([a10, a11]) = terms1[0];
+    let (mut p0_lo, mut p0_hi) = (a00.0 as u128, 0u32);
+    let (mut w0_lo, mut w0_hi) = (0u128, 0u32);
+    let (mut c1_0_lo, mut c1_0_hi) = (a01.0 as u128, 0u32);
+    let (mut p1_lo, mut p1_hi) = (a10.0 as u128, 0u32);
+    let (mut w1_lo, mut w1_hi) = (0u128, 0u32);
+    let (mut c1_1_lo, mut c1_1_hi) = (a11.0 as u128, 0u32);
+
+    for i in 1..16 {
         let QuadraticExtension([a00, a01]) = terms0[i];
         let QuadraticExtension([a10, a11]) = terms1[i];
         let QuadraticExtension([b0, b1]) = powers[i];
