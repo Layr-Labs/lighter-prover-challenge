@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "c4e1766864814e439b4c3f49c49e2e0598a70194128a33323fab4fa0cce1521e";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -309,11 +309,12 @@ fn build_pipeline(
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 11] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
     "poseidon2_absorb_pass",
+    "poseidon2_pow_search",
     "ntt_prepare",
     "ntt_stage",
     "ifft_finalize",
@@ -1352,13 +1353,11 @@ impl<F: RichField> TreeReadback<'_, F> {
     }
 }
 
-/// The two gate-quotient pipelines, lowered off the context's blocking path.
+/// Optional pipelines lowered off the context's blocking path.
 ///
 /// Each is `None` until its background build finishes and `Some(None)` if that
-/// build failed. Both readers already treat an absent pipeline as "evaluate
-/// this gate on the CPU", which is the same behaviour a failed build produced
-/// before, so a caller that arrives early simply takes the CPU path it would
-/// have taken had the kernel been unbuildable.
+/// build failed. Every reader has a complete CPU fallback, so an early caller
+/// can report the optional backend unavailable without compromising a proof.
 struct LazyPipeline {
     built: std::sync::OnceLock<Option<ComputePipelineState>>,
     builder: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1402,7 +1401,7 @@ impl LazyPipeline {
     /// exactly the pre-streaming behaviour and is asserted bit-identical by
     /// this file's differentials.
     ///
-    /// That difference matters at startup. The four optional lowerings only
+    /// That difference matters at startup. The optional lowerings only
     /// start once the context is ready, and the first thing to reach the
     /// streamed path afterwards is the embedded-blob load: both 2^19-leaf tx
     /// blobs recompute `constants_sigmas_commitment`, and at 82 columns they
@@ -1419,6 +1418,7 @@ static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static POW_SEARCH_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1437,6 +1437,12 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     // has landed — which is every call in steady state — this is the same
     // pointer `get` would return.
     ABSORB_PASS_PIPELINE.try_get()
+}
+
+fn pow_search_pipeline() -> Option<&'static ComputePipelineState> {
+    // PoW always has the complete CPU-quad fallback. Never wait for an optional
+    // lowering on the proof spine.
+    POW_SEARCH_PIPELINE.try_get()
 }
 
 /// Starts the two gate-quotient pipeline builds on detached threads.
@@ -1461,6 +1467,7 @@ fn spawn_optional_pipelines(
         ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        ("poseidon2_pow_search", &POW_SEARCH_PIPELINE),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -1686,12 +1693,85 @@ impl GpuJobGuard {
         GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         GpuJobGuard
     }
+
+    /// Atomically reserves an actually idle GPU path. PoW never queues behind
+    /// an existing tree/quotient job: a failed reservation returns immediately
+    /// to the CPU quad search. The sole BufferSet is acquired only after this
+    /// reservation, and a nonblocking miss releases it again.
+    fn try_begin_idle() -> Option<Self> {
+        GPU_JOBS_IN_FLIGHT
+            .compare_exchange(
+                0,
+                1,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| GpuJobGuard)
+    }
 }
 
 impl Drop for GpuJobGuard {
     fn drop(&mut self) {
-        GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+        GPU_JOBS_IN_FLIGHT.fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
+}
+
+const POW_WAVE_CANDIDATES: usize = 1 << 13;
+const POW_WAVES_PER_COMMAND: usize = 8;
+const POW_WINDOW_CANDIDATES: usize = POW_WAVE_CANDIDATES * POW_WAVES_PER_COMMAND;
+const POW_NO_WINNER: u32 = u32::MAX;
+
+/// Opportunistically searches FRI PoW candidates on an actually idle Metal
+/// path. `None` means no candidate was checked. `Ok(candidate)` is a witness;
+/// `Err(resume_at)` proves only that candidates below `resume_at` were checked,
+/// so the caller resumes its complete CPU-quad fallback there.
+pub(crate) fn try_find_fri_pow_witness<F: RichField>(
+    duplex_intermediate_state: &[F],
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+    max_candidate: u64,
+) -> Option<Result<u64, u64>> {
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || duplex_intermediate_state.len() != 12
+        || witness_input_pos >= 8
+        || min_leading_zeros > 64
+        || max_candidate > F::NEG_ONE.to_canonical_u64()
+        || !context_ready()
+    {
+        return None;
+    }
+    let context = force_context().as_ref().ok()?;
+    let pipeline = pow_search_pipeline()?;
+
+    // Reserve before touching the singleton BufferSet. A busy GPU, a set race,
+    // or a queued spine waiter returns immediately to CPU instead of extending
+    // the serialized Metal queue.
+    let job = GpuJobGuard::try_begin_idle()?;
+    let mut set = match context.try_acquire_set() {
+        Ok(Some(set)) => set,
+        Ok(None) => return None,
+        Err(error) => {
+            log::warn!("Metal FRI PoW buffer pool unavailable; using CPU path: {error}");
+            return Some(Err(0));
+        }
+    };
+    let raw_state: [u64; 12] = core::array::from_fn(|i| {
+        duplex_intermediate_state[i].to_noncanonical_u64()
+    });
+    let result = context.find_fri_pow_witness_with_set(
+        &mut set,
+        pipeline,
+        &raw_state,
+        witness_input_pos,
+        min_leading_zeros,
+        0,
+        max_candidate,
+    );
+    context.release_set(set);
+    drop(job);
+    Some(result)
 }
 
 fn gpu_worthwhile(leaf_width: usize, leaf_count: usize, cap_height: usize) -> bool {
@@ -3008,7 +3088,7 @@ impl MetalShared {
                         .expect("ifft finalize pipeline thread panicked"),
                 )
             });
-            // Everything the context blocks on is now built; the four optional
+            // Everything the context blocks on is now built; the optional
             // kernels below land on their own threads.
             PIPELINE_BLOCKING_US.store(
                 PIPELINE_PHASE_START
@@ -3418,8 +3498,158 @@ impl MetalShared {
         })
     }
 
+    fn find_fri_pow_witness_with_set(
+        &self,
+        set: &mut BufferSet,
+        pipeline: &ComputePipelineState,
+        initial_state: &[u64; 12],
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+        first_candidate: u64,
+        max_candidate: u64,
+    ) -> Result<u64, u64> {
+        let input_bytes = size_of_val(initial_state) as u64;
+        if set
+            .input
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < input_bytes)
+        {
+            set.input = Some(autoreleasepool(|| {
+                self.device
+                    .new_buffer(input_bytes, MTLResourceOptions::StorageModeShared)
+            }));
+        }
+        if set
+            .output
+            .as_ref()
+            .map_or(true, |buffer| buffer.length() < size_of::<u32>() as u64)
+        {
+            set.output = Some(autoreleasepool(|| {
+                self.device.new_buffer(
+                    size_of::<u32>() as u64,
+                    MTLResourceOptions::StorageModeShared,
+                )
+            }));
+        }
+        let input = set.input.as_ref().expect("PoW input buffer was installed");
+        let output = set.output.as_ref().expect("PoW output buffer was installed");
+        let input_ptr = input.contents().cast::<u64>();
+        let output_ptr = output.contents().cast::<u32>();
+        if input_ptr.is_null() || output_ptr.is_null() {
+            return Err(first_candidate);
+        }
+        // SAFETY: the shared input buffer has room for all twelve words and no
+        // GPU command using this reserved set exists yet.
+        unsafe {
+            slice::from_raw_parts_mut(input_ptr, initial_state.len())
+                .copy_from_slice(initial_state);
+        }
+
+        let mut window_start = first_candidate;
+        while window_start <= max_candidate {
+            let window_count = (max_candidate - window_start + 1)
+                .min(POW_WINDOW_CANDIDATES as u64) as usize;
+            // SAFETY: output is a shared buffer with at least one aligned u32.
+            unsafe { output_ptr.write(POW_NO_WINNER) };
+
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                let command_buffer = self.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(input), 0);
+                encoder.set_buffer(1, Some(output), 0);
+                encoder.set_buffer(2, Some(&self.parameters), 0);
+                encoder.set_bytes(
+                    3,
+                    size_of::<u64>() as NSUInteger,
+                    (&window_start as *const u64).cast::<c_void>(),
+                );
+                set_u32(encoder, 4, witness_input_pos as u32);
+                set_u32(encoder, 5, min_leading_zeros);
+                let output_resource: &metal::ResourceRef = output;
+                for wave in 0..POW_WAVES_PER_COMMAND {
+                    let wave_offset = wave * POW_WAVE_CANDIDATES;
+                    if wave_offset >= window_count {
+                        break;
+                    }
+                    if wave != 0 {
+                        // Later dispatches read the winner written by the
+                        // preceding wave and must observe it before deciding to
+                        // no-op. This is the same explicit inter-dispatch
+                        // resource barrier used by the parent Merkle ladder.
+                        encoder.memory_barrier_with_resources(&[output_resource]);
+                    }
+                    let wave_count = (window_count - wave_offset).min(POW_WAVE_CANDIDATES);
+                    set_u32(encoder, 6, wave_offset as u32);
+                    set_u32(encoder, 7, wave_count as u32);
+                    dispatch(encoder, pipeline, wave_count);
+                }
+                encoder.end_encoding();
+                #[cfg(feature = "diagnostic_profile")]
+                profile_command_buffer(
+                    command_buffer,
+                    "fri_pow_search",
+                    window_count as u64,
+                );
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                log::warn!(
+                    "Metal FRI PoW command buffer ended with status {:?}; resuming CPU at {}",
+                    command_buffer.status(),
+                    window_start,
+                );
+                // The failed window is not trusted. Earlier disjoint windows
+                // completed with no hit, so retry exactly this start on CPU.
+                return Err(window_start);
+            }
+
+            // SAFETY: completion makes the shared output visible to the CPU.
+            let relative = unsafe { output_ptr.read() };
+            if relative != POW_NO_WINNER {
+                let relative = relative as usize;
+                if relative < window_count {
+                    return Ok(window_start + relative as u64);
+                }
+                log::warn!(
+                    "Metal FRI PoW returned out-of-window offset {relative}; resuming CPU at {window_start}"
+                );
+                return Err(window_start);
+            }
+            window_start += window_count as u64;
+        }
+
+        // The complete bounded range had no witness. This is reachable in
+        // focused no-hit/tail tests; production's field-sized range makes it
+        // overwhelmingly unlikely. The caller's CPU fallback receives an empty
+        // range and preserves the historical failure behavior.
+        Err(window_start)
+    }
+
     fn acquire_set(&self) -> Result<BufferSet, String> {
         self.acquire_set_priority(false)
+    }
+
+    /// Nonblocking acquisition for opportunistic PoW. It must never join the
+    /// tree wait queue, and it must not jump an already-admitted spine waiter.
+    fn try_acquire_set(&self) -> Result<Option<BufferSet>, String> {
+        let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
+        if pool.spine_waiters != 0 {
+            return Ok(None);
+        }
+        if let Some(set) = pool.free.pop() {
+            return Ok(Some(set));
+        }
+        if pool.created < MAX_BUFFER_SETS {
+            pool.created += 1;
+            return Ok(Some(BufferSet {
+                input: None,
+                output: None,
+            }));
+        }
+        Ok(None)
     }
 
     /// `spine` acquisitions (the 2^17 serial-critical trees) take a freed set
@@ -4567,6 +4797,9 @@ mod tests {
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
+    use crate::hash::hashing::PlonkyPermutation;
+    use crate::hash::poseidon2::hash::Poseidon2;
+    use crate::iop::challenger::Challenger;
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
@@ -4661,6 +4894,7 @@ mod tests {
                 &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             ),
             ("range_check_gate_quotient", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            ("poseidon2_pow_search", &[0, 1, 2, 3, 4, 5, 6, 7]),
             ("poseidon2_hash_leaves", &[0, 1, 2, 3, 4]),
             ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
             ("ntt_stage", &[0, 1, 2, 3, 4]),
@@ -4722,7 +4956,7 @@ mod tests {
             regions += 1;
         }
         assert_eq!(
-            regions, 19,
+            regions, 20,
             "the number of production dispatch sites changed; each one is audited \
              above, so update this count deliberately rather than by reflex."
         );
@@ -4764,6 +4998,174 @@ mod tests {
                 "prebuilt metallib is missing kernel {name}"
             );
         }
+    }
+
+    fn forced_fri_pow_search_raw(
+        initial_state: &[u64; 12],
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+        first_candidate: u64,
+        max_candidate: u64,
+    ) -> Result<u64, u64> {
+        let context = force_context()
+            .as_ref()
+            .expect("Metal context must initialize for PoW differential");
+        let pipeline = POW_SEARCH_PIPELINE
+            .get()
+            .expect("optional PoW pipeline must build for forced differential");
+        let job = GpuJobGuard::begin();
+        let mut set = context.acquire_set().expect("PoW differential buffer set");
+        let result = context.find_fri_pow_witness_with_set(
+            &mut set,
+            pipeline,
+            initial_state,
+            witness_input_pos,
+            min_leading_zeros,
+            first_candidate,
+            max_candidate,
+        );
+        context.release_set(set);
+        drop(job);
+        result
+    }
+
+    #[test]
+    fn metal_fri_pow_matches_scalar_for_raw_states_and_every_witness_position() {
+        type F = GoldilocksField;
+        let raw = [
+            0,
+            1,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            1 << 32,
+            u64::MAX - 1,
+            u64::MAX,
+            0x1234_5678_9abc_def0,
+            0xfedc_ba98_7654_3210,
+            7,
+            11,
+        ];
+        let candidate = 0x1020_3040u64;
+        for witness_input_pos in 0..8 {
+            let mut scalar_state = raw.map(GoldilocksField);
+            scalar_state[witness_input_pos] = F::from_canonical_u64(candidate);
+            let response = F::poseidon2(scalar_state)[7].to_canonical_u64();
+            let leading_zeros = response.leading_zeros();
+
+            assert_eq!(
+                forced_fri_pow_search_raw(
+                    &raw,
+                    witness_input_pos,
+                    leading_zeros,
+                    candidate,
+                    candidate,
+                ),
+                Ok(candidate),
+                "hit at witness position {witness_input_pos}",
+            );
+            if leading_zeros < 64 {
+                assert_eq!(
+                    forced_fri_pow_search_raw(
+                        &raw,
+                        witness_input_pos,
+                        leading_zeros + 1,
+                        candidate,
+                        candidate,
+                    ),
+                    Err(candidate + 1),
+                    "no-hit at witness position {witness_input_pos}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_fri_pow_windows_are_disjoint_barriered_and_tail_safe() {
+        type F = GoldilocksField;
+        let state = [0u64; 12];
+
+        // With a zero-bit target every candidate is valid. The first 8192-wide
+        // wave must publish a winner which all seven later dispatches observe
+        // through explicit resource barriers and skip.
+        let hit = forced_fri_pow_search_raw(
+            &state,
+            0,
+            0,
+            0,
+            (POW_WINDOW_CANDIDATES - 1) as u64,
+        )
+        .expect("zero-bit window must hit");
+        assert!(hit < POW_WAVE_CANDIDATES as u64);
+
+        // A 65-bit predicate cannot be met by a u64 response. This crosses one
+        // complete 65536-candidate command window and a ragged second window;
+        // the exact resume token proves no gap or overlap in host progression.
+        let first = 7u64;
+        let max = first + POW_WINDOW_CANDIDATES as u64 + 5;
+        assert_eq!(
+            forced_fri_pow_search_raw(&state, 3, 65, first, max),
+            Err(max + 1),
+        );
+
+        // Tail arithmetic at the Goldilocks canonical endpoint never forms an
+        // overflowing `max + 1` and checks the final one-to-four candidates.
+        let field_max = F::NEG_ONE.to_canonical_u64();
+        assert_eq!(
+            forced_fri_pow_search_raw(&state, 7, 65, field_max - 3, field_max),
+            Err(field_max + 1),
+        );
+    }
+
+    #[test]
+    fn metal_fri_pow_witness_replays_through_scalar_challenger() {
+        type F = GoldilocksField;
+        type H = Poseidon2Hash;
+        let mut challenger = Challenger::<F, H>::new();
+        challenger.observe_elements(&[
+            F::from_canonical_u64(7),
+            F::from_canonical_u64(11),
+            F::from_canonical_u64(13),
+        ]);
+        let mut intermediate = challenger.sponge_state;
+        let witness_input_pos = challenger.input_buffer.len();
+        intermediate.set_from_slice(&challenger.input_buffer, 0);
+        let raw_state: [u64; 12] =
+            core::array::from_fn(|i| intermediate.as_ref()[i].to_noncanonical_u64());
+        let min_leading_zeros = 8;
+        let candidate = forced_fri_pow_search_raw(
+            &raw_state,
+            witness_input_pos,
+            min_leading_zeros,
+            0,
+            F::NEG_ONE.to_canonical_u64(),
+        )
+        .expect("Metal PoW must find a witness");
+
+        challenger.observe_element(F::from_canonical_u64(candidate));
+        let response = challenger.get_challenge();
+        assert!(response.to_canonical_u64().leading_zeros() >= min_leading_zeros);
+        // The ordinary Challenger remains the sole transcript authority after
+        // selection; later challenges come from its scalar replayed state.
+        let following = challenger.get_n_challenges(16);
+        assert_eq!(following.len(), 16);
+    }
+
+    #[test]
+    fn fri_pow_idle_reservation_rejects_a_busy_gpu() {
+        type F = GoldilocksField;
+        // Finish optional setup before marking the GPU busy; the assertion then
+        // covers production admission rather than an unavailable-pipeline exit.
+        let _ = force_context();
+        assert!(POW_SEARCH_PIPELINE.get().is_some());
+        let busy = GpuJobGuard::begin();
+        assert!(GpuJobGuard::try_begin_idle().is_none());
+        assert_eq!(
+            try_find_fri_pow_witness(&[F::ZERO; 12], 0, 0, F::NEG_ONE.to_canonical_u64()),
+            None,
+            "busy production route must leave the full CPU fallback selected",
+        );
+        drop(busy);
     }
 
     /// Opens the committed archive from a scratch copy, exactly as

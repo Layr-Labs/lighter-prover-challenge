@@ -13,6 +13,8 @@ use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::config::{AlgebraicHasher, Hasher};
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use crate::plonk::config::FriPowSearchResult;
 
 pub trait Poseidon2: PrimeField64 {
     #[inline]
@@ -948,6 +950,25 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
 
     fn two_to_one_quad(inputs: [(Self::Hash, Self::Hash); 4]) -> [Self::Hash; 4] {
         compress_quad::<F>(inputs)
+    }
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_find_fri_pow_witness(
+        duplex_intermediate_state: Self::Permutation,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+        max_candidate: u64,
+    ) -> Option<FriPowSearchResult<F>> {
+        super::metal::try_find_fri_pow_witness(
+            duplex_intermediate_state.as_ref(),
+            witness_input_pos,
+            min_leading_zeros,
+            max_candidate,
+        )
+        .map(|result| match result {
+            Ok(candidate) => FriPowSearchResult::Found(F::from_canonical_u64(candidate)),
+            Err(resume_at) => FriPowSearchResult::ResumeAt(resume_at),
+        })
     }
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]

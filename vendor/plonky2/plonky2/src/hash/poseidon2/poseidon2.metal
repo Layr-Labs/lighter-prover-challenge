@@ -1645,6 +1645,41 @@ kernel void range_check_gate_quotient(
     output[(ulong)gid * 2 + 1] = gl_canonicalize(total[1]);
 }
 
+// Searches one disjoint FRI proof-of-work wave. `winner` stores a
+// window-relative candidate offset, with 0xffffffff meaning no hit. Dispatches
+// for later waves share this word and return immediately after an earlier wave
+// finds any valid witness. The host inserts an explicit resource barrier between
+// dispatches, so this check is a sound work-elision hint; validity never depends
+// on which racing valid candidate wins.
+kernel void poseidon2_pow_search(
+    const device ulong* initial_state [[buffer(0)]],
+    device atomic_uint* winner [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant ulong& window_start [[buffer(3)]],
+    constant uint& witness_input_pos [[buffer(4)]],
+    constant uint& min_leading_zeros [[buffer(5)]],
+    constant uint& wave_offset [[buffer(6)]],
+    constant uint& wave_count [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= wave_count ||
+        atomic_load_explicit(winner, memory_order_relaxed) != 0xffffffffu) {
+        return;
+    }
+
+    ulong state[12];
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = initial_state[i];
+    }
+    uint relative_candidate = wave_offset + gid;
+    state[witness_input_pos] = window_start + (ulong)relative_candidate;
+    poseidon2(state, parameters);
+    ulong response = gl_canonicalize(state[7]);
+    if (clz(response) >= min_leading_zeros) {
+        atomic_fetch_min_explicit(
+            winner, relative_candidate, memory_order_relaxed);
+    }
+}
+
 kernel void poseidon2_hash_leaves(
     const device ulong* leaves [[buffer(0)]],
     device ulong* hashes [[buffer(1)]],

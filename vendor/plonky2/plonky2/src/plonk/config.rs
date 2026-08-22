@@ -40,6 +40,18 @@ pub trait GenericHashOut<F: RichField>:
     }
 }
 
+/// Outcome of an optional specialized FRI proof-of-work search.
+///
+/// `ResumeAt` means every candidate below the returned bound was checked and
+/// failed. The generic CPU path can resume at that candidate without repeating
+/// work or skipping a possible witness. Backends return `None` when they did no
+/// work (busy, unavailable, unsupported, or disabled).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FriPowSearchResult<F> {
+    Found(F),
+    ResumeAt(u64),
+}
+
 /// Trait for hash functions.
 pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// Size of `Hash` in bytes.
@@ -125,6 +137,20 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     }
 
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
+
+    /// Try a specialized FRI proof-of-work search.
+    ///
+    /// Implementations may return a valid witness or an exact candidate at
+    /// which the generic search must resume. `None` means no candidate was
+    /// checked, so the caller starts its unchanged CPU search at zero.
+    fn try_find_fri_pow_witness(
+        _duplex_intermediate_state: Self::Permutation,
+        _witness_input_pos: usize,
+        _min_leading_zeros: u32,
+        _max_candidate: u64,
+    ) -> Option<FriPowSearchResult<F>> {
+        None
+    }
 
     /// Build the native Merkle digests and cap with a specialized backend, when available.
     ///
