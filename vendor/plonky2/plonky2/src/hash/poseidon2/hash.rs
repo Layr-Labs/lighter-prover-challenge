@@ -8,7 +8,7 @@ use crate::field::goldilocks_field::GoldilocksField as F;
 use crate::field::types::{Field, PrimeField64};
 use crate::gates::poseidon2::Poseidon2Gate;
 use crate::hash::hash_types::{HashOut, NUM_HASH_OUT_ELTS, RichField};
-use crate::hash::hashing::{PlonkyPermutation, compress, hash_n_to_hash_no_pad};
+use crate::hash::hashing::{PlonkyPermutation, compress};
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::target::{BoolTarget, Target};
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -774,6 +774,120 @@ fn sum_12<F: PrimeField64>(inputs: &[F]) -> F {
     F::from_noncanonical_u128_with_96_bits(tmp)
 }
 
+/// Squeeze the first `NUM_HASH_OUT_ELTS` limbs of an overwrite-mode sponge.
+#[inline(always)]
+fn squeeze_hash<T: Copy>(state: &[T; WIDTH]) -> HashOut<T> {
+    HashOut {
+        elements: state[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    }
+}
+
+/// Absorb one RATE-aligned chunk into a Poseidon2 state (overwrite mode).
+#[inline(always)]
+fn absorb_rate_chunk<T: Copy>(state: &mut [T; WIDTH], chunk: &[T]) {
+    debug_assert_eq!(chunk.len(), RATE);
+    state[..RATE].copy_from_slice(chunk);
+}
+
+/// Production FRI commit leaves are `arity * D = 16 * 2 = 32` field elements —
+/// exactly four RATE=8 chunks. Unrolling the four overwrite+permute steps is
+/// bit-identical to `inputs.chunks(RATE)` and keeps the permutation chain in
+/// registers instead of looping on a runtime remainder length that is always
+/// zero at this width.
+#[inline(always)]
+fn absorb_width32<F: RichField + Poseidon2>(state: &mut [F; WIDTH], inputs: &[F]) {
+    debug_assert_eq!(inputs.len(), 32);
+    absorb_rate_chunk(state, &inputs[0..RATE]);
+    *state = F::poseidon2(*state);
+    absorb_rate_chunk(state, &inputs[RATE..2 * RATE]);
+    *state = F::poseidon2(*state);
+    absorb_rate_chunk(state, &inputs[2 * RATE..3 * RATE]);
+    *state = F::poseidon2(*state);
+    absorb_rate_chunk(state, &inputs[3 * RATE..4 * RATE]);
+    *state = F::poseidon2(*state);
+}
+
+#[inline(always)]
+fn absorb_width32_pair<F: RichField + Poseidon2>(
+    input_a: &[F],
+    input_b: &[F],
+) -> ([F; WIDTH], [F; WIDTH]) {
+    debug_assert_eq!(input_a.len(), 32);
+    debug_assert_eq!(input_b.len(), 32);
+    let mut state_a = [F::ZERO; WIDTH];
+    let mut state_b = [F::ZERO; WIDTH];
+    absorb_rate_chunk(&mut state_a, &input_a[0..RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[0..RATE]);
+    (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
+    absorb_rate_chunk(&mut state_a, &input_a[RATE..2 * RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[RATE..2 * RATE]);
+    (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
+    absorb_rate_chunk(&mut state_a, &input_a[2 * RATE..3 * RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[2 * RATE..3 * RATE]);
+    (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
+    absorb_rate_chunk(&mut state_a, &input_a[3 * RATE..4 * RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[3 * RATE..4 * RATE]);
+    (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
+    (state_a, state_b)
+}
+
+#[inline(always)]
+fn absorb_width32_quad<F: RichField + Poseidon2>(
+    input_a: &[F],
+    input_b: &[F],
+    input_c: &[F],
+    input_d: &[F],
+) -> ([F; WIDTH], [F; WIDTH], [F; WIDTH], [F; WIDTH]) {
+    debug_assert_eq!(input_a.len(), 32);
+    let mut state_a = [F::ZERO; WIDTH];
+    let mut state_b = [F::ZERO; WIDTH];
+    let mut state_c = [F::ZERO; WIDTH];
+    let mut state_d = [F::ZERO; WIDTH];
+    absorb_rate_chunk(&mut state_a, &input_a[0..RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[0..RATE]);
+    absorb_rate_chunk(&mut state_c, &input_c[0..RATE]);
+    absorb_rate_chunk(&mut state_d, &input_d[0..RATE]);
+    (state_a, state_b, state_c, state_d) = F::poseidon2_x4(state_a, state_b, state_c, state_d);
+    absorb_rate_chunk(&mut state_a, &input_a[RATE..2 * RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[RATE..2 * RATE]);
+    absorb_rate_chunk(&mut state_c, &input_c[RATE..2 * RATE]);
+    absorb_rate_chunk(&mut state_d, &input_d[RATE..2 * RATE]);
+    (state_a, state_b, state_c, state_d) = F::poseidon2_x4(state_a, state_b, state_c, state_d);
+    absorb_rate_chunk(&mut state_a, &input_a[2 * RATE..3 * RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[2 * RATE..3 * RATE]);
+    absorb_rate_chunk(&mut state_c, &input_c[2 * RATE..3 * RATE]);
+    absorb_rate_chunk(&mut state_d, &input_d[2 * RATE..3 * RATE]);
+    (state_a, state_b, state_c, state_d) = F::poseidon2_x4(state_a, state_b, state_c, state_d);
+    absorb_rate_chunk(&mut state_a, &input_a[3 * RATE..4 * RATE]);
+    absorb_rate_chunk(&mut state_b, &input_b[3 * RATE..4 * RATE]);
+    absorb_rate_chunk(&mut state_c, &input_c[3 * RATE..4 * RATE]);
+    absorb_rate_chunk(&mut state_d, &input_d[3 * RATE..4 * RATE]);
+    (state_a, state_b, state_c, state_d) = F::poseidon2_x4(state_a, state_b, state_c, state_d);
+    (state_a, state_b, state_c, state_d)
+}
+
+/// Overwrite-mode sponge whose permutation matches `hash_n_to_hash_no_pad`.
+/// RATE-aligned inputs (every production Merkle leaf width) skip the remainder
+/// length check; width 32 is fully unrolled.
+#[inline]
+fn hash_no_pad_overwrite<F: RichField + Poseidon2>(inputs: &[F]) -> HashOut<F> {
+    let mut state = [F::ZERO; WIDTH];
+    if inputs.len() == 32 {
+        absorb_width32(&mut state, inputs);
+    } else if inputs.len() % RATE == 0 {
+        for chunk in inputs.chunks_exact(RATE) {
+            absorb_rate_chunk(&mut state, chunk);
+            state = F::poseidon2(state);
+        }
+    } else {
+        for chunk in inputs.chunks(RATE) {
+            state[..chunk.len()].copy_from_slice(chunk);
+            state = F::poseidon2(state);
+        }
+    }
+    squeeze_hash(&state)
+}
+
 /// Hash two equal-length inputs with two lockstep overwrite-mode sponges whose
 /// permutations run interleaved via `poseidon2_x2`. Each output is
 /// bit-identical to `hash_n_to_hash_no_pad` on the corresponding input.
@@ -782,23 +896,29 @@ pub(crate) fn hash_pair_no_pad<F: RichField + Poseidon2>(
     input_b: &[F],
 ) -> (HashOut<F>, HashOut<F>) {
     debug_assert_eq!(input_a.len(), input_b.len());
-    let mut state_a = [F::ZERO; WIDTH];
-    let mut state_b = [F::ZERO; WIDTH];
+    let (state_a, state_b) = if input_a.len() == 32 {
+        absorb_width32_pair(input_a, input_b)
+    } else if input_a.len() % RATE == 0 {
+        let mut state_a = [F::ZERO; WIDTH];
+        let mut state_b = [F::ZERO; WIDTH];
+        for (chunk_a, chunk_b) in input_a.chunks_exact(RATE).zip(input_b.chunks_exact(RATE)) {
+            absorb_rate_chunk(&mut state_a, chunk_a);
+            absorb_rate_chunk(&mut state_b, chunk_b);
+            (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
+        }
+        (state_a, state_b)
+    } else {
+        let mut state_a = [F::ZERO; WIDTH];
+        let mut state_b = [F::ZERO; WIDTH];
+        for (chunk_a, chunk_b) in input_a.chunks(RATE).zip(input_b.chunks(RATE)) {
+            state_a[..chunk_a.len()].copy_from_slice(chunk_a);
+            state_b[..chunk_b.len()].copy_from_slice(chunk_b);
+            (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
+        }
+        (state_a, state_b)
+    };
 
-    for (chunk_a, chunk_b) in input_a.chunks(RATE).zip(input_b.chunks(RATE)) {
-        state_a[..chunk_a.len()].copy_from_slice(chunk_a);
-        state_b[..chunk_b.len()].copy_from_slice(chunk_b);
-        (state_a, state_b) = F::poseidon2_x2(state_a, state_b);
-    }
-
-    (
-        HashOut {
-            elements: state_a[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-        },
-        HashOut {
-            elements: state_b[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
-        },
-    )
+    (squeeze_hash(&state_a), squeeze_hash(&state_b))
 }
 
 /// Four-input variant of `hash_pair_no_pad`: four lockstep overwrite-mode
@@ -813,29 +933,54 @@ pub(crate) fn hash_quad_no_pad<F: RichField + Poseidon2>(
     debug_assert_eq!(input_a.len(), input_b.len());
     debug_assert_eq!(input_a.len(), input_c.len());
     debug_assert_eq!(input_a.len(), input_d.len());
-    let mut state_a = [F::ZERO; WIDTH];
-    let mut state_b = [F::ZERO; WIDTH];
-    let mut state_c = [F::ZERO; WIDTH];
-    let mut state_d = [F::ZERO; WIDTH];
-
-    for (((chunk_a, chunk_b), chunk_c), chunk_d) in input_a
-        .chunks(RATE)
-        .zip(input_b.chunks(RATE))
-        .zip(input_c.chunks(RATE))
-        .zip(input_d.chunks(RATE))
-    {
-        state_a[..chunk_a.len()].copy_from_slice(chunk_a);
-        state_b[..chunk_b.len()].copy_from_slice(chunk_b);
-        state_c[..chunk_c.len()].copy_from_slice(chunk_c);
-        state_d[..chunk_d.len()].copy_from_slice(chunk_d);
-        (state_a, state_b, state_c, state_d) =
-            F::poseidon2_x4(state_a, state_b, state_c, state_d);
-    }
-
-    let out = |state: &[F; WIDTH]| HashOut {
-        elements: state[..NUM_HASH_OUT_ELTS].try_into().unwrap(),
+    let (state_a, state_b, state_c, state_d) = if input_a.len() == 32 {
+        absorb_width32_quad(input_a, input_b, input_c, input_d)
+    } else if input_a.len() % RATE == 0 {
+        let mut state_a = [F::ZERO; WIDTH];
+        let mut state_b = [F::ZERO; WIDTH];
+        let mut state_c = [F::ZERO; WIDTH];
+        let mut state_d = [F::ZERO; WIDTH];
+        for (((chunk_a, chunk_b), chunk_c), chunk_d) in input_a
+            .chunks_exact(RATE)
+            .zip(input_b.chunks_exact(RATE))
+            .zip(input_c.chunks_exact(RATE))
+            .zip(input_d.chunks_exact(RATE))
+        {
+            absorb_rate_chunk(&mut state_a, chunk_a);
+            absorb_rate_chunk(&mut state_b, chunk_b);
+            absorb_rate_chunk(&mut state_c, chunk_c);
+            absorb_rate_chunk(&mut state_d, chunk_d);
+            (state_a, state_b, state_c, state_d) =
+                F::poseidon2_x4(state_a, state_b, state_c, state_d);
+        }
+        (state_a, state_b, state_c, state_d)
+    } else {
+        let mut state_a = [F::ZERO; WIDTH];
+        let mut state_b = [F::ZERO; WIDTH];
+        let mut state_c = [F::ZERO; WIDTH];
+        let mut state_d = [F::ZERO; WIDTH];
+        for (((chunk_a, chunk_b), chunk_c), chunk_d) in input_a
+            .chunks(RATE)
+            .zip(input_b.chunks(RATE))
+            .zip(input_c.chunks(RATE))
+            .zip(input_d.chunks(RATE))
+        {
+            state_a[..chunk_a.len()].copy_from_slice(chunk_a);
+            state_b[..chunk_b.len()].copy_from_slice(chunk_b);
+            state_c[..chunk_c.len()].copy_from_slice(chunk_c);
+            state_d[..chunk_d.len()].copy_from_slice(chunk_d);
+            (state_a, state_b, state_c, state_d) =
+                F::poseidon2_x4(state_a, state_b, state_c, state_d);
+        }
+        (state_a, state_b, state_c, state_d)
     };
-    (out(&state_a), out(&state_b), out(&state_c), out(&state_d))
+
+    (
+        squeeze_hash(&state_a),
+        squeeze_hash(&state_b),
+        squeeze_hash(&state_c),
+        squeeze_hash(&state_d),
+    )
 }
 
 /// Two independent `compress` calls with their permutations interleaved via
@@ -897,7 +1042,7 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     type Permutation = Poseidon2Permutation<F>;
 
     fn hash_no_pad(input: &[F]) -> Self::Hash {
-        hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
+        hash_no_pad_overwrite(input)
     }
 
     fn hash_or_noop_pair(input_a: &[F], input_b: &[F]) -> (Self::Hash, Self::Hash) {
