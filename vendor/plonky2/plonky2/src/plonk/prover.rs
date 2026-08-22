@@ -1768,19 +1768,43 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
     // multiply per coefficient instead of two; the table is circuit-shape
     // fixed and shared by every proof in the process.
     let omega_powers_scaled = precomputed::odd_coset_ifft_powers_scaled::<F>(half_rows);
-    let odd: Vec<Vec<F>> = (0..gates.len() * 2)
+    // One sequential walk of each gate's interleaved `[c0, c1, c0, c1, ...]`
+    // half-domain row splits both challenge columns. The previous loop ran
+    // two independent stride-2 gathers, so every limb was loaded twice from
+    // the same 2*half_rows image. Challenge transforms stay bit-identical:
+    // each IFFT still sees the same contiguous `k -> low[base + 2k + c]`
+    // column, only the gather is fused. Indexing of `odd` remains
+    // `odd[g * 2 + c]`.
+    //
+    // Parallelism is one task per gate (both challenges sequential inside).
+    // Ranked light-tx has 16 low gates; two sequential half-domain transforms
+    // per task is the same two-wave occupancy as 32 independent tasks on an
+    // 18-core M4 Pro (`ceil(32/18) = 2`).
+    let odd_pairs: Vec<(Vec<F>, Vec<F>)> = (0..gates.len())
         .into_par_iter()
-        .map(|t| {
-            let g = t / 2;
-            let c = t % 2;
+        .map(|g| {
             let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
-            PolynomialValues::new(values)
-                .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
-                .fft()
-                .values
+            let src = &low[base..base + half_rows * 2];
+            let mut ch0 = Vec::with_capacity(half_rows);
+            let mut ch1 = Vec::with_capacity(half_rows);
+            for pair in src.chunks_exact(2) {
+                ch0.push(pair[0]);
+                ch1.push(pair[1]);
+            }
+            let transform = |values: Vec<F>| {
+                PolynomialValues::new(values)
+                    .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
+                    .fft()
+                    .values
+            };
+            (transform(ch0), transform(ch1))
         })
         .collect();
+    let mut odd = Vec::with_capacity(odd_pairs.len() * 2);
+    for (odd0, odd1) in odd_pairs {
+        odd.push(odd0);
+        odd.push(odd1);
+    }
     #[cfg(feature = "diagnostic_profile")]
     let _combine_span = crate::util::profile::span("quotient", "range_low_combine_only");
     combine_low_range_quotient(
