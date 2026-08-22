@@ -338,12 +338,12 @@ fn ext2_base_scalar_dot_product(
 /// Raw-representative exactness of the fused loop: the single-dot form sums
 /// its four 160-bit banks with `u160_add_accumulators` before reducing, so
 /// its `reduce160` input is the *exact* integer `sum_i v_limb_i * c_i`.
-/// This form accumulates the same terms of the same dot into one bank per
-/// (output, limb) and therefore forms the same exact integer, so every
-/// `reduce160` sees identical inputs and returns identical raw limbs. The
-/// four accumulator chains (two outputs by two limbs) also keep the
-/// single-dot version's four-way instruction-level parallelism while
-/// halving the traffic through the shared powers table.
+/// This form uses the same two-bank split per (output, limb) and merges
+/// those exact 160-bit sums before the sole `reduce160`, so every reduction
+/// sees the same integer and returns identical raw limbs. Eight accumulator
+/// chains (two outputs by two limbs by two banks) keep the single-dot
+/// version's instruction-level parallelism while still reading the shared
+/// powers table once.
 ///
 /// The per-accumulator bound is the single-dot bound verbatim: at most
 /// `2^32 - 1` terms of `(2^64 - 1)^2` each, i.e. below
@@ -374,20 +374,51 @@ fn ext2_base_scalar_dot_products_2(
         debug_assert_eq!(values.len(), poly_a.len());
         debug_assert_eq!(values.len(), poly_b.len());
         debug_assert!(values.len() <= MAX_TERMS_PER_REDUCTION);
-        let (mut a0_lo, mut a0_hi) = (0u128, 0u32);
-        let (mut a1_lo, mut a1_hi) = (0u128, 0u32);
-        let (mut b0_lo, mut b0_hi) = (0u128, 0u32);
-        let (mut b1_lo, mut b1_hi) = (0u128, 0u32);
-        for ((&QuadraticExtension([v0, v1]), &ca), &cb) in
-            values.iter().zip(poly_a).zip(poly_b)
+        // Two banks per (output, limb), same shape as the single-dot form.
+        // Even terms hit bank 0, odd terms hit bank 1; a leftover last term
+        // lands in bank 0. Merging the exact 160-bit sums before reduce160
+        // keeps the historical delayed-reduction representative.
+        let (mut a00_lo, mut a00_hi) = (0u128, 0u32);
+        let (mut a01_lo, mut a01_hi) = (0u128, 0u32);
+        let (mut a10_lo, mut a10_hi) = (0u128, 0u32);
+        let (mut a11_lo, mut a11_hi) = (0u128, 0u32);
+        let (mut b00_lo, mut b00_hi) = (0u128, 0u32);
+        let (mut b01_lo, mut b01_hi) = (0u128, 0u32);
+        let (mut b10_lo, mut b10_hi) = (0u128, 0u32);
+        let (mut b11_lo, mut b11_hi) = (0u128, 0u32);
+        for ((value_pair, ca_pair), cb_pair) in values
+            .chunks_exact(2)
+            .zip(poly_a.chunks_exact(2))
+            .zip(poly_b.chunks_exact(2))
         {
-            u160_add_product(&mut a0_lo, &mut a0_hi, v0.0, ca.0);
-            u160_add_product(&mut a1_lo, &mut a1_hi, v1.0, ca.0);
-            u160_add_product(&mut b0_lo, &mut b0_hi, v0.0, cb.0);
-            u160_add_product(&mut b1_lo, &mut b1_hi, v1.0, cb.0);
+            let QuadraticExtension([v00, v10]) = value_pair[0];
+            let QuadraticExtension([v01, v11]) = value_pair[1];
+            u160_add_product(&mut a00_lo, &mut a00_hi, v00.0, ca_pair[0].0);
+            u160_add_product(&mut a10_lo, &mut a10_hi, v10.0, ca_pair[0].0);
+            u160_add_product(&mut b00_lo, &mut b00_hi, v00.0, cb_pair[0].0);
+            u160_add_product(&mut b10_lo, &mut b10_hi, v10.0, cb_pair[0].0);
+            u160_add_product(&mut a01_lo, &mut a01_hi, v01.0, ca_pair[1].0);
+            u160_add_product(&mut a11_lo, &mut a11_hi, v11.0, ca_pair[1].0);
+            u160_add_product(&mut b01_lo, &mut b01_hi, v01.0, cb_pair[1].0);
+            u160_add_product(&mut b11_lo, &mut b11_hi, v11.0, cb_pair[1].0);
         }
+        if values.len() % 2 != 0 {
+            let last = values.len() - 1;
+            let QuadraticExtension([v0, v1]) = values[last];
+            let ca = poly_a[last];
+            let cb = poly_b[last];
+            u160_add_product(&mut a00_lo, &mut a00_hi, v0.0, ca.0);
+            u160_add_product(&mut a10_lo, &mut a10_hi, v1.0, ca.0);
+            u160_add_product(&mut b00_lo, &mut b00_hi, v0.0, cb.0);
+            u160_add_product(&mut b10_lo, &mut b10_hi, v1.0, cb.0);
+        }
+        let (a0_lo, a0_hi) = u160_add_accumulators((a00_lo, a00_hi), (a01_lo, a01_hi));
+        let (a1_lo, a1_hi) = u160_add_accumulators((a10_lo, a10_hi), (a11_lo, a11_hi));
+        let (b0_lo, b0_hi) = u160_add_accumulators((b00_lo, b00_hi), (b01_lo, b01_hi));
+        let (b1_lo, b1_hi) = u160_add_accumulators((b10_lo, b10_hi), (b11_lo, b11_hi));
         // SAFETY: the exact worst-case bound documented above covers arbitrary
-        // u64 representatives for every term in this chunk.
+        // u64 representatives for every term in this chunk. Splitting into two
+        // banks does not change that integer; it only changes add order.
         [
             QuadraticExtension([unsafe { reduce160(a0_lo, a0_hi) }, unsafe {
                 reduce160(a1_lo, a1_hi)

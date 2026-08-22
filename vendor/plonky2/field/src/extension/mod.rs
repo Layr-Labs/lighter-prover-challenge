@@ -219,22 +219,103 @@ impl<F: Field> FieldExtension<1> for F {
 }
 
 /// Flatten the slice by sending every extension field element to its D-sized canonical representation.
+///
+/// One output allocation. Each element's `[F; D]` is appended directly; there is no per-element
+/// temporary `Vec`.
 pub fn flatten<F, const D: usize>(l: &[F::Extension]) -> Vec<F>
 where
     F: Field + Extendable<D>,
 {
-    l.iter()
-        .flat_map(|x| x.to_basefield_array().to_vec())
-        .collect()
+    let mut out = Vec::with_capacity(l.len() * D);
+    for x in l {
+        out.extend_from_slice(&x.to_basefield_array());
+    }
+    out
 }
 
 /// Batch every D-sized chunks into extension field elements.
+///
+/// `chunks_exact(D)` already yields a slice of length `D`. Copy it into a stack `[F; D]` instead
+/// of allocating a temporary heap `Vec` per reconstructed extension element.
 pub fn unflatten<F, const D: usize>(l: &[F]) -> Vec<F::Extension>
 where
     F: Field + Extendable<D>,
 {
     debug_assert_eq!(l.len() % D, 0);
     l.chunks_exact(D)
-        .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
+        .map(|c| {
+            let mut arr = [F::ZERO; D];
+            arr.copy_from_slice(c);
+            F::Extension::from_basefield_array(arr)
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod flatten_tests {
+    use super::{flatten, unflatten, FieldExtension};
+    use crate::extension::quadratic::QuadraticExtension;
+    use crate::extension::quartic::QuarticExtension;
+    use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Sample;
+
+    type F = GoldilocksField;
+
+    fn naive_flatten<const D: usize>(l: &[<F as super::Extendable<D>>::Extension]) -> Vec<F>
+    where
+        F: super::Extendable<D>,
+    {
+        l.iter()
+            .flat_map(|x| x.to_basefield_array().to_vec())
+            .collect()
+    }
+
+    fn naive_unflatten<const D: usize>(l: &[F]) -> Vec<<F as super::Extendable<D>>::Extension>
+    where
+        F: super::Extendable<D>,
+    {
+        l.chunks_exact(D)
+            .map(|c| {
+                <F as super::Extendable<D>>::Extension::from_basefield_array(
+                    c.to_vec().try_into().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flatten_unflatten_matches_naive_quadratic() {
+        let vals: Vec<QuadraticExtension<F>> = (0..64)
+            .map(|_| QuadraticExtension::from_basefield_array([F::rand(), F::rand()]))
+            .collect();
+        let flat = flatten::<F, 2>(&vals);
+        assert_eq!(flat, naive_flatten::<2>(&vals));
+        assert_eq!(flat.len(), vals.len() * 2);
+        let back = unflatten::<F, 2>(&flat);
+        assert_eq!(back, naive_unflatten::<2>(&flat));
+        assert_eq!(back, vals);
+        assert!(flatten::<F, 2>(&[]).is_empty());
+        assert!(unflatten::<F, 2>(&[]).is_empty());
+    }
+
+    #[test]
+    fn flatten_unflatten_matches_naive_quartic() {
+        let vals: Vec<QuarticExtension<F>> = (0..33)
+            .map(|_| {
+                QuarticExtension::from_basefield_array([F::rand(), F::rand(), F::rand(), F::rand()])
+            })
+            .collect();
+        let flat = flatten::<F, 4>(&vals);
+        assert_eq!(flat, naive_flatten::<4>(&vals));
+        let back = unflatten::<F, 4>(&flat);
+        assert_eq!(back, vals);
+    }
+
+    #[test]
+    fn flatten_unflatten_degree_one_is_identity() {
+        let base: Vec<F> = (0..19).map(|_| F::rand()).collect();
+        let flat = flatten::<F, 1>(&base);
+        assert_eq!(flat, base);
+        assert_eq!(unflatten::<F, 1>(&flat), base);
+    }
 }

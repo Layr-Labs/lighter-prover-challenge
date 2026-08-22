@@ -668,7 +668,7 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
 
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     let product_count = subgroup.len() * num_chunks;
     // Same uninitialised-capacity handling as the per-challenge path: every
     // slot is written below before anything reads it, so zero-filling first is
@@ -726,10 +726,18 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                // Numerator and denominator share `wire + gamma`.
+                                // Field-equal to `wire + beta_* * point + gamma`.
+                                let wire_plus_gamma_0 = wire_value + gamma_0;
+                                let wire_plus_gamma_1 = wire_value + gamma_1;
+                                numerator_0 *=
+                                    wire_plus_gamma_0.multiply_accumulate(beta_k_is_0[j], x);
+                                numerator_1 *=
+                                    wire_plus_gamma_1.multiply_accumulate(beta_k_is_1[j], x);
+                                denominator_0 *=
+                                    wire_plus_gamma_0.multiply_accumulate(beta_0, sigma);
+                                denominator_1 *=
+                                    wire_plus_gamma_1.multiply_accumulate(beta_1, sigma);
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -821,7 +829,7 @@ fn wires_permutation_partial_products_and_zs<
     // The permutation argument only consumes one numerator/denominator ratio per quotient-degree
     // chunk. Form those products before Montgomery inversion, shrinking each inversion batch by
     // `degree` and reading every witness wire only once.
-    const INV_BATCH: usize = 128;
+    const INV_BATCH: usize = 256;
     // Every slot of this buffer is assigned below before anything reads it —
     // the inner loop writes `quotient_products[t * num_chunks + chunk]` for
     // every `t` in the batch and every `chunk`, which covers each sub-slice
@@ -859,8 +867,11 @@ fn wires_permutation_partial_products_and_zs<
                         let mut denominator_product = F::ONE;
                         for j in start..end {
                             let wire_value = witness.get_wire(i, j);
-                            numerator_product *= wire_value + beta_k_is[j] * x + gamma;
-                            denominator_product *= wire_value + beta * s_sigmas[j] + gamma;
+                            let wire_plus_gamma = wire_value + gamma;
+                            numerator_product *=
+                                wire_plus_gamma.multiply_accumulate(beta_k_is[j], x);
+                            denominator_product *=
+                                wire_plus_gamma.multiply_accumulate(beta, s_sigmas[j]);
                         }
                         quotient_products[t * num_chunks + chunk].write(numerator_product);
                         denominator_products.push(denominator_product);
@@ -1639,7 +1650,7 @@ fn combine_low_range_quotient<F: RichField>(
     constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
     filter_cache: Option<&LowRangeSelectorFilterCache<F>>,
 ) -> (Vec<F>, bool) {
-    const ROWS_PER_CHUNK: usize = 512;
+    const ROWS_PER_CHUNK: usize = 1024;
     const MAX_GROUP: usize = 16;
 
     let plans = low_range_selector_group_plans(gates);
@@ -4668,7 +4679,7 @@ mod permutation_pairing_tests {
         assert_eq!(data.common.k_is.len(), num_routed_wires);
 
         // PolynomialValues requires power-of-two domains. Span a single
-        // point, short batches, the inversion boundary (INV_BATCH = 128),
+        // point, short batches, the inversion boundary (INV_BATCH = 256),
         // and several complete batches.
         for &n_points in &[1usize, 2, 64, 128, 256, 512] {
             let mut rng = Rng::new(0x9e37_79b9_7f4a_7c15 ^ ((n_points as u64) << 8));
