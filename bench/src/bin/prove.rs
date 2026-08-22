@@ -86,6 +86,22 @@ fn main() {
     // Do not link and initialize an unused logger in every scored process.
     rayon::ThreadPoolBuilder::new()
         .stack_size(PROVER_THREAD_STACK_BYTES)
+        .start_handler(|_| {
+            #[cfg(target_os = "macos")]
+            {
+                #[allow(non_camel_case_types)]
+                type qos_class_t = u32;
+                unsafe extern "C" {
+                    fn pthread_set_qos_class_self_np(
+                        qos_class: qos_class_t,
+                        relative_priority: i32,
+                    ) -> i32;
+                }
+                unsafe {
+                    let _ = pthread_set_qos_class_self_np(0x19, 0);
+                }
+            }
+        })
         .build_global()
         .expect("cannot configure prover thread pool");
     #[cfg(feature = "diagnostic_profile")]
