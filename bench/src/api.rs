@@ -1,9 +1,5 @@
-// Redraw marker 815
-// Bumped only to obtain a fresh submission hash: the ranked score is a draw
-// from a strongly bimodal runner pool (~27% of draws land in the fast band),
-// so an unchanged tree cannot be re-sampled — the service dedupes identical
-// submissions. Changes no executable behavior; the previous authors used the
-// same convention and their markers reached 573.
+// Mechanism: NEON stride-2 deinterleave draw-20-1787423450 on a59b7c8
+// Value-exact layout only. Not a redraw. LIGHTER_LOW_RANGE_DEINTERLEAVE=0 rolls back.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
