@@ -388,7 +388,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &|group, destinations: &mut [&mut [F]]| {
                             destinations.par_iter_mut().enumerate().for_each(
                                 |(k, destination)| {
-                                    let polynomial = &polys[group * 8 + k];
+                                    let polynomial = &polys[group + k];
                                     assert_eq!(
                                         polynomial.len(),
                                         degree,
@@ -407,7 +407,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
+                                    copy_even(group + k, destination);
                                 },
                             );
                         },
