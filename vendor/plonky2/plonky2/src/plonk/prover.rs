@@ -1774,38 +1774,7 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let g = t / 2;
             let c = t % 2;
             let base = g * half_rows * 2;
-            let src = &low[base..base + half_rows * 2];
-            let mut values: Vec<F> = Vec::with_capacity(half_rows);
-            unsafe { values.set_len(half_rows); }
-            if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
-                unsafe {
-                    use core::arch::aarch64::*;
-                    let mut src_base = src.as_ptr() as *const u64;
-                    let mut dst_ptr = values.as_mut_ptr() as *mut u64;
-                    let chunks = half_rows / 4;
-                    for _ in 0..chunks {
-                        let val = vld2q_u64(src_base);
-                        let val2 = vld2q_u64(src_base.add(4));
-                        if c == 0 {
-                            vst1q_u64(dst_ptr, val.0);
-                            vst1q_u64(dst_ptr.add(2), val2.0);
-                        } else {
-                            vst1q_u64(dst_ptr, val.1);
-                            vst1q_u64(dst_ptr.add(2), val2.1);
-                        }
-                        src_base = src_base.add(8);
-                        dst_ptr = dst_ptr.add(4);
-                    }
-                    let remainder = half_rows % 4;
-                    for i in 0..remainder {
-                        *dst_ptr.add(i) = *src_base.add(i * 2 + c);
-                    }
-                }
-            } else {
-                for (k, out) in values.iter_mut().enumerate() {
-                    *out = src[k * 2 + c];
-                }
-            }
+            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
             PolynomialValues::new(values)
                 .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
                 .fft()
@@ -3371,92 +3340,39 @@ fn compute_quotient_polys<
         // GPU accumulation pass and point-major scatter pass into one walk:
         // CPU quotient pages are now read once and never dirtied again.
         // validator population; this comment changes no executable behavior.
-        const MERGE_CHUNK_POINTS: usize = 512;
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let pos_vals = gpu_poseidon_values;
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let rng_vals = gpu_range_values;
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let rng_low_vals = gpu_range_low_values.as_deref();
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-        let perm_vals = gpu_permutation_values;
-
-        if num_challenges == 2 && column_ptrs.len() == 2 {
-            let col0 = &column_ptrs[0];
-            let col1 = &column_ptrs[1];
-            quotient_values
-                .par_chunks(MERGE_CHUNK_POINTS * 2)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base_point = chunk_idx * MERGE_CHUNK_POINTS;
-                    for (offset, cpu_pair) in chunk.chunks_exact(2).enumerate() {
-                        let i = base_point + offset;
-                        let denominator_inv = z_h_on_coset.eval_inverse(i);
-                        let start = i * 2;
-                        let mut v0 = cpu_pair[0];
-                        let mut v1 = cpu_pair[1];
-                        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                        {
-                            if let Some(values) = pos_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
-                            if let Some(values) = rng_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
-                            if let Some(values) = rng_low_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
-                            if let Some(values) = perm_vals {
-                                v0 += values[start];
-                                v1 += values[start + 1];
-                            }
+        quotient_values
+            .par_chunks_exact(num_challenges)
+            .enumerate()
+            .for_each(|(i, cpu_values)| {
+                let denominator_inv = z_h_on_coset.eval_inverse(i);
+                let start = i * num_challenges;
+                for (challenge, (&cpu, column)) in
+                    cpu_values.iter().zip(column_ptrs).enumerate()
+                {
+                    let mut value = cpu;
+                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                    {
+                        if let Some(values) = gpu_poseidon_values {
+                            value += values[start + challenge];
                         }
-                        v0 = v0 * denominator_inv;
-                        v1 = v1 * denominator_inv;
-                        unsafe {
-                            *col0.0.add(i) = v0;
-                            *col1.0.add(i) = v1;
+                        if let Some(values) = gpu_range_values {
+                            value += values[start + challenge];
+                        }
+                        if let Some(values) = &gpu_range_low_values {
+                            value += values[start + challenge];
+                        }
+                        if let Some(values) = gpu_permutation_values {
+                            value += values[start + challenge];
                         }
                     }
-                });
-        } else {
-            quotient_values
-                .par_chunks(MERGE_CHUNK_POINTS * num_challenges)
-                .enumerate()
-                .for_each(|(chunk_idx, chunk)| {
-                    let base_point = chunk_idx * MERGE_CHUNK_POINTS;
-                    for (offset, cpu_values) in chunk.chunks_exact(num_challenges).enumerate() {
-                        let i = base_point + offset;
-                        let denominator_inv = z_h_on_coset.eval_inverse(i);
-                        let start = i * num_challenges;
-                        for (challenge, (&cpu, column)) in
-                            cpu_values.iter().zip(column_ptrs).enumerate()
-                        {
-                            let mut value = cpu;
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                if let Some(values) = pos_vals {
-                                    value += values[start + challenge];
-                                }
-                                if let Some(values) = rng_vals {
-                                    value += values[start + challenge];
-                                }
-                                if let Some(values) = rng_low_vals {
-                                    value += values[start + challenge];
-                                }
-                                if let Some(values) = perm_vals {
-                                    value += values[start + challenge];
-                                }
-                            }
-                            let value = value * denominator_inv;
-                            unsafe { *column.0.add(i) = value };
-                        }
-                    }
-                });
-        }
+                    // Single `1/Z_H` scaling for the summed contributions; see
+                    // the deferral note at the batch loop above.
+                    let value = value * denominator_inv;
+                    // SAFETY: point `i` is owned by this parallel iteration,
+                    // and every (challenge, point) destination is written once.
+                    unsafe { *column.0.add(i) = value };
+                }
+            });
     } else {
         // CPU-only path: parallel scatter of the interleaved point-major
         // buffer into the per-challenge columns.
