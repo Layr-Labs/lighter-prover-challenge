@@ -132,6 +132,8 @@ mod accumulate_microbench {
     use plonky2::plonk::circuit_data::CircuitConfig;
 
     use super::*;
+    use crate::blob::evaluate_bitstream::EvaluateBitstreamGate;
+    use crate::delta::evaluate_sequence::EvaluateSequenceGate;
 
     fn bench_gate<G>(gate: &G, iters: usize)
     where
@@ -199,6 +201,14 @@ mod accumulate_microbench {
                 ITERS,
             );
         }
+        bench_gate(
+            &EvaluateSequenceGate::new_from_config(&CircuitConfig::standard_recursion_config()),
+            ITERS,
+        );
+        bench_gate(
+            &EvaluateBitstreamGate::new_from_config(&CircuitConfig::standard_recursion_config()),
+            ITERS,
+        );
     }
 }
 

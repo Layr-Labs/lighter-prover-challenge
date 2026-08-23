@@ -20,7 +20,7 @@ use plonky2::iop::target::{BoolTarget, Target};
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
 use plonky2::plonk::circuit_data::{CircuitConfig, CommonCircuitData};
-use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars};
+use plonky2::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBaseBatch};
 
 use crate::builder::Builder;
 use crate::eddsa::gadgets::base_field::{CircuitBuilderGFp5, QuinticExtensionTarget};
@@ -138,6 +138,49 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateSequen
         }
         constraints
     }
+
+    /// Filter-fused base-field evaluation. All inputs and results are already
+    /// in the base field at quotient points, so the default extension-field
+    /// promotion and temporary constraint matrix are unnecessary.
+    fn eval_unfiltered_base_batch_accumulate(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+    ) {
+        let n = vars_base.len();
+        assert_eq!(filters.len(), n);
+        assert!(combined_gate_constraints.len() >= self.num_constraints() * n);
+        let wires = vars_base.local_wires;
+
+        for p in 0..n {
+            let quintuple = |range: Range<usize>| {
+                QuintupleBase::<F, D>::new(core::array::from_fn(|j| {
+                    wires[(range.start + j) * n + p]
+                }))
+            };
+            let x = quintuple(self.wire_x());
+            let mut constraint = 0usize;
+
+            for i in 1..self.num_states {
+                let sum_old = quintuple(self.wire_sum(i - 1));
+                let sum = quintuple(self.wire_sum(i));
+                let current_element = wires[self.wire_element(i) * n + p];
+                let selector = wires[self.wire_selector(i) * n + p];
+                let expected_sum = (sum_old * x)
+                    .add_scalar(current_element)
+                    .scalar_mul(selector)
+                    + sum_old.scalar_mul(F::ONE - selector);
+
+                for value in (expected_sum - sum).0 {
+                    combined_gate_constraints[constraint * n + p] += filters[p] * value;
+                    constraint += 1;
+                }
+            }
+            debug_assert_eq!(constraint, self.num_constraints());
+        }
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -468,6 +511,17 @@ mod tests {
         let gate: EvaluateSequenceGate =
             EvaluateSequenceGate::new_from_config(&CircuitConfig::standard_recursion_config());
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn direct_accumulation_matches_materialized_batch() {
+        use crate::gate_batch_testing::assert_accumulate_matches_materialized_at_batch_size;
+
+        let gate =
+            EvaluateSequenceGate::new_from_config(&CircuitConfig::standard_recursion_config());
+        for batch_size in [1, 11, 32] {
+            assert_accumulate_matches_materialized_at_batch_size(&gate, batch_size);
+        }
     }
 
     #[test]

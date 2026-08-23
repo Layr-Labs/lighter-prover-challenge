@@ -179,11 +179,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
         let mut alpha_heap;
         let mut acc_heap;
         let mut scratch_heap;
-        let (alphas, accs, scratch):
-            (&mut [F::Extension], &mut [F::Extension], &mut [F]) = if use_stack {
-                // SAFETY: every alpha/acc slot is assigned immediately below,
-                // and each scratch slot is assigned by every coefficient's
-                // point loop before the batch multiply reads it.
+        let (alphas, accs, scratch): (&mut [F::Extension], &mut [F::Extension], &mut [F]) =
+            if use_stack {
                 unsafe {
                     (
                         core::slice::from_raw_parts_mut(
@@ -210,7 +207,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
             alphas[p] = ext(Self::wires_alpha().start, p);
             accs[p] = ext(Self::wires_old_acc().start, p);
         }
-
         for i in 0..self.num_coeffs {
             let coeff_start = Self::wires_coeff(i).start;
             let acc_start = self.wires_accs(i).start;
