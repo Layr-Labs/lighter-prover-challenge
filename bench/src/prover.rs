@@ -331,6 +331,11 @@ fn chain_step_proof<'a>(
     seed_layout: &ChainSeedLayout<'a>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
+    // Only the 49-step light chain determines block completion. Metal uses
+    // this thread-local marker to reserve its queue position before waiting for
+    // the singleton Merkle set; the overlapping three-step heavy chain keeps
+    // ordinary FIFO placement.
+    plonky2::hash::poseidon2::set_light_spine_thread(path == TxPath::Light);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
         profile_path_context(path, "chain"),
