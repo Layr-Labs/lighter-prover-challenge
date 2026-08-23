@@ -34,6 +34,24 @@ use plonky2::util::timing::TimingTree;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
+/// Bounded Rayon pool for the final-block circuit-build lane.
+///
+/// That lane has deadline slack vs the light pipeline (xadenryan 3b09836):
+/// unbounded use of the process-wide pool steals workers from the critical
+/// path. Cap it at ~half the cores so interference stays bounded.
+fn block_build_pool() -> &'static rayon::ThreadPool {
+    static BLOCK_BUILD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    BLOCK_BUILD_POOL.get_or_init(|| {
+        let threads = (rayon::current_num_threads() / 2).clamp(2, 8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build()
+            .expect("cannot build bounded block-build lane pool")
+    })
+}
+
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
     Heavy,
@@ -1076,7 +1094,10 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        // Bound interference with the light pipeline: the
+                        // block-build lane has slack, so it must not steal the
+                        // full process-wide Rayon pool (xadenryan lane-pool).
+                        block_build_pool().install(|| circuits.build_block_circuit())
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));
