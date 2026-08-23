@@ -133,8 +133,12 @@ impl<F> EvenColumns<F> {
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 #[inline]
-unsafe fn copy_even_fast<F: crate::hash::hash_types::RichField>(dst: *mut F, src: &[F], half_len: usize) {
-    if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+unsafe fn copy_even_fast<F: crate::hash::hash_types::RichField>(
+    dst: *mut F,
+    src: &[F],
+    half_len: usize,
+) {
+    if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
         use core::arch::aarch64::*;
         let mut s = src.as_ptr() as *const u64;
         let mut d = dst as *mut u64;

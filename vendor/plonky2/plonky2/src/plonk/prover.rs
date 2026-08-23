@@ -1596,7 +1596,7 @@ fn build_low_range_selector_filter_cache<F: RichField>(
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 #[inline(always)]
 fn accumulate_low_range_quotient_chunk<F: RichField>(
-    chunk: &mut [F],
+    chunk: &mut [core::mem::MaybeUninit<F>],
     row0: usize,
     half_rows: usize,
     num_gates: usize,
@@ -1605,7 +1605,13 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     filter_at: impl Fn(usize, usize) -> F,
 ) {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
+    for slot in chunk.iter_mut() {
+        slot.write(F::ZERO);
+    }
+    // SAFETY: every slot was initialized above. This view is confined to the
+    // chunk's disjoint Rayon task and ends before the outer Vec sets its length.
+    let chunk =
+        unsafe { core::slice::from_raw_parts_mut(chunk.as_mut_ptr().cast::<F>(), chunk.len()) };
     for g in 0..num_gates {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
@@ -1619,11 +1625,10 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            chunk[2 * r] += filter * sv0;
+            chunk[2 * r + 1] += filter * sv1;
         }
     }
-    chunk.copy_from_slice(&acc);
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -1669,13 +1674,15 @@ fn combine_low_range_quotient<F: RichField>(
         })
         .map(|entry| entry.filters.as_slice());
 
-    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
-    // SAFETY: both disjoint parallel branches below write every output slot
-    // before the vector is returned, exactly as the pre-cache implementation.
-    unsafe { out.set_len(full_rows * 2) };
+    let out_len = full_rows
+        .checked_mul(2)
+        .expect("low-range quotient output length overflow");
+    let mut out: Vec<F> = Vec::with_capacity(out_len);
+    let out_slots = &mut out.spare_capacity_mut()[..out_len];
     let num_gates = gates.len();
-    if let Some(filters) = cached_filters {
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
+    let used_cache = if let Some(filters) = cached_filters {
+        out_slots
+            .par_chunks_mut(2 * ROWS_PER_CHUNK)
             .enumerate()
             .for_each(|(chunk_i, chunk)| {
                 let row0 = chunk_i * ROWS_PER_CHUNK;
@@ -1689,10 +1696,11 @@ fn combine_low_range_quotient<F: RichField>(
                     |g, r| filters[g][row0 + r],
                 );
             });
-        (out, true)
+        true
     } else {
         let unused = F::from_canonical_u64(u32::MAX as u64);
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
+        out_slots
+            .par_chunks_mut(2 * ROWS_PER_CHUNK)
             .enumerate()
             .for_each(|(chunk_i, chunk)| {
                 let row0 = chunk_i * ROWS_PER_CHUNK;
@@ -1738,8 +1746,11 @@ fn combine_low_range_quotient<F: RichField>(
                     |g, r| filters[g * ROWS_PER_CHUNK + r],
                 );
             });
-        (out, false)
-    }
+        false
+    };
+    // SAFETY: the selected parallel branch initialized every output slot.
+    unsafe { out.set_len(out_len) };
+    (out, used_cache)
 }
 
 /// Extends the per-gate half-domain sums to the odd rows and applies the
@@ -1776,12 +1787,12 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let base = g * half_rows * 2;
             let src = &low[base..base + half_rows * 2];
             let mut values: Vec<F> = Vec::with_capacity(half_rows);
-            unsafe { values.set_len(half_rows); }
-            if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+            let value_slots = &mut values.spare_capacity_mut()[..half_rows];
+            if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
                 unsafe {
                     use core::arch::aarch64::*;
                     let mut src_base = src.as_ptr() as *const u64;
-                    let mut dst_ptr = values.as_mut_ptr() as *mut u64;
+                    let mut dst_ptr = value_slots.as_mut_ptr().cast::<u64>();
                     let chunks = half_rows / 4;
                     for _ in 0..chunks {
                         let val = vld2q_u64(src_base);
@@ -1802,10 +1813,12 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                     }
                 }
             } else {
-                for (k, out) in values.iter_mut().enumerate() {
-                    *out = src[k * 2 + c];
+                for (k, out) in value_slots.iter_mut().enumerate() {
+                    out.write(src[k * 2 + c]);
                 }
             }
+            // SAFETY: both branches initialize every slot in 0..half_rows.
+            unsafe { values.set_len(half_rows) };
             PolynomialValues::new(values)
                 .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
                 .fft()
@@ -2878,12 +2891,11 @@ fn compute_quotient_polys<
     // flag below is exactly "something still reads Z(g x)".
     let needs_next_zs = !permutation_products_offloaded;
 
-    let quotient_len = points.len() * num_challenges;
+    let quotient_len = points
+        .len()
+        .checked_mul(num_challenges)
+        .expect("quotient output length overflow");
     let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
-    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
-    // writes every element before any is read (see above). Same idiom as the
-    // promoted zero-tail fast path in `fri/oracle.rs`.
-    unsafe { quotient_values.set_len(quotient_len) };
     // The half-domain range job's CPU extension runs concurrently with the
     // CPU gate batch loop below (both on the pool), so its latency hides
     // behind work the proof does anyway; its result is consumed after.
@@ -2912,7 +2924,7 @@ fn compute_quotient_polys<
     };
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let low_extension = || -> core::result::Result<Option<Vec<F>>, String> { Ok(None) };
-    let quotient_values_ref = &mut quotient_values;
+    let quotient_values_ref = &mut quotient_values.spare_capacity_mut()[..quotient_len];
     let z_h_on_coset_ref = &z_h_on_coset;
     let run_batches = move || quotient_values_ref
         .par_chunks_mut(BATCH_SIZE * num_challenges)
@@ -3195,6 +3207,9 @@ fn compute_quotient_polys<
             },
         );
     let ((), low_extension_result) = plonky2_maybe_rayon::join(run_batches, low_extension);
+    // SAFETY: every disjoint batch initialized its complete active output slice,
+    // and the parallel join completed before the vector length changes.
+    unsafe { quotient_values.set_len(quotient_len) };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
@@ -3337,23 +3352,20 @@ fn compute_quotient_polys<
         None
     };
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    assert!(num_challenges > 0, "quotient scatter needs a challenge");
+    assert_eq!(quotient_values.len(), quotient_len);
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
     let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
+        .map(|_| Vec::with_capacity(points.len()))
         .collect();
     let column_ptrs: Vec<ColPtr<F>> = challenge_columns
         .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
+        .map(|column| {
+            assert!(column.capacity() >= points.len());
+            ColPtr(column.spare_capacity_mut().as_mut_ptr().cast::<F>())
+        })
         .collect();
     let column_ptrs = &column_ptrs;
 
@@ -3476,6 +3488,11 @@ fn compute_quotient_polys<
                     }
                 }
             });
+    }
+    // SAFETY: each scatter branch wrote every point in every challenge column,
+    // and all parallel workers completed before lengths become visible.
+    for column in &mut challenge_columns {
+        unsafe { column.set_len(points.len()) };
     }
     let inverse_coset_shift_powers =
         precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
@@ -3742,8 +3759,8 @@ mod quotient_layout_tests {
     use crate::field::extension::quadratic::QuadraticExtension;
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     use super::{
-        combine_low_range_quotient, gpu_poseidon_quotient_stats, LowDegreeRangeGate,
-        COMPARE_GPU_QUOTIENT,
+        accumulate_low_range_quotient_chunk, combine_low_range_quotient,
+        gpu_poseidon_quotient_stats, LowDegreeRangeGate, COMPARE_GPU_QUOTIENT,
     };
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field, Field64, PrimeField64};
@@ -3795,6 +3812,78 @@ mod quotient_layout_tests {
         );
         let sum = builder.constant(F::from_canonical_usize(value));
         builder.connect(sum, Target::wire(row, 0));
+    }
+
+    /// Frozen pre-optimization differential for the direct MaybeUninit output
+    /// helper. The reference retains the old temporary accumulator and loops.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    #[test]
+    fn low_range_direct_output_matches_frozen_legacy_raw() {
+        let half_rows = 700usize;
+        let field = |i: usize| {
+            let limb = ((i * 43 + 11) % 100_000 + 1) as u64;
+            if i % 5 == 0 {
+                F::from_noncanonical_u64(F::ORDER + limb)
+            } else {
+                F::from_canonical_u64(limb)
+            }
+        };
+
+        for num_gates in [0usize, 1, 5, 16, 19] {
+            let low = (0..num_gates * half_rows * 2)
+                .map(field)
+                .collect::<Vec<_>>();
+            let odd = (0..num_gates * 2)
+                .map(|column| {
+                    (0..half_rows)
+                        .map(|row| field(1_000_000 + column * half_rows + row))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            for (row0, rows) in [(0usize, 1usize), (0, 512), (512, 188)] {
+                let filter_at = |g: usize, r: usize| field(2_000_000 + g * 1_000 + row0 + r);
+                let mut expected = vec![F::ZERO; rows * 2];
+                for g in 0..num_gates {
+                    let odd0 = &odd[g * 2];
+                    let odd1 = &odd[g * 2 + 1];
+                    let low_base = g * half_rows * 2;
+                    for r in 0..rows {
+                        let i = row0 + r;
+                        let (sv0, sv1) = if i & 1 == 0 {
+                            let base = low_base + (i >> 1) * 2;
+                            (low[base], low[base + 1])
+                        } else {
+                            (odd0[i >> 1], odd1[i >> 1])
+                        };
+                        let filter = filter_at(g, r);
+                        expected[2 * r] += filter * sv0;
+                        expected[2 * r + 1] += filter * sv1;
+                    }
+                }
+
+                let mut actual = vec![core::mem::MaybeUninit::<F>::uninit(); expected.len()];
+                accumulate_low_range_quotient_chunk(
+                    &mut actual,
+                    row0,
+                    half_rows,
+                    num_gates,
+                    &low,
+                    &odd,
+                    filter_at,
+                );
+                // SAFETY: the direct helper initializes every output slot.
+                let actual = unsafe {
+                    core::slice::from_raw_parts(actual.as_ptr().cast::<F>(), actual.len())
+                };
+                for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        actual.to_noncanonical_u64(),
+                        expected.to_noncanonical_u64(),
+                        "raw mismatch at {index}, gates={num_gates}, row0={row0}, rows={rows}"
+                    );
+                }
+            }
+        }
     }
 
     /// Raw-limb differential and dispatch guard for the immutable low-range

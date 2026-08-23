@@ -5,7 +5,8 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{mem::MaybeUninit, ops::Range};
+use core::mem::MaybeUninit;
+use core::ops::Range;
 
 use anyhow::Result;
 
@@ -169,46 +170,50 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingGate<D
 
         const STACK_POINTS: usize = 32;
         const STACK_BASE_VALUES: usize = 128;
+        let scratch_len = D
+            .checked_mul(n)
+            .expect("reducing gate scratch length overflow");
         let use_stack = reducing_stack_scratch_enabled()
             && n <= STACK_POINTS
-            && D * n <= STACK_BASE_VALUES;
+            && scratch_len <= STACK_BASE_VALUES;
         let mut alpha_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
         let mut acc_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
         let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_BASE_VALUES];
         let mut alpha_heap;
         let mut acc_heap;
         let mut scratch_heap;
-        let (alphas, accs, scratch):
-            (&mut [F::Extension], &mut [F::Extension], &mut [F]) = if use_stack {
-                // SAFETY: every alpha/acc slot is assigned immediately below,
-                // and each scratch slot is assigned by every coefficient's
-                // point loop before the batch multiply reads it.
-                unsafe {
-                    (
-                        core::slice::from_raw_parts_mut(
-                            alpha_stack.as_mut_ptr().cast::<F::Extension>(),
-                            n,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            acc_stack.as_mut_ptr().cast::<F::Extension>(),
-                            n,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            scratch_stack.as_mut_ptr().cast::<F>(),
-                            D * n,
-                        ),
-                    )
-                }
-            } else {
-                alpha_heap = vec![F::Extension::ZERO; n];
-                acc_heap = vec![F::Extension::ZERO; n];
-                scratch_heap = vec![F::ZERO; D * n];
-                (&mut alpha_heap, &mut acc_heap, &mut scratch_heap)
-            };
+        let (alpha_slots, acc_slots, scratch_slots): (
+            &mut [MaybeUninit<F::Extension>],
+            &mut [MaybeUninit<F::Extension>],
+            &mut [MaybeUninit<F>],
+        ) = if use_stack {
+            (
+                &mut alpha_stack[..n],
+                &mut acc_stack[..n],
+                &mut scratch_stack[..scratch_len],
+            )
+        } else {
+            // Preserve the heap fallback's lengths and valid ZERO initialization.
+            alpha_heap = vec![MaybeUninit::new(F::Extension::ZERO); n];
+            acc_heap = vec![MaybeUninit::new(F::Extension::ZERO); n];
+            scratch_heap = vec![MaybeUninit::new(F::ZERO); scratch_len];
+            (&mut alpha_heap, &mut acc_heap, &mut scratch_heap)
+        };
         for p in 0..n {
-            alphas[p] = ext(Self::wires_alpha().start, p);
-            accs[p] = ext(Self::wires_old_acc().start, p);
+            alpha_slots[p].write(ext(Self::wires_alpha().start, p));
+            acc_slots[p].write(ext(Self::wires_old_acc().start, p));
         }
+
+        // SAFETY: both slot prefixes have length n, and the preceding loop
+        // initialized every element with a valid extension-field value.
+        // MaybeUninit has the same layout and alignment as its element type;
+        // the backing buffers are distinct and their slot views are not used
+        // while these typed views are live.
+        let alphas: &[F::Extension] =
+            unsafe { core::slice::from_raw_parts(alpha_slots.as_ptr().cast::<F::Extension>(), n) };
+        let accs: &mut [F::Extension] = unsafe {
+            core::slice::from_raw_parts_mut(acc_slots.as_mut_ptr().cast::<F::Extension>(), n)
+        };
 
         for i in 0..self.num_coeffs {
             let coeff = &wires[(Self::START_COEFFS + i) * n..][..n];
@@ -218,14 +223,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingGate<D
                 let constraint = accs[p] * alphas[p] + coeff[p].into() - next_acc;
                 let arr = constraint.to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
+                    scratch_slots[d * n + p].write(*a);
                 }
                 accs[p] = next_acc;
             }
             for d in 0..D {
+                let row_slots = &scratch_slots[d * n..][..n];
+                // SAFETY: this coefficient's point loop wrote every slot in
+                // every active row before any row is viewed. This temporary
+                // shared view ends with the batch read, before the next write.
+                let scratch_row: &[F] =
+                    unsafe { core::slice::from_raw_parts(row_slots.as_ptr().cast::<F>(), n) };
                 batch_multiply_add_inplace(
                     &mut combined_gate_constraints[(i * D + d) * n..][..n],
-                    &scratch[d * n..][..n],
+                    scratch_row,
                     filters,
                 );
             }
@@ -360,20 +371,57 @@ mod tests {
     use anyhow::Result;
 
     use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::Sample;
+    use crate::gates::gate::Gate;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::gates::reducing::ReducingGate;
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::vars::EvaluationVarsBaseBatch;
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
 
     #[test]
     fn low_degree() {
         test_low_degree::<GoldilocksField, _, 4>(ReducingGate::new(22));
     }
 
+    fn check_batch_accumulate_at_size(gate: ReducingGate<D>, n: usize) {
+        let num_wires = <ReducingGate<D> as Gate<F, D>>::num_wires(&gate);
+        let num_constants = <ReducingGate<D> as Gate<F, D>>::num_constants(&gate);
+        let num_constraints = <ReducingGate<D> as Gate<F, D>>::num_constraints(&gate);
+        let wires = F::rand_vec(num_wires * n);
+        let constants = F::rand_vec(num_constants * n);
+        let public_inputs_hash = HashOut::rand();
+        let vars = EvaluationVarsBaseBatch::new(n, &constants, &wires, &public_inputs_hash);
+        let reference = gate.eval_unfiltered_base_batch(vars);
+        let filters = F::rand_vec(n);
+        let mut expected = F::rand_vec(num_constraints * n);
+        let mut actual = expected.clone();
+        for (expected_row, reference_row) in
+            expected.chunks_exact_mut(n).zip(reference.chunks_exact(n))
+        {
+            for ((value, &constraint), &filter) in
+                expected_row.iter_mut().zip(reference_row).zip(&filters)
+            {
+                *value += constraint * filter;
+            }
+        }
+        gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+        assert_eq!(actual, expected, "batch size {n}");
+    }
+
+    #[test]
+    fn batch_accumulate_stack_boundary() {
+        for n in [1, 31, 32, 33] {
+            check_batch_accumulate_at_size(ReducingGate::new(22), n);
+        }
+    }
+
     #[test]
     fn eval_fns() -> Result<()> {
-        const D: usize = 2;
-        type C = PoseidonGoldilocksConfig;
-        type F = <C as GenericConfig<D>>::F;
         test_eval_fns::<F, C, _, D>(ReducingGate::new(22))
     }
 }
