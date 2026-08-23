@@ -187,11 +187,12 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     }
 
     /// Streamed variant of [`Hasher::try_build_merkle_tree_column_store`]:
-    /// the caller computes the leaf columns on demand, eight at a time, via
-    /// `fill_group(group, slices)` (covering columns `[8 * group, 8 * group +
-    /// slices.len())`), and a capable backend overlaps each group's sponge
-    /// absorption with the next group's fill. Returns `None` when no backend
-    /// is available or the shape does not qualify; the caller then fills the
+    /// the caller computes the leaf columns on demand via
+    /// `fill_group(col_start, slices)` (covering columns `[col_start, col_start
+    /// + slices.len())`). The Metal backend fills 16 columns at a time so the
+    /// CPU FFT/coset work can use all 14 M4 Pro cores, then absorbs in the
+    /// original 8-column shader chunks. Returns `None` when no backend is
+    /// available or the shape does not qualify; the caller then fills the
     /// storage itself and uses the classic build (the fill is idempotent).
     #[allow(clippy::type_complexity)]
     fn try_build_merkle_tree_column_store_streamed(
