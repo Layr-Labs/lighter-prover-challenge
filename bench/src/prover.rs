@@ -331,6 +331,11 @@ fn chain_step_proof<'a>(
     seed_layout: &ChainSeedLayout<'a>,
 ) -> Proof {
     mark_spine_thread_latency_critical();
+    // Only the 49-step light chain determines block completion. Metal uses
+    // this thread-local marker to reserve its queue position before waiting for
+    // the singleton Merkle set; the overlapping three-step heavy chain keeps
+    // ordinary FIFO placement.
+    plonky2::hash::poseidon2::set_light_spine_thread(path == TxPath::Light);
     #[cfg(feature = "diagnostic_profile")]
     let _profile_context = plonky2::util::profile::enter_context(
         profile_path_context(path, "chain"),
@@ -1614,6 +1619,195 @@ mod tests {
         let heavy = "heavy";
 
         assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
+    }
+
+    /// Full production light-chain differential. It proves one exact ranked
+    /// chain step twice from one cloned partition witness: old path first, then
+    /// sparse opening/FRI reuse. Deterministic commitments, openings and the FRI
+    /// commit phase must agree; PoW-dependent query paths may differ, and both
+    /// complete proofs must verify.
+    #[test]
+    #[ignore = "two production proofs; run explicitly under the heavy lock"]
+    fn exact_ranked_light_chain_sparse_sigma_proof_differential() {
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(|| {
+                use circuit::block_tx_chain_constraints::Circuit as _;
+                use circuit::types::constants::TX_TYPE_EMPTY;
+                use plonky2::field::types::{Field, PrimeField64};
+                use plonky2::plonk::circuit_data::sparse_sigma_reuse_counters;
+                use plonky2::plonk::config::GenericHashOut;
+
+                use crate::api::{PathCircuits, LIGHT_TX_MODE};
+
+                assert_ne!(
+                    std::env::var_os("LIGHTER_SPARSE_SIGMA_REUSE").as_deref(),
+                    Some(std::ffi::OsStr::new("0")),
+                    "proof differential requires the default-enabled environment"
+                );
+                let circuits = PathCircuits::new(LIGHT_TX_PER_PROOF, LIGHT_TX_MODE);
+                assert_eq!(
+                    hex::encode(circuits.chain_data.prover_only.circuit_digest.to_bytes()),
+                    "8ee863c98f192fc00c96945fab8009738bbb53a5a9d55d74424c240e57b287a4"
+                );
+                assert_eq!(circuits.chain_data.common.degree(), 16_384);
+                assert_eq!(circuits.chain_data.common.config.num_routed_wires, 80);
+                assert_eq!(circuits.chain_data.common.quotient_degree_factor, 8);
+                assert_eq!(circuits.chain_data.common.fri_params.config.rate_bits, 3);
+
+                let block = Block::<F>::from_json_with_empty_txs(
+                    include_bytes!("../bench_test.json"),
+                    HEAVY_TX_PER_PROOF,
+                    LIGHT_TX_PER_PROOF,
+                    PUBLIC_HEAVY_TX_COUNT,
+                    PUBLIC_LIGHT_TX_COUNT,
+                )
+                .expect("public fixture must parse");
+                let mut empty_tx = (**block
+                    .tx_chunks
+                    .iter()
+                    .flatten()
+                    .find(|tx| tx.tx_type == TX_TYPE_EMPTY)
+                    .expect("fixture must contain an empty padding tx"))
+                .clone();
+                empty_tx.tx_circuit_type = TX_LIGHT;
+                empty_tx.tx_index = F::NEG_ONE.to_canonical_u64();
+                let new_state_root = empty_tx.old_state_root;
+                let old_delta_root = empty_tx.old_account_delta_tree_root;
+                let mut new_state_metadata = block.state_metadata.clone();
+                if block.calculate_funding {
+                    new_state_metadata.last_funding_round_timestamp = block.created_at;
+                }
+                if block.calculate_oracle_prices {
+                    new_state_metadata.last_oracle_price_timestamp = block.created_at;
+                }
+                if block.calculate_premium {
+                    new_state_metadata.last_premium_timestamp = block.created_at;
+                }
+                let state_metadata_hash = new_state_metadata.hash();
+                let jump = JumpState::initial(new_state_root, old_delta_root);
+                let light_chunk = vec![Arc::new(empty_tx); LIGHT_TX_PER_PROOF];
+                let (tx_witness, _) = generate_tx_witness(
+                    TxPath::Light,
+                    0,
+                    light_chunk,
+                    &circuits.tx_data,
+                    &circuits.tx_target,
+                    block.created_at,
+                    state_metadata_hash,
+                    jump,
+                    &mut None,
+                );
+                let mut timing = TimingTree::default();
+                let tx_proof = prove_with_partition_witness::<F, C, D>(
+                    &circuits.tx_data.prover_only,
+                    &circuits.tx_data.common,
+                    tx_witness,
+                    &mut timing,
+                )
+                .expect("light tx proof failed");
+                let base_proof = cyclic_base_witness(
+                    &circuits.dummy_proof,
+                    block.block_number,
+                    block.created_at,
+                    new_state_root,
+                    new_state_root,
+                    old_delta_root,
+                );
+                let inputs = BlockTxChainCircuit::generate_witness(
+                    &circuits.chain_target,
+                    &circuits.chain_data,
+                    0,
+                    &base_proof,
+                    &circuits.dummy_proof,
+                    &tx_proof,
+                )
+                .expect("chain witness inputs failed");
+                let witness = generate_partial_witness::<F, C, D>(
+                    inputs,
+                    &circuits.chain_data.prover_only,
+                    &circuits.chain_data.common,
+                )
+                .expect("chain partition witness failed");
+
+                let counters_before = sparse_sigma_reuse_counters();
+                let old =
+                    plonky2::plonk::prover::prove_with_partition_witness_sparse_sigma_policy::<
+                        F,
+                        C,
+                        D,
+                    >(
+                        &circuits.chain_data.prover_only,
+                        &circuits.chain_data.common,
+                        witness.clone(),
+                        &mut TimingTree::default(),
+                        false,
+                    )
+                    .expect("old-path chain proof failed");
+                let cached =
+                    plonky2::plonk::prover::prove_with_partition_witness_sparse_sigma_policy::<
+                        F,
+                        C,
+                        D,
+                    >(
+                        &circuits.chain_data.prover_only,
+                        &circuits.chain_data.common,
+                        witness,
+                        &mut TimingTree::default(),
+                        true,
+                    )
+                    .expect("cached chain proof failed");
+                let counters_after = sparse_sigma_reuse_counters();
+
+                circuits
+                    .chain_data
+                    .verify(old.clone())
+                    .expect("old-path proof did not verify");
+                circuits
+                    .chain_data
+                    .verify(cached.clone())
+                    .expect("cached proof did not verify");
+
+                assert_eq!(old.public_inputs, cached.public_inputs);
+                assert_eq!(old.proof.wires_cap, cached.proof.wires_cap);
+                assert_eq!(
+                    old.proof.plonk_zs_partial_products_cap,
+                    cached.proof.plonk_zs_partial_products_cap
+                );
+                assert_eq!(
+                    old.proof.quotient_polys_cap,
+                    cached.proof.quotient_polys_cap
+                );
+                assert_eq!(old.proof.openings, cached.proof.openings);
+                assert_eq!(
+                    old.proof.opening_proof.commit_phase_merkle_caps,
+                    cached.proof.opening_proof.commit_phase_merkle_caps
+                );
+                assert_eq!(
+                    old.proof.opening_proof.final_poly,
+                    cached.proof.opening_proof.final_poly
+                );
+                // Parallel FRI grinding deliberately uses `find_any`, so two
+                // equivalent proofs may select different valid PoW witnesses.
+                // That changes the later query challenges and Merkle paths. If
+                // grinding selects the same witness, those query proofs must
+                // remain byte-for-byte identical as well.
+                if old.proof.opening_proof.pow_witness == cached.proof.opening_proof.pow_witness {
+                    assert_eq!(
+                        old.proof.opening_proof.query_round_proofs,
+                        cached.proof.opening_proof.query_round_proofs
+                    );
+                }
+                assert_eq!(counters_after.builds, counters_before.builds + 1);
+                assert_eq!(
+                    counters_after.opening_hits,
+                    counters_before.opening_hits + 1
+                );
+                assert_eq!(counters_after.fri_hits, counters_before.fri_hits + 1);
+            })
+            .expect("proof differential thread must start")
+            .join()
+            .expect("proof differential thread must finish");
     }
 
     /// Manual timing harness for the two-phase chain-step witness split. Run with:

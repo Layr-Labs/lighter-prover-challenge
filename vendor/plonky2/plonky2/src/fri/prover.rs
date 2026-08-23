@@ -28,6 +28,44 @@ use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
 
 const FRI_FOLD_ARITY16_BATCH_WIDTH: usize = 8;
+/// The d14 recursive-chain round-0 fold emits exactly 1024 rows. Route only
+/// that audited width to the latency-critical caller. In particular, d16
+/// transaction rounds with 256 or 16 outputs and later d14 rounds retain the
+/// exact leader's Rayon path.
+const FRI_FOLD_ARITY16_EXACT_SERIAL_OUTPUTS: usize = 1 << 10;
+#[cfg(feature = "std")]
+const FRI_FOLD_ARITY16_EXACT_EXECUTION_ENV: &str = "LIGHTER_FRI_1024_FOLD_EXECUTION";
+
+#[inline]
+const fn fri_fold_arity16_exact_1024_serial_wanted(output_len: usize, enabled: bool) -> bool {
+    enabled && output_len == FRI_FOLD_ARITY16_EXACT_SERIAL_OUTPUTS
+}
+
+/// `parallel` restores the exact leader's all-Rayon dispatch for same-binary
+/// rollback. Missing and all other values keep only the exact 1024-output
+/// fold on the caller.
+#[cfg(feature = "std")]
+#[inline]
+fn fri_fold_arity16_exact_1024_serial_from_env_value(value: Option<&std::ffi::OsStr>) -> bool {
+    !value.is_some_and(|value| value.eq_ignore_ascii_case("parallel"))
+}
+
+#[cfg(feature = "std")]
+#[inline]
+fn fri_fold_arity16_exact_1024_serial_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fri_fold_arity16_exact_1024_serial_from_env_value(
+            std::env::var_os(FRI_FOLD_ARITY16_EXACT_EXECUTION_ENV).as_deref(),
+        )
+    })
+}
+
+#[cfg(not(feature = "std"))]
+#[inline(always)]
+const fn fri_fold_arity16_exact_1024_serial_enabled() -> bool {
+    true
+}
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
@@ -227,6 +265,23 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
     beta: F::Extension,
     beta_powers: &[F::Extension; 16],
 ) -> Vec<F::Extension> {
+    fri_fold_arity16_chunks_with_exact_1024_serial::<F, D>(
+        terms,
+        beta,
+        beta_powers,
+        fri_fold_arity16_exact_1024_serial_enabled(),
+    )
+}
+
+/// Mode-injected dispatcher used by raw-word differential tests and the
+/// same-binary rollback. The execution mode only partitions independent output
+/// rows; every row still runs the exact leader's SIMD kernel.
+fn fri_fold_arity16_chunks_with_exact_1024_serial<F: RichField + Extendable<D>, const D: usize>(
+    terms: &[F::Extension],
+    beta: F::Extension,
+    beta_powers: &[F::Extension; 16],
+    exact_1024_serial_enabled: bool,
+) -> Vec<F::Extension> {
     assert_eq!(terms.len() % 16, 0);
 
     #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
@@ -258,20 +313,37 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
                     folded_len,
                 )
             };
-            folded_ext2
-                .par_chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
-                .enumerate()
-                .for_each(|(batch, output)| {
-                    let start = batch * FRI_FOLD_ARITY16_BATCH_WIDTH * 16;
-                    ext2_fri_fold_arity16_batch(
-                        &terms_ext2[start..start + output.len() * 16],
-                        powers_ext2,
-                        output,
-                    );
-                });
+            if fri_fold_arity16_exact_1024_serial_wanted(folded_len, exact_1024_serial_enabled) {
+                folded_ext2
+                    .chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
+                    .enumerate()
+                    .for_each(|(batch, output)| {
+                        let start = batch * FRI_FOLD_ARITY16_BATCH_WIDTH * 16;
+                        ext2_fri_fold_arity16_batch(
+                            &terms_ext2[start..start + output.len() * 16],
+                            powers_ext2,
+                            output,
+                        );
+                    });
+            } else {
+                folded_ext2
+                    .par_chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
+                    .enumerate()
+                    .for_each(|(batch, output)| {
+                        let start = batch * FRI_FOLD_ARITY16_BATCH_WIDTH * 16;
+                        ext2_fri_fold_arity16_batch(
+                            &terms_ext2[start..start + output.len() * 16],
+                            powers_ext2,
+                            output,
+                        );
+                    });
+            }
             return folded;
         }
     }
+
+    #[cfg(not(all(target_arch = "aarch64", target_vendor = "apple")))]
+    let _ = exact_1024_serial_enabled;
 
     terms
         .par_chunks_exact(16)
@@ -657,6 +729,36 @@ mod tests {
     use crate::fri::reduction_strategies::FriReductionStrategy;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
 
+    #[test]
+    fn fri_fold_arity16_exact_1024_serial_routing_boundary() {
+        let exact = FRI_FOLD_ARITY16_EXACT_SERIAL_OUTPUTS;
+        assert!(!fri_fold_arity16_exact_1024_serial_wanted(0, true));
+        assert!(!fri_fold_arity16_exact_1024_serial_wanted(exact - 1, true));
+        assert!(fri_fold_arity16_exact_1024_serial_wanted(exact, true));
+        assert!(!fri_fold_arity16_exact_1024_serial_wanted(exact + 1, true));
+        assert!(!fri_fold_arity16_exact_1024_serial_wanted(exact, false));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn fri_fold_arity16_exact_1024_serial_rollback_uses_only_parallel_value() {
+        use std::ffi::OsStr;
+
+        assert!(fri_fold_arity16_exact_1024_serial_from_env_value(None));
+        assert!(fri_fold_arity16_exact_1024_serial_from_env_value(Some(
+            OsStr::new("")
+        )));
+        assert!(fri_fold_arity16_exact_1024_serial_from_env_value(Some(
+            OsStr::new("serial")
+        )));
+        assert!(!fri_fold_arity16_exact_1024_serial_from_env_value(Some(
+            OsStr::new("parallel")
+        )));
+        assert!(!fri_fold_arity16_exact_1024_serial_from_env_value(Some(
+            OsStr::new("PARALLEL")
+        )));
+    }
+
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
     #[test]
@@ -741,14 +843,42 @@ mod tests {
                 <F as Extendable<2>>::fri_fold_arity16(chunk.try_into().unwrap(), beta, &powers)
             })
             .collect::<Vec<_>>();
-        let actual = fri_fold_arity16_chunks::<F, 2>(terms, beta, &powers);
-        assert_eq!(actual.len(), expected.len());
-        for (row, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
-            let actual: [F; 2] = actual.to_basefield_array();
+        let exact =
+            fri_fold_arity16_chunks_with_exact_1024_serial::<F, 2>(terms, beta, &powers, true);
+        let parallel =
+            fri_fold_arity16_chunks_with_exact_1024_serial::<F, 2>(terms, beta, &powers, false);
+        // This call exercises the OnceLock-backed production selector. The
+        // validation driver runs this exact test in fresh default and
+        // `LIGHTER_FRI_1024_FOLD_EXECUTION=parallel` processes, so both sides
+        // of the same-binary rollback cross the 1024/1025 routing boundary.
+        let production = fri_fold_arity16_chunks::<F, 2>(terms, beta, &powers);
+        assert_eq!(exact.len(), expected.len());
+        assert_eq!(parallel.len(), expected.len());
+        assert_eq!(production.len(), expected.len());
+        for (row, (((&exact, &parallel), &production), &expected)) in exact
+            .iter()
+            .zip(&parallel)
+            .zip(&production)
+            .zip(&expected)
+            .enumerate()
+        {
+            let exact: [F; 2] = exact.to_basefield_array();
+            let parallel: [F; 2] = parallel.to_basefield_array();
+            let production: [F; 2] = production.to_basefield_array();
             let expected: [F; 2] = expected.to_basefield_array();
             for limb in 0..2 {
-                assert_eq!(actual[limb].0, expected[limb].0,
-                    "raw mismatch at row {row}, limb {limb}");
+                assert_eq!(
+                    exact[limb].0, expected[limb].0,
+                    "exact-1024 raw mismatch at row {row}, limb {limb}"
+                );
+                assert_eq!(
+                    parallel[limb].0, expected[limb].0,
+                    "parallel raw mismatch at row {row}, limb {limb}"
+                );
+                assert_eq!(
+                    production[limb].0, expected[limb].0,
+                    "production raw mismatch at row {row}, limb {limb}"
+                );
             }
         }
     }
@@ -762,7 +892,7 @@ mod tests {
             F::from_canonical_u64(0x1234_5678_9abc_def0),
             F::from_canonical_u64(0x0fed_cba9_8765_4321),
         ]);
-        for rows in [1, 2, 3, 7, 8, 9, 16, 19] {
+        for rows in [1, 2, 3, 7, 8, 9, 16, 19, 1024, 1025] {
             let terms = (0..rows * 16)
                 .map(|i| {
                     let x = (i as u64)
@@ -789,7 +919,7 @@ mod tests {
             GoldilocksField(u64::MAX),
             GoldilocksField(F::ORDER),
         ]);
-        for rows in [1, 3, 7, 8, 9, 17] {
+        for rows in [1, 3, 7, 8, 9, 17, 1024, 1025] {
             let terms = (0..rows * 16)
                 .map(|i| FE::from_basefield_array([
                     GoldilocksField(raw[i % raw.len()]),

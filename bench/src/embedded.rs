@@ -349,6 +349,217 @@ mod tests {
         });
     }
 
+    /// Exact production admission, freshness, concurrency and hostile-input
+    /// oracle for the runtime-only sparse-sigma cache. This constructs no proof.
+    #[test]
+    #[ignore = "large embedded sparse-sigma cache diagnostic; run explicitly"]
+    fn ranked_light_chain_sparse_sigma_cache_contract() {
+        use plonky2::field::types::Field;
+        use plonky2::plonk::circuit_data::{sparse_sigma_reuse_counters, SparseSigmaReuseSummary};
+        use plonky2::recursion::cyclic_recursion::check_cyclic_proof_verifier_data;
+
+        on_big_stack(|| {
+            assert_ne!(
+                std::env::var_os("LIGHTER_SPARSE_SIGMA_REUSE").as_deref(),
+                Some(std::ffi::OsStr::new("0")),
+                "cache contract test requires the default-enabled environment"
+            );
+            let expected = SparseSigmaReuseSummary {
+                n: 16_384,
+                p: 80,
+                m: 352_783,
+                u: 10_860,
+                payload_bytes: 6_062_851,
+            };
+            let generator_serializer = EmbedGeneratorSerializer {
+                _phantom: Default::default(),
+                _phantom2: Default::default(),
+            };
+
+            let (_, data) = load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB)
+                .expect("ranked light-chain embedded circuit must decode");
+            let dummy: Proof =
+                bincode::deserialize(include_bytes!("../dummy-light-chain-proof.bin"))
+                    .expect("ranked light-chain dummy proof must decode");
+            check_cyclic_proof_verifier_data(&dummy, &data.verifier_only, &data.common)
+                .expect("ranked light-chain digest/cap must match the committed dummy proof");
+
+            let bytes_before = data
+                .to_bytes(&BlockGateSerializer, &generator_serializer)
+                .expect("fresh circuit must serialize");
+            let before = sparse_sigma_reuse_counters();
+            std::thread::scope(|scope| {
+                let data = &data;
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            data.prover_only
+                                .sparse_sigma_reuse_summary(&data.common, true)
+                        })
+                    })
+                    .collect();
+                for handle in handles {
+                    assert_eq!(
+                        handle.join().expect("cache initializer panicked"),
+                        Some(expected)
+                    );
+                }
+            });
+            let after = sparse_sigma_reuse_counters();
+            assert_eq!(
+                after.builds - before.builds,
+                1,
+                "OnceLock built more than once"
+            );
+            assert!(after.ready_hits - before.ready_hits >= 8);
+            assert_eq!(
+                after.reserved_bytes - before.reserved_bytes,
+                expected.payload_bytes
+            );
+            let bytes_after = data
+                .to_bytes(&BlockGateSerializer, &generator_serializer)
+                .expect("filled circuit must serialize");
+            assert_eq!(
+                bytes_before, bytes_after,
+                "cache fill changed serialization"
+            );
+
+            let fresh = CircuitData::<F, C, D>::from_bytes(
+                &bytes_before,
+                &BlockGateSerializer,
+                &generator_serializer,
+            )
+            .expect("serialized circuit must decode");
+            assert_eq!(
+                data.prover_only.sparse_sigma_reuse_cache,
+                fresh.prover_only.sparse_sigma_reuse_cache,
+                "cache fill state changed equality"
+            );
+            drop(data);
+            assert_eq!(
+                fresh
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&fresh.common, true),
+                Some(expected),
+                "deserialized data did not start fresh and admit"
+            );
+            drop(fresh);
+
+            // The 8 MiB process budget admits exactly one 6,062,851-byte cache.
+            let (_, first) = load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB)
+                .expect("first budget circuit must decode");
+            let (_, second) = load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB)
+                .expect("second budget circuit must decode");
+            assert_eq!(
+                first
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&first.common, true),
+                Some(expected)
+            );
+            let budget_before = sparse_sigma_reuse_counters();
+            assert_eq!(
+                second
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&second.common, true),
+                None,
+                "second simultaneous cache exceeded the process budget"
+            );
+            assert_eq!(
+                sparse_sigma_reuse_counters().budget_rejects,
+                budget_before.budget_rejects + 1
+            );
+            drop((first, second));
+
+            // Every hostile mismatch must remain on the old path. Load and
+            // drop them one at a time so the diagnostic itself has a bounded peak.
+            let load_hostile = || {
+                load_blob::<BlockTxChainTarget>("light_chain", LIGHT_CHAIN_BLOB)
+                    .expect("hostile case circuit must decode")
+                    .1
+            };
+            let mut hostile = load_hostile();
+            hostile.prover_only.circuit_digest.elements[0] += F::ONE;
+            assert_eq!(
+                hostile
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&hostile.common, true),
+                None,
+                "hostile digest admitted sparse sigma reuse"
+            );
+            assert_eq!(
+                hostile
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&hostile.common, false),
+                None,
+                "explicit off policy did not force the old path"
+            );
+            drop(hostile);
+
+            let mut hostile = load_hostile();
+            hostile.common.fri_params.degree_bits -= 1;
+            assert_eq!(
+                hostile
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&hostile.common, true),
+                None,
+                "hostile domain admitted sparse sigma reuse"
+            );
+            drop(hostile);
+
+            let mut hostile = load_hostile();
+            hostile.prover_only.fixed_routed_wires[0] ^= 1;
+            assert_eq!(
+                hostile
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&hostile.common, true),
+                None,
+                "hostile density admitted sparse sigma reuse"
+            );
+            drop(hostile);
+
+            let mut hostile = load_hostile();
+            hostile.prover_only.sigmas[0].pop();
+            assert_eq!(
+                hostile
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&hostile.common, true),
+                None,
+                "hostile bounds admitted sparse sigma reuse"
+            );
+            drop(hostile);
+
+            let mut hostile = load_hostile();
+            let (row, column) = (0..hostile.common.degree())
+                .flat_map(|row| {
+                    (0..hostile.common.config.num_routed_wires).map(move |column| (row, column))
+                })
+                .find(|&(row, column)| {
+                    let bit = row * hostile.common.config.num_routed_wires + column;
+                    (hostile.prover_only.fixed_routed_wires[bit >> 3] >> (bit & 7)) & 1 == 0
+                })
+                .expect("ranked circuit must contain a non-fixed sigma position");
+            hostile.prover_only.sigmas[row][column] += F::ONE;
+            assert_eq!(
+                hostile
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&hostile.common, true),
+                None,
+                "in-bounds sigma corruption admitted sparse sigma reuse"
+            );
+            drop(hostile);
+
+            let mut hostile = load_hostile();
+            hostile.prover_only.subgroup[1] += F::ONE;
+            assert_eq!(
+                hostile
+                    .prover_only
+                    .sparse_sigma_reuse_summary(&hostile.common, true),
+                None,
+                "in-bounds subgroup corruption admitted sparse sigma reuse"
+            );
+        });
+    }
+
     /// Manual timing harness: embedded load vs fresh build, both under the
     /// production overlapped layout and per circuit sequentially. Run:
     /// `cargo test --release -p bench --bin prove -- --ignored embedded_load_timing --nocapture`

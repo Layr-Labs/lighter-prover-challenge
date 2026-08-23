@@ -311,6 +311,116 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+#[cfg(feature = "std")]
+fn sparse_sigma_openings_from_parts<F: RichField + Extendable<D>, const D: usize>(
+    zeta: F::Extension,
+    zeta_to_n: F::Extension,
+    subgroup: &[F],
+    k_is: &[F],
+    row_offsets: &[u32],
+    columns: &[u8],
+    preweights: &[F],
+) -> Option<Vec<F::Extension>> {
+    let n = subgroup.len();
+    let p = k_is.len();
+    if !n.is_power_of_two()
+        || row_offsets.first().copied() != Some(0)
+        || row_offsets.len() != n + 1
+        || columns.len() != preweights.len()
+        || row_offsets.last().copied()? as usize != columns.len()
+        || columns.iter().any(|&column| column as usize >= p)
+        || row_offsets.windows(2).any(|bounds| bounds[0] > bounds[1])
+        || zeta_to_n == F::Extension::ONE
+    {
+        return None;
+    }
+    let active_rows: Vec<usize> = row_offsets
+        .windows(2)
+        .enumerate()
+        .filter_map(|(row, bounds)| (bounds[0] != bounds[1]).then_some(row))
+        .collect();
+    let denominators: Vec<F::Extension> = active_rows
+        .iter()
+        .map(|&row| zeta - F::Extension::from_basefield(subgroup[row]))
+        .collect();
+    if denominators.iter().any(|denominator| denominator.is_zero()) {
+        return None;
+    }
+    let inverses = F::Extension::batch_multiplicative_inverse(&denominators);
+    let mut inverse_by_row = vec![F::Extension::ZERO; n];
+    for (&row, inverse) in active_rows.iter().zip(inverses) {
+        inverse_by_row[row] = inverse;
+    }
+
+    let sums = (0..n)
+        .into_par_iter()
+        .fold(
+            || vec![F::Extension::ZERO; p],
+            |mut sums, row| {
+                let start = row_offsets[row] as usize;
+                let end = row_offsets[row + 1] as usize;
+                let inverse = inverse_by_row[row];
+                for entry in start..end {
+                    sums[columns[entry] as usize] += inverse.scalar_mul(preweights[entry]);
+                }
+                sums
+            },
+        )
+        .reduce(
+            || vec![F::Extension::ZERO; p],
+            |mut left, right| {
+                for (left, right) in left.iter_mut().zip(right) {
+                    *left += right;
+                }
+                left
+            },
+        );
+    let zero = zeta_to_n - F::Extension::ONE;
+    Some(
+        k_is.iter()
+            .zip(sums)
+            .map(|(&k, sum)| zeta.scalar_mul(k) + zero * sum)
+            .collect(),
+    )
+}
+
+#[cfg(feature = "std")]
+fn sparse_sigma_openings<F: RichField + Extendable<D>, const D: usize>(
+    zeta: F::Extension,
+    zeta_to_n: F::Extension,
+    common_data: &CommonCircuitData<F, D>,
+    cache: &crate::plonk::circuit_data::SparseSigmaReuseCacheEntry<F>,
+) -> Option<Vec<F::Extension>> {
+    let n = common_data.degree();
+    let sigma_range = common_data.sigmas_range();
+    if cache.n() != n
+        || cache.p() != sigma_range.len()
+        || cache.sigma_start != sigma_range.start
+        || cache.columns.len() != cache.deltas.len()
+        || cache
+            .row_offsets
+            .windows(2)
+            .filter(|bounds| bounds[0] != bounds[1])
+            .count()
+            != 10_860
+    {
+        return None;
+    }
+    let subgroup =
+        crate::plonk::prover::precomputed::two_adic_subgroup::<F>(common_data.degree_bits());
+    let openings = sparse_sigma_openings_from_parts(
+        zeta,
+        zeta_to_n,
+        subgroup.as_slice(),
+        &common_data.k_is,
+        &cache.row_offsets,
+        &cache.columns,
+        &cache.preweights,
+    )?;
+    crate::plonk::circuit_data::note_sparse_sigma_opening_hit();
+    Some(openings)
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -320,6 +430,30 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
         quotient_polys_commitment: &PolynomialBatch<F, C, D>,
         common_data: &CommonCircuitData<F, D>,
+    ) -> Self {
+        Self::new_with_sparse_sigma(
+            zeta,
+            g,
+            constants_sigmas_commitment,
+            wires_commitment,
+            zs_partial_products_lookup_commitment,
+            quotient_polys_commitment,
+            common_data,
+            F::Extension::ZERO,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_sparse_sigma<C: GenericConfig<D, F = F>>(
+        zeta: F::Extension,
+        g: F::Extension,
+        constants_sigmas_commitment: &PolynomialBatch<F, C, D>,
+        wires_commitment: &PolynomialBatch<F, C, D>,
+        zs_partial_products_lookup_commitment: &PolynomialBatch<F, C, D>,
+        quotient_polys_commitment: &PolynomialBatch<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+        zeta_to_n: F::Extension,
+        sparse_sigma_reuse: Option<&crate::plonk::circuit_data::SparseSigmaReuseCacheEntry<F>>,
     ) -> Self {
         // Every committed polynomial in these batches has at most `degree`
         // coefficients, so one powers table per opening point covers all of
@@ -419,15 +553,29 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         let shifted_zs_polys = &shifted_polynomials[zs_range.clone()];
         let shifted_lookup_polys = &shifted_polynomials[lookup_range.clone()];
 
-        let mut jobs: Vec<(&[F], bool)> = Vec::with_capacity(
+        #[cfg(feature = "std")]
+        let sparse_sigmas = sparse_sigma_reuse.and_then(|cache| {
+            (constants_sigmas_polys.len() == common_data.sigmas_range().end)
+                .then(|| sparse_sigma_openings(zeta, zeta_to_n, common_data, cache))
+                .flatten()
+        });
+        #[cfg(not(feature = "std"))]
+        let sparse_sigmas: Option<Vec<F::Extension>> = None;
+        let dense_preprocessed_len = if sparse_sigmas.is_some() {
+            common_data.sigmas_range().start
+        } else {
             constants_sigmas_polys.len()
+        };
+
+        let mut jobs: Vec<(&[F], bool)> = Vec::with_capacity(
+            dense_preprocessed_len
                 + zs_partial_products_lookup_polys.len()
                 + quotient_polys_src.len()
                 + wires_polys.len()
                 + shifted_zs_polys.len()
                 + shifted_lookup_polys.len(),
         );
-        for poly in constants_sigmas_polys {
+        for poly in &constants_sigmas_polys[..dense_preprocessed_len] {
             jobs.push((poly.coeffs.as_slice(), false));
         }
         for poly in zs_partial_products_lookup_polys {
@@ -455,62 +603,60 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
             let zeta_pows = &zeta_pows;
             let g_zeta_pows = &g_zeta_pows;
             let g_subgroup = g_subgroup.as_slice();
-            evals
-                .par_chunks_mut(2)
-                .enumerate()
-                .for_each(|(pair, out)| {
-                    let base = pair * 2;
-                    let eval_one = |(coeffs, shifted): (&[F], bool)| {
-                        if !shifted {
-                            F::extension_base_dot_product(zeta_pows, coeffs)
-                        } else if use_fused_shifted {
-                            // Shifted opening without a materialized `(g·ζ)`
-                            // table: fold the natural-order subgroup power
-                            // into each coefficient.
-                            F::extension_base_dot_product_with_subgroup_scales(
-                                zeta_pows, coeffs, g_subgroup,
-                            )
-                        } else {
-                            F::extension_base_dot_product(g_zeta_pows, coeffs)
-                        }
-                    };
-                    // Only two unshifted openings share a powers slice, so
-                    // only they can ride the fused two-accumulator dot.
-                    if out.len() == 2 && !jobs[base].1 && !jobs[base + 1].1 {
-                        let [first, second] = F::extension_base_dot_products_2(
-                            zeta_pows,
-                            [jobs[base].0, jobs[base + 1].0],
-                        );
-                        out[0] = first;
-                        out[1] = second;
+            evals.par_chunks_mut(2).enumerate().for_each(|(pair, out)| {
+                let base = pair * 2;
+                let eval_one = |(coeffs, shifted): (&[F], bool)| {
+                    if !shifted {
+                        F::extension_base_dot_product(zeta_pows, coeffs)
+                    } else if use_fused_shifted {
+                        // Shifted opening without a materialized `(g·ζ)`
+                        // table: fold the natural-order subgroup power
+                        // into each coefficient.
+                        F::extension_base_dot_product_with_subgroup_scales(
+                            zeta_pows, coeffs, g_subgroup,
+                        )
                     } else {
-                        for (slot, &job) in out.iter_mut().zip(&jobs[base..]) {
-                            *slot = eval_one(job);
-                        }
+                        F::extension_base_dot_product(g_zeta_pows, coeffs)
                     }
-                });
+                };
+                // Only two unshifted openings share a powers slice, so
+                // only they can ride the fused two-accumulator dot.
+                if out.len() == 2 && !jobs[base].1 && !jobs[base + 1].1 {
+                    let [first, second] = F::extension_base_dot_products_2(
+                        zeta_pows,
+                        [jobs[base].0, jobs[base + 1].0],
+                    );
+                    out[0] = first;
+                    out[1] = second;
+                } else {
+                    for (slot, &job) in out.iter_mut().zip(&jobs[base..]) {
+                        *slot = eval_one(job);
+                    }
+                }
+            });
         }
 
-        let constants_sigmas_len = constants_sigmas_polys.len();
+        let dense_preprocessed_len = dense_preprocessed_len;
         let zs_partial_products_lookup_len = zs_partial_products_lookup_polys.len();
         let quotient_len = quotient_polys_src.len();
         let wires_len = wires_polys.len();
-        let constants_sigmas_at = 0;
-        let zs_partial_products_lookup_at = constants_sigmas_at + constants_sigmas_len;
+        let preprocessed_at = 0;
+        let zs_partial_products_lookup_at = preprocessed_at + dense_preprocessed_len;
         let quotient_at = zs_partial_products_lookup_at + zs_partial_products_lookup_len;
         let wires_at = quotient_at + quotient_len;
         let zs_next_at = wires_at + wires_len;
         let lookup_next_at = zs_next_at + shifted_zs_polys.len();
 
-        let constants_sigmas_eval =
-            &evals[constants_sigmas_at..constants_sigmas_at + constants_sigmas_len];
+        let dense_preprocessed_eval =
+            &evals[preprocessed_at..preprocessed_at + dense_preprocessed_len];
         // `zs_partial_products_lookup_eval` contains the permutation argument polynomials as well as lookup polynomials.
         let zs_partial_products_lookup_eval = &evals[zs_partial_products_lookup_at
             ..zs_partial_products_lookup_at + zs_partial_products_lookup_len];
 
         Self {
-            constants: constants_sigmas_eval[common_data.constants_range()].to_vec(),
-            plonk_sigmas: constants_sigmas_eval[common_data.sigmas_range()].to_vec(),
+            constants: dense_preprocessed_eval[common_data.constants_range()].to_vec(),
+            plonk_sigmas: sparse_sigmas
+                .unwrap_or_else(|| dense_preprocessed_eval[common_data.sigmas_range()].to_vec()),
             wires: evals[wires_at..wires_at + wires_len].to_vec(),
             plonk_zs: zs_partial_products_lookup_eval[common_data.zs_range()].to_vec(),
             plonk_zs_next: evals[zs_next_at..zs_next_at + shifted_zs_polys.len()].to_vec(),
@@ -737,5 +883,89 @@ mod tests {
 
         verify(proof, &data.verifier_only, &data.common)?;
         data.verify_compressed(compressed_proof)
+    }
+    #[cfg(feature = "std")]
+    #[test]
+    fn sparse_sigma_barycentric_openings_match_dense_interpolation() {
+        use crate::field::polynomial::PolynomialValues;
+        use crate::field::types::PrimeField64;
+
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        type FF = <C as GenericConfig<D>>::FE;
+        const N: usize = 8;
+        const P: usize = 3;
+
+        let generator = F::primitive_root_of_unity(3);
+        let subgroup: Vec<F> = generator.powers().take(N).collect();
+        let k_is = [
+            F::from_canonical_u64(3),
+            F::from_canonical_u64(5),
+            F::from_canonical_u64(7),
+        ];
+        let changes = [
+            (0usize, 0usize, F::from_canonical_u64(11)),
+            (1, 2, F::from_canonical_u64(13)),
+            (3, 1, F::from_canonical_u64(17)),
+            (3, 2, F::from_canonical_u64(19)),
+            (7, 0, F::from_canonical_u64(23)),
+        ];
+        let n_inverse = F::from_canonical_usize(N).inverse();
+        let mut row_offsets = Vec::with_capacity(N + 1);
+        let mut columns = Vec::new();
+        let mut preweights = Vec::new();
+        let mut sigma_values: Vec<Vec<F>> = (0..P)
+            .map(|column| subgroup.iter().map(|&omega| k_is[column] * omega).collect())
+            .collect();
+        row_offsets.push(0);
+        for row in 0..N {
+            for &(changed_row, column, delta) in &changes {
+                if changed_row == row {
+                    columns.push(column as u8);
+                    preweights.push(delta * subgroup[row] * n_inverse);
+                    sigma_values[column][row] += delta;
+                }
+            }
+            row_offsets.push(columns.len() as u32);
+        }
+
+        let zeta = FF::from_basefield_array([F::from_canonical_u64(29), F::from_canonical_u64(31)]);
+        let zeta_to_n = zeta.exp_power_of_2(3);
+        let sparse = sparse_sigma_openings_from_parts::<F, D>(
+            zeta,
+            zeta_to_n,
+            &subgroup,
+            &k_is,
+            &row_offsets,
+            &columns,
+            &preweights,
+        )
+        .expect("synthetic sparse interpolation must admit");
+        let dense: Vec<FF> = sigma_values
+            .into_iter()
+            .map(|values| {
+                PolynomialValues::new(values)
+                    .ifft()
+                    .to_extension::<D>()
+                    .eval(zeta)
+            })
+            .collect();
+
+        assert_eq!(dense.len(), sparse.len());
+        for (column, (dense, sparse)) in dense.iter().zip(&sparse).enumerate() {
+            let dense_limbs: [F; D] = dense.to_basefield_array();
+            let sparse_limbs: [F; D] = sparse.to_basefield_array();
+            for limb in 0..D {
+                let dense_raw = dense_limbs[limb].to_noncanonical_u64();
+                let sparse_raw = sparse_limbs[limb].to_noncanonical_u64();
+                assert_eq!(
+                    dense_limbs[limb].to_canonical_u64(),
+                    sparse_limbs[limb].to_canonical_u64(),
+                    "column {column} limb {limb}; raw {dense_raw:#x} vs {sparse_raw:#x}"
+                );
+                let _raw_representatives_match = dense_raw == sparse_raw;
+            }
+        }
     }
 }

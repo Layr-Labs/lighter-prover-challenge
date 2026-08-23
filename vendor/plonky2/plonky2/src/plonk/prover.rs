@@ -11,6 +11,8 @@ use plonky2_maybe_rayon::*;
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
+use crate::field::packable::Packable;
+use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -27,12 +29,10 @@ use crate::iop::witness::{MatrixWitness, PartialWitness, PartitionWitness, Witne
 use crate::plonk::circuit_builder::NUM_COINS_LOOKUP;
 use crate::plonk::circuit_data::{CommonCircuitData, ProverOnlyCircuitData};
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-use crate::plonk::circuit_data::{
-    LowRangeSelectorFilterCache, LowRangeSelectorFilterCacheEntry,
-};
+use crate::plonk::circuit_data::{LowRangeSelectorFilterCache, LowRangeSelectorFilterCacheEntry};
 use crate::plonk::config::{GenericConfig, Hasher};
-use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::permutation_argument::fixed_routed_wire;
+use crate::plonk::plonk_common::PlonkOracle;
 use crate::plonk::proof::{OpeningSet, Proof, ProofWithPublicInputs};
 use crate::plonk::vanishing_poly::{
     eval_vanishing_poly_base_batch, get_lut_poly, interleave_pair_plan, PermutationBatch,
@@ -128,13 +128,40 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
+    prove_with_sparse_sigma_policy(prover_data, common_data, inputs, timing, true)
+}
+
+/// Diagnostic control for proving the same circuit with sparse-sigma reuse
+/// explicitly allowed or denied. The environment rollback remains authoritative.
+#[doc(hidden)]
+pub fn prove_with_sparse_sigma_policy<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    inputs: PartialWitness<F>,
+    timing: &mut TimingTree,
+    allow_sparse_sigma_reuse: bool,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
     let partition_witness = timed!(
         timing,
         "run generators",
         generate_partial_witness(inputs, prover_data, common_data)?
     );
 
-    prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
+    prove_with_partition_witness_sparse_sigma_policy(
+        prover_data,
+        common_data,
+        partition_witness,
+        timing,
+        allow_sparse_sigma_reuse,
+    )
 }
 
 pub fn prove_with_partition_witness<
@@ -144,8 +171,33 @@ pub fn prove_with_partition_witness<
 >(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+    partition_witness: PartitionWitness<F>,
+    timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    prove_with_partition_witness_sparse_sigma_policy(
+        prover_data,
+        common_data,
+        partition_witness,
+        timing,
+        true,
+    )
+}
+
+#[doc(hidden)]
+pub fn prove_with_partition_witness_sparse_sigma_policy<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
     timing: &mut TimingTree,
+    allow_sparse_sigma_reuse: bool,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -468,22 +520,26 @@ where
     // `g * zeta`, are not in our subgroup `H`. It suffices to check `zeta` only, since
     // `(g * zeta)^n = zeta^n`, where `n` is the order of `g`.
     let g = F::Extension::primitive_root_of_unity(common_data.degree_bits());
+    let zeta_to_n = zeta.exp_power_of_2(common_data.degree_bits());
     ensure!(
-        zeta.exp_power_of_2(common_data.degree_bits()) != F::Extension::ONE,
+        zeta_to_n != F::Extension::ONE,
         "Opening point is in the subgroup."
     );
+    let sparse_sigma_reuse = prover_data.sparse_sigma_reuse(common_data, allow_sparse_sigma_reuse);
 
     let openings = timed!(
         timing,
         "construct the opening set, including lookups",
-        OpeningSet::new(
+        OpeningSet::new_with_sparse_sigma(
             zeta,
             g,
             &prover_data.constants_sigmas_commitment,
             &wires_commitment,
             &partial_products_zs_and_lookup_commitment,
             &quotient_polys_commitment,
-            common_data
+            common_data,
+            zeta_to_n,
+            sparse_sigma_reuse,
         )
     );
     challenger.observe_openings(&openings.to_fri_openings());
@@ -492,7 +548,7 @@ where
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        PolynomialBatch::<F, C, D>::prove_openings_with_sparse_sigma(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
@@ -505,6 +561,13 @@ where
             None,
             None,
             timing,
+            sparse_sigma_reuse.map(|cache| {
+                crate::plonk::circuit_data::SparseSigmaFriContext {
+                    cache,
+                    subgroup: &prover_data.subgroup,
+                    k_is: &common_data.k_is,
+                }
+            }),
         )
     );
 
@@ -628,6 +691,145 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+const PERMUTATION_ROW4_WIDTH: usize = 4;
+
+/// Exact same-binary rollback for the adjacent-row packed permutation ratio pass. Missing or any
+/// value other than `0` requests packing; the type/backend guard in the caller still has final say.
+#[cfg(feature = "std")]
+fn permutation_row4_requested() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PLONKY2_PERMUTATION_ROW4").as_deref() != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
+#[cfg(not(feature = "std"))]
+const fn permutation_row4_requested() -> bool {
+    false
+}
+
+/// Returns true only when all four rows have the same fixed/active decision at each `j` in this
+/// quotient-degree chunk. Common fixed factors can then be skipped before any packed arithmetic;
+/// a mixed-lane decision takes the scalar helper below to preserve symbolic `0 / 0` cancellation.
+#[inline]
+fn permutation_row4_chunk_has_uniform_mask(
+    fixed_routed_wires: &[u8],
+    first_row: usize,
+    start: usize,
+    end: usize,
+    num_routed_wires: usize,
+) -> bool {
+    let first_routed_base = first_row * num_routed_wires;
+    for j in start..end {
+        let first_is_fixed = fixed_routed_wire(fixed_routed_wires, first_routed_base + j);
+        for lane in 1..PERMUTATION_ROW4_WIDTH {
+            let routed_index = (first_row + lane) * num_routed_wires + j;
+            if fixed_routed_wire(fixed_routed_wires, routed_index) != first_is_fixed {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// The original per-row/per-chunk expression, retained for mixed fixed-mask groups and row tails.
+/// Each lane therefore has a byte-for-byte scalar fallback without changing its `j` order.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn two_challenge_permutation_chunk_scalar<F: Field>(
+    witness: &MatrixWitness<F>,
+    sigmas: &[Vec<F>],
+    fixed_routed_wires: &[u8],
+    row: usize,
+    x: F,
+    beta_0: F,
+    beta_1: F,
+    beta_k_is_0: &[F],
+    beta_k_is_1: &[F],
+    gamma_0: F,
+    gamma_1: F,
+    start: usize,
+    end: usize,
+    num_routed_wires: usize,
+) -> (F, F, F, F) {
+    let mut numerator_0 = F::ONE;
+    let mut numerator_1 = F::ONE;
+    let mut denominator_0 = F::ONE;
+    let mut denominator_1 = F::ONE;
+    let routed_base = row * num_routed_wires;
+    for j in start..end {
+        if fixed_routed_wire(fixed_routed_wires, routed_base + j) {
+            continue;
+        }
+        let wire_value = witness.get_wire(row, j);
+        let sigma = sigmas[row][j];
+        numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+        numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+        denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+        denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+    }
+    (numerator_0, numerator_1, denominator_0, denominator_1)
+}
+
+/// Evaluate one uniform-mask quotient-degree chunk for four independent rows. `P` is selected
+/// through `F: Packable`; production enters only when its width is four and the backend certifies
+/// raw-word equality with scalar add/mul. There is no type cast or Goldilocks downcast here.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn two_challenge_permutation_chunk_row4<F, P>(
+    witness: &MatrixWitness<F>,
+    sigmas: &[Vec<F>],
+    fixed_routed_wires: &[u8],
+    x_lanes: &[F],
+    first_row: usize,
+    num_routed_wires: usize,
+    beta_0: F,
+    beta_1: F,
+    beta_k_is_0: &[F],
+    beta_k_is_1: &[F],
+    gamma_0: F,
+    gamma_1: F,
+    start: usize,
+    end: usize,
+) -> (P, P, P, P)
+where
+    F: Field,
+    P: PackedField<Scalar = F>,
+{
+    debug_assert_eq!(P::WIDTH, PERMUTATION_ROW4_WIDTH);
+    debug_assert_eq!(x_lanes.len(), PERMUTATION_ROW4_WIDTH);
+
+    let x = *P::from_slice(x_lanes);
+    let mut numerator_0 = P::ONES;
+    let mut numerator_1 = P::ONES;
+    let mut denominator_0 = P::ONES;
+    let mut denominator_1 = P::ONES;
+
+    let first_routed_base = first_row * num_routed_wires;
+    for j in start..end {
+        // The caller proved that this bit is identical in every lane. Skip common fixed factors
+        // symbolically before touching witness, sigma, x, or shifts, just like the scalar loop.
+        if fixed_routed_wire(fixed_routed_wires, first_routed_base + j) {
+            continue;
+        }
+        let wire_lanes: [F; PERMUTATION_ROW4_WIDTH] =
+            core::array::from_fn(|lane| witness.get_wire(first_row + lane, j));
+        let sigma_lanes: [F; PERMUTATION_ROW4_WIDTH] =
+            core::array::from_fn(|lane| sigmas[first_row + lane][j]);
+        let wire_value = *P::from_slice(&wire_lanes);
+        let sigma = *P::from_slice(&sigma_lanes);
+
+        // Each lane retains the scalar expression and dependent multiplication order. Only four
+        // independent rows share an instruction stream.
+        numerator_0 *= wire_value + x * beta_k_is_0[j] + gamma_0;
+        numerator_1 *= wire_value + x * beta_k_is_1[j] + gamma_1;
+        denominator_0 *= wire_value + sigma * beta_0 + gamma_0;
+        denominator_1 *= wire_value + sigma * beta_1 + gamma_1;
+    }
+
+    (numerator_0, numerator_1, denominator_0, denominator_1)
+}
+
 /// Compute both production permutation challenges in one pass over the witness
 /// and sigma rows.
 ///
@@ -644,7 +846,7 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// memory traversal and the Rayon scheduling are shared, so every output limb
 /// is bit-identical to running the per-challenge path twice.
 fn two_challenge_wires_permutation_partial_products_and_zs<
-    F: RichField + Extendable<D>,
+    F: RichField + Extendable<D> + Packable,
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
@@ -654,6 +856,32 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     gammas: &[F],
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    two_challenge_wires_permutation_partial_products_and_zs_with_row4(
+        witness,
+        betas,
+        beta_k_is,
+        gammas,
+        prover_data,
+        common_data,
+        permutation_row4_requested(),
+    )
+}
+
+/// Implementation seam used by the raw-word differential: `request_row4 = false` is the exact
+/// inherited scalar loop, while `true` still packs only a certified raw-exact width-four backend.
+fn two_challenge_wires_permutation_partial_products_and_zs_with_row4<
+    F: RichField + Extendable<D> + Packable,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    request_row4: bool,
 ) -> Vec<Vec<PolynomialValues<F>>> {
     debug_assert_eq!(betas.len(), 2);
     debug_assert_eq!(gammas.len(), 2);
@@ -667,6 +895,11 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+    // The blanket `Packable` implementation keeps all generic fields on the inherited scalar
+    // loop. Today only AArch64 Goldilocks opts into raw-exact add/mul and selects width four.
+    let use_row4 = request_row4
+        && <<F as Packable>::Packing as PackedField>::RAW_MUL_ADD_EQUIVALENT
+        && <<F as Packable>::Packing as PackedField>::WIDTH == PERMUTATION_ROW4_WIDTH;
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
@@ -695,47 +928,178 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                     (
                         Vec::with_capacity(2 * num_chunks * INV_BATCH),
                         Vec::with_capacity(2 * num_chunks * INV_BATCH),
+                        Vec::<([F; PERMUTATION_ROW4_WIDTH], [F; PERMUTATION_ROW4_WIDTH])>::new(),
                     )
                 },
                 |scratch, (chunk_idx, ((products_0, products_1), xs))| {
                     let base = chunk_idx * INV_BATCH;
-                    let (denominators, denominator_inverses) = scratch;
+                    let (denominators, denominator_inverses, row4_denominators) = scratch;
                     denominators.clear();
-                    for (t, &x) in xs.iter().enumerate() {
-                        let i = base + t;
-                        let s_sigmas = &prover_data.sigmas[i];
-                        let routed_base = i * num_routed_wires;
-                        for chunk in 0..num_chunks {
-                            let start = chunk * degree;
-                            let end = min(start + degree, num_routed_wires);
-                            let mut numerator_0 = F::ONE;
-                            let mut numerator_1 = F::ONE;
-                            let mut denominator_0 = F::ONE;
-                            let mut denominator_1 = F::ONE;
-                            for j in start..end {
-                                // A singleton routed copy component maps this position to itself:
-                                // sigma(i,j) = k_j * x. Its numerator and denominator factors are
-                                // therefore identical for both challenges and cancel symbolically,
-                                // including when that common factor evaluates to zero. Check the
-                                // circuit-fixed bit before touching witness, sigma, x, or shifts.
-                                if fixed_routed_wire(
+                    if use_row4 {
+                        // A four-row staging buffer lets packed chunks be evaluated chunk-major,
+                        // then appended in the inherited row/chunk/challenge denominator order.
+                        let mut t = 0;
+                        while t + PERMUTATION_ROW4_WIDTH <= xs.len() {
+                            let first_row = base + t;
+                            row4_denominators.clear();
+                            for chunk in 0..num_chunks {
+                                let start = chunk * degree;
+                                let end = min(start + degree, num_routed_wires);
+                                if permutation_row4_chunk_has_uniform_mask(
                                     &prover_data.fixed_routed_wires,
-                                    routed_base + j,
+                                    first_row,
+                                    start,
+                                    end,
+                                    num_routed_wires,
                                 ) {
-                                    continue;
+                                    let (numerator_0, numerator_1, denominator_0, denominator_1) =
+                                        two_challenge_permutation_chunk_row4::<
+                                            F,
+                                            <F as Packable>::Packing,
+                                        >(
+                                            witness,
+                                            &prover_data.sigmas,
+                                            &prover_data.fixed_routed_wires,
+                                            &xs[t..t + PERMUTATION_ROW4_WIDTH],
+                                            first_row,
+                                            num_routed_wires,
+                                            beta_0,
+                                            beta_1,
+                                            beta_k_is_0,
+                                            beta_k_is_1,
+                                            gamma_0,
+                                            gamma_1,
+                                            start,
+                                            end,
+                                        );
+                                    let numerator_0 = numerator_0.as_slice();
+                                    let numerator_1 = numerator_1.as_slice();
+                                    let denominator_0 = denominator_0.as_slice();
+                                    let denominator_1 = denominator_1.as_slice();
+                                    for lane in 0..PERMUTATION_ROW4_WIDTH {
+                                        let output = (t + lane) * num_chunks + chunk;
+                                        products_0[output].write(numerator_0[lane]);
+                                        products_1[output].write(numerator_1[lane]);
+                                    }
+                                    row4_denominators.push((
+                                        core::array::from_fn(|lane| denominator_0[lane]),
+                                        core::array::from_fn(|lane| denominator_1[lane]),
+                                    ));
+                                } else {
+                                    // A `j` with different fixed decisions between lanes cannot be
+                                    // packed without evaluating a symbolically cancelled factor.
+                                    let mut denominator_lanes_0 = [F::ZERO; PERMUTATION_ROW4_WIDTH];
+                                    let mut denominator_lanes_1 = [F::ZERO; PERMUTATION_ROW4_WIDTH];
+                                    for lane in 0..PERMUTATION_ROW4_WIDTH {
+                                        let row = first_row + lane;
+                                        let (
+                                            numerator_0,
+                                            numerator_1,
+                                            denominator_0,
+                                            denominator_1,
+                                        ) = two_challenge_permutation_chunk_scalar(
+                                            witness,
+                                            &prover_data.sigmas,
+                                            &prover_data.fixed_routed_wires,
+                                            row,
+                                            xs[t + lane],
+                                            beta_0,
+                                            beta_1,
+                                            beta_k_is_0,
+                                            beta_k_is_1,
+                                            gamma_0,
+                                            gamma_1,
+                                            start,
+                                            end,
+                                            num_routed_wires,
+                                        );
+                                        let output = (t + lane) * num_chunks + chunk;
+                                        products_0[output].write(numerator_0);
+                                        products_1[output].write(numerator_1);
+                                        denominator_lanes_0[lane] = denominator_0;
+                                        denominator_lanes_1[lane] = denominator_1;
+                                    }
+                                    row4_denominators
+                                        .push((denominator_lanes_0, denominator_lanes_1));
                                 }
-                                let wire_value = witness.get_wire(i, j);
-                                let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
                             }
-                            let output = t * num_chunks + chunk;
-                            products_0[output].write(numerator_0);
-                            products_1[output].write(numerator_1);
-                            denominators.push(denominator_0);
-                            denominators.push(denominator_1);
+                            debug_assert_eq!(row4_denominators.len(), num_chunks);
+                            for lane in 0..PERMUTATION_ROW4_WIDTH {
+                                for (denominator_0, denominator_1) in row4_denominators.iter() {
+                                    denominators.push(denominator_0[lane]);
+                                    denominators.push(denominator_1[lane]);
+                                }
+                            }
+                            t += PERMUTATION_ROW4_WIDTH;
+                        }
+                        // `xs` is normally a power-of-two batch, but the source contract does not
+                        // depend on that. One to three final rows use the exact scalar expression.
+                        for t in t..xs.len() {
+                            let row = base + t;
+                            for chunk in 0..num_chunks {
+                                let start = chunk * degree;
+                                let end = min(start + degree, num_routed_wires);
+                                let (numerator_0, numerator_1, denominator_0, denominator_1) =
+                                    two_challenge_permutation_chunk_scalar(
+                                        witness,
+                                        &prover_data.sigmas,
+                                        &prover_data.fixed_routed_wires,
+                                        row,
+                                        xs[t],
+                                        beta_0,
+                                        beta_1,
+                                        beta_k_is_0,
+                                        beta_k_is_1,
+                                        gamma_0,
+                                        gamma_1,
+                                        start,
+                                        end,
+                                        num_routed_wires,
+                                    );
+                                let output = t * num_chunks + chunk;
+                                products_0[output].write(numerator_0);
+                                products_1[output].write(numerator_1);
+                                denominators.push(denominator_0);
+                                denominators.push(denominator_1);
+                            }
+                        }
+                    } else {
+                        // Exact inherited loop for generic fields and
+                        // `PLONKY2_PERMUTATION_ROW4=0` rollback runs.
+                        for (t, &x) in xs.iter().enumerate() {
+                            let i = base + t;
+                            let s_sigmas = &prover_data.sigmas[i];
+                            let routed_base = i * num_routed_wires;
+                            for chunk in 0..num_chunks {
+                                let start = chunk * degree;
+                                let end = min(start + degree, num_routed_wires);
+                                let mut numerator_0 = F::ONE;
+                                let mut numerator_1 = F::ONE;
+                                let mut denominator_0 = F::ONE;
+                                let mut denominator_1 = F::ONE;
+                                for j in start..end {
+                                    // A singleton routed copy component maps this position to
+                                    // itself: sigma(i,j) = k_j * x. Its numerator and denominator
+                                    // factors cancel symbolically, even when both evaluate to zero.
+                                    if fixed_routed_wire(
+                                        &prover_data.fixed_routed_wires,
+                                        routed_base + j,
+                                    ) {
+                                        continue;
+                                    }
+                                    let wire_value = witness.get_wire(i, j);
+                                    let sigma = s_sigmas[j];
+                                    numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
+                                    numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
+                                    denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
+                                    denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                }
+                                let output = t * num_chunks + chunk;
+                                products_0[output].write(numerator_0);
+                                products_1[output].write(numerator_1);
+                                denominators.push(denominator_0);
+                                denominators.push(denominator_1);
+                            }
                         }
                     }
                     // SAFETY: the loop above wrote every slot of both
@@ -4497,18 +4861,21 @@ mod l_0_table_tests {
 /// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
+    use super::{
+        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        two_challenge_wires_permutation_partial_products_and_zs_with_row4,
+        wires_permutation_partial_products_and_zs,
+    };
+    #[cfg(target_arch = "aarch64")]
+    use crate::field::packable::Packable;
+    #[cfg(target_arch = "aarch64")]
+    use crate::field::packed::PackedField;
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::iop::witness::MatrixWitness;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
-
-    use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
-        two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
-    };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
     const D: usize = 2;
@@ -4666,6 +5033,11 @@ mod permutation_pairing_tests {
         );
         assert_eq!(num_chunks, num_routed_wires.div_ceil(degree));
         assert_eq!(data.common.k_is.len(), num_routed_wires);
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(<<F as Packable>::Packing as PackedField>::RAW_MUL_ADD_EQUIVALENT);
+            assert_eq!(<<F as Packable>::Packing as PackedField>::WIDTH, 4);
+        }
 
         // PolynomialValues requires power-of-two domains. Span a single
         // point, short batches, the inversion boundary (INV_BATCH = 128),
@@ -4721,13 +5093,17 @@ mod permutation_pairing_tests {
                 .collect();
 
             // Candidate: the fused single pass.
-            let paired = two_challenge_wires_permutation_partial_products_and_zs(
+            // Force the request independently of the process environment. The implementation
+            // still clamps this to a certified raw-exact width-four backend, so generic fields
+            // retain their scalar path.
+            let paired = two_challenge_wires_permutation_partial_products_and_zs_with_row4(
                 &witness,
                 &betas,
                 &beta_k_is,
                 &gammas,
                 &data.prover_only,
                 &data.common,
+                true,
             );
 
             assert_eq!(paired.len(), 2);
@@ -4906,13 +5282,28 @@ mod permutation_pairing_tests {
             + gammas[0];
         assert!(numerator.is_zero() && denominator.is_zero());
 
-        let paired = two_challenge_wires_permutation_partial_products_and_zs(
+        let scalar = two_challenge_wires_permutation_partial_products_and_zs_with_row4(
             &witness,
             &betas,
             &beta_k_is,
             &gammas,
             &data.prover_only,
             &data.common,
+            false,
+        );
+        let paired = two_challenge_wires_permutation_partial_products_and_zs_with_row4(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+            true,
+        );
+        assert_eq!(
+            raw_limbs(&paired),
+            raw_limbs(&scalar),
+            "row4 changed a raw fixed-mask permutation-product limb",
         );
         for challenge in 0..2 {
             let reference = naive_reference(

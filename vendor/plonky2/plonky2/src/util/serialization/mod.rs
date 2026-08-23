@@ -986,6 +986,7 @@ pub trait Read {
             constants_sigmas_quotient_step: 0,
             constants_sigmas_quotient_domain: 0,
             low_range_selector_filter_cache: Default::default(),
+            sparse_sigma_reuse_cache: Default::default(),
         })
     }
 
@@ -1957,6 +1958,7 @@ pub trait Write {
             constants_sigmas_quotient_step: _,
             constants_sigmas_quotient_domain: _,
             low_range_selector_filter_cache: _,
+            sparse_sigma_reuse_cache: _,
             constants_sigmas_commitment,
             sigmas,
             subgroup,

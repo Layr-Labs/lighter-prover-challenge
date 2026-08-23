@@ -813,6 +813,107 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .collect_vec()
     }
 
+    #[cfg(feature = "std")]
+    fn sparse_sigma_fri_combination_from_parts(
+        fri_alpha: F::Extension,
+        sigma_start: usize,
+        subgroup: &[F],
+        k_is: &[F],
+        row_offsets: &[u32],
+        columns: &[u8],
+        deltas: &[F],
+    ) -> Option<PolynomialCoeffs<F::Extension>> {
+        let n = subgroup.len();
+        let p = k_is.len();
+        if !n.is_power_of_two()
+            || row_offsets.first().copied() != Some(0)
+            || row_offsets.len() != n + 1
+            || row_offsets.last().copied()? as usize != deltas.len()
+            || columns.len() != deltas.len()
+            || columns.iter().any(|&column| column as usize >= p)
+            || row_offsets.windows(2).any(|bounds| bounds[0] > bounds[1])
+        {
+            return None;
+        }
+        let sigma_powers: Vec<F::Extension> =
+            fri_alpha.powers().skip(sigma_start).take(p).collect();
+        if sigma_powers.len() != p {
+            return None;
+        }
+        let identity_scale = sigma_powers
+            .iter()
+            .zip(k_is)
+            .fold(F::Extension::ZERO, |sum, (&power, &k)| {
+                sum + power.scalar_mul(k)
+            });
+        let mut evaluations: Vec<F::Extension> = subgroup
+            .par_iter()
+            .map(|&omega| identity_scale.scalar_mul(omega))
+            .collect();
+        evaluations
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, evaluation)| {
+                let start = row_offsets[row] as usize;
+                let end = row_offsets[row + 1] as usize;
+                for entry in start..end {
+                    let column = columns[entry] as usize;
+                    *evaluation += sigma_powers[column].scalar_mul(deltas[entry]);
+                }
+            });
+        Some(PolynomialValues::new(evaluations).ifft())
+    }
+
+    #[cfg(feature = "std")]
+    fn sparse_sigma_descriptor_range(
+        polynomials: &[crate::fri::structure::FriPolynomialInfo],
+        sigma_start: usize,
+        p: usize,
+    ) -> Option<core::ops::Range<usize>> {
+        let sigma_range = sigma_start..sigma_start.checked_add(p)?;
+        if sigma_range.end > polynomials.len()
+            || polynomials[..sigma_range.end]
+                .iter()
+                .enumerate()
+                .any(|(index, polynomial)| {
+                    polynomial.oracle_index != 0 || polynomial.polynomial_index != index
+                })
+        {
+            return None;
+        }
+        Some(sigma_range)
+    }
+
+    #[cfg(feature = "std")]
+    fn sparse_sigma_fri_combination(
+        polynomials: &[crate::fri::structure::FriPolynomialInfo],
+        fri_alpha: F::Extension,
+        context: crate::plonk::circuit_data::SparseSigmaFriContext<'_, F>,
+    ) -> Option<(core::ops::Range<usize>, PolynomialCoeffs<F::Extension>)> {
+        let cache = context.cache;
+        let n = cache.n();
+        let p = cache.p();
+        if n != 1 << 14 || p != 80 || context.subgroup.len() != n || context.k_is.len() != p {
+            return None;
+        }
+        // The first FRI batch starts with the complete constants/sigmas oracle.
+        // Pin every prefix descriptor so a hostile instance falls back instead
+        // of applying sparse weights at the wrong alpha positions.
+        let sigma_range = Self::sparse_sigma_descriptor_range(polynomials, cache.sigma_start, p)?;
+
+        let combination = Self::sparse_sigma_fri_combination_from_parts(
+            fri_alpha,
+            sigma_range.start,
+            context.subgroup,
+            context.k_is,
+            &cache.row_offsets,
+            &cache.columns,
+            &cache.deltas,
+        )?;
+        crate::plonk::circuit_data::note_sparse_sigma_fri_hit();
+        Some((sigma_range, combination))
+    }
+
     /// Produces a batch opening proof.
     pub fn prove_openings(
         instance: &FriInstanceInfo<F, D>,
@@ -823,9 +924,33 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         max_num_query_steps: Option<usize>,
         timing: &mut TimingTree,
     ) -> FriProof<F, C::Hasher, D> {
+        Self::prove_openings_with_sparse_sigma(
+            instance,
+            oracles,
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+            timing,
+            None,
+        )
+    }
+
+    pub(crate) fn prove_openings_with_sparse_sigma(
+        instance: &FriInstanceInfo<F, D>,
+        oracles: &[&Self],
+        challenger: &mut Challenger<F, C::Hasher>,
+        fri_params: &FriParams,
+        final_poly_coeff_len: Option<usize>,
+        max_num_query_steps: Option<usize>,
+        timing: &mut TimingTree,
+        sparse_sigma_reuse: Option<crate::plonk::circuit_data::SparseSigmaFriContext<'_, F>>,
+    ) -> FriProof<F, C::Hasher, D> {
+        #[cfg(not(feature = "std"))]
+        let _ = sparse_sigma_reuse;
         assert!(D > 1, "Not implemented for D=1.");
-        let alpha = challenger.get_extension_challenge::<D>();
-        let mut alpha = ReducingFactor::new(alpha);
+        let fri_alpha = challenger.get_extension_challenge::<D>();
+        let mut alpha = ReducingFactor::new(fri_alpha);
 
         // Final low-degree polynomial that goes into FRI.
         let mut final_poly = PolynomialCoeffs::empty();
@@ -841,9 +966,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             instance.batches.iter().enumerate()
         {
             // Collect the coefficients of all the polynomials in `polynomials`.
-            let polys_coeff = polynomials.iter().map(|fri_poly| {
-                &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
-            });
+            let polys_coeff: Vec<&PolynomialCoeffs<F>> = polynomials
+                .iter()
+                .map(|fri_poly| {
+                    &oracles[fri_poly.oracle_index].polynomials[fri_poly.polynomial_index]
+                })
+                .collect();
             // The label is formatted unconditionally, but `timing`'s `push` is
             // compiled out unless the `timing` feature is on — which it is not
             // here — so the `String` is allocated, written and dropped without
@@ -867,10 +995,37 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 );
                 continue;
             }
+            #[cfg(feature = "std")]
+            let sparse_sigma_combination = (batch_index == 0
+                && oracles.first().is_some_and(|oracle| {
+                    oracle.polynomials.len()
+                        == sparse_sigma_reuse
+                            .as_ref()
+                            .map_or(0, |context| context.cache.sigma_start + context.cache.p())
+                }))
+            .then(|| {
+                sparse_sigma_reuse.and_then(|context| {
+                    Self::sparse_sigma_fri_combination(polynomials, fri_alpha, context)
+                })
+            })
+            .flatten();
+            #[cfg(not(feature = "std"))]
+            let sparse_sigma_combination: Option<(
+                core::ops::Range<usize>,
+                PolynomialCoeffs<F::Extension>,
+            )> = None;
             let composition_poly = timed!(
                 timing,
                 "reduce batch of polynomials",
-                alpha.reduce_polys_base(polys_coeff)
+                match sparse_sigma_combination {
+                    Some((sigma_range, sigma_combination)) => alpha
+                        .reduce_polys_base_with_omitted_range(
+                            polys_coeff,
+                            sigma_range,
+                            sigma_combination,
+                        ),
+                    None => alpha.reduce_polys_base(polys_coeff),
+                }
             );
             // Fused (value-exact) form of:
             //   let quotient = composition_poly.divide_by_linear_padded_in_place(*point);
@@ -2222,5 +2377,116 @@ mod tests {
             };
             assert_eq!(raw(&by_ref), raw(&consumed), "width={width} degree={degree}");
         }
+    }
+    #[cfg(feature = "std")]
+    #[test]
+    fn sparse_sigma_fri_interpolation_matches_dense_weighted_polynomials() {
+        use crate::field::types::PrimeField64;
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+        type FF = <F as Extendable<D>>::Extension;
+        const N: usize = 8;
+        const P: usize = 3;
+        const SIGMA_START: usize = 5;
+
+        let generator = F::primitive_root_of_unity(3);
+        let subgroup: Vec<F> = generator.powers().take(N).collect();
+        let k_is = [
+            F::from_canonical_u64(3),
+            F::from_canonical_u64(5),
+            F::from_canonical_u64(7),
+        ];
+        let changes = [
+            (0usize, 0usize, F::from_canonical_u64(11)),
+            (1, 2, F::from_canonical_u64(13)),
+            (3, 1, F::from_canonical_u64(17)),
+            (3, 2, F::from_canonical_u64(19)),
+            (7, 0, F::from_canonical_u64(23)),
+        ];
+        let mut row_offsets = Vec::with_capacity(N + 1);
+        let mut columns = Vec::new();
+        let mut deltas = Vec::new();
+        let mut sigma_values: Vec<Vec<F>> = (0..P)
+            .map(|column| subgroup.iter().map(|&omega| k_is[column] * omega).collect())
+            .collect();
+        row_offsets.push(0);
+        for row in 0..N {
+            for &(changed_row, column, delta) in &changes {
+                if changed_row == row {
+                    columns.push(column as u8);
+                    deltas.push(delta);
+                    sigma_values[column][row] += delta;
+                }
+            }
+            row_offsets.push(columns.len() as u32);
+        }
+        let alpha =
+            FF::from_basefield_array([F::from_canonical_u64(29), F::from_canonical_u64(31)]);
+        let sigma_powers: Vec<FF> = alpha.powers().skip(SIGMA_START).take(P).collect();
+        let sigma_polys: Vec<PolynomialCoeffs<F>> = sigma_values
+            .into_iter()
+            .map(|values| PolynomialValues::new(values).ifft())
+            .collect();
+        let mut dense = vec![FF::ZERO; N];
+        for (&power, polynomial) in sigma_powers.iter().zip(&sigma_polys) {
+            for (slot, &coefficient) in dense.iter_mut().zip(&polynomial.coeffs) {
+                *slot += <FF as FieldExtension<D>>::scalar_mul(&power, coefficient);
+            }
+        }
+        let sparse = PolynomialBatch::<F, C, D>::sparse_sigma_fri_combination_from_parts(
+            alpha,
+            SIGMA_START,
+            &subgroup,
+            &k_is,
+            &row_offsets,
+            &columns,
+            &deltas,
+        )
+        .expect("synthetic sparse FRI interpolation must admit");
+
+        assert_eq!(dense.len(), sparse.coeffs.len());
+        for (coefficient, (dense, sparse)) in dense.iter().zip(&sparse.coeffs).enumerate() {
+            let dense_limbs: [F; D] = dense.to_basefield_array();
+            let sparse_limbs: [F; D] = sparse.to_basefield_array();
+            for limb in 0..D {
+                let dense_raw = dense_limbs[limb].to_noncanonical_u64();
+                let sparse_raw = sparse_limbs[limb].to_noncanonical_u64();
+                assert_eq!(
+                    dense_limbs[limb].to_canonical_u64(),
+                    sparse_limbs[limb].to_canonical_u64(),
+                    "coefficient {coefficient} limb {limb}; raw {dense_raw:#x} vs {sparse_raw:#x}"
+                );
+                let _raw_representatives_match = dense_raw == sparse_raw;
+            }
+        }
+
+        let descriptors =
+            crate::fri::structure::FriPolynomialInfo::from_range(0, 0..SIGMA_START + P);
+        assert_eq!(
+            PolynomialBatch::<F, C, D>::sparse_sigma_descriptor_range(&descriptors, SIGMA_START, P,),
+            Some(SIGMA_START..SIGMA_START + P)
+        );
+        let mut hostile = descriptors.clone();
+        hostile[SIGMA_START].oracle_index = 1;
+        assert_eq!(
+            PolynomialBatch::<F, C, D>::sparse_sigma_descriptor_range(&hostile, SIGMA_START, P,),
+            None
+        );
+        let mut hostile = descriptors.clone();
+        hostile[SIGMA_START].polynomial_index += 1;
+        assert_eq!(
+            PolynomialBatch::<F, C, D>::sparse_sigma_descriptor_range(&hostile, SIGMA_START, P,),
+            None
+        );
+        assert_eq!(
+            PolynomialBatch::<F, C, D>::sparse_sigma_descriptor_range(
+                &descriptors[..descriptors.len() - 1],
+                SIGMA_START,
+                P,
+            ),
+            None
+        );
     }
 }
