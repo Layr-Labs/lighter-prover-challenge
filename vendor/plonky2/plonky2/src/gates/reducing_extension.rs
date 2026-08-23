@@ -5,7 +5,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{mem::MaybeUninit, ops::Range};
+use core::ops::Range;
 
 use anyhow::Result;
 
@@ -173,33 +173,25 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
         let use_stack = reducing_extension_stack_scratch_enabled()
             && n <= STACK_POINTS
             && D * n <= STACK_BASE_VALUES;
-        let mut alpha_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
-        let mut acc_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
-        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_BASE_VALUES];
+        let mut alpha_stack;
+        let mut acc_stack;
+        let mut scratch_stack;
         let mut alpha_heap;
         let mut acc_heap;
         let mut scratch_heap;
-        let (alphas, accs, scratch):
-            (&mut [F::Extension], &mut [F::Extension], &mut [F]) = if use_stack {
-                // SAFETY: every alpha/acc slot is assigned immediately below,
-                // and each scratch slot is assigned by every coefficient's
-                // point loop before the batch multiply reads it.
-                unsafe {
-                    (
-                        core::slice::from_raw_parts_mut(
-                            alpha_stack.as_mut_ptr().cast::<F::Extension>(),
-                            n,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            acc_stack.as_mut_ptr().cast::<F::Extension>(),
-                            n,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            scratch_stack.as_mut_ptr().cast::<F>(),
-                            D * n,
-                        ),
-                    )
-                }
+        let (alphas, accs, scratch): (&mut [F::Extension], &mut [F::Extension], &mut [F]) =
+            if use_stack {
+                // Initialize the fixed storage before creating field slices.
+                // The hot prefix is overwritten below, but valid zeros keep
+                // reference construction within Rust's validity rules.
+                alpha_stack = [F::Extension::ZERO; STACK_POINTS];
+                acc_stack = [F::Extension::ZERO; STACK_POINTS];
+                scratch_stack = [F::ZERO; STACK_BASE_VALUES];
+                (
+                    &mut alpha_stack[..n],
+                    &mut acc_stack[..n],
+                    &mut scratch_stack[..D * n],
+                )
             } else {
                 alpha_heap = vec![F::Extension::ZERO; n];
                 acc_heap = vec![F::Extension::ZERO; n];
