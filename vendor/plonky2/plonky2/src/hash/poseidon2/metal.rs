@@ -29,6 +29,9 @@ use crate::hash::poseidon2::config::{EXTERNAL_CONSTANTS, INTERNAL_CONSTANTS, MAT
 #[cfg(feature = "diagnostic_profile")]
 static PROFILE_COMMAND_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "diagnostic_profile")]
+static PROFILE_SPINE_RESERVATION_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(feature = "diagnostic_profile")]
 fn profile_command_buffer(
@@ -352,6 +355,25 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
+/// `shared` restores the current single-condvar broadcast path for a same-binary
+/// A/B. Production/default targets spine waiters directly.
+const TARGETED_SPINE_CONDVAR_ENV: &str = "LIGHTER_METAL_SPINE_CONDVAR";
+static TARGETED_SPINE_CONDVAR: LazyLock<bool> = LazyLock::new(|| {
+    !std::env::var(TARGETED_SPINE_CONDVAR_ENV)
+        .is_ok_and(|value| value.eq_ignore_ascii_case("shared"))
+});
+/// Same-binary rollback for the light recursive spine's early Metal queue
+/// reservation. `off` restores commit-time FIFO placement while retaining the
+/// targeted singleton-pool wakeup above.
+const SPINE_EARLY_ENQUEUE_ENV: &str = "LIGHTER_METAL_SPINE_EARLY_ENQUEUE";
+
+fn spine_early_enqueue_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    !value.is_some_and(|value| value.eq_ignore_ascii_case("off"))
+}
+
+static SPINE_EARLY_ENQUEUE: LazyLock<bool> = LazyLock::new(|| {
+    spine_early_enqueue_setting(std::env::var_os(SPINE_EARLY_ENQUEUE_ENV).as_deref())
+});
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;
 /// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
@@ -386,7 +408,10 @@ struct MetalShared {
     /// Buffers backing live level-order digest stores return here after the
     /// proof has extracted its sparse Merkle paths.
     digest_output_pool: Arc<Mutex<DigestOutputPool>>,
+    /// Regular tree builders wait here; serial-critical spine builders use a
+    /// dedicated condition variable when targeted wakeup is enabled.
     available: Condvar,
+    spine_available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
     ntt_roots: Mutex<HashMap<u32, NttRoots>>,
@@ -1066,9 +1091,95 @@ struct BufferSet {
     output: Option<Buffer>,
 }
 
+/// A command buffer whose place in the one Metal queue is fixed before the
+/// light recursive spine waits for the singleton staging set. Later streamed
+/// absorbs and quotient commands may still encode and commit, but cannot pass
+/// this uncommitted reservation. If acquisition fails, `Drop` commits the empty
+/// buffer so the queue can never remain blocked by an abandoned reservation.
+struct EnqueuedSpineCommand {
+    command_buffer: Option<CommandBuffer>,
+    #[cfg(feature = "diagnostic_profile")]
+    profile_sequence: u64,
+    #[cfg(feature = "diagnostic_profile")]
+    enqueue_to_encode: Option<crate::util::profile::Span>,
+}
+
+impl EnqueuedSpineCommand {
+    fn new(queue: &CommandQueue) -> Self {
+        let command_buffer = autoreleasepool(|| queue.new_command_buffer().to_owned());
+        command_buffer.enqueue();
+        #[cfg(feature = "diagnostic_profile")]
+        let profile_sequence = PROFILE_SPINE_RESERVATION_SEQUENCE.fetch_add(
+            1,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        #[cfg(feature = "diagnostic_profile")]
+        crate::util::profile::counter(
+            "metal_enqueue",
+            "reservation_sequence",
+            profile_sequence,
+        );
+        Self {
+            command_buffer: Some(command_buffer),
+            #[cfg(feature = "diagnostic_profile")]
+            profile_sequence,
+            #[cfg(feature = "diagnostic_profile")]
+            enqueue_to_encode: Some(crate::util::profile::span(
+                "metal_enqueue_to_encode",
+                "spine_merkle",
+            )),
+        }
+    }
+
+    fn into_command_buffer(mut self) -> CommandBuffer {
+        #[cfg(feature = "diagnostic_profile")]
+        if let Some(span) = self.enqueue_to_encode.as_ref() {
+            span.counter(
+                "metal_enqueue_to_encode",
+                "reservation_sequence",
+                self.profile_sequence,
+            );
+        }
+        #[cfg(feature = "diagnostic_profile")]
+        drop(self.enqueue_to_encode.take());
+        self.command_buffer
+            .take()
+            .expect("enqueued spine command is present")
+    }
+}
+
+impl Drop for EnqueuedSpineCommand {
+    fn drop(&mut self) {
+        let Some(command_buffer) = self.command_buffer.take() else {
+            return;
+        };
+        #[cfg(feature = "diagnostic_profile")]
+        {
+            if let Some(span) = self.enqueue_to_encode.as_ref() {
+                span.counter(
+                    "metal_enqueue_abandoned",
+                    "reservation_sequence",
+                    self.profile_sequence,
+                );
+            }
+            drop(self.enqueue_to_encode.take());
+            crate::util::profile::counter("metal_enqueue_abandoned", "count", 1);
+        }
+        command_buffer.commit();
+    }
+}
+
 struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
+    /// True after the singleton owner has enqueued its command buffer. An early
+    /// spine reservation is safe only in this phase: reserving ahead of a
+    /// preparing owner would put that owner's command behind the waiter and
+    /// deadlock the queue against the buffer set.
+    owner_enqueued: bool,
+    /// The thread whose uncommitted spine command already owns the next queue
+    /// position. Other spine waiters must not take the set first.
+    reserved_spine: Option<std::thread::ThreadId>,
     waiters: usize,
     /// Waiters for serial-critical-path (2^17 spine) tree builds. While one is
     /// queued, non-spine acquisitions defer, so a freed set always goes to the
@@ -1661,6 +1772,23 @@ static SPINE_BACKLOG: core::sync::atomic::AtomicIsize = core::sync::atomic::Atom
 /// host, so this rests on the causal argument above and is submitted to be
 /// tested by the ranked draw.
 const SPINE_URGENT_BACKLOG: isize = 1;
+
+std::thread_local! {
+    /// Only the 49-step light chain is the terminal block path. The three-step
+    /// heavy chain may overlap it, but must not create a second early queue
+    /// reservation which could disagree with singleton-pool wake order.
+    static LIGHT_SPINE_THREAD: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Marks whether the calling proof thread belongs to the terminal light-chain
+/// spine. Scoped chain-step threads set this once before proving and then exit.
+pub fn set_light_spine_thread(enabled: bool) {
+    LIGHT_SPINE_THREAD.with(|light| light.set(enabled));
+}
+
+fn light_spine_thread() -> bool {
+    LIGHT_SPINE_THREAD.with(|light| light.get())
+}
 
 /// See [`SPINE_BACKLOG`].
 pub fn spine_backlog_add(delta: isize) {
@@ -2630,7 +2758,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch_hash(encoder, pipeline, leaf_count);
+            dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -3055,6 +3183,8 @@ impl MetalShared {
                 pool: Mutex::new(BufferPool {
                     free: Vec::new(),
                     created: 0,
+                    owner_enqueued: false,
+                    reserved_spine: None,
                     waiters: 0,
                     spine_waiters: 0,
                     spare_outputs: Vec::new(),
@@ -3063,6 +3193,7 @@ impl MetalShared {
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
+                spine_available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
@@ -3422,28 +3553,82 @@ impl MetalShared {
         self.acquire_set_priority(false)
     }
 
-    /// `spine` acquisitions (the 2^17 serial-critical trees) take a freed set
-    /// ahead of any queued non-spine waiter; see `BufferPool::spine_waiters`.
+    /// Compatibility wrapper for tests and non-proof helpers which need pool
+    /// priority but never reserve an uncommitted queue position.
     fn acquire_set_priority(&self, spine: bool) -> Result<BufferSet, String> {
+        self.acquire_set_for_build(spine, false)
+            .map(|(set, reservation)| {
+                debug_assert!(reservation.is_none());
+                set
+            })
+    }
+
+    /// Acquires the singleton set and, for the terminal light spine, reserves
+    /// its command-buffer position as soon as doing so cannot deadlock against
+    /// the current owner. The reservation is made while holding the pool mutex,
+    /// so no later set handoff can cross the queue-order decision.
+    fn acquire_set_for_build(
+        &self,
+        spine: bool,
+        early_enqueue: bool,
+    ) -> Result<(BufferSet, Option<EnqueuedSpineCommand>), String> {
+        let current_thread = std::thread::current().id();
+        let mut reservation = None;
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
         loop {
-            if spine || pool.spine_waiters == 0 {
-                if let Some(set) = pool.free.pop() {
-                    return Ok(set);
-                }
-                if pool.created < MAX_BUFFER_SETS {
+            let reserved_for_other = pool
+                .reserved_spine
+                .is_some_and(|owner| owner != current_thread);
+            if !reserved_for_other && (spine || pool.spine_waiters == 0) {
+                let set = if let Some(set) = pool.free.pop() {
+                    Some(set)
+                } else if pool.created < MAX_BUFFER_SETS {
                     pool.created += 1;
-                    return Ok(BufferSet {
+                    Some(BufferSet {
                         input: None,
                         output: None,
-                    });
+                    })
+                } else {
+                    None
+                };
+                if let Some(set) = set {
+                    if early_enqueue && reservation.is_none() {
+                        reservation = Some(EnqueuedSpineCommand::new(&self.queue));
+                    }
+                    if pool.reserved_spine == Some(current_thread) {
+                        pool.reserved_spine = None;
+                    }
+                    // A reservation has already been enqueued; an ordinary
+                    // owner is still in its CPU preparation phase.
+                    pool.owner_enqueued = reservation.is_some();
+                    return Ok((set, reservation));
                 }
             }
+
+            // Never enqueue ahead of an owner which is still staging or
+            // encoding: that owner holds the set and would then be unable to
+            // run the command needed to release it. If it is already enqueued,
+            // reserving behind it is safe and prevents later non-station work
+            // from overtaking this light-spine tree.
+            if early_enqueue
+                && reservation.is_none()
+                && pool.owner_enqueued
+                && pool.reserved_spine.is_none()
+            {
+                reservation = Some(EnqueuedSpineCommand::new(&self.queue));
+                pool.reserved_spine = Some(current_thread);
+            }
+
             pool.waiters += 1;
             if spine {
                 pool.spine_waiters += 1;
             }
-            match self.available.wait(pool) {
+            let available = if spine && *TARGETED_SPINE_CONDVAR {
+                &self.spine_available
+            } else {
+                &self.available
+            };
+            match available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
                     if spine {
@@ -3457,10 +3642,25 @@ impl MetalShared {
                     if spine {
                         next.spine_waiters -= 1;
                     }
+                    if next.reserved_spine == Some(current_thread) {
+                        next.reserved_spine = None;
+                    }
                     return Err("buffer pool poisoned".to_string());
                 }
             }
         }
+    }
+
+    /// Records the point at which a normal singleton owner has appended its
+    /// command to the queue. Called after `enqueue` and before `commit`; no
+    /// fallible work is allowed between this marker and the commit.
+    fn mark_station_command_enqueued(&self) {
+        let mut pool = self
+            .pool
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert_eq!(pool.free.len() + 1, pool.created);
+        pool.owner_enqueued = true;
     }
 
     fn release_set(&self, set: BufferSet) {
@@ -3468,21 +3668,38 @@ impl MetalShared {
             .pool
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pool.owner_enqueued = false;
         pool.free.push(set);
+        if pool.waiters == 0 {
+            return;
+        }
+        // An enqueued-but-uncommitted command belongs to one particular spine
+        // thread. Wake the whole spine class so that owner, rather than a heavy
+        // spine waiter, can take the set; the owner check above re-blocks all
+        // other threads without letting them enqueue behind the reservation.
+        if pool.reserved_spine.is_some() {
+            if *TARGETED_SPINE_CONDVAR {
+                self.spine_available.notify_all();
+            } else {
+                self.available.notify_all();
+            }
+            return;
+        }
+        // In targeted mode, spine and regular builders sleep on distinct
+        // condition variables, so the priority class can be woken directly.
+        if *TARGETED_SPINE_CONDVAR {
+            if pool.spine_waiters != 0 {
+                self.spine_available.notify_one();
+            } else {
+                self.available.notify_one();
+            }
+            return;
+        }
         // With a spine waiter queued, whichever non-spine waiter the OS would
         // hand a `notify_one` to would just re-block, so the wake must reach
         // the spine thread. Otherwise, a released singleton set can satisfy
         // only one waiter and broadcasting just creates mutex contention.
-        // slow-host band; this comment changes no executable behavior.
-        if pool.waiters == 0 {
-            return;
-        }
         if pool.spine_waiters == 0 {
-            // All sleepers are interchangeable non-spine jobs. One released
-            // set can satisfy exactly one of them, so waking the rest only
-            // makes them contend for the mutex and go back to sleep. Keep the
-            // broadcast solely for the priority case below, where the OS may
-            // otherwise wake a non-spine waiter ahead of the chain spine.
             self.available.notify_one();
         } else {
             self.available.notify_all();
@@ -3905,6 +4122,8 @@ impl MetalShared {
                     "values_ntt_merkle",
                     (lde_size * cols) as u64,
                 );
+                command_buffer.enqueue();
+                self.mark_station_command_enqueued();
                 command_buffer.commit();
                 command_buffer.to_owned()
             });
@@ -4169,6 +4388,8 @@ impl MetalShared {
                 "coeff_ntt_merkle",
                 (lde_size * cols) as u64,
             );
+            command_buffer.enqueue();
+            self.mark_station_command_enqueued();
             command_buffer.commit();
             command_buffer.to_owned()
         });
@@ -4218,7 +4439,12 @@ impl MetalShared {
         // gpu_worthwhile) jump queued chunk-tree waiters for the single set —
         // but only while the chain is actually the laggard (see SPINE_BACKLOG).
         let spine = leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent();
-        let mut set = self.acquire_set_priority(spine)?;
+        // Queue-position reservation is narrower than buffer-set priority: only
+        // the terminal light chain uses it. The heavy chain has schedule slack
+        // and can overlap light phase-1 work, so reserving both would add queue
+        // head blocking without shortening the block critical path.
+        let early_enqueue = spine && light_spine_thread() && *SPINE_EARLY_ENQUEUE;
+        let (mut set, reservation) = self.acquire_set_for_build(spine, early_enqueue)?;
         let result = self.build_with_set(
             &mut set,
             source,
@@ -4229,6 +4455,7 @@ impl MetalShared {
             input_bytes,
             output_len,
             output_bytes,
+            reservation,
         );
         self.release_set(set);
         drop(job);
@@ -4247,6 +4474,7 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
+        reservation: Option<EnqueuedSpineCommand>,
     ) -> Result<TreeReadback<'_, F>, String> {
         let cap_count = 1usize << cap_height;
 
@@ -4326,7 +4554,10 @@ impl MetalShared {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
-            let command_buffer = self.queue.new_command_buffer();
+            let pre_enqueued = reservation.is_some();
+            let command_buffer = reservation
+                .map(EnqueuedSpineCommand::into_command_buffer)
+                .unwrap_or_else(|| self.queue.new_command_buffer().to_owned());
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(leaf_pipeline);
             encoder.set_buffer(0, Some(input_buffer), 0);
@@ -4394,12 +4625,16 @@ impl MetalShared {
 
             #[cfg(feature = "diagnostic_profile")]
             profile_command_buffer(
-                command_buffer,
+                &command_buffer,
                 "merkle_tree",
                 (leaf_count * leaf_width) as u64,
             );
+            if !pre_enqueued {
+                command_buffer.enqueue();
+                self.mark_station_command_enqueued();
+            }
             command_buffer.commit();
-            command_buffer.to_owned()
+            command_buffer
         });
 
         command_buffer.wait_until_completed();
@@ -4458,38 +4693,10 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
-}
-
-fn dispatch_hash(
-    encoder: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
-    thread_count: usize,
-) {
-    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
-}
-
-fn hash_threadgroup_cap() -> NSUInteger {
-    static CAP: std::sync::OnceLock<NSUInteger> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("LIGHTER_HASH_TG")
-            .ok()
-            .and_then(|value| value.parse::<NSUInteger>().ok())
-            .filter(|&value| (32..=1024).contains(&value) && value.is_power_of_two())
-            .unwrap_or(256)
-    })
-}
-
-fn dispatch_with_group_cap(
-    encoder: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
-    thread_count: usize,
-    cap: NSUInteger,
-) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(cap)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -5015,6 +5222,36 @@ mod tests {
     use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
+    fn light_spine_early_enqueue_fresh_process_setting() {
+        assert_eq!(
+            *SPINE_EARLY_ENQUEUE,
+            spine_early_enqueue_setting(std::env::var_os(SPINE_EARLY_ENQUEUE_ENV).as_deref()),
+        );
+    }
+
+    #[test]
+    fn abandoned_spine_reservation_commits_empty_command_and_unblocks_queue() {
+        let context = MetalShared::new().expect("Metal context");
+        let reservation = EnqueuedSpineCommand::new(&context.queue);
+        let abandoned = reservation
+            .command_buffer
+            .as_ref()
+            .expect("reservation command")
+            .clone();
+        assert_eq!(abandoned.status(), MTLCommandBufferStatus::Enqueued);
+
+        let follower = autoreleasepool(|| context.queue.new_command_buffer().to_owned());
+        follower.enqueue();
+        assert_eq!(follower.status(), MTLCommandBufferStatus::Enqueued);
+        drop(reservation);
+        follower.commit();
+        follower.wait_until_completed();
+
+        assert_eq!(abandoned.status(), MTLCommandBufferStatus::Completed);
+        assert_eq!(follower.status(), MTLCommandBufferStatus::Completed);
+    }
+
+    #[test]
     fn detaches_output_without_a_waiter_for_resident_store() {
         let context = MetalShared::new().expect("Metal context");
         let mut set = context.acquire_set().expect("buffer set");
@@ -5036,6 +5273,226 @@ mod tests {
         let pool = context.pool.lock().unwrap();
         assert!(!pool.spare_outputs.is_empty());
         assert_eq!(pool.detached_readbacks, 0);
+    }
+
+    #[test]
+    fn singleton_pool_prioritizes_spine_without_losing_regular_waiter() {
+        let context = MetalShared::new().expect("Metal context");
+        let held = context.acquire_set().expect("singleton set");
+
+        std::thread::scope(|scope| {
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let (release_spine_tx, release_spine_rx) = std::sync::mpsc::sync_channel(0);
+
+            let regular_tx = acquired_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set()
+                    .expect("regular waiter acquires set");
+                regular_tx
+                    .send("regular")
+                    .expect("report regular acquisition");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.waiters == 1 && pool.spine_waiters == 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "regular waiter did not block");
+                drop(pool);
+                std::thread::yield_now();
+            }
+
+            let spine_tx = acquired_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set_priority(true)
+                    .expect("spine waiter acquires set");
+                spine_tx.send("spine").expect("report spine acquisition");
+                release_spine_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release spine set");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.waiters == 2 && pool.spine_waiters == 1 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "spine waiter did not block");
+                drop(pool);
+                std::thread::yield_now();
+            }
+
+            context.release_set(held);
+            assert_eq!(
+                acquired_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("a waiter acquires released set"),
+                "spine"
+            );
+            assert!(
+                matches!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "regular waiter acquired while the spine still held the singleton set"
+            );
+
+            release_spine_tx.send(()).expect("allow spine release");
+            assert_eq!(
+                acquired_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("regular waiter wakes after spine release"),
+                "regular"
+            );
+        });
+
+        let pool = context.pool.lock().unwrap();
+        assert_eq!(pool.waiters, 0);
+        assert_eq!(pool.spine_waiters, 0);
+        assert_eq!(pool.created, 1);
+        assert_eq!(pool.free.len(), 1);
+    }
+
+
+    #[test]
+    fn enqueued_spine_owner_cannot_be_stolen_by_another_spine_waiter() {
+        let context = MetalShared::new().expect("Metal context");
+        let held = context.acquire_set().expect("singleton set");
+        // Model the only phase in which an early reservation is safe: the
+        // current owner already has a queue position, but has not returned its
+        // buffer set yet.
+        let predecessor = autoreleasepool(|| context.queue.new_command_buffer().to_owned());
+        predecessor.enqueue();
+        context.mark_station_command_enqueued();
+        predecessor.commit();
+        predecessor.wait_until_completed();
+        assert_eq!(predecessor.status(), MTLCommandBufferStatus::Completed);
+
+        std::thread::scope(|scope| {
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let (release_light_tx, release_light_rx) = std::sync::mpsc::sync_channel(0);
+
+            let light_tx = acquired_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let (set, reservation) = context_ref
+                    .acquire_set_for_build(true, true)
+                    .expect("light spine acquires reserved set");
+                let command_buffer = reservation
+                    .expect("busy enqueued owner permits a queue reservation")
+                    .into_command_buffer();
+                assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Enqueued);
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+                light_tx.send("light").expect("report light acquisition");
+                release_light_rx.recv().expect("release light owner");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.reserved_spine.is_some() && pool.spine_waiters == 1 {
+                    break;
+                }
+                drop(pool);
+                assert!(Instant::now() < deadline, "light spine did not reserve queue");
+                std::thread::yield_now();
+            }
+
+            let heavy_tx = acquired_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set_priority(true)
+                    .expect("heavy spine eventually acquires set");
+                heavy_tx.send("heavy").expect("report heavy acquisition");
+                context_ref.release_set(set);
+            });
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.spine_waiters == 2 {
+                    break;
+                }
+                drop(pool);
+                assert!(Instant::now() < deadline, "heavy spine did not block");
+                std::thread::yield_now();
+            }
+
+            context.release_set(held);
+            assert_eq!(
+                acquired_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("reserved waiter acquires"),
+                "light"
+            );
+            assert!(matches!(
+                acquired_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+            release_light_tx.send(()).expect("release light spine");
+            assert_eq!(
+                acquired_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("heavy waiter acquires after light"),
+                "heavy"
+            );
+        });
+
+        let pool = context.pool.lock().unwrap();
+        assert!(pool.reserved_spine.is_none());
+        assert!(!pool.owner_enqueued);
+        assert_eq!(pool.free.len(), 1);
+    }
+
+    #[test]
+    fn preparing_station_owner_never_gets_an_early_spine_reservation() {
+        let context = MetalShared::new().expect("Metal context");
+        let held = context.acquire_set().expect("preparing singleton owner");
+        assert!(!context.pool.lock().unwrap().owner_enqueued);
+
+        std::thread::scope(|scope| {
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let (set, reservation) = context_ref
+                    .acquire_set_for_build(true, true)
+                    .expect("spine acquires after preparing owner releases");
+                let command_buffer = reservation
+                    .expect("spine enqueues only after it owns the free set")
+                    .into_command_buffer();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                acquired_tx.send(()).expect("report acquisition");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.spine_waiters == 1 {
+                    assert!(pool.reserved_spine.is_none());
+                    break;
+                }
+                drop(pool);
+                assert!(Instant::now() < deadline, "spine did not wait for preparing owner");
+                std::thread::yield_now();
+            }
+            context.release_set(held);
+            acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("spine completes without queue/set cycle");
+        });
     }
 
     #[test]
@@ -7496,6 +7953,20 @@ kernel void goldilocks_mul_bench_native(
     /// full 131072-digest chunk plus a 131056-digest remainder).
     #[test]
     fn metal_merkle_matches_cpu_across_staging_chunks() {
+        struct LightSpineReset;
+        impl Drop for LightSpineReset {
+            fn drop(&mut self) {
+                set_light_spine_thread(false);
+                SPINE_BACKLOG.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            }
+        }
+
+        // Exercise the production admission predicate in fresh default and
+        // rollback processes while preserving the existing raw CPU differential.
+        set_light_spine_thread(true);
+        SPINE_BACKLOG.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let _light_spine_reset = LightSpineReset;
+
         const WIDTH: usize = 4;
         let leaf_count = 1usize << 17;
         let cap_height = 4;
