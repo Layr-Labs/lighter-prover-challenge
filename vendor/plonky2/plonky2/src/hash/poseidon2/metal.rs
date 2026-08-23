@@ -352,6 +352,13 @@ const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
 /// official ranked host (submission 41467098), so concurrent GPU submission is
 /// intentionally disabled.
 const MAX_BUFFER_SETS: usize = 1;
+/// `shared` restores the current single-condvar broadcast path for a same-binary
+/// A/B. Production/default targets spine waiters directly.
+const TARGETED_SPINE_CONDVAR_ENV: &str = "LIGHTER_METAL_SPINE_CONDVAR";
+static TARGETED_SPINE_CONDVAR: LazyLock<bool> = LazyLock::new(|| {
+    !std::env::var(TARGETED_SPINE_CONDVAR_ENV)
+        .is_ok_and(|value| value.eq_ignore_ascii_case("shared"))
+});
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;
 /// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
@@ -386,7 +393,10 @@ struct MetalShared {
     /// Buffers backing live level-order digest stores return here after the
     /// proof has extracted its sparse Merkle paths.
     digest_output_pool: Arc<Mutex<DigestOutputPool>>,
+    /// Regular tree builders wait here; serial-critical spine builders use a
+    /// dedicated condition variable when targeted wakeup is enabled.
     available: Condvar,
+    spine_available: Condvar,
     /// Per-`log2(lde_size)` concatenated FFT twiddle rows (canonical u64), with
     /// `offsets[lg_half_m]` giving each stage row's element offset.
     ntt_roots: Mutex<HashMap<u32, NttRoots>>,
@@ -2630,7 +2640,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch_hash(encoder, pipeline, leaf_count);
+            dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -3063,6 +3073,7 @@ impl MetalShared {
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
                 available: Condvar::new(),
+                spine_available: Condvar::new(),
                 ntt_roots: Mutex::new(HashMap::new()),
                 ntt_shifts: Mutex::new(HashMap::new()),
                 ntt_ones: Mutex::new(HashMap::new()),
@@ -3443,7 +3454,12 @@ impl MetalShared {
             if spine {
                 pool.spine_waiters += 1;
             }
-            match self.available.wait(pool) {
+            let available = if spine && *TARGETED_SPINE_CONDVAR {
+                &self.spine_available
+            } else {
+                &self.available
+            };
+            match available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
                     if spine {
@@ -3469,14 +3485,24 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
+        if pool.waiters == 0 {
+            return;
+        }
+        // In targeted mode, spine and regular builders sleep on distinct
+        // condition variables, so the priority class can be woken directly.
+        if *TARGETED_SPINE_CONDVAR {
+            if pool.spine_waiters != 0 {
+                self.spine_available.notify_one();
+            } else {
+                self.available.notify_one();
+            }
+            return;
+        }
         // With a spine waiter queued, whichever non-spine waiter the OS would
         // hand a `notify_one` to would just re-block, so the wake must reach
         // the spine thread. Otherwise, a released singleton set can satisfy
         // only one waiter and broadcasting just creates mutex contention.
         // slow-host band; this comment changes no executable behavior.
-        if pool.waiters == 0 {
-            return;
-        }
         if pool.spine_waiters == 0 {
             // All sleepers are interchangeable non-spine jobs. One released
             // set can satisfy exactly one of them, so waking the rest only
@@ -4458,38 +4484,10 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
-}
-
-fn dispatch_hash(
-    encoder: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
-    thread_count: usize,
-) {
-    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
-}
-
-fn hash_threadgroup_cap() -> NSUInteger {
-    static CAP: std::sync::OnceLock<NSUInteger> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("LIGHTER_HASH_TG")
-            .ok()
-            .and_then(|value| value.parse::<NSUInteger>().ok())
-            .filter(|&value| (32..=1024).contains(&value) && value.is_power_of_two())
-            .unwrap_or(256)
-    })
-}
-
-fn dispatch_with_group_cap(
-    encoder: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
-    thread_count: usize,
-    cap: NSUInteger,
-) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(cap)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -5036,6 +5034,93 @@ mod tests {
         let pool = context.pool.lock().unwrap();
         assert!(!pool.spare_outputs.is_empty());
         assert_eq!(pool.detached_readbacks, 0);
+    }
+
+    #[test]
+    fn singleton_pool_prioritizes_spine_without_losing_regular_waiter() {
+        let context = MetalShared::new().expect("Metal context");
+        let held = context.acquire_set().expect("singleton set");
+
+        std::thread::scope(|scope| {
+            let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+            let (release_spine_tx, release_spine_rx) = std::sync::mpsc::sync_channel(0);
+
+            let regular_tx = acquired_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set()
+                    .expect("regular waiter acquires set");
+                regular_tx
+                    .send("regular")
+                    .expect("report regular acquisition");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.waiters == 1 && pool.spine_waiters == 0 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "regular waiter did not block");
+                drop(pool);
+                std::thread::yield_now();
+            }
+
+            let spine_tx = acquired_tx.clone();
+            let context_ref = &context;
+            scope.spawn(move || {
+                let set = context_ref
+                    .acquire_set_priority(true)
+                    .expect("spine waiter acquires set");
+                spine_tx.send("spine").expect("report spine acquisition");
+                release_spine_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release spine set");
+                context_ref.release_set(set);
+            });
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let pool = context.pool.lock().unwrap();
+                if pool.waiters == 2 && pool.spine_waiters == 1 {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "spine waiter did not block");
+                drop(pool);
+                std::thread::yield_now();
+            }
+
+            context.release_set(held);
+            assert_eq!(
+                acquired_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("a waiter acquires released set"),
+                "spine"
+            );
+            assert!(
+                matches!(
+                    acquired_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "regular waiter acquired while the spine still held the singleton set"
+            );
+
+            release_spine_tx.send(()).expect("allow spine release");
+            assert_eq!(
+                acquired_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("regular waiter wakes after spine release"),
+                "regular"
+            );
+        });
+
+        let pool = context.pool.lock().unwrap();
+        assert_eq!(pool.waiters, 0);
+        assert_eq!(pool.spine_waiters, 0);
+        assert_eq!(pool.created, 1);
+        assert_eq!(pool.free.len(), 1);
     }
 
     #[test]

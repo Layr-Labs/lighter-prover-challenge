@@ -1774,7 +1774,38 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let g = t / 2;
             let c = t % 2;
             let base = g * half_rows * 2;
-            let values: Vec<F> = (0..half_rows).map(|k| low[base + k * 2 + c]).collect();
+            let src = &low[base..base + half_rows * 2];
+            let mut values: Vec<F> = Vec::with_capacity(half_rows);
+            unsafe { values.set_len(half_rows); }
+            if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+                unsafe {
+                    use core::arch::aarch64::*;
+                    let mut src_base = src.as_ptr() as *const u64;
+                    let mut dst_ptr = values.as_mut_ptr() as *mut u64;
+                    let chunks = half_rows / 4;
+                    for _ in 0..chunks {
+                        let val = vld2q_u64(src_base);
+                        let val2 = vld2q_u64(src_base.add(4));
+                        if c == 0 {
+                            vst1q_u64(dst_ptr, val.0);
+                            vst1q_u64(dst_ptr.add(2), val2.0);
+                        } else {
+                            vst1q_u64(dst_ptr, val.1);
+                            vst1q_u64(dst_ptr.add(2), val2.1);
+                        }
+                        src_base = src_base.add(8);
+                        dst_ptr = dst_ptr.add(4);
+                    }
+                    let remainder = half_rows % 4;
+                    for i in 0..remainder {
+                        *dst_ptr.add(i) = *src_base.add(i * 2 + c);
+                    }
+                }
+            } else {
+                for (k, out) in values.iter_mut().enumerate() {
+                    *out = src[k * 2 + c];
+                }
+            }
             PolynomialValues::new(values)
                 .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
                 .fft()
@@ -2714,17 +2745,29 @@ fn compute_quotient_polys<
     };
 
     let z_h_on_coset = ZeroPolyOnCoset::new(common_data.degree_bits(), quotient_degree_bits);
-    // The `L_0` denominator inverses consumed by `eval_l_0` depend only on
-    // `(degree_bits, quotient_degree_bits, coset shift)` — not on any challenge — so they are
-    // computed once per circuit shape for the process and shared across proofs. Each cached
-    // entry is bit-identical to the per-point inversion it replaces.
+    // For the offloaded two-challenge path, the full table caches exactly the inherited
+    // `eval(i) * (n * (x_i - ONE)).inverse()` raw result once per circuit shape. Selecting it
+    // outside the vanishing point loop removes both that loop's table-kind test and multiply.
+    // The same binary can restore the inherited denominator-only table with
+    // `LIGHTER_L0_FULL_CACHE=0`; generic modes use that table and no-std keeps the original
+    // uncached fallback.
     #[cfg(feature = "std")]
-    let z_h_on_coset = z_h_on_coset.with_l_0_denominator_inverses(
-        l_0_table_cache::l_0_denominator_inverses::<F>(
+    let z_h_on_coset = if permutation_products_offloaded
+        && num_challenges == 2
+        && l_0_table_cache::full_evaluations_enabled()
+    {
+        z_h_on_coset.with_l_0_evaluations(l_0_table_cache::l_0_evaluations::<F>(
             common_data.degree_bits(),
             quotient_degree_bits,
-        ),
-    );
+        ))
+    } else {
+        z_h_on_coset.with_l_0_denominator_inverses(
+            l_0_table_cache::l_0_denominator_inverses::<F>(
+                common_data.degree_bits(),
+                quotient_degree_bits,
+            ),
+        )
+    };
 
     // Precompute the lookup table evals on the challenges in delta
     // These values are used to produce the final RE constraints for each lut,
@@ -3340,39 +3383,92 @@ fn compute_quotient_polys<
         // GPU accumulation pass and point-major scatter pass into one walk:
         // CPU quotient pages are now read once and never dirtied again.
         // validator population; this comment changes no executable behavior.
-        quotient_values
-            .par_chunks_exact(num_challenges)
-            .enumerate()
-            .for_each(|(i, cpu_values)| {
-                let denominator_inv = z_h_on_coset.eval_inverse(i);
-                let start = i * num_challenges;
-                for (challenge, (&cpu, column)) in
-                    cpu_values.iter().zip(column_ptrs).enumerate()
-                {
-                    let mut value = cpu;
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    {
-                        if let Some(values) = gpu_poseidon_values {
-                            value += values[start + challenge];
+        const MERGE_CHUNK_POINTS: usize = 512;
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        let pos_vals = gpu_poseidon_values;
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        let rng_vals = gpu_range_values;
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        let rng_low_vals = gpu_range_low_values.as_deref();
+        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+        let perm_vals = gpu_permutation_values;
+
+        if num_challenges == 2 && column_ptrs.len() == 2 {
+            let col0 = &column_ptrs[0];
+            let col1 = &column_ptrs[1];
+            quotient_values
+                .par_chunks(MERGE_CHUNK_POINTS * 2)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_point = chunk_idx * MERGE_CHUNK_POINTS;
+                    for (offset, cpu_pair) in chunk.chunks_exact(2).enumerate() {
+                        let i = base_point + offset;
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        let start = i * 2;
+                        let mut v0 = cpu_pair[0];
+                        let mut v1 = cpu_pair[1];
+                        #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                        {
+                            if let Some(values) = pos_vals {
+                                v0 += values[start];
+                                v1 += values[start + 1];
+                            }
+                            if let Some(values) = rng_vals {
+                                v0 += values[start];
+                                v1 += values[start + 1];
+                            }
+                            if let Some(values) = rng_low_vals {
+                                v0 += values[start];
+                                v1 += values[start + 1];
+                            }
+                            if let Some(values) = perm_vals {
+                                v0 += values[start];
+                                v1 += values[start + 1];
+                            }
                         }
-                        if let Some(values) = gpu_range_values {
-                            value += values[start + challenge];
-                        }
-                        if let Some(values) = &gpu_range_low_values {
-                            value += values[start + challenge];
-                        }
-                        if let Some(values) = gpu_permutation_values {
-                            value += values[start + challenge];
+                        v0 = v0 * denominator_inv;
+                        v1 = v1 * denominator_inv;
+                        unsafe {
+                            *col0.0.add(i) = v0;
+                            *col1.0.add(i) = v1;
                         }
                     }
-                    // Single `1/Z_H` scaling for the summed contributions; see
-                    // the deferral note at the batch loop above.
-                    let value = value * denominator_inv;
-                    // SAFETY: point `i` is owned by this parallel iteration,
-                    // and every (challenge, point) destination is written once.
-                    unsafe { *column.0.add(i) = value };
-                }
-            });
+                });
+        } else {
+            quotient_values
+                .par_chunks(MERGE_CHUNK_POINTS * num_challenges)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let base_point = chunk_idx * MERGE_CHUNK_POINTS;
+                    for (offset, cpu_values) in chunk.chunks_exact(num_challenges).enumerate() {
+                        let i = base_point + offset;
+                        let denominator_inv = z_h_on_coset.eval_inverse(i);
+                        let start = i * num_challenges;
+                        for (challenge, (&cpu, column)) in
+                            cpu_values.iter().zip(column_ptrs).enumerate()
+                        {
+                            let mut value = cpu;
+                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                            {
+                                if let Some(values) = pos_vals {
+                                    value += values[start + challenge];
+                                }
+                                if let Some(values) = rng_vals {
+                                    value += values[start + challenge];
+                                }
+                                if let Some(values) = rng_low_vals {
+                                    value += values[start + challenge];
+                                }
+                                if let Some(values) = perm_vals {
+                                    value += values[start + challenge];
+                                }
+                            }
+                            let value = value * denominator_inv;
+                            unsafe { *column.0.add(i) = value };
+                        }
+                    }
+                });
+        }
     } else {
         // CPU-only path: parallel scatter of the interleaved point-major
         // buffer into the per-challenge columns.
@@ -4217,12 +4313,13 @@ mod quotient_layout_tests {
     }
 }
 
-/// Process-global cache of the `L_0(x)` denominator inverses `(n * (x - 1))^-1` consumed by
-/// `ZeroPolyOnCoset::eval_l_0` in the quotient pass: one entry per LDE point `x = g * w^i`,
-/// `2^(degree_bits + quotient_degree_bits)` per circuit shape. The values depend only on
-/// `(degree_bits, quotient_degree_bits)` and the field's coset shift, so they are built once
-/// per process and shared across proofs, mirroring the precomputed-table style of
-/// `field::fft::fft_root_table`.
+/// Process-global caches for the `L_0(x)` quotient table: one entry per LDE point
+/// `x = g * w^i`, `2^(degree_bits + quotient_degree_bits)` per circuit shape. The rollback
+/// representation stores the inherited denominator inverses `(n * (x - 1))^-1`. The default
+/// representation performs the inherited `Z_H(x) * denominator_inverse` multiplication once
+/// while building the table and stores its raw result. Both depend only on
+/// `(degree_bits, quotient_degree_bits)` and the field's coset shift, so they are shared across
+/// proofs, mirroring the precomputed-table style of `field::fft::fft_root_table`.
 #[cfg(feature = "std")]
 mod l_0_table_cache {
     use core::any::{Any, TypeId};
@@ -4232,18 +4329,36 @@ mod l_0_table_cache {
     use plonky2_maybe_rayon::*;
 
     use crate::field::types::Field;
+    use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 
-    /// Keyed by field type and `(degree_bits, quotient_degree_bits)`; the coset shift is a
-    /// constant of the field type.
-    static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize, usize), Arc<dyn Any + Send + Sync>>>> =
-        OnceLock::new();
+    type Cache = Mutex<HashMap<(TypeId, usize, usize), Arc<dyn Any + Send + Sync>>>;
 
-    /// Builds the table with, per entry, exactly the operations of the uncached
-    /// `eval_l_0(i, g * w^i)` path: `x = g * w^i` from the same `two_adic_subgroup` points the
-    /// prover feeds it, then `(n * (x - ONE)).inverse()` — the same inverse of the same
-    /// product, so every entry is bit-identical to the value it replaces. Entries are
-    /// independent, so the parallel map changes nothing.
-    fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
+    /// The two representations intentionally have disjoint caches. A successful ranked
+    /// offload builds only the default full table; `LIGHTER_L0_FULL_CACHE=0` builds only the
+    /// exact inherited denominator table. A process mixing offloaded and generic/declined
+    /// paths can retain both representations so neither path regresses.
+    static DENOMINATOR_CACHE: OnceLock<Cache> = OnceLock::new();
+    static FULL_CACHE: OnceLock<Cache> = OnceLock::new();
+
+    /// Same-binary rollback switch. The ranked sandbox clears the environment, so absence
+    /// selects the full table. `0` restores the inherited denominator-inverse representation.
+    pub(super) fn full_evaluations_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("LIGHTER_L0_FULL_CACHE")
+                .map(|value| value != "0")
+                .unwrap_or(true)
+        })
+    }
+
+    /// Builds the inherited denominator table. Per entry the operations are exactly the
+    /// uncached `eval_l_0(i, g * w^i)` denominator path: form `x = g * w^i`, then compute
+    /// `(n * (x - ONE)).inverse()`. Entries are independent, so the parallel map changes no
+    /// raw representative.
+    fn build_denominator_inverses<F: Field>(
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+    ) -> Vec<F> {
         let n = F::from_canonical_usize(1 << degree_bits);
         F::two_adic_subgroup(degree_bits + quotient_degree_bits)
             .into_par_iter()
@@ -4251,23 +4366,66 @@ mod l_0_table_cache {
             .collect()
     }
 
-    pub(super) fn l_0_denominator_inverses<F: Field>(
+    /// Converts the inherited denominator representation in place to full `L_0` values.
+    /// `ZeroPolyOnCoset::eval_l_0` used exactly `self.eval(i) * table[i]`; retain that operand
+    /// order and store the resulting raw field word without canonicalization. The conversion
+    /// runs once per shape instead of once for every proof point.
+    fn build_full_evaluations<F: Field>(
         degree_bits: usize,
         quotient_degree_bits: usize,
+    ) -> Vec<F> {
+        let mut table = build_denominator_inverses::<F>(degree_bits, quotient_degree_bits);
+        let z_h = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+        table
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(i, value)| *value = z_h.eval(i) * *value);
+        table
+    }
+
+    fn get_or_build<F: Field>(
+        cache: &OnceLock<Cache>,
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+        build: impl FnOnce() -> Vec<F>,
     ) -> Arc<Vec<F>> {
         let key = (TypeId::of::<F>(), degree_bits, quotient_degree_bits);
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let cache = cache.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(entry) = cache.lock().unwrap().get(&key) {
             return Arc::clone(entry).downcast::<Vec<F>>().unwrap();
         }
-        // Built outside the lock so a slow build never serializes other keys; concurrent
-        // builders of the same key produce identical tables and the first insert wins.
-        let table: Arc<Vec<F>> = Arc::new(build::<F>(degree_bits, quotient_degree_bits));
+        // Build outside the lock so a slow first shape never serializes other keys. Concurrent
+        // builders of one key produce raw-identical tables and the first insert wins.
+        let table: Arc<Vec<F>> = Arc::new(build());
         let mut guard = cache.lock().unwrap();
         let entry = guard
             .entry(key)
             .or_insert_with(|| table as Arc<dyn Any + Send + Sync>);
         Arc::clone(entry).downcast::<Vec<F>>().unwrap()
+    }
+
+    pub(super) fn l_0_denominator_inverses<F: Field>(
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+    ) -> Arc<Vec<F>> {
+        get_or_build::<F>(
+            &DENOMINATOR_CACHE,
+            degree_bits,
+            quotient_degree_bits,
+            || build_denominator_inverses::<F>(degree_bits, quotient_degree_bits),
+        )
+    }
+
+    pub(super) fn l_0_evaluations<F: Field>(
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+    ) -> Arc<Vec<F>> {
+        get_or_build::<F>(
+            &FULL_CACHE,
+            degree_bits,
+            quotient_degree_bits,
+            || build_full_evaluations::<F>(degree_bits, quotient_degree_bits),
+        )
     }
 }
 
@@ -4427,15 +4585,18 @@ mod flat_chunk_products_tests {
 
 #[cfg(all(test, feature = "std"))]
 mod l_0_table_tests {
+    use std::sync::Arc;
+
     use plonky2_field::goldilocks_field::GoldilocksField;
     use plonky2_field::types::Field;
     use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
 
-    use super::l_0_table_cache::l_0_denominator_inverses;
+    use super::l_0_table_cache::{l_0_denominator_inverses, l_0_evaluations};
 
     type F = GoldilocksField;
 
     const COMBOS: [(usize, usize); 5] = [(1, 1), (3, 2), (4, 3), (6, 2), (8, 3)];
+    const PRODUCTION_COMBOS: [(usize, usize); 3] = [(14, 3), (16, 3), (18, 3)];
 
     /// Every cached entry must equal the legacy per-point computation
     /// `(n * (g * w^i - 1)).inverse()` bit-for-bit (raw u64 representation, not just field
@@ -4460,8 +4621,8 @@ mod l_0_table_tests {
         }
     }
 
-    /// `eval_l_0` with the table attached must return raw-identical values to the uncached
-    /// path at every LDE point.
+    /// `eval_l_0` with the denominator table attached is the exact same-binary rollback and
+    /// must return raw-identical values to the uncached path at every LDE point.
     #[test]
     fn eval_l_0_with_table_matches_uncached() {
         for (degree_bits, quotient_degree_bits) in COMBOS {
@@ -4482,6 +4643,71 @@ mod l_0_table_tests {
                     "eval_l_0({i}) for ({degree_bits}, {quotient_degree_bits})"
                 );
             }
+        }
+    }
+
+    fn assert_full_table_raw(degree_bits: usize, quotient_degree_bits: usize) {
+        let denominators =
+            l_0_denominator_inverses::<F>(degree_bits, quotient_degree_bits);
+        let full = l_0_evaluations::<F>(degree_bits, quotient_degree_bits);
+        let expected_len = 1usize << (degree_bits + quotient_degree_bits);
+        assert_eq!(denominators.len(), expected_len);
+        assert_eq!(full.len(), expected_len);
+
+        let z_h = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits);
+        for i in 0..expected_len {
+            // This is the inherited hot operation, including its operand order. Compare raw
+            // tuple words so reassociation or canonicalization cannot hide a divergence.
+            let legacy = z_h.eval(i) * denominators[i];
+            assert_eq!(
+                full[i].0, legacy.0,
+                "full L_0 entry {i} of ({degree_bits}, {quotient_degree_bits})"
+            );
+        }
+
+        // A hit must preserve both the shape key and the single shared allocation.
+        let hit = l_0_evaluations::<F>(degree_bits, quotient_degree_bits);
+        assert!(Arc::ptr_eq(&full, &hit));
+        let attached = ZeroPolyOnCoset::<F>::new(degree_bits, quotient_degree_bits)
+            .with_l_0_evaluations(full.clone());
+        let visible = attached
+            .eval_l_0_evaluations()
+            .expect("full table representation must be visible");
+        assert_eq!(visible.len(), expected_len);
+        assert_eq!(visible.as_ptr(), full.as_ptr());
+        for i in 0..expected_len {
+            // `x` is deliberately wrong: a full-table load must not redo any denominator work.
+            assert_eq!(attached.eval_l_0(i, F::ZERO).0, full[i].0);
+        }
+    }
+
+    /// Fast default test over multiple small keys; every table index is checked raw.
+    #[test]
+    fn full_l_0_tables_match_inherited_operation_raw() {
+        for (degree_bits, quotient_degree_bits) in COMBOS {
+            assert_full_table_raw(degree_bits, quotient_degree_bits);
+        }
+    }
+
+    /// Equal-length domains with different base/rate splits must not alias: `eval(i)` depends
+    /// on the split, not only on the sum of the two key fields.
+    #[test]
+    fn full_l_0_cache_key_preserves_domain_shape() {
+        let a = l_0_evaluations::<F>(3, 2);
+        let b = l_0_evaluations::<F>(4, 1);
+        assert_eq!(a.len(), b.len());
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(a.iter().zip(b.iter()).any(|(x, y)| x.0 != y.0));
+    }
+
+    /// Exact ranked shapes: d14/d16/d18 base circuits have quotient domains
+    /// 2^17/2^19/2^21. This intentionally large differential checks every table index and is
+    /// ignored in the ordinary suite; run it explicitly in release mode before promotion.
+    #[test]
+    #[ignore = "production-domain full L_0 raw differential; run explicitly in release mode"]
+    fn full_l_0_tables_match_all_production_indices_raw() {
+        for (degree_bits, quotient_degree_bits) in PRODUCTION_COMBOS {
+            assert_full_table_raw(degree_bits, quotient_degree_bits);
         }
     }
 }

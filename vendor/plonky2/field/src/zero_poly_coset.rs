@@ -21,13 +21,18 @@ pub struct ZeroPolyOnCoset<F: Field> {
     evals: Vec<F>,
     /// Holds the multiplicative inverses of `evals`.
     inverses: Vec<F>,
-    /// Optional precomputed inverses of the `L_0` denominator `n * (x - 1)` for every point
-    /// `x = g * w^i` of the coset, indexed by `i in 0..n * rate`. These depend only on
-    /// `(n, rate, g)` — not on any challenge — so callers may attach a table shared across
-    /// proofs via [`Self::with_l_0_denominator_inverses`]. Each entry must be bit-identical to
-    /// `(self.n * (x - F::ONE)).inverse()`, the value [`Self::eval_l_0`] computes without the
-    /// table.
-    l_0_denominator_inverses: Option<Arc<Vec<F>>>,
+    /// Optional process-shared `L_0` table. The legacy cache stores only denominator
+    /// inverses, while the full cache stores the result of the inherited
+    /// `self.eval(i) * denominator_inverse[i]` operation. Keeping the representation in the
+    /// table kind makes [`Self::eval_l_0_evaluations`] a safe one-time discriminator for hot
+    /// point loops, while [`Self::eval_l_0`] retains the generic/no-cache fallback.
+    l_0_table: Option<L0Table<F>>,
+}
+
+#[derive(Debug)]
+enum L0Table<F: Field> {
+    DenominatorInverses(Arc<Vec<F>>),
+    Evaluations(Arc<Vec<F>>),
 }
 
 impl<F: Field> ZeroPolyOnCoset<F> {
@@ -43,7 +48,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
             rate_mask: (1 << rate_bits) - 1,
             evals,
             inverses,
-            l_0_denominator_inverses: None,
+            l_0_table: None,
         }
     }
 
@@ -51,8 +56,27 @@ impl<F: Field> ZeroPolyOnCoset<F> {
     /// exact contract). With a table attached, [`Self::eval_l_0`] reads entry `i` instead of
     /// computing the per-point field inversion.
     pub fn with_l_0_denominator_inverses(mut self, table: Arc<Vec<F>>) -> Self {
-        self.l_0_denominator_inverses = Some(table);
+        self.l_0_table = Some(L0Table::DenominatorInverses(table));
         self
+    }
+
+    /// Attaches full precomputed `L_0` evaluations. Entry `i` must be raw-identical to
+    /// `self.eval(i) * (self.n * (x_i - F::ONE)).inverse()`, including that multiplication's
+    /// operand order. Hot loops can select this representation once through
+    /// [`Self::eval_l_0_evaluations`] and then load entries without a per-point tag test.
+    pub fn with_l_0_evaluations(mut self, table: Arc<Vec<F>>) -> Self {
+        self.l_0_table = Some(L0Table::Evaluations(table));
+        self
+    }
+
+    /// Returns the full `L_0` table only when that representation is attached. This method is
+    /// intentionally separate from [`Self::eval_l_0`]: callers with a point loop can branch
+    /// once on the table kind and remove both the old per-point `Option` test and multiply.
+    pub fn eval_l_0_evaluations(&self) -> Option<&[F]> {
+        match &self.l_0_table {
+            Some(L0Table::Evaluations(table)) => Some(table),
+            _ => None,
+        }
     }
 
     /// Returns `Z_H(g * w^i)`.
@@ -78,11 +102,14 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 
     /// Returns `L_0(x) = Z_H(x)/(n * (x - 1))` with `x = w^i`.
     pub fn eval_l_0(&self, i: usize, x: F) -> F {
-        if let Some(table) = &self.l_0_denominator_inverses {
-            // The table entry is bit-identical to the expression below, so the product is too.
-            return self.eval(i) * table[i];
+        match &self.l_0_table {
+            Some(L0Table::Evaluations(table)) => table[i],
+            Some(L0Table::DenominatorInverses(table)) => {
+                // Preserve the inherited operand order and raw representative exactly.
+                self.eval(i) * table[i]
+            }
+            None => self.eval(i) * (self.n * (x - F::ONE)).inverse(),
         }
-        self.eval(i) * (self.n * (x - F::ONE)).inverse()
     }
 }
 
@@ -90,6 +117,7 @@ impl<F: Field> ZeroPolyOnCoset<F> {
 mod tests {
     use super::*;
     use crate::goldilocks_field::GoldilocksField;
+    use crate::types::Field64;
 
     /// `eval` / `eval_inverse` index with `i & rate_mask`; that must be
     /// raw-`u64` identical to the `i % rate` it replaced, over every index the
@@ -113,5 +141,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A full table is already the final field representation. Accessing it must not
+    /// canonicalize dirty/noncanonical words or accidentally fall back to arithmetic using `x`.
+    #[test]
+    fn full_l_0_table_preserves_raw_words() {
+        type F = GoldilocksField;
+
+        let order = F::ORDER;
+        let raw = (0..32)
+            .map(|i| match i % 4 {
+                0 => F(order),
+                1 => F(order + i as u64),
+                2 => F(u64::MAX - i as u64),
+                _ => F(i as u64),
+            })
+            .collect::<Vec<_>>();
+        let z = ZeroPolyOnCoset::<F>::new(2, 3)
+            .with_l_0_evaluations(Arc::new(raw.clone()));
+        let attached = z.eval_l_0_evaluations().expect("full table must be visible");
+        assert_eq!(attached.len(), raw.len());
+        for (i, expected) in raw.iter().enumerate() {
+            assert_eq!(attached[i].0, expected.0, "attached table entry {i}");
+            assert_eq!(
+                z.eval_l_0(i, F(u64::MAX - i as u64)).0,
+                expected.0,
+                "eval_l_0 table entry {i}"
+            );
+        }
+
+        let denominators = Arc::new(vec![F::ONE; raw.len()]);
+        let legacy = ZeroPolyOnCoset::<F>::new(2, 3)
+            .with_l_0_denominator_inverses(denominators);
+        assert!(legacy.eval_l_0_evaluations().is_none());
     }
 }
