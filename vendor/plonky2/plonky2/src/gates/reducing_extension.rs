@@ -214,21 +214,34 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
         for i in 0..self.num_coeffs {
             let coeff_start = Self::wires_coeff(i).start;
             let acc_start = self.wires_accs(i).start;
-            for p in 0..n {
-                let next_acc = ext(acc_start, p);
-                let constraint = accs[p] * alphas[p] + ext(coeff_start, p) - next_acc;
-                let arr = constraint.to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
+            if D == 2 {
+                let (out0, rest) = combined_gate_constraints[(i * 2) * n..].split_at_mut(n);
+                let out1 = &mut rest[..n];
+                for p in 0..n {
+                    let next_acc = ext(acc_start, p);
+                    let constraint = accs[p] * alphas[p] + ext(coeff_start, p) - next_acc;
+                    let arr = constraint.to_basefield_array();
+                    out0[p] = out0[p] + arr[0] * filters[p];
+                    out1[p] = out1[p] + arr[1] * filters[p];
+                    accs[p] = next_acc;
                 }
-                accs[p] = next_acc;
-            }
-            for d in 0..D {
-                batch_multiply_add_inplace(
-                    &mut combined_gate_constraints[(i * D + d) * n..][..n],
-                    &scratch[d * n..][..n],
-                    filters,
-                );
+            } else {
+                for p in 0..n {
+                    let next_acc = ext(acc_start, p);
+                    let constraint = accs[p] * alphas[p] + ext(coeff_start, p) - next_acc;
+                    let arr = constraint.to_basefield_array();
+                    for (d, a) in arr.iter().enumerate() {
+                        scratch[d * n + p] = *a;
+                    }
+                    accs[p] = next_acc;
+                }
+                for d in 0..D {
+                    batch_multiply_add_inplace(
+                        &mut combined_gate_constraints[(i * D + d) * n..][..n],
+                        &scratch[d * n..][..n],
+                        filters,
+                    );
+                }
             }
         }
     }
