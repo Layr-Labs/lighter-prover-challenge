@@ -4238,17 +4238,50 @@ mod l_0_table_cache {
     static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize, usize), Arc<dyn Any + Send + Sync>>>> =
         OnceLock::new();
 
-    /// Builds the table with, per entry, exactly the operations of the uncached
-    /// `eval_l_0(i, g * w^i)` path: `x = g * w^i` from the same `two_adic_subgroup` points the
-    /// prover feeds it, then `(n * (x - ONE)).inverse()` — the same inverse of the same
-    /// product, so every entry is bit-identical to the value it replaces. Entries are
-    /// independent, so the parallel map changes nothing.
-    fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
+    const L_0_INVERSION_CHUNK: usize = 4096;
+
+    /// Same-binary causal rollback for the cold table producer. The ranked sandbox clears the
+    /// environment, so absence selects chunked Montgomery batch inversion; `0` restores the
+    /// inherited independent-inverse map exactly.
+    fn batch_inversion_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var_os("LIGHTER_L0_BATCH_INVERSE")
+                .map(|value| value != "0")
+                .unwrap_or(true)
+        })
+    }
+
+    /// Builds the exact denominator table consumed by `eval_l_0`. The rollback mode preserves
+    /// the inherited independent inverse map. The default forms those same denominators first,
+    /// then replaces thousands of field inversions with bounded Montgomery batches.
+    pub(super) fn build_with_mode<F: Field>(
+        degree_bits: usize,
+        quotient_degree_bits: usize,
+        batch_inversion: bool,
+    ) -> Vec<F> {
         let n = F::from_canonical_usize(1 << degree_bits);
-        F::two_adic_subgroup(degree_bits + quotient_degree_bits)
+        let subgroup = F::two_adic_subgroup(degree_bits + quotient_degree_bits);
+        if !batch_inversion {
+            return subgroup
+                .into_par_iter()
+                .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
+                .collect();
+        }
+
+        let denominators = subgroup
             .into_par_iter()
-            .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
-            .collect()
+            .map(|x| n * (F::coset_shift() * x - F::ONE))
+            .collect::<Vec<_>>();
+        let mut inverses = vec![F::ZERO; denominators.len()];
+        denominators
+            .par_chunks(L_0_INVERSION_CHUNK)
+            .zip(inverses.par_chunks_mut(L_0_INVERSION_CHUNK))
+            .for_each_init(Vec::<F>::new, |scratch, (input, output)| {
+                F::batch_multiplicative_inverse_into(input, scratch);
+                output.copy_from_slice(scratch);
+            });
+        inverses
     }
 
     pub(super) fn l_0_denominator_inverses<F: Field>(
@@ -4262,7 +4295,11 @@ mod l_0_table_cache {
         }
         // Built outside the lock so a slow build never serializes other keys; concurrent
         // builders of the same key produce identical tables and the first insert wins.
-        let table: Arc<Vec<F>> = Arc::new(build::<F>(degree_bits, quotient_degree_bits));
+        let table: Arc<Vec<F>> = Arc::new(build_with_mode::<F>(
+            degree_bits,
+            quotient_degree_bits,
+            batch_inversion_enabled(),
+        ));
         let mut guard = cache.lock().unwrap();
         let entry = guard
             .entry(key)
@@ -4431,11 +4468,47 @@ mod l_0_table_tests {
     use plonky2_field::types::Field;
     use plonky2_field::zero_poly_coset::ZeroPolyOnCoset;
 
-    use super::l_0_table_cache::l_0_denominator_inverses;
+    use super::l_0_table_cache::{build_with_mode, l_0_denominator_inverses};
 
     type F = GoldilocksField;
 
     const COMBOS: [(usize, usize); 5] = [(1, 1), (3, 2), (4, 3), (6, 2), (8, 3)];
+    const PRODUCTION_COMBOS: [(usize, usize); 3] = [(14, 3), (16, 3), (18, 3)];
+
+    /// Chunked Montgomery inversion must preserve the exact raw word produced by the
+    /// independent-inverse builder, not merely the canonical field value.
+    #[test]
+    fn batch_l_0_builder_matches_independent_raw() {
+        for (degree_bits, quotient_degree_bits) in COMBOS {
+            let independent = build_with_mode::<F>(degree_bits, quotient_degree_bits, false);
+            let batched = build_with_mode::<F>(degree_bits, quotient_degree_bits, true);
+            assert_eq!(independent.len(), batched.len());
+            for (i, (expected, actual)) in independent.iter().zip(&batched).enumerate() {
+                assert_eq!(
+                    actual.0, expected.0,
+                    "entry {i} of table ({degree_bits}, {quotient_degree_bits})"
+                );
+            }
+        }
+    }
+
+    /// Exact ranked domains. Run explicitly in release mode before promotion so every
+    /// d14/d16/d18 denominator word is compared across modes.
+    #[test]
+    #[ignore = "production-domain batch-inversion raw differential; run explicitly in release mode"]
+    fn batch_l_0_builder_matches_all_production_words() {
+        for (degree_bits, quotient_degree_bits) in PRODUCTION_COMBOS {
+            let independent = build_with_mode::<F>(degree_bits, quotient_degree_bits, false);
+            let batched = build_with_mode::<F>(degree_bits, quotient_degree_bits, true);
+            assert_eq!(independent.len(), batched.len());
+            for (i, (expected, actual)) in independent.iter().zip(&batched).enumerate() {
+                assert_eq!(
+                    actual.0, expected.0,
+                    "entry {i} of table ({degree_bits}, {quotient_degree_bits})"
+                );
+            }
+        }
+    }
 
     /// Every cached entry must equal the legacy per-point computation
     /// `(n * (g * w^i - 1)).inverse()` bit-for-bit (raw u64 representation, not just field
