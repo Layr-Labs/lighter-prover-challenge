@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "8a8280be13214bcac81167656bab014047b1a446996a1648c66e7f722d8ed43e";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -309,7 +309,7 @@ fn build_pipeline(
 /// of them resolve, so a stale or truncated artifact falls back to compiling the
 /// source. This deliberately includes the lazily-built gate-quotient kernels:
 /// they are absent from the eager path but must still be present in the AIR.
-const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
+const METALLIB_REQUIRED_KERNELS: [&str; 12] = [
     "poseidon2_hash_leaves",
     "poseidon2_hash_leaves_colmajor",
     "poseidon2_hash_parents",
@@ -320,6 +320,8 @@ const METALLIB_REQUIRED_KERNELS: [&str; 10] = [
     "poseidon2_gate_quotient",
     "range_check_gate_quotient",
     "permutation_quotient",
+    "fri_pow_search",
+    "fri_ext2_hash_leaves_colmajor",
 ];
 /// Trees below this size hash on the CPU. The promoted 8.0011 frontier
 /// (6654d43) ranked-validated this raised value inside its composition; my
@@ -1352,7 +1354,7 @@ impl<F: RichField> TreeReadback<'_, F> {
     }
 }
 
-/// The two gate-quotient pipelines, lowered off the context's blocking path.
+/// Optional pipelines lowered off the context's blocking path.
 ///
 /// Each is `None` until its background build finishes and `Some(None)` if that
 /// build failed. Both readers already treat an absent pipeline as "evaluate
@@ -1402,7 +1404,7 @@ impl LazyPipeline {
     /// exactly the pre-streaming behaviour and is asserted bit-identical by
     /// this file's differentials.
     ///
-    /// That difference matters at startup. The four optional lowerings only
+    /// That difference matters at startup. The optional lowerings only
     /// start once the context is ready, and the first thing to reach the
     /// streamed path afterwards is the embedded-blob load: both 2^19-leaf tx
     /// blobs recompute `constants_sigmas_commitment`, and at 82 columns they
@@ -1419,6 +1421,8 @@ static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
+static FRI_POW_PIPELINE: LazyPipeline = LazyPipeline::new();
+static FRI_EXT2_LEAF_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     POSEIDON_GATE_QUOTIENT_PIPELINE.get()
@@ -1439,7 +1443,18 @@ fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
     ABSORB_PASS_PIPELINE.try_get()
 }
 
-/// Starts the two gate-quotient pipeline builds on detached threads.
+fn fri_pow_pipeline() -> Option<&'static ComputePipelineState> {
+    // PoW has an exact CPU fallback and must never wait for optional lowering.
+    FRI_POW_PIPELINE.try_get()
+}
+
+fn fri_ext2_leaf_pipeline() -> Option<&'static ComputePipelineState> {
+    // This optimization has the complete CPU FRI path as its fallback and is
+    // reached well after context prewarming; never wait on optional lowering.
+    FRI_EXT2_LEAF_PIPELINE.try_get()
+}
+
+/// Starts optional pipeline builds on detached threads.
 ///
 /// One thread each rather than one for both: they are the two slowest kernels
 /// in the shader, so serializing them would keep the GPU quotient path on the
@@ -1461,6 +1476,11 @@ fn spawn_optional_pipelines(
         ),
         ("permutation_quotient", &PERMUTATION_QUOTIENT_PIPELINE),
         ("poseidon2_absorb_pass", &ABSORB_PASS_PIPELINE),
+        ("fri_pow_search", &FRI_POW_PIPELINE),
+        (
+            "fri_ext2_hash_leaves_colmajor",
+            &FRI_EXT2_LEAF_PIPELINE,
+        ),
     ] {
         let device = device.clone();
         let library = library.clone();
@@ -1686,6 +1706,21 @@ impl GpuJobGuard {
         GPU_JOBS_IN_FLIGHT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         GpuJobGuard
     }
+
+    /// Reserve a presently idle queue for a small fail-open side job. A race
+    /// with a later ordinary submission is harmless: this guard is installed
+    /// before PoW encoding, so the normal queue order still applies.
+    fn try_begin_idle() -> Option<Self> {
+        GPU_JOBS_IN_FLIGHT
+            .compare_exchange(
+                0,
+                1,
+                core::sync::atomic::Ordering::AcqRel,
+                core::sync::atomic::Ordering::Relaxed,
+            )
+            .ok()
+            .map(|_| GpuJobGuard)
+    }
 }
 
 impl Drop for GpuJobGuard {
@@ -1732,6 +1767,117 @@ fn shared_context() -> Option<&'static MetalShared> {
             log::warn!("Metal Poseidon2 unavailable; using CPU Merkle hashing: {error}");
             None
         }
+    }
+}
+
+const GPU_POW_BATCH: u32 = 1 << 16;
+const GPU_POW_DISABLE_ENV: &str = "LIGHTER_DISABLE_GPU_POW";
+
+#[inline]
+fn gpu_pow_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(GPU_POW_DISABLE_ENV).as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+    })
+}
+
+/// Tries FRI grinding on a presently idle Metal queue. The caller must replay
+/// the returned witness through the ordinary Challenger; every decline or GPU
+/// failure returns `None` and leaves the exact CPU search as the fallback.
+pub(crate) fn try_fri_pow_search(
+    common_state: &[u64; 12],
+    witness_input_pos: usize,
+    leading_zero_bits: u32,
+    max_candidate: u64,
+) -> Option<u64> {
+    if !gpu_pow_enabled() || witness_input_pos >= 12 || leading_zero_bits > 64 {
+        return None;
+    }
+
+    if !context_ready() {
+        return None;
+    }
+    let context = shared_context()?;
+    let pipeline = fri_pow_pipeline()?;
+    let _job = GpuJobGuard::try_begin_idle()?;
+    let initial_winner = u32::MAX;
+    let winner = context.device.new_buffer_with_data(
+        (&initial_winner as *const u32).cast::<c_void>(),
+        size_of::<u32>() as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let mut candidate_base = 0u64;
+
+    loop {
+        let remaining = max_candidate - candidate_base;
+        let candidate_count = if remaining >= (GPU_POW_BATCH - 1) as u64 {
+            GPU_POW_BATCH
+        } else {
+            remaining as u32 + 1
+        };
+        unsafe {
+            winner.contents().cast::<u32>().write(u32::MAX);
+        }
+
+        let command_buffer = autoreleasepool(|| {
+            let command_buffer = context.queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_bytes(
+                0,
+                size_of_val(common_state) as NSUInteger,
+                common_state.as_ptr().cast::<c_void>(),
+            );
+            encoder.set_buffer(1, Some(&winner), 0);
+            encoder.set_buffer(2, Some(&context.parameters), 0);
+            encoder.set_bytes(
+                3,
+                size_of::<u64>() as NSUInteger,
+                (&candidate_base as *const u64).cast::<c_void>(),
+            );
+            set_u32(encoder, 4, witness_input_pos as u32);
+            set_u32(encoder, 5, candidate_count);
+            set_u32(encoder, 6, leading_zero_bits);
+            let execution_width = pipeline.thread_execution_width();
+            let group_width = pipeline
+                .max_total_threads_per_threadgroup()
+                .min(64)
+                .max(execution_width);
+            encoder.dispatch_threads(
+                MTLSize {
+                    width: candidate_count as NSUInteger,
+                    height: 1,
+                    depth: 1,
+                },
+                MTLSize {
+                    width: group_width,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            encoder.end_encoding();
+            #[cfg(feature = "diagnostic_profile")]
+            profile_command_buffer(&command_buffer, "fri_pow", candidate_count as u64);
+            command_buffer.commit();
+            command_buffer.to_owned()
+        });
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return None;
+        }
+
+        let offset = unsafe { winner.contents().cast::<u32>().read() };
+        if offset != u32::MAX {
+            return Some(candidate_base + offset as u64);
+        }
+        if candidate_count != GPU_POW_BATCH {
+            return None;
+        }
+        if remaining < GPU_POW_BATCH as u64 {
+            return None;
+        }
+        candidate_base += candidate_count as u64;
     }
 }
 
@@ -2630,7 +2776,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch_hash(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2797,6 +2943,43 @@ pub(crate) fn build_commitment_from_coeffs<F: RichField>(
         Ok(result) => Some(result),
         Err(error) => {
             log::warn!("Metal NTT commitment failed; using CPU path: {error}");
+            None
+        }
+    }
+}
+
+/// Builds FRI's first arity-16 ext2 commitment directly from its two live
+/// coefficient limbs. Unlike the generic NTT commitment, one tree leaf groups
+/// sixteen evaluations, so a dedicated leaf kernel preserves the verifier's
+/// exact bit-reversed `[eval][limb]` order. Admission is fail-open and
+/// nonblocking: an occupied singleton buffer returns `None` to the unchanged
+/// CPU path. Global queue idleness protects the critical GPU stream.
+pub(crate) fn build_fri_ext2_commitment_from_coeffs<F: RichField>(
+    coeffs: &[[F; 2]],
+    rate_bits: usize,
+    cap_height: usize,
+) -> Option<(
+    MetalColumns<F>,
+    LevelOrderDigests<HashOut<F>>,
+    Vec<HashOut<F>>,
+)> {
+    let degree = coeffs.len();
+    let lde_size = degree.checked_shl(rate_bits as u32)?;
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || degree == 0
+        || !degree.is_power_of_two()
+        || rate_bits != 3
+        || lde_size < 16
+        || cap_height > (lde_size / 16).ilog2() as usize
+    {
+        return None;
+    }
+    let context = ready_context(2, lde_size)?;
+    match context.try_build_fri_ext2_from_coeffs(coeffs, degree, rate_bits, cap_height) {
+        Ok(result) => result,
+        Err(error) => {
+            log::warn!("Metal FRI ext2 NTT commitment failed; using CPU path: {error}");
             None
         }
     }
@@ -3008,7 +3191,7 @@ impl MetalShared {
                         .expect("ifft finalize pipeline thread panicked"),
                 )
             });
-            // Everything the context blocks on is now built; the four optional
+            // Everything the context blocks on is now built; the five optional
             // kernels below land on their own threads.
             PIPELINE_BLOCKING_US.store(
                 PIPELINE_PHASE_START
@@ -3420,6 +3603,24 @@ impl MetalShared {
 
     fn acquire_set(&self) -> Result<BufferSet, String> {
         self.acquire_set_priority(false)
+    }
+
+    /// Nonblocking counterpart for opportunistic jobs. It never joins the
+    /// waiter queue: if the singleton set is occupied, the caller immediately
+    /// retains its CPU implementation.
+    fn try_acquire_set(&self) -> Result<Option<BufferSet>, String> {
+        let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
+        if let Some(set) = pool.free.pop() {
+            return Ok(Some(set));
+        }
+        if pool.created < MAX_BUFFER_SETS {
+            pool.created += 1;
+            return Ok(Some(BufferSet {
+                input: None,
+                output: None,
+            }));
+        }
+        Ok(None)
     }
 
     /// `spine` acquisitions (the 2^17 serial-critical trees) take a freed set
@@ -3947,6 +4148,199 @@ impl MetalShared {
     }
 
     #[allow(clippy::type_complexity)]
+    fn try_build_fri_ext2_from_coeffs<F: RichField>(
+        &self,
+        coeffs: &[[F; 2]],
+        degree: usize,
+        rate_bits: usize,
+        cap_height: usize,
+    ) -> Result<
+        Option<(
+            MetalColumns<F>,
+            LevelOrderDigests<HashOut<F>>,
+            Vec<HashOut<F>>,
+        )>,
+        String,
+    > {
+        let Some(leaf_pipeline) = fri_ext2_leaf_pipeline() else {
+            return Ok(None);
+        };
+        let lde_size = degree << rate_bits;
+        let leaf_count = lde_size / 16;
+        let cap_count = 1usize << cap_height;
+        let node_count = 2 * leaf_count - cap_count;
+        let input_len = degree * 2;
+        let input_bytes = input_len * size_of::<u64>();
+        let column_len = lde_size * 2;
+        let column_bytes = column_len * size_of::<u64>();
+        let output_len = node_count * 4;
+        let output_bytes = output_len * size_of::<u64>();
+        let Some(job) = GpuJobGuard::try_begin_idle() else {
+            return Ok(None);
+        };
+        let Some(mut set) = self.try_acquire_set()? else {
+            drop(job);
+            return Ok(None);
+        };
+        let (roots_buffer, root_offsets) = match self.roots_for(lde_size.ilog2()) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                self.release_set(set);
+                drop(job);
+                return Err(error);
+            }
+        };
+        let shift_buffer = match self.shift_powers_for(degree) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                self.release_set(set);
+                drop(job);
+                return Err(error);
+            }
+        };
+        let column_buffer = take_or_new_column_buffer(&self.device, column_bytes as u64);
+
+        let result = (|| -> Result<TreeReadback<'_, F>, String> {
+            if set
+                .input
+                .as_ref()
+                .map_or(true, |buffer| buffer.length() < input_bytes as u64)
+            {
+                set.input = Some(autoreleasepool(|| {
+                    self.device.new_buffer(
+                        input_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }));
+            }
+            let input = set.input.as_ref().unwrap();
+            let destination = unsafe {
+                slice::from_raw_parts_mut(input.contents().cast::<F>(), input_len)
+            };
+            for (i, limbs) in coeffs.iter().enumerate() {
+                destination[i] = limbs[0];
+                destination[degree + i] = limbs[1];
+            }
+
+            if set
+                .output
+                .as_ref()
+                .map_or(true, |buffer| buffer.length() < output_bytes as u64)
+            {
+                set.output = Some(autoreleasepool(|| {
+                    self.device.new_buffer(
+                        output_bytes as u64,
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }));
+            }
+            let output = set.output.as_ref().unwrap();
+
+            let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                let command_buffer = self.queue.new_command_buffer();
+                let prepare = command_buffer.new_compute_command_encoder();
+                prepare.set_compute_pipeline_state(&self.ntt_prepare_pipeline);
+                prepare.set_buffer(0, Some(input), 0);
+                prepare.set_buffer(1, Some(&shift_buffer), 0);
+                prepare.set_buffer(2, Some(&column_buffer), 0);
+                set_u32(prepare, 3, degree as u32);
+                set_u32(prepare, 4, lde_size as u32);
+                set_u32(prepare, 5, degree.ilog2());
+                set_u32(prepare, 6, rate_bits as u32);
+                dispatch2d(prepare, &self.ntt_prepare_pipeline, lde_size, 2);
+                prepare.end_encoding();
+
+                let log_lde = lde_size.ilog2();
+                for stage_index in rate_bits as u32..log_lde {
+                    let stage = command_buffer.new_compute_command_encoder();
+                    stage.set_compute_pipeline_state(&self.ntt_stage_pipeline);
+                    stage.set_buffer(0, Some(&column_buffer), 0);
+                    stage.set_buffer(
+                        1,
+                        Some(&roots_buffer),
+                        (root_offsets[stage_index as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(stage, 2, lde_size as u32);
+                    set_u32(stage, 3, stage_index);
+                    set_u32(stage, 4, u32::from(stage_index == log_lde - 1));
+                    dispatch2d(stage, &self.ntt_stage_pipeline, lde_size / 2, 2);
+                    stage.end_encoding();
+                }
+
+                let leaf = command_buffer.new_compute_command_encoder();
+                leaf.set_compute_pipeline_state(leaf_pipeline);
+                leaf.set_buffer(0, Some(&column_buffer), 0);
+                leaf.set_buffer(1, Some(output), 0);
+                leaf.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(leaf, 3, leaf_count as u32);
+                set_u32(leaf, 4, leaf_count.ilog2());
+                dispatch(leaf, leaf_pipeline, leaf_count);
+                leaf.end_encoding();
+
+                let mut level_offset = 0usize;
+                let mut child_count = leaf_count;
+                level_offsets.push(level_offset);
+                while child_count > cap_count {
+                    let parent_count = child_count / 2;
+                    let child_offset = level_offset;
+                    level_offset += child_count * 4;
+                    level_offsets.push(level_offset);
+                    let parent = command_buffer.new_compute_command_encoder();
+                    parent.set_compute_pipeline_state(&self.parent_pipeline);
+                    parent.set_buffer(
+                        0,
+                        Some(output),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent.set_buffer(
+                        1,
+                        Some(output),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(parent, 3, parent_count as u32);
+                    dispatch(parent, &self.parent_pipeline, parent_count);
+                    parent.end_encoding();
+                    child_count = parent_count;
+                }
+
+                #[cfg(feature = "diagnostic_profile")]
+                profile_command_buffer(
+                    command_buffer,
+                    "fri_ext2_ntt_commit",
+                    (lde_size * 2) as u64,
+                );
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            if command_buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(format!(
+                    "FRI ext2 command ended with status {:?}",
+                    command_buffer.status(),
+                ));
+            }
+            self.completed_tree_readback(
+                &mut set,
+                output_len,
+                level_offsets,
+                leaf_count,
+                cap_height,
+            )
+        })();
+        self.release_set(set);
+        drop(job);
+        let readback = result?;
+        let (digests, cap) = readback.finish();
+        Ok(Some((
+            MetalColumns::with_buffer(column_buffer, lde_size, 2),
+            digests,
+            cap,
+        )))
+    }
+
+    #[allow(clippy::type_complexity)]
     fn build_from_coeffs<F: RichField>(
         &self,
         coeff_columns: &[&[F]],
@@ -4458,10 +4852,38 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
+}
+
+fn dispatch_hash(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
+}
+
+fn hash_threadgroup_cap() -> NSUInteger {
+    static CAP: std::sync::OnceLock<NSUInteger> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("LIGHTER_HASH_TG")
+            .ok()
+            .and_then(|value| value.parse::<NSUInteger>().ok())
+            .filter(|&value| (32..=1024).contains(&value) && value.is_power_of_two())
+            .unwrap_or(256)
+    })
+}
+
+fn dispatch_with_group_cap(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    cap: NSUInteger,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
@@ -4568,6 +4990,308 @@ mod tests {
     use crate::gates::gate::Gate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
+    const POW_TEST_KERNELS: &str = r#"
+kernel void fri_pow_responses(
+    const device ulong* common_state [[buffer(0)]],
+    device ulong* responses [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant ulong& candidate_base [[buffer(3)]],
+    constant uint& witness_input_pos [[buffer(4)]],
+    constant uint& candidate_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= candidate_count) {
+        return;
+    }
+    ulong state[12];
+    for (uint i = 0; i < 12; ++i) {
+        state[i] = common_state[i];
+    }
+    state[witness_input_pos] = candidate_base + (ulong)gid;
+    poseidon2(state, parameters);
+    responses[gid] = gl_canonicalize(state[7]);
+}
+
+"#;
+
+    struct PowBenchmarkHarness {
+        device: Device,
+        queue: CommandQueue,
+        parameters: Buffer,
+        responses: ComputePipelineState,
+        search: ComputePipelineState,
+    }
+
+    impl PowBenchmarkHarness {
+        fn new() -> Self {
+            autoreleasepool(|| {
+                let device = Device::system_default().expect("no Metal device");
+                let source = [SHADER_SOURCE, POW_TEST_KERNELS].concat();
+                let options = CompileOptions::new();
+                let library = device
+                    .new_library_with_source(&source, &options)
+                    .unwrap_or_else(|error| panic!("PoW test shader failed: {error}"));
+                let pipeline = |name| {
+                    let function = library
+                        .get_function(name, None)
+                        .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+                };
+                let mut parameter_values = Vec::with_capacity(130);
+                parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+                parameter_values.extend(INTERNAL_CONSTANTS);
+                parameter_values.extend(MATRIX_DIAG_12_U64);
+                let parameters = device.new_buffer_with_data(
+                    parameter_values.as_ptr().cast::<c_void>(),
+                    size_of_val(parameter_values.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                Self {
+                    queue: device.new_command_queue(),
+                    responses: pipeline("fri_pow_responses"),
+                    search: pipeline("fri_pow_search"),
+                    device,
+                    parameters,
+                }
+            })
+        }
+
+        fn input_buffer(&self, common_state: &[u64; 12]) -> Buffer {
+            self.device.new_buffer_with_data(
+                common_state.as_ptr().cast::<c_void>(),
+                size_of_val(common_state) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        }
+
+        fn encode_common(
+            &self,
+            encoder: &metal::ComputeCommandEncoderRef,
+            input: &Buffer,
+            output: &Buffer,
+            candidate_base: u64,
+            witness_input_pos: u32,
+            candidate_count: u32,
+        ) {
+            encoder.set_buffer(0, Some(input), 0);
+            encoder.set_buffer(1, Some(output), 0);
+            encoder.set_buffer(2, Some(&self.parameters), 0);
+            encoder.set_bytes(
+                3,
+                size_of::<u64>() as NSUInteger,
+                (&candidate_base as *const u64).cast::<c_void>(),
+            );
+            set_u32(encoder, 4, witness_input_pos);
+            set_u32(encoder, 5, candidate_count);
+        }
+
+        fn run_responses(
+            &self,
+            common_state: &[u64; 12],
+            candidate_base: u64,
+            witness_input_pos: u32,
+            candidate_count: usize,
+        ) -> (Vec<u64>, Duration) {
+            let input = self.input_buffer(common_state);
+            let output = self.device.new_buffer(
+                (candidate_count * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let start = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.responses);
+                self.encode_common(
+                    encoder,
+                    &input,
+                    &output,
+                    candidate_base,
+                    witness_input_pos,
+                    candidate_count as u32,
+                );
+                dispatch(encoder, &self.responses, candidate_count);
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let responses = unsafe {
+                slice::from_raw_parts(output.contents().cast::<u64>(), candidate_count).to_vec()
+            };
+            (responses, gpu_duration(&command_buffer, start.elapsed()))
+        }
+
+        fn run_search(
+            &self,
+            common_state: &[u64; 12],
+            candidate_base: u64,
+            witness_input_pos: u32,
+            candidate_count: usize,
+            leading_zero_bits: u32,
+            group_cap: NSUInteger,
+        ) -> (Option<u32>, Duration) {
+            let input = self.input_buffer(common_state);
+            let initial_winner = u32::MAX;
+            let output = self.device.new_buffer_with_data(
+                (&initial_winner as *const u32).cast::<c_void>(),
+                size_of::<u32>() as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let start = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.search);
+                self.encode_common(
+                    encoder,
+                    &input,
+                    &output,
+                    candidate_base,
+                    witness_input_pos,
+                    candidate_count as u32,
+                );
+                set_u32(encoder, 6, leading_zero_bits);
+                let execution_width = self.search.thread_execution_width();
+                let group_width = self
+                    .search
+                    .max_total_threads_per_threadgroup()
+                    .min(group_cap)
+                    .max(execution_width);
+                encoder.dispatch_threads(
+                    MTLSize {
+                        width: candidate_count as NSUInteger,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: group_width,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+            let winner = unsafe { *output.contents().cast::<u32>() };
+            (
+                (winner != u32::MAX).then_some(winner),
+                gpu_duration(&command_buffer, start.elapsed()),
+            )
+        }
+    }
+
+    #[test]
+    fn fri_pow_gpu_responses_match_cpu_poseidon2() {
+        use crate::hash::poseidon2::hash::Poseidon2;
+
+        let harness = PowBenchmarkHarness::new();
+        let common_state = core::array::from_fn(|i| {
+            GoldilocksField::from_canonical_u64((i as u64 + 17) * 0x1020_3040).0
+        });
+        let candidate_base = 0x1234_5678_u64;
+        let witness_input_pos = 5_u32;
+        let count = 4096;
+        let (gpu, _) = harness.run_responses(
+            &common_state,
+            candidate_base,
+            witness_input_pos,
+            count,
+        );
+        for (offset, &actual) in gpu.iter().enumerate() {
+            let mut state = common_state.map(GoldilocksField);
+            state[witness_input_pos as usize] =
+                GoldilocksField::from_canonical_u64(candidate_base + offset as u64);
+            let expected = GoldilocksField::poseidon2(state)[7].to_canonical_u64();
+            assert_eq!(actual, expected, "candidate offset {offset}");
+        }
+
+        let (winner, _) = harness.run_search(
+            &common_state,
+            candidate_base,
+            witness_input_pos,
+            count,
+            8,
+            128,
+        );
+        let winner = winner.expect("2^12 candidates should contain an 8-bit PoW witness");
+        assert!(winner < count as u32);
+        assert!(gpu[winner as usize].leading_zeros() >= 8);
+    }
+
+    #[test]
+    fn fri_pow_product_path_returns_cpu_replayable_witness() {
+        use crate::hash::poseidon2::hash::Poseidon2;
+
+        force_context_for_tests();
+        assert!(
+            FRI_POW_PIPELINE.get().is_some(),
+            "production PoW pipeline must build"
+        );
+        let common_state = core::array::from_fn(|i| {
+            GoldilocksField::from_canonical_u64(
+                (i as u64 + 9).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            )
+            .0
+        });
+        let witness_input_pos = 6;
+        let leading_zero_bits = 16;
+        let witness = try_fri_pow_search(
+            &common_state,
+            witness_input_pos,
+            leading_zero_bits,
+            GoldilocksField::NEG_ONE.to_canonical_u64(),
+        )
+        .expect("2^16 batches should find a PoW witness");
+
+        let mut replay = common_state.map(GoldilocksField);
+        replay[witness_input_pos] = GoldilocksField::from_canonical_u64(witness);
+        let response = GoldilocksField::poseidon2(replay)[7].to_canonical_u64();
+        assert!(response.leading_zeros() >= leading_zero_bits);
+    }
+
+    #[test]
+    #[ignore = "reports isolated fixed-batch GPU PoW throughput"]
+    fn benchmark_fri_pow_gpu_batch() {
+        let harness = PowBenchmarkHarness::new();
+        let common_state = core::array::from_fn(|i| {
+            GoldilocksField::from_canonical_u64(
+                (i as u64 + 1).wrapping_mul(0x9e37_79b9_7f4a_7c15),
+            )
+            .0
+        });
+        let count = 1 << 16;
+        for _ in 0..3 {
+            let _ = harness.run_search(&common_state, 0, 6, count, 16, 128);
+        }
+        for group_cap in [64, 128, 256, 512, 1024] {
+            let mut samples = Vec::with_capacity(15);
+            for batch in 0..15_u64 {
+                let (_, elapsed) = harness.run_search(
+                    &common_state,
+                    batch * count as u64,
+                    6,
+                    count,
+                    16,
+                    group_cap,
+                );
+                samples.push(elapsed);
+            }
+            samples.sort_unstable();
+            eprintln!(
+                "fri-pow-gpu count={count} tg={group_cap} median_ms={:.6} min_ms={:.6} max_ms={:.6}",
+                samples[samples.len() / 2].as_secs_f64() * 1000.0,
+                samples[0].as_secs_f64() * 1000.0,
+                samples[samples.len() - 1].as_secs_f64() * 1000.0,
+            );
+        }
+    }
+
     /// The prebuilt AIR library is only sound while it is the compiled form of
     /// the MSL we ship. Nothing in the type system ties the two together, so
     /// this pins the source bytes: edit `poseidon2.metal` without regenerating
@@ -4661,11 +5385,13 @@ mod tests {
                 &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             ),
             ("range_check_gate_quotient", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
+            ("fri_pow_search", &[0, 1, 2, 3, 4, 5, 6]),
             ("poseidon2_hash_leaves", &[0, 1, 2, 3, 4]),
             ("ntt_prepare", &[0, 1, 2, 3, 4, 5, 6]),
             ("ntt_stage", &[0, 1, 2, 3, 4]),
             ("ifft_finalize", &[0, 1, 2, 3]),
             ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5]),
+            ("fri_ext2_hash_leaves_colmajor", &[0, 1, 2, 3, 4]),
             ("poseidon2_hash_parents", &[0, 1, 2, 3]),
             ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
         ];
@@ -4722,7 +5448,7 @@ mod tests {
             regions += 1;
         }
         assert_eq!(
-            regions, 19,
+            regions, 24,
             "the number of production dispatch sites changed; each one is audited \
              above, so update this count deliberately rather than by reflex."
         );
@@ -6465,6 +7191,47 @@ mod tests {
         }
     }
 
+    const FRI_EXT2_NTT_TEST_KERNEL: &str = r#"
+kernel void fri_ext2_hash_leaves_colmajor_test(
+    const device ulong* values [[buffer(0)]],
+    device ulong* hashes [[buffer(1)]],
+    constant ulong* parameters [[buffer(2)]],
+    constant uint& leaf_count [[buffer(3)]],
+    constant uint& log_leaf_count [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= leaf_count) {
+        return;
+    }
+
+    // The two extension limbs occupy two natural-order NTT columns of
+    // `16 * leaf_count` rows. Tree leaf `reverse_bits(gid)` contains the 16
+    // evaluations whose natural indices are
+    // `gid + reverse_bits(j, 4) * leaf_count`.
+    uint out_row = log_leaf_count == 0
+        ? gid
+        : (reverse_bits(gid) >> (32 - log_leaf_count));
+    device ulong* output = hashes + (ulong)out_row * 4;
+    ulong state[12] = { 0 };
+    const uint local_bitrev[16] = {
+        0, 8, 4, 12, 2, 10, 6, 14,
+        1, 9, 5, 13, 3, 11, 7, 15
+    };
+    ulong lde_size = (ulong)leaf_count * 16UL;
+    for (uint group = 0; group < 4; ++group) {
+        for (uint lane = 0; lane < 4; ++lane) {
+            uint j = group * 4 + lane;
+            ulong row = (ulong)gid + (ulong)local_bitrev[j] * leaf_count;
+            state[2 * lane] = gl_canonicalize(values[row]);
+            state[2 * lane + 1] = gl_canonicalize(values[lde_size + row]);
+        }
+        poseidon2(state, parameters);
+    }
+    for (uint i = 0; i < 4; ++i) {
+        output[i] = gl_canonicalize(state[i]);
+    }
+}
+"#;
+
     const ARITHMETIC_TEST_KERNELS: &str = r#"
 inline ulong gl_add_native_reference(ulong a, ulong b) {
     ulong sum = a + b;
@@ -6765,6 +7532,151 @@ kernel void goldilocks_mul_bench_native(
                 command_buffer.status()
             );
             gpu_duration(&command_buffer, start.elapsed())
+        }
+    }
+
+    struct FriExt2NttHarness {
+        device: Device,
+        queue: CommandQueue,
+        parameters: Buffer,
+        prepare: ComputePipelineState,
+        stage: ComputePipelineState,
+        leaf: ComputePipelineState,
+        parent: ComputePipelineState,
+    }
+
+    impl FriExt2NttHarness {
+        fn new() -> Self {
+            autoreleasepool(|| {
+                let device = Device::system_default().expect("no Metal device");
+                let source = [SHADER_SOURCE, FRI_EXT2_NTT_TEST_KERNEL].concat();
+                let options = CompileOptions::new();
+                let library = device
+                    .new_library_with_source(&source, &options)
+                    .unwrap_or_else(|error| panic!("FRI ext2 NTT test shader failed: {error}"));
+                let pipeline = |name| {
+                    let function = library
+                        .get_function(name, None)
+                        .unwrap_or_else(|error| panic!("{name} unavailable: {error}"));
+                    device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .unwrap_or_else(|error| panic!("{name} pipeline failed: {error}"))
+                };
+                let mut parameter_values = Vec::with_capacity(130);
+                parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
+                parameter_values.extend(INTERNAL_CONSTANTS);
+                parameter_values.extend(MATRIX_DIAG_12_U64);
+                let parameters = device.new_buffer_with_data(
+                    parameter_values.as_ptr().cast::<c_void>(),
+                    size_of_val(parameter_values.as_slice()) as u64,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                Self {
+                    queue: device.new_command_queue(),
+                    prepare: pipeline("ntt_prepare"),
+                    stage: pipeline("ntt_stage"),
+                    leaf: pipeline("fri_ext2_hash_leaves_colmajor_test"),
+                    parent: pipeline("poseidon2_hash_parents"),
+                    device,
+                    parameters,
+                }
+            })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn run(
+            &self,
+            coeffs: &Buffer,
+            columns: &Buffer,
+            hashes: &Buffer,
+            roots: &Buffer,
+            root_offsets: &[usize],
+            shift_powers: &Buffer,
+            degree: usize,
+            rate_bits: usize,
+            cap_height: usize,
+        ) -> Duration {
+            let lde_size = degree << rate_bits;
+            let log_lde = lde_size.ilog2();
+            let leaf_count = lde_size / 16;
+            let log_leaf_count = leaf_count.ilog2();
+            let cap_count = 1usize << cap_height;
+            let started = Instant::now();
+            let command_buffer = autoreleasepool(|| {
+                let command_buffer = self.queue.new_command_buffer();
+                let prepare = command_buffer.new_compute_command_encoder();
+                prepare.set_compute_pipeline_state(&self.prepare);
+                prepare.set_buffer(0, Some(coeffs), 0);
+                prepare.set_buffer(1, Some(shift_powers), 0);
+                prepare.set_buffer(2, Some(columns), 0);
+                set_u32(prepare, 3, degree as u32);
+                set_u32(prepare, 4, lde_size as u32);
+                set_u32(prepare, 5, degree.ilog2());
+                set_u32(prepare, 6, rate_bits as u32);
+                dispatch2d(prepare, &self.prepare, lde_size, 2);
+                prepare.end_encoding();
+
+                for stage_index in rate_bits as u32..log_lde {
+                    let stage = command_buffer.new_compute_command_encoder();
+                    stage.set_compute_pipeline_state(&self.stage);
+                    stage.set_buffer(0, Some(columns), 0);
+                    stage.set_buffer(
+                        1,
+                        Some(roots),
+                        (root_offsets[stage_index as usize] * size_of::<u64>()) as NSUInteger,
+                    );
+                    set_u32(stage, 2, lde_size as u32);
+                    set_u32(stage, 3, stage_index);
+                    set_u32(stage, 4, u32::from(stage_index == log_lde - 1));
+                    dispatch2d(stage, &self.stage, lde_size / 2, 2);
+                    stage.end_encoding();
+                }
+
+                let leaf = command_buffer.new_compute_command_encoder();
+                leaf.set_compute_pipeline_state(&self.leaf);
+                leaf.set_buffer(0, Some(columns), 0);
+                leaf.set_buffer(1, Some(hashes), 0);
+                leaf.set_buffer(2, Some(&self.parameters), 0);
+                set_u32(leaf, 3, leaf_count as u32);
+                set_u32(leaf, 4, log_leaf_count);
+                dispatch(leaf, &self.leaf, leaf_count);
+                leaf.end_encoding();
+
+                let mut level_offset = 0usize;
+                let mut child_count = leaf_count;
+                while child_count > cap_count {
+                    let parent_count = child_count / 2;
+                    let child_offset = level_offset;
+                    level_offset += child_count * 4;
+                    let parent = command_buffer.new_compute_command_encoder();
+                    parent.set_compute_pipeline_state(&self.parent);
+                    parent.set_buffer(
+                        0,
+                        Some(hashes),
+                        (child_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent.set_buffer(
+                        1,
+                        Some(hashes),
+                        (level_offset * size_of::<u64>()) as NSUInteger,
+                    );
+                    parent.set_buffer(2, Some(&self.parameters), 0);
+                    set_u32(parent, 3, parent_count as u32);
+                    dispatch(parent, &self.parent, parent_count);
+                    parent.end_encoding();
+                    child_count = parent_count;
+                }
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            command_buffer.wait_until_completed();
+            assert_eq!(
+                command_buffer.status(),
+                MTLCommandBufferStatus::Completed,
+                "FRI ext2 NTT command failed with status {:?}",
+                command_buffer.status(),
+            );
+            gpu_duration(&command_buffer, started.elapsed())
         }
     }
 
@@ -7125,6 +8037,240 @@ kernel void goldilocks_mul_bench_native(
                 assert_all_paths_match_cpu(&gpu, &cpu, lde_size, cap_height);
             }
         }
+    }
+
+    #[test]
+    #[ignore = "manual focused FRI ext2 NTT+commit benchmark"]
+    fn benchmark_fri_ext2_ntt_commitment() {
+        use crate::field::extension::{Extendable, FieldExtension};
+        use crate::field::polynomial::PolynomialCoeffs;
+        use crate::field::types::{Field, Sample};
+        use crate::fri::oracle::coset_fft_zero_tail_base_dif_bitrev;
+        use crate::hash::merkle_tree::MerkleTree;
+        use crate::hash::poseidon2::hash::Poseidon2Hash;
+        use crate::util::reverse_bits;
+
+        type F = GoldilocksField;
+        type FE = <F as Extendable<2>>::Extension;
+
+        let log_degree = 16usize;
+        let rate_bits = 3usize;
+        let degree = 1usize << log_degree;
+        let lde_size = degree << rate_bits;
+        let log_lde = log_degree + rate_bits;
+        let leaf_count = lde_size / 16;
+        let cap_height = 4usize;
+        let cap_count = 1usize << cap_height;
+        let node_count = 2 * leaf_count - cap_count;
+
+        let coeffs = (0..degree).map(|_| FE::rand()).collect::<Vec<_>>();
+        let mut coeff_limbs = vec![0u64; degree * 2];
+        for (i, &value) in coeffs.iter().enumerate() {
+            let limbs: [F; 2] = value.to_basefield_array();
+            coeff_limbs[i] = limbs[0].to_canonical_u64();
+            coeff_limbs[degree + i] = limbs[1].to_canonical_u64();
+        }
+
+        let harness = FriExt2NttHarness::new();
+        let input = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                coeff_limbs.as_ptr().cast::<c_void>(),
+                size_of_val(coeff_limbs.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let columns = autoreleasepool(|| {
+            harness.device.new_buffer(
+                (2 * lde_size * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let hashes = autoreleasepool(|| {
+            harness.device.new_buffer(
+                (node_count * 4 * size_of::<u64>()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+
+        let root = F::primitive_root_of_unity(log_lde);
+        let mut bases = Vec::with_capacity(log_lde);
+        let mut base = root;
+        bases.push(base);
+        for _ in 1..log_lde {
+            base *= base;
+            bases.push(base);
+        }
+        let mut root_values = Vec::with_capacity(lde_size);
+        let mut root_offsets = Vec::with_capacity(log_lde);
+        for stage in 0..log_lde {
+            root_offsets.push(root_values.len());
+            let row_base = bases[log_lde - 1 - stage];
+            let mut power = F::ONE;
+            for _ in 0..(1usize << stage) {
+                root_values.push(power.to_canonical_u64());
+                power *= row_base;
+            }
+        }
+        let roots = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                root_values.as_ptr().cast::<c_void>(),
+                size_of_val(root_values.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let mut shift_values = Vec::with_capacity(degree);
+        let mut shift = F::ONE;
+        for _ in 0..degree {
+            shift_values.push(shift.to_canonical_u64());
+            shift *= F::coset_shift();
+        }
+        let shifts = autoreleasepool(|| {
+            harness.device.new_buffer_with_data(
+                shift_values.as_ptr().cast::<c_void>(),
+                size_of_val(shift_values.as_slice()) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+
+        // Current production reference: rate-8 zero-tail ext2 DIF already
+        // emits bit-reversed evaluations, which are transferred directly into
+        // arity-16 flat leaves before CPU Merkle construction.
+        let mut padded = coeffs.clone();
+        padded.resize(lde_size, FE::ZERO);
+        let padded = PolynomialCoeffs::new(padded);
+        let bitrev_values = coset_fft_zero_tail_base_dif_bitrev::<F, 2>(
+            &padded,
+            F::coset_shift(),
+            degree,
+        )
+        .values;
+        let flat_reference = {
+            let mut values = core::mem::ManuallyDrop::new(bitrev_values.clone());
+            let len = values.len();
+            let capacity = values.capacity();
+            // SAFETY: production `FE` is the transparent quadratic extension
+            // over `[F; 2]`; preserve the allocation and express its size in
+            // base-field elements exactly like `flatten_bitrev_order`.
+            unsafe {
+                Vec::from_raw_parts(
+                    values.as_mut_ptr().cast::<F>(),
+                    len * 2,
+                    capacity * 2,
+                )
+            }
+        };
+        let cpu = MerkleTree::<F, Poseidon2Hash>::new_flat(
+            flat_reference,
+            32,
+            cap_height,
+        );
+
+        harness.run(
+            &input,
+            &columns,
+            &hashes,
+            &roots,
+            &root_offsets,
+            &shifts,
+            degree,
+            rate_bits,
+            cap_height,
+        );
+
+        let gpu_columns = unsafe {
+            slice::from_raw_parts(columns.contents().cast::<u64>(), 2 * lde_size)
+        };
+        for natural_index in 0..lde_size {
+            let value = bitrev_values[reverse_bits(natural_index, log_lde)];
+            let limbs: [F; 2] = value.to_basefield_array();
+            assert_eq!(
+                gpu_columns[natural_index],
+                limbs[0].to_canonical_u64(),
+                "first ext2 limb at natural row {natural_index}",
+            );
+            assert_eq!(
+                gpu_columns[lde_size + natural_index],
+                limbs[1].to_canonical_u64(),
+                "second ext2 limb at natural row {natural_index}",
+            );
+        }
+        let mut cap_offset = 0usize;
+        let mut level_count = leaf_count;
+        while level_count > cap_count {
+            cap_offset += level_count * 4;
+            level_count /= 2;
+        }
+        let gpu_cap = unsafe {
+            slice::from_raw_parts(
+                hashes.contents().cast::<u64>().add(cap_offset),
+                cap_count * 4,
+            )
+        };
+        let cpu_cap = cpu
+            .cap
+            .0
+            .iter()
+            .flat_map(|digest| digest.elements)
+            .map(|value| value.to_canonical_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(gpu_cap, cpu_cap.as_slice(), "FRI r0 cap mismatch");
+
+        let mut gpu_samples = Vec::with_capacity(9);
+        for _ in 0..9 {
+            gpu_samples.push(harness.run(
+                &input,
+                &columns,
+                &hashes,
+                &roots,
+                &root_offsets,
+                &shifts,
+                degree,
+                rate_bits,
+                cap_height,
+            ));
+        }
+        gpu_samples.sort_unstable();
+
+        let mut cpu_samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let started = Instant::now();
+            let values = coset_fft_zero_tail_base_dif_bitrev::<F, 2>(
+                &padded,
+                F::coset_shift(),
+                degree,
+            )
+            .values;
+            let flat = {
+                let mut values = core::mem::ManuallyDrop::new(values);
+                let len = values.len();
+                let capacity = values.capacity();
+                // SAFETY: same production ext2 allocation transfer as above.
+                unsafe {
+                    Vec::from_raw_parts(
+                        values.as_mut_ptr().cast::<F>(),
+                        len * 2,
+                        capacity * 2,
+                    )
+                }
+            };
+            core::hint::black_box(MerkleTree::<F, Poseidon2Hash>::new_flat(
+                flat,
+                32,
+                cap_height,
+            ));
+            cpu_samples.push(started.elapsed());
+        }
+        cpu_samples.sort_unstable();
+        let gpu_median = gpu_samples[gpu_samples.len() / 2];
+        let cpu_median = cpu_samples[cpu_samples.len() / 2];
+        eprintln!(
+            "FRI ext2 r0 NTT+commit: gpu={gpu_median:?}, cpu={cpu_median:?}, speedup={:.3}x, leaf_threads={}/{}, stage_threads={}/{}",
+            cpu_median.as_secs_f64() / gpu_median.as_secs_f64(),
+            harness.leaf.max_total_threads_per_threadgroup(),
+            harness.leaf.thread_execution_width(),
+            harness.stage.max_total_threads_per_threadgroup(),
+            harness.stage.thread_execution_width(),
+        );
     }
 
     #[test]
