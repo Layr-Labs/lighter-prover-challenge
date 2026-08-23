@@ -2588,23 +2588,25 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
     // absorption of group g: commands on one queue execute in submission
     // order, and each pass is committed before the next group''s fill starts.
-    let groups = leaf_width.div_ceil(8);
+    const FILL_WIDTH: usize = 16;
+    const ABSORB_WIDTH: usize = 8;
+    let absorb_groups = leaf_width.div_ceil(ABSORB_WIDTH);
     let base = columns.buffer.contents().cast::<F>();
-    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
-    // Filled by the final group's encoder, which now carries the parent ladder
+    let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(absorb_groups);
+    // Filled by the final absorb encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
+    let mut col = 0usize;
+    while col < leaf_width {
+        let fill_chunk = (leaf_width - col).min(FILL_WIDTH);
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
             // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
+            let mut slices: Vec<&mut [F]> = (0..fill_chunk)
                 .map(|k| unsafe {
                     slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        base.add((col + k) * leaf_count).cast::<F>(),
                         leaf_count,
                     )
                 })
@@ -2614,8 +2616,13 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // ambiguous whether that time is CPU work or GPU queue wait.
             #[cfg(feature = "diagnostic_profile")]
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
-            fill_group(group, &mut slices);
+            fill_group(col, &mut slices);
         }
+        for sub in 0..fill_chunk.div_ceil(ABSORB_WIDTH) {
+            let col_start = col + sub * ABSORB_WIDTH;
+            let chunk = (leaf_width - col_start).min(ABSORB_WIDTH);
+            let first_pass = col_start == 0;
+            let final_pass = col_start + chunk == leaf_width;
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -2628,8 +2635,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 5, leaf_count.ilog2());
             set_u32(encoder, 6, col_start as u32);
             set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
+            set_u32(encoder, 8, first_pass as u32);
+            set_u32(encoder, 9, final_pass as u32);
             dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
@@ -2639,7 +2646,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // second command buffer with one encoder per level. Identical
             // shaders, dispatch counts and buffer offsets; strictly fewer
             // command buffers and encoders.
-            if group == groups - 1 {
+            if final_pass {
                 let mut level_offset = 0usize;
                 let mut child_count = leaf_count;
                 level_offsets.push(level_offset);
@@ -2683,6 +2690,8 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             command_buffer.to_owned()
         });
         absorb_commands.push(command_buffer);
+        }
+        col += fill_chunk;
     }
 
     let all_ok = absorb_commands.iter().all(|command_buffer| {
@@ -7375,7 +7384,7 @@ kernel void goldilocks_mul_bench_native(
             cap_height,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    destination.fill(F::from_canonical_usize(group + index + 1));
                 }
             },
         )
