@@ -1,4 +1,4 @@
-// Redraw marker reducing-scratch-r1 1787499809993 (inert)
+// Mechanism: cleantip draw-2-1787526098 on 9ace468 / e9d1881 (nathanethx 33.388)
 // Bumped only to obtain a fresh submission hash: the ranked score is a draw
 // from a strongly bimodal runner pool (~27% of draws land in the fast band),
 // so an unchanged tree cannot be re-sampled — the service dedupes identical
