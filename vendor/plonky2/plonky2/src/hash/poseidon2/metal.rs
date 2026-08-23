@@ -16,7 +16,7 @@ use objc::Message;
 use metal::{
     BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
     ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
+    MTLPipelineOption, MTLResourceOptions, MTLSize, NSRange, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -813,10 +813,11 @@ pub fn prewarm_large_column_store(bytes: u64) {
 /// install, and only when the stashed pair is actually smaller, so a build that
 /// is mid-flight simply finishes first.
 ///
-/// Writing zeros is semantics-preserving: a fresh `StorageModeShared` buffer is
-/// already zero-filled, and no build can observe this one until it is
-/// published, so the pair a later build takes holds exactly what a fresh
-/// allocation would have held.
+/// Writing zeros is semantics-preserving for the Shared digest-output half of
+/// the pair (a fresh Shared buffer is already zero-filled). The parked sponge
+/// *state* half is `StorageModePrivate`: CPU cannot page-walk it, so
+/// [`allocate_private_blit_filled`] GPU-blits zeros instead. No build can
+/// observe either buffer until the pair is published.
 /// Pre-faulted digest-output buffers for the final block's streamed builds.
 ///
 /// Each streamed build swaps a fresh output buffer in so the completed one can
@@ -856,6 +857,45 @@ fn allocate_page_walked(device: &Device, bytes: u64) -> Option<Buffer> {
     Some(buffer)
 }
 
+/// Allocates a GPU-private sponge-state buffer and GPU-blits zeros through it.
+///
+/// The streamed absorb kernel parks 12 u64 lanes per leaf between RATE-8
+/// passes. CPU never reads that parking lot — first_pass initializes
+/// registers without loading `state`, later passes load GPU-written words —
+/// so `StorageModePrivate` is legal and drops CPU/GPU coherency traffic on
+/// the ~192 MiB 2^21-leaf shape. CPU cannot `contents()`-walk Private, so
+/// residency is paid with a blit `fill_buffer` instead of a store loop.
+///
+/// Blit failure is fail-open: the Private buffer is still returned. A missed
+/// prewarm only defers GPU page faults to the first absorb dispatch; it must
+/// not fall back to Shared (that would silently undo the mechanism).
+fn allocate_private_blit_filled(
+    device: &Device,
+    queue: &CommandQueue,
+    bytes: u64,
+) -> Option<Buffer> {
+    let buffer =
+        autoreleasepool(|| device.new_buffer(bytes, MTLResourceOptions::StorageModePrivate));
+    if buffer.length() < bytes {
+        return None;
+    }
+    let completed = autoreleasepool(|| {
+        let command_buffer = queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.fill_buffer(&buffer, NSRange::new(0, bytes as NSUInteger), 0);
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        command_buffer.status() == MTLCommandBufferStatus::Completed
+    });
+    if !completed {
+        log::debug!(
+            "private streamed-state blit prewarm missed; first absorb will fault pages"
+        );
+    }
+    Some(buffer)
+}
+
 pub fn prewarm_streamed_buffers(leaf_count: usize) {
     let Some(context) = shared_context() else {
         return;
@@ -878,7 +918,9 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
     };
     let (state_bytes, output_bytes) = (state_bytes as u64, output_bytes as u64);
 
-    let Some(state) = allocate_page_walked(&context.device, state_bytes) else {
+    let Some(state) =
+        allocate_private_blit_filled(&context.device, &context.queue, state_bytes)
+    else {
         return;
     };
     let Some(output) = allocate_page_walked(&context.device, output_bytes) else {
@@ -2496,10 +2538,13 @@ pub(crate) fn allocate_columns<F: RichField>(
 /// Hashes retained shared columns without copying them through the pooled
 /// staging buffer.
 /// Retained buffers for the streamed sponge build: the inter-pass state
-/// (12 u64 lanes per leaf, column-major) and the level-order digest output.
+/// (12 u64 lanes per leaf, column-major, `StorageModePrivate`) and the
+/// level-order digest output (`StorageModeShared`, CPU-readable).
 /// One streamed build runs at a time (exclusive proving phases only), so a
 /// single grow-on-demand pair suffices; holding the lock for the whole build
 /// serializes any unexpected second caller onto the classic path.
+/// Isolated ownership change only: do not restack absorb/parent fusion or
+/// extra buffer sets onto this pair (combined package ranked 31.28).
 static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 
 /// Streamed shared-column Merkle build: `fill_group(g, slices)` computes the
@@ -2574,7 +2619,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             (
                 context.device.new_buffer(
                     state_bytes as u64,
-                    MTLResourceOptions::StorageModeShared,
+                    MTLResourceOptions::StorageModePrivate,
                 ),
                 context.device.new_buffer(
                     output_bytes as u64,
