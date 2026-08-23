@@ -639,6 +639,86 @@ pub fn interpolate_over_base_domain<F: Field + Extendable<D>, const D: usize>(
     result
 }
 
+/// Test-only switch that forces `partial_interpolate` back down the generic
+/// fold, so a benchmark can time both arms in one binary instead of comparing
+/// across builds. Outside `cfg(test)` this is a `const fn` returning `false`,
+/// so the production path keeps no branch and no atomic.
+#[cfg(test)]
+pub(crate) static FORCE_GENERIC_INTERPOLATE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+#[inline(always)]
+fn force_generic_interpolate() -> bool {
+    FORCE_GENERIC_INTERPOLATE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+const fn force_generic_interpolate() -> bool {
+    false
+}
+
+/// Routes the production `GoldilocksField`/`QuadraticExtension` instantiation
+/// to the delayed-reduction kernel, and returns `None` for every other field so
+/// the generic fold below stays authoritative.
+fn goldilocks_partial_interpolate<F: Field + Extendable<D>, const D: usize>(
+    domain: &[F],
+    values: &[F::Extension],
+    barycentric_weights: &[F],
+    x: F::Extension,
+    initial_eval: F::Extension,
+    initial_partial_prod: F::Extension,
+) -> Option<(F::Extension, F::Extension)> {
+    use core::any::TypeId;
+
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::field::goldilocks_extensions::ext2_partial_interpolate;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    if force_generic_interpolate()
+        || TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<F::Extension>() != TypeId::of::<QuadraticExtension<GoldilocksField>>()
+    {
+        return None;
+    }
+
+    // SAFETY (every cast below): the `TypeId` compares prove `F` is exactly
+    // `GoldilocksField` and `F::Extension` is exactly
+    // `QuadraticExtension<GoldilocksField>`; only the generic spelling of the
+    // types differs, so the reinterpretations preserve layout, length and
+    // alignment exactly.
+    unsafe {
+        let domain = core::slice::from_raw_parts(
+            domain.as_ptr().cast::<GoldilocksField>(),
+            domain.len(),
+        );
+        let values = core::slice::from_raw_parts(
+            values.as_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+            values.len(),
+        );
+        let weights = core::slice::from_raw_parts(
+            barycentric_weights.as_ptr().cast::<GoldilocksField>(),
+            barycentric_weights.len(),
+        );
+        let cast_ext = |value: F::Extension| -> QuadraticExtension<GoldilocksField> {
+            *(&value as *const F::Extension).cast::<QuadraticExtension<GoldilocksField>>()
+        };
+        let (eval, prod) = ext2_partial_interpolate(
+            domain,
+            values,
+            weights,
+            cast_ext(x),
+            cast_ext(initial_eval),
+            cast_ext(initial_partial_prod),
+        );
+        let back = |value: QuadraticExtension<GoldilocksField>| -> F::Extension {
+            *(&value as *const QuadraticExtension<GoldilocksField>).cast::<F::Extension>()
+        };
+        Some((back(eval), back(prod)))
+    }
+}
+
 /// Perform a partial interpolation of the polynomial defined by its values on an arbitrary domain.
 ///
 /// The Barycentric algorithm to interpolate a polynomial at a given point `x` is a linear pass
@@ -657,7 +737,18 @@ fn partial_interpolate<F: Field + Extendable<D>, const D: usize>(
     let n = domain.len();
     assert_ne!(n, 0);
     assert_eq!(n, values.len());
-    assert_eq!(n, barycentric_weights.len());
+        assert_eq!(n, barycentric_weights.len());
+
+    if let Some(result) = goldilocks_partial_interpolate::<F, D>(
+        domain,
+        values,
+        barycentric_weights,
+        x,
+        initial_eval,
+        initial_partial_prod,
+    ) {
+        return result;
+    }
 
     let weighted_values = values
         .iter()
@@ -756,6 +847,72 @@ mod tests {
     /// batch, including the bounded-degree production shape (subgroup bits 4,
     /// degree 6) used by the recursion circuits, which the public constructor
     /// cannot reach.
+
+    /// The Goldilocks delayed-reduction kernel must agree with the generic
+    /// fold as a field element.
+    #[test]
+    fn goldilocks_partial_interpolate_matches_generic_fold() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FE = <F as Extendable<D>>::Extension;
+
+        let reference = |domain: &[F],
+                         values: &[FE],
+                         weights: &[F],
+                         x: FE,
+                         initial_eval: FE,
+                         initial_prod: FE| {
+            let mut eval = initial_eval;
+            let mut prod = initial_prod;
+            for i in 0..domain.len() {
+                let val = FieldExtension::<D>::scalar_mul(&values[i], weights[i]);
+                let term = x - domain[i].into();
+                eval = eval * term + val * prod;
+                prod = prod * term;
+            }
+            (eval, prod)
+        };
+
+        for len in 1..=16usize {
+            for trial in 0..8 {
+                let mut domain = (0..len).map(|_| F::rand()).collect::<Vec<_>>();
+                let values = (0..len).map(|_| FE::rand()).collect::<Vec<_>>();
+                let weights = (0..len).map(|_| F::rand()).collect::<Vec<_>>();
+                let x = FE::rand();
+                if trial == 0 && len > 1 {
+                    domain[len / 2] = FieldExtension::<D>::to_basefield_array(&x)[0];
+                }
+                let (initial_eval, initial_prod) = match trial {
+                    1 => (FE::ZERO, FE::ONE),
+                    2 => (FE::ONE, FE::ZERO),
+                    3 => (FE::ZERO, FE::ZERO),
+                    _ => (FE::rand(), FE::rand()),
+                };
+
+                let expected = reference(
+                    &domain,
+                    &values,
+                    &weights,
+                    x,
+                    initial_eval,
+                    initial_prod,
+                );
+                let actual = partial_interpolate::<F, D>(
+                    &domain,
+                    &values,
+                    &weights,
+                    x,
+                    initial_eval,
+                    initial_prod,
+                );
+                assert_eq!(
+                    expected, actual,
+                    "len {len} trial {trial}: delayed reduction disagreed with the generic fold"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_accumulate_matches_default_across_batch() {
         const D: usize = 2;

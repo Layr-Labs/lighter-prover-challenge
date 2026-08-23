@@ -1046,7 +1046,18 @@ fn compute_all_lookup_polys<
     }
 }
 
-const BATCH_SIZE: usize = 32;
+/// Compact quotient evaluation batch size.
+///
+/// Degree-14 and degree-16 circuits (the production light shapes) use 256-point
+/// Rayon grains; every other shape keeps the verified 64-point compact path.
+/// Larger grains amortize per-batch gather/setup/dispatch without changing the
+/// gather itself (direct strided LDE views were measured slower).
+fn quotient_batch_size(degree_bits: usize) -> usize {
+    match degree_bits {
+        14 | 16 => 256,
+        _ => 64,
+    }
+}
 
 /// Process-wide counters for the narrow Metal Poseidon2 quotient path. A
 /// successful `started` count proves all of the production guards held: no
@@ -2582,6 +2593,7 @@ fn compute_quotient_polys<
     allow_gpu_poseidon: bool,
 ) -> Vec<PolynomialCoeffs<F>> {
     let num_challenges = common_data.config.num_challenges;
+    let batch_size = quotient_batch_size(common_data.degree_bits());
 
     let has_lookup = common_data.num_lookup_polys != 0;
 
@@ -2762,8 +2774,8 @@ fn compute_quotient_polys<
     let lut_re_poly_evals_refs: Vec<&[F]> =
         lut_re_poly_evals.iter().map(|v| v.as_slice()).collect();
 
-    let points_batches = points.par_chunks(BATCH_SIZE);
-    let num_batches = points.len().div_ceil(BATCH_SIZE);
+    let points_batches = points.par_chunks(batch_size);
+    let num_batches = points.len().div_ceil(batch_size);
 
     struct QuotientScratch<F: RichField> {
         indices: Vec<usize>,
@@ -2884,13 +2896,13 @@ fn compute_quotient_polys<
     let quotient_values_ref = &mut quotient_values;
     let z_h_on_coset_ref = &z_h_on_coset;
     let run_batches = move || quotient_values_ref
-        .par_chunks_mut(BATCH_SIZE * num_challenges)
+        .par_chunks_mut(batch_size * num_challenges)
         .zip(points_batches)
         .enumerate()
         .for_each_init(
             || QuotientScratch::<F> {
-                indices: Vec::with_capacity(BATCH_SIZE),
-                indices_next: Vec::with_capacity(BATCH_SIZE),
+                indices: Vec::with_capacity(batch_size),
+                indices_next: Vec::with_capacity(batch_size),
                 local_constants: Vec::new(),
                 local_wires: Vec::new(),
                 s_sigmas_flat: Vec::new(),
@@ -2901,15 +2913,15 @@ fn compute_quotient_polys<
             |scratch, (batch_i, (quotient_values_batch, xs_batch))| {
                 // Each batch must be the same size, except the last one, which may be smaller.
                 debug_assert!(
-                    xs_batch.len() == BATCH_SIZE
-                        || (batch_i == num_batches - 1 && xs_batch.len() <= BATCH_SIZE)
+                    xs_batch.len() == batch_size
+                        || (batch_i == num_batches - 1 && xs_batch.len() <= batch_size)
                 );
 
                 let n = xs_batch.len();
                 scratch.indices.clear();
                 scratch
                     .indices
-                    .extend(BATCH_SIZE * batch_i..BATCH_SIZE * batch_i + n);
+                    .extend(batch_size * batch_i..batch_size * batch_i + n);
                 scratch.indices_next.clear();
                 // The wrapped "next" indices exist for exactly one consumer: the
                 // permutation argument's Z(g x) column. When the permutation
@@ -2928,7 +2940,7 @@ fn compute_quotient_polys<
                         .extend(scratch.indices.iter().map(|&i| (i + next_step) & lde_mask));
                 }
 
-                let shifted_xs_batch = &shifted_points[BATCH_SIZE * batch_i..][..n];
+                let shifted_xs_batch = &shifted_points[batch_size * batch_i..][..n];
                 debug_assert!(
                     shifted_xs_batch
                         .iter()
@@ -2940,7 +2952,7 @@ fn compute_quotient_polys<
                 // quotient-domain values were extracted once at circuit build
                 // time; copy them per batch instead of re-walking the strided
                 // LDE (which amplifies cache-line traffic 8x at step 8).
-                let cache_start = BATCH_SIZE * batch_i;
+                let cache_start = batch_size * batch_i;
                 // The cache is column-major (`PolyMajor`); the per-point
                 // (`PointMajor`) path with lookups keeps the original gathers.
                 let constants_cache = if col_major_perm {
@@ -3377,10 +3389,10 @@ fn compute_quotient_polys<
         // CPU-only path: parallel scatter of the interleaved point-major
         // buffer into the per-challenge columns.
         quotient_values
-            .par_chunks(BATCH_SIZE * num_challenges)
+            .par_chunks(batch_size * num_challenges)
             .enumerate()
             .for_each(|(chunk_i, chunk)| {
-                let base = BATCH_SIZE * chunk_i;
+                let base = batch_size * chunk_i;
                 for (k, point_values) in chunk.chunks_exact(num_challenges).enumerate() {
                     // Applies the `1/Z_H` scaling the batch loop deferred; on
                     // this branch there is nothing to sum in first, so the
