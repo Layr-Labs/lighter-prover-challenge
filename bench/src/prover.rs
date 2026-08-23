@@ -34,6 +34,26 @@ use plonky2::util::timing::TimingTree;
 
 use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
 
+/// Bounded Rayon pool for the final-block circuit build lane.
+///
+/// The block lane has deadline slack (it joins the heavy path, then waits for
+/// the much longer light path), so its CPU-heavy `build_block_circuit` work
+/// competes with the light transaction pipeline for the global pool without
+/// helping the critical path. Running it on a smaller dedicated pool caps that
+/// interference.
+static BLOCK_BUILD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+fn block_build_pool() -> &'static rayon::ThreadPool {
+    BLOCK_BUILD_POOL.get_or_init(|| {
+        let threads = (rayon::current_num_threads() / 2).clamp(2, 8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build()
+            .expect("cannot build bounded block-build lane pool")
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
     Heavy,
@@ -909,6 +929,24 @@ fn prove_path(
                 // wires store because that one is the larger fault set and the
                 // block reaches it first.
                 plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
+                // The final block's three GPU quotient jobs each allocate a
+                // one-off ~32 MiB output (above the quotient pool cap) in the
+                // same serial window. Pre-fault them here too.
+                const FINAL_QUOTIENT_BYTES: u64 = (1 << 21) * 2 * 8;
+                for _ in 0..3 {
+                    plonky2::hash::poseidon2::prewarm_final_quotient_output(FINAL_QUOTIENT_BYTES);
+                }
+                // The final block also allocates and writes ~64 MiB of
+                // CPU-side quotient scratch: the point-major quotient values
+                // (2^21 points x 2 challenges x 8 B = 32 MiB) and the two
+                // challenge columns (2 x 16 MiB). These are jemalloc-backed,
+                // so touching and dropping a same-size scratch vector leaves
+                // the pages resident in the allocator's default decay window
+                // and the final-block allocations reuse them without fresh
+                // kernel zero-faults. A size mismatch or allocator policy
+                // change simply falls through to the normal allocation.
+                let final_cpu_scratch = vec![0u64; 8 << 20];
+                drop(final_cpu_scratch);
             })
             .ok();
     }
@@ -1076,7 +1114,7 @@ pub(crate) fn prove_block_after_pre(
                         #[cfg(feature = "diagnostic_profile")]
                         let _span =
                             plonky2::util::profile::span("orchestration", "build_block_circuit");
-                        circuits.build_block_circuit()
+                        block_build_pool().install(|| circuits.build_block_circuit())
                     };
                     let block_data: &'static CircuitData<F, C, D> =
                         Box::leak(Box::new(block_data));

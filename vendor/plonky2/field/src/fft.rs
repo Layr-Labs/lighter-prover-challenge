@@ -1047,9 +1047,15 @@ fn fft_classic_simd_single_layer_neon_ext(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    // A root row is `base.powers().take(half_m.max(2))`, so row[1] is the
+    // generator itself. If that generator is in the base subfield (extension
+    // component zero), every power in the row is too; if it is not, row[1]
+    // carries the extension component. Checking the generator is therefore
+    // exact and removes the previous O(half) scan of every row element on
+    // every layer. No arithmetic is skipped: the boolean selects exactly the
+    // same multiplication form the scan would have chosen.
+    debug_assert!(omega_row.len() >= 2, "root rows are at least two elements");
+    let base_subfield = omega_row[1].0[1].0 == 0;
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;

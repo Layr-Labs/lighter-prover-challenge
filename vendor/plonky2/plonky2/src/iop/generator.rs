@@ -144,17 +144,27 @@ impl<'a> TargetReadiness<'a> {
     /// unresolved count is already zero can do anything in the first round. The others are queued
     /// exactly once when their final missing representative is populated. General incremental
     /// generators retain the legacy all-generators first round.
-    fn initial_worklist(&self, generators_defer_until_ready: bool) -> Vec<usize> {
+    fn initial_worklist(&self, generators_defer_until_ready: bool) -> Vec<u32> {
         let mut pending = Vec::with_capacity(self.unresolved.len());
         if generators_defer_until_ready {
             pending.extend(
                 self.unresolved
                     .iter()
                     .enumerate()
-                    .filter_map(|(generator, &unresolved)| (unresolved == 0).then_some(generator)),
+                    .filter_map(|(generator, &unresolved)| {
+                        (unresolved == 0).then(|| {
+                            u32::try_from(generator)
+                                .expect("generator index exceeds the CSR u32 edge index")
+                        })
+                    }),
             );
         } else {
-            pending.extend(0..self.unresolved.len());
+            pending.extend(
+                (0..self.unresolved.len()).map(|generator| {
+                    u32::try_from(generator)
+                        .expect("generator index exceeds the CSR u32 edge index")
+                }),
+            );
         }
         pending
     }
@@ -180,7 +190,7 @@ impl<'a> TargetReadiness<'a> {
         &mut self,
         representative: usize,
         generator_is_expired: &[bool],
-        pending: &mut Vec<usize>,
+        pending: &mut Vec<u32>,
         generators_defer_until_ready: bool,
     ) {
         if let Some(watchers) = self.watchers.get(&representative) {
@@ -198,7 +208,7 @@ impl<'a> TargetReadiness<'a> {
         &mut self,
         watchers: &[u32],
         generator_is_expired: &[bool],
-        pending: &mut Vec<usize>,
+        pending: &mut Vec<u32>,
         generators_defer_until_ready: bool,
     ) {
         for &generator in watchers {
@@ -209,7 +219,7 @@ impl<'a> TargetReadiness<'a> {
                     generators_defer_until_ready,
                 )
             {
-                pending.push(generator);
+                pending.push(generator as u32);
             }
         }
     }
@@ -247,7 +257,7 @@ fn run_generator_worklist<
     readiness: &mut TargetReadiness<'_>,
     generator_is_expired: &mut [bool],
     remaining_generators: &mut usize,
-    mut pending_generator_indices: Vec<usize>,
+    mut pending_generator_indices: Vec<u32>,
     parallel_threshold: usize,
 ) -> Result<()> {
     let generators = &prover_data.generators;
@@ -308,6 +318,7 @@ fn run_generator_worklist<
                     let mut annotated_values = Vec::with_capacity(chunk.len());
                     let mut round_buffer = GeneratedValues::empty();
                     for &generator_idx in chunk {
+                        let generator_idx = generator_idx as usize;
                         if round_generator_is_expired[generator_idx] {
                             continue;
                         }
@@ -390,6 +401,7 @@ fn run_generator_worklist<
         }
 
         for &generator_idx in &pending_generator_indices {
+            let generator_idx = generator_idx as usize;
             if generator_is_expired[generator_idx] {
                 continue;
             }
@@ -664,7 +676,7 @@ pub struct PartitionFeeder<'a, 'b, F: Field> {
     witness: &'b mut PartitionWitness<'a, F>,
     readiness: &'b mut TargetReadiness<'a>,
     generator_is_expired: &'b [bool],
-    pending_generator_indices: &'b mut Vec<usize>,
+    pending_generator_indices: &'b mut Vec<u32>,
     generators_defer_until_ready: bool,
 }
 
