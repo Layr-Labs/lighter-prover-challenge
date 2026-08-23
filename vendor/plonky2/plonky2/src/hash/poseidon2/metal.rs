@@ -2614,7 +2614,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // ambiguous whether that time is CPU work or GPU queue wait.
             #[cfg(feature = "diagnostic_profile")]
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
-            fill_group(group, &mut slices);
+            fill_group(col_start, &mut slices);
         }
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = context.queue.new_command_buffer();
@@ -7375,7 +7375,7 @@ kernel void goldilocks_mul_bench_native(
             cap_height,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    destination.fill(F::from_canonical_usize(group + index + 1));
                 }
             },
         )
