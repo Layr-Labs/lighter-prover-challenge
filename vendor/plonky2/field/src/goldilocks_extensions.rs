@@ -877,6 +877,97 @@ pub(crate) fn ext2_mul(a: [u64; 2], b: [u64; 2]) -> [GoldilocksField; 2] {
     [c0, c1]
 }
 
+/// One delayed-reduction barycentric step: next_eval = eval*(t0,x1)+val*prod
+/// and next_prod = prod*(t0,x1), with a single reduce160 per limb.
+#[inline(always)]
+fn ext2_interpolate_step(
+    eval: [u64; 2],
+    val: [u64; 2],
+    prod: [u64; 2],
+    t0: u64,
+    x1: u64,
+) -> ([GoldilocksField; 2], [GoldilocksField; 2]) {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+
+    let [e0, e1] = eval;
+    let [v0, v1] = val;
+    let [p0, p1] = prod;
+
+    let (mut c0_plain_lo, mut c0_plain_hi) = (0u128, 0u32);
+    let (mut c0_w_lo, mut c0_w_hi) = (0u128, 0u32);
+    let (mut c1_lo, mut c1_hi) = (0u128, 0u32);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, e0, t0);
+    u160_add_product(&mut c0_plain_lo, &mut c0_plain_hi, v0, p0);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, e1, x1);
+    u160_add_product(&mut c0_w_lo, &mut c0_w_hi, v1, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e0, x1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, e1, t0);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v0, p1);
+    u160_add_product(&mut c1_lo, &mut c1_hi, v1, p0);
+
+    let (c0_w_lo, c0_w_hi) = u160_times_7(c0_w_lo, c0_w_hi);
+    let (c0_lo, carry) = c0_plain_lo.overflowing_add(c0_w_lo);
+    let c0_hi = c0_plain_hi + c0_w_hi + carry as u32;
+
+    let (mut d0_plain_lo, mut d0_plain_hi) = (0u128, 0u32);
+    let (mut d0_w_lo, mut d0_w_hi) = (0u128, 0u32);
+    let (mut d1_lo, mut d1_hi) = (0u128, 0u32);
+    u160_add_product(&mut d0_plain_lo, &mut d0_plain_hi, p0, t0);
+    u160_add_product(&mut d0_w_lo, &mut d0_w_hi, p1, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p0, x1);
+    u160_add_product(&mut d1_lo, &mut d1_hi, p1, t0);
+
+    let (d0_w_lo, d0_w_hi) = u160_times_7(d0_w_lo, d0_w_hi);
+    let (d0_lo, carry) = d0_plain_lo.overflowing_add(d0_w_lo);
+    let d0_hi = d0_plain_hi + d0_w_hi + carry as u32;
+
+    // SAFETY: accumulators stay far below reduce160's bound.
+    unsafe {
+        (
+            [reduce160(c0_lo, c0_hi), reduce160(c1_lo, c1_hi)],
+            [reduce160(d0_lo, d0_hi), reduce160(d1_lo, d1_hi)],
+        )
+    }
+}
+
+/// Delayed-reduction Goldilocks quadratic barycentric partial interpolate.
+/// Value-identical to the generic fold modulo p; representatives may differ.
+pub fn ext2_partial_interpolate(
+    domain: &[GoldilocksField],
+    values: &[QuadraticExtension<GoldilocksField>],
+    barycentric_weights: &[GoldilocksField],
+    x: QuadraticExtension<GoldilocksField>,
+    initial_eval: QuadraticExtension<GoldilocksField>,
+    initial_partial_prod: QuadraticExtension<GoldilocksField>,
+) -> (
+    QuadraticExtension<GoldilocksField>,
+    QuadraticExtension<GoldilocksField>,
+) {
+    debug_assert_eq!(domain.len(), values.len());
+    debug_assert_eq!(domain.len(), barycentric_weights.len());
+
+    let QuadraticExtension([x0, x1]) = x;
+    let QuadraticExtension([e0, e1]) = initial_eval;
+    let QuadraticExtension([p0, p1]) = initial_partial_prod;
+    let mut eval = [e0.0, e1.0];
+    let mut prod = [p0.0, p1.0];
+
+    for i in 0..domain.len() {
+        let QuadraticExtension([v0, v1]) = values[i];
+        let weight = barycentric_weights[i];
+        let val = [(v0 * weight).0, (v1 * weight).0];
+        let t0 = (x0 - domain[i]).0;
+        let (next_eval, next_prod) = ext2_interpolate_step(eval, val, prod, t0, x1.0);
+        eval = [next_eval[0].0, next_eval[1].0];
+        prod = [next_prod[0].0, next_prod[1].0];
+    }
+
+    (
+        QuadraticExtension([GoldilocksField(eval[0]), GoldilocksField(eval[1])]),
+        QuadraticExtension([GoldilocksField(prod[0]), GoldilocksField(prod[1])]),
+    )
+}
+
 /*
  * Quartic multiplication and squaring
  */

@@ -646,6 +646,59 @@ pub fn interpolate_over_base_domain<F: Field + Extendable<D>, const D: usize>(
 /// accumulated values, a partial evaluation and a partial product. This partially updates the
 /// accumulated values, so that starting with an initial evaluation of 0 and a partial evaluation
 /// of 1 and running over the whole domain is a full interpolation.
+fn goldilocks_partial_interpolate<F: Field + Extendable<D>, const D: usize>(
+    domain: &[F],
+    values: &[F::Extension],
+    barycentric_weights: &[F],
+    x: F::Extension,
+    initial_eval: F::Extension,
+    initial_partial_prod: F::Extension,
+) -> Option<(F::Extension, F::Extension)> {
+    use core::any::TypeId;
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::field::goldilocks_extensions::ext2_partial_interpolate;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<F::Extension>() != TypeId::of::<QuadraticExtension<GoldilocksField>>()
+    {
+        return None;
+    }
+    // SAFETY: TypeId proves F is GoldilocksField and F::Extension is
+    // QuadraticExtension<GoldilocksField>; only the generic spelling differs.
+    unsafe {
+        let domain = core::slice::from_raw_parts(
+            domain.as_ptr().cast::<GoldilocksField>(),
+            domain.len(),
+        );
+        let values = core::slice::from_raw_parts(
+            values
+                .as_ptr()
+                .cast::<QuadraticExtension<GoldilocksField>>(),
+            values.len(),
+        );
+        let weights = core::slice::from_raw_parts(
+            barycentric_weights.as_ptr().cast::<GoldilocksField>(),
+            barycentric_weights.len(),
+        );
+        let cast_ext = |value: F::Extension| -> QuadraticExtension<GoldilocksField> {
+            *(&value as *const F::Extension).cast::<QuadraticExtension<GoldilocksField>>()
+        };
+        let (eval, prod) = ext2_partial_interpolate(
+            domain,
+            values,
+            weights,
+            cast_ext(x),
+            cast_ext(initial_eval),
+            cast_ext(initial_partial_prod),
+        );
+        let cast_back = |value: QuadraticExtension<GoldilocksField>| -> F::Extension {
+            *(&value as *const QuadraticExtension<GoldilocksField>).cast::<F::Extension>()
+        };
+        Some((cast_back(eval), cast_back(prod)))
+    }
+}
+
 fn partial_interpolate<F: Field + Extendable<D>, const D: usize>(
     domain: &[F],
     values: &[F::Extension],
@@ -654,6 +707,16 @@ fn partial_interpolate<F: Field + Extendable<D>, const D: usize>(
     initial_eval: F::Extension,
     initial_partial_prod: F::Extension,
 ) -> (F::Extension, F::Extension) {
+    if let Some(specialized) = goldilocks_partial_interpolate(
+        domain,
+        values,
+        barycentric_weights,
+        x,
+        initial_eval,
+        initial_partial_prod,
+    ) {
+        return specialized;
+    }
     let n = domain.len();
     assert_ne!(n, 0);
     assert_eq!(n, values.len());
