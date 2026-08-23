@@ -382,10 +382,33 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
                 for k in 0..vec_size / 2 {
                     let xs = col(self.wire_list_item(2 * k, copy));
                     let ys = col(self.wire_list_item(2 * k + 1, copy));
-                    for p in 0..n {
+                    // Four independent points expose enough scalar ILP to
+                    // overlap Goldilocks multiply reductions without changing
+                    // the per-point expression or its raw representative.
+                    let mut p = 0;
+                    while p + 4 <= n {
+                        let x0 = xs[p];
+                        let y0 = ys[p];
+                        let x1 = xs[p + 1];
+                        let y1 = ys[p + 1];
+                        let x2 = xs[p + 2];
+                        let y2 = ys[p + 2];
+                        let x3 = xs[p + 3];
+                        let y3 = ys[p + 3];
+                        items_uninit[k * n + p].write(x0 + b[p] * (y0 - x0));
+                        items_uninit[k * n + p + 1]
+                            .write(x1 + b[p + 1] * (y1 - x1));
+                        items_uninit[k * n + p + 2]
+                            .write(x2 + b[p + 2] * (y2 - x2));
+                        items_uninit[k * n + p + 3]
+                            .write(x3 + b[p + 3] * (y3 - x3));
+                        p += 4;
+                    }
+                    while p < n {
                         let x = xs[p];
                         let y = ys[p];
                         items_uninit[k * n + p].write(x + b[p] * (y - x));
+                        p += 1;
                     }
                 }
             }
@@ -399,10 +422,27 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for RandomAccessGa
             for i in 1..self.bits {
                 let b = col(self.wire_bit(i, copy));
                 for k in 0..level_size / 2 {
-                    for p in 0..n {
+                    let mut p = 0;
+                    while p + 4 <= n {
+                        let x0 = items[2 * k * n + p];
+                        let y0 = items[(2 * k + 1) * n + p];
+                        let x1 = items[2 * k * n + p + 1];
+                        let y1 = items[(2 * k + 1) * n + p + 1];
+                        let x2 = items[2 * k * n + p + 2];
+                        let y2 = items[(2 * k + 1) * n + p + 2];
+                        let x3 = items[2 * k * n + p + 3];
+                        let y3 = items[(2 * k + 1) * n + p + 3];
+                        items[k * n + p] = x0 + b[p] * (y0 - x0);
+                        items[k * n + p + 1] = x1 + b[p + 1] * (y1 - x1);
+                        items[k * n + p + 2] = x2 + b[p + 2] * (y2 - x2);
+                        items[k * n + p + 3] = x3 + b[p + 3] * (y3 - x3);
+                        p += 4;
+                    }
+                    while p < n {
                         let x = items[2 * k * n + p];
                         let y = items[(2 * k + 1) * n + p];
                         items[k * n + p] = x + b[p] * (y - x);
+                        p += 1;
                     }
                 }
                 level_size /= 2;
