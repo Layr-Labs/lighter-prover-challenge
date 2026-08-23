@@ -1671,6 +1671,42 @@ fn spine_urgent() -> bool {
     SPINE_BACKLOG.load(core::sync::atomic::Ordering::Relaxed) >= SPINE_URGENT_BACKLOG
 }
 
+/// exp-spine-gate: while a chain proof is in flight (`spine_urgent`), defer
+/// submissions of Merkle trees larger than the chain domain so the serial
+/// spine's own GPU work never queues behind hideable tx-chunk commitments
+/// (the join-window contention measured as `chain_predecessor_join`).
+/// Chain-side trees live on exactly the 2^17 domain and pass unconditionally.
+/// Bounded park preserves liveness even if the backlog flag leaks.
+static SPINE_GATE_DISABLED: core::sync::atomic::AtomicU8 =
+    core::sync::atomic::AtomicU8::new(0);
+
+fn spine_gate_disabled() -> bool {
+    use core::sync::atomic::Ordering;
+    match SPINE_GATE_DISABLED.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let disabled =
+                std::env::var_os("LIGHTER_DISABLE_SPINE_GATE").is_some();
+            SPINE_GATE_DISABLED.store(if disabled { 2 } else { 1 }, Ordering::Relaxed);
+            disabled
+        }
+    }
+}
+
+fn gate_hideable_submission(leaf_count: usize) {
+    const CHAIN_DOMAIN_LEAVES: usize = 1 << 17;
+    const PARK_CAP_MS: u128 = 4000;
+    if leaf_count <= CHAIN_DOMAIN_LEAVES || spine_gate_disabled() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while spine_urgent() && started.elapsed().as_millis() < PARK_CAP_MS {
+        std::thread::sleep(std::time::Duration::from_micros(250));
+    }
+}
+
+
 /// Number of Merkle builds currently occupying the serialized GPU stream
 /// (from buffer acquisition through `wait_until_completed`). Routing reads
 /// this to decide whether a small serial-path tree would enqueue behind
@@ -1788,6 +1824,7 @@ pub(crate) fn build_merkle_tree<F: RichField>(
     leaf_count: usize,
     cap_height: usize,
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    gate_hideable_submission(leaf_count);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaves.len() != leaf_count * leaf_width
@@ -1814,6 +1851,7 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.len();
     let leaf_count = columns.first().map_or(0, Vec::len);
+    gate_hideable_submission(leaf_count);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_count == 0
@@ -2525,6 +2563,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
+    gate_hideable_submission(leaf_count);
     // Exclusive phases stream the 2^20+ trees as before. Outside them, the
     // pipelined 2^19 commitments also stream: streaming converts the proof's
     // serial CPU-fill-then-GPU-hash into max(fill, hash), and it runs out of
@@ -2630,7 +2669,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch_hash(encoder, pipeline, leaf_count);
+            dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2731,6 +2770,7 @@ pub(crate) fn build_merkle_tree_shared<F: RichField>(
 ) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
+    gate_hideable_submission(leaf_count);
     if F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || leaf_width == 0
@@ -4458,38 +4498,10 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
-    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
-}
-
-fn dispatch_hash(
-    encoder: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
-    thread_count: usize,
-) {
-    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
-}
-
-fn hash_threadgroup_cap() -> NSUInteger {
-    static CAP: std::sync::OnceLock<NSUInteger> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("LIGHTER_HASH_TG")
-            .ok()
-            .and_then(|value| value.parse::<NSUInteger>().ok())
-            .filter(|&value| (32..=1024).contains(&value) && value.is_power_of_two())
-            .unwrap_or(256)
-    })
-}
-
-fn dispatch_with_group_cap(
-    encoder: &metal::ComputeCommandEncoderRef,
-    pipeline: &ComputePipelineState,
-    thread_count: usize,
-    cap: NSUInteger,
-) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(cap)
+        .min(128)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
