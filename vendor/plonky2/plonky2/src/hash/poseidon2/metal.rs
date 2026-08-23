@@ -2630,7 +2630,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch_hash(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -2671,7 +2671,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
                     );
                     encoder.set_buffer(2, Some(&context.parameters), 0);
                     set_u32(encoder, 3, parent_count_u32);
-                    dispatch(encoder, &context.parent_pipeline, parent_count);
+                    dispatch_hash(encoder, &context.parent_pipeline, parent_count);
 
                     child_count = parent_count;
                 }
@@ -3866,7 +3866,7 @@ impl MetalShared {
                 set_u32(leaf_encoder, 3, cols_u32);
                 set_u32(leaf_encoder, 4, lde_size_u32);
                 set_u32(leaf_encoder, 5, log_lde);
-                dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
+                dispatch_hash(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
                 leaf_encoder.end_encoding();
 
                 let mut level_offset = 0usize;
@@ -3893,7 +3893,7 @@ impl MetalShared {
                     );
                     parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                     set_u32(parent_encoder, 3, parent_count_u32);
-                    dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                    dispatch_hash(parent_encoder, &self.parent_pipeline, parent_count);
                     parent_encoder.end_encoding();
 
                     child_count = parent_count;
@@ -4130,7 +4130,7 @@ impl MetalShared {
             set_u32(leaf_encoder, 3, cols_u32);
             set_u32(leaf_encoder, 4, lde_size_u32);
             set_u32(leaf_encoder, 5, log_lde);
-            dispatch(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
+            dispatch_hash(leaf_encoder, &self.leaf_colmajor_pipeline, lde_size);
             leaf_encoder.end_encoding();
 
             let mut level_offset = 0usize;
@@ -4157,7 +4157,7 @@ impl MetalShared {
                 );
                 parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                 set_u32(parent_encoder, 3, parent_count_u32);
-                dispatch(parent_encoder, &self.parent_pipeline, parent_count);
+                dispatch_hash(parent_encoder, &self.parent_pipeline, parent_count);
                 parent_encoder.end_encoding();
 
                 child_count = parent_count;
@@ -4349,7 +4349,7 @@ impl MetalShared {
                     (&log_leaf_count_u32 as *const u32).cast::<c_void>(),
                 );
             }
-            dispatch(encoder, leaf_pipeline, leaf_count);
+            dispatch_hash(encoder, leaf_pipeline, leaf_count);
 
             let mut level_offset = 0usize;
             let mut child_count = leaf_count;
@@ -4386,7 +4386,7 @@ impl MetalShared {
                     size_of::<u32>() as NSUInteger,
                     (&parent_count_u32 as *const u32).cast::<c_void>(),
                 );
-                dispatch(encoder, &self.parent_pipeline, parent_count);
+                dispatch_hash(encoder, &self.parent_pipeline, parent_count);
 
                 child_count = parent_count;
             }
@@ -4463,6 +4463,46 @@ fn dispatch(
         .max_total_threads_per_threadgroup()
         .min(128)
         .max(execution_width);
+    encoder.dispatch_threads(
+        MTLSize {
+            width: thread_count as NSUInteger,
+            height: 1,
+            depth: 1,
+        },
+        MTLSize {
+            width: group_width,
+            height: 1,
+            depth: 1,
+        },
+    );
+}
+
+/// Hash / Merkle Poseidon2 kernels are gid-bounded with zero threadgroup
+/// memory. Occupancy is therefore limited by the host cap, not by registers
+/// or tg memory. Tip hard-caps them at 128; M-series PSO ceiling is 1024.
+/// Launch at the ceiling (env `LIGHTER_HASH_TG` still A/B 32..=1024, power
+/// of two) and shrink the group on tiny parent levels so a 2-node level
+/// does not launch a 1024-wide group.
+fn hash_group_width(pipeline: &ComputePipelineState, thread_count: usize) -> NSUInteger {
+    let execution_width = pipeline.thread_execution_width().max(1);
+    let pso_ceiling = pipeline.max_total_threads_per_threadgroup();
+    let requested = std::env::var("LIGHTER_HASH_TG")
+        .ok()
+        .and_then(|value| value.parse::<NSUInteger>().ok())
+        .filter(|&value| (32..=1024).contains(&value) && value.is_power_of_two())
+        .unwrap_or(1024);
+    let cap = pso_ceiling.min(requested).max(execution_width);
+    let simd = execution_width;
+    let rounded = ((thread_count as NSUInteger + simd - 1) / simd) * simd;
+    cap.min(rounded.max(simd))
+}
+
+fn dispatch_hash(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    let group_width = hash_group_width(pipeline, thread_count);
     encoder.dispatch_threads(
         MTLSize {
             width: thread_count as NSUInteger,
@@ -6725,7 +6765,7 @@ kernel void goldilocks_mul_bench_native(
                 leaf_encoder.set_buffer(2, Some(&self.parameters), 0);
                 set_u32(leaf_encoder, 3, leaf_width as u32);
                 set_u32(leaf_encoder, 4, leaf_count as u32);
-                dispatch(leaf_encoder, leaf_pipeline, leaf_count);
+                dispatch_hash(leaf_encoder, leaf_pipeline, leaf_count);
                 leaf_encoder.end_encoding();
 
                 let cap_count = 1usize << cap_height;
@@ -6749,7 +6789,7 @@ kernel void goldilocks_mul_bench_native(
                     );
                     parent_encoder.set_buffer(2, Some(&self.parameters), 0);
                     set_u32(parent_encoder, 3, parent_count as u32);
-                    dispatch(parent_encoder, parent_pipeline, parent_count);
+                    dispatch_hash(parent_encoder, parent_pipeline, parent_count);
                     parent_encoder.end_encoding();
                     child_count = parent_count;
                 }
