@@ -100,6 +100,13 @@ pub enum MerkleLeaves<F> {
         columns: ColumnStore<F>,
         log_rows: usize,
     },
+    /// FRI arity-16 leaves backed by two natural-order extension limbs.
+    /// Logical leaf `i` gathers sixteen bit-reversed evaluations and
+    /// interleaves their two limbs; only sparse query leaves are materialized.
+    FriExt2Columns {
+        columns: ColumnStore<F>,
+        leaf_count: usize,
+    },
 }
 
 /// Storage for level-order digests. Metal-produced nodes can remain in their
@@ -491,7 +498,7 @@ pub(crate) fn fill_subtree_flat<F: RichField, H: Hasher<F>>(
 
         // Rayon task creation dominates the tiny subtrees near the leaves. Keep
         // enough parallelism at the upper levels, then recurse synchronously.
-        let (left_digest, right_digest) = if num_leaves > 64 {
+        let (left_digest, right_digest) = if num_leaves > 128 {
             plonky2_maybe_rayon::join(
                 || fill_subtree_flat::<F, H>(left_digests_buf, left_leaves, leaf_width, half),
                 || fill_subtree_flat::<F, H>(right_digests_buf, right_leaves, leaf_width, half),
@@ -581,7 +588,7 @@ pub(crate) fn fill_subtree_gather<F: RichField, H: Hasher<F>>(
 
     // Same threshold as `fill_subtree_flat`: rayon task creation dominates the
     // tiny subtrees near the leaves.
-    let (left_digest, right_digest) = if num_leaves > 64 {
+    let (left_digest, right_digest) = if num_leaves > 128 {
         plonky2_maybe_rayon::join(
             || {
                 fill_subtree_gather::<F, H>(left_digests_buf, columns, log_rows, start_leaf, half)
@@ -908,6 +915,56 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         }
     }
 
+    /// Wraps an already-hashed flat row-major leaf buffer. Used when a GPU
+    /// producer computes a nonstandard logical leaf grouping but queries still
+    /// need the ordinary borrowed row representation.
+    pub fn from_prebuilt_flat(
+        leaves: Vec<F>,
+        leaf_width: usize,
+        level_digests: LevelOrderDigests<H::Hash>,
+        cap: Vec<H::Hash>,
+    ) -> Self {
+        assert!(leaf_width > 0);
+        assert_eq!(leaves.len() % leaf_width, 0);
+        let num_leaves = leaves.len() / leaf_width;
+        debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - cap.len());
+        Self {
+            leaves: MerkleLeaves::Rows {
+                data: leaves,
+                width: leaf_width,
+            },
+            num_leaves,
+            digests: Vec::new(),
+            level_digests: Some(level_digests),
+            cap: MerkleCap(cap),
+        }
+    }
+
+    /// Wrap FRI's two retained natural-order evaluation columns without
+    /// copying the full codeword into row-major query storage.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    pub fn from_prebuilt_fri_ext2_columns(
+        columns: crate::hash::poseidon2::metal::MetalColumns<F>,
+        level_digests: LevelOrderDigests<H::Hash>,
+        cap: Vec<H::Hash>,
+    ) -> Self {
+        assert_eq!(columns.cols(), 2);
+        assert_eq!(columns.rows() % 16, 0);
+        let num_leaves = columns.rows() / 16;
+        assert!(num_leaves.is_power_of_two());
+        debug_assert_eq!(level_digests.nodes.len(), 2 * num_leaves - cap.len());
+        Self {
+            leaves: MerkleLeaves::FriExt2Columns {
+                columns: ColumnStore::Shared(columns),
+                leaf_count: num_leaves,
+            },
+            num_leaves,
+            digests: Vec::new(),
+            level_digests: Some(level_digests),
+            cap: MerkleCap(cap),
+        }
+    }
+
     /// [`Self::cpu_digests`] reading natural-order columns instead of a
     /// materialized bit-reversed matrix.
     fn cpu_digests_gather(
@@ -1024,6 +1081,7 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
         match &self.leaves {
             MerkleLeaves::Rows { width, .. } => *width,
             MerkleLeaves::Columns { columns, .. } => columns.num_cols(),
+            MerkleLeaves::FriExt2Columns { .. } => 32,
         }
     }
 
@@ -1033,6 +1091,9 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
             MerkleLeaves::Rows { data, width } => &data[i * width..(i + 1) * width],
             MerkleLeaves::Columns { .. } => {
                 panic!("MerkleTree::get is unavailable for column-major leaves")
+            }
+            MerkleLeaves::FriExt2Columns { .. } => {
+                panic!("MerkleTree::get is unavailable for FRI ext2 column leaves")
             }
         }
     }
@@ -1046,6 +1107,23 @@ impl<F: RichField, H: Hasher<F>> MerkleTree<F, H> {
                 (0..columns.num_cols())
                     .map(|j| columns.col(j)[natural])
                     .collect()
+            }
+            MerkleLeaves::FriExt2Columns {
+                columns,
+                leaf_count,
+            } => {
+                let log_leaves = log2_strict(*leaf_count);
+                let natural_base = crate::util::reverse_bits(i, log_leaves);
+                let limb0 = columns.col(0);
+                let limb1 = columns.col(1);
+                let mut leaf = Vec::with_capacity(32);
+                for j in 0..16 {
+                    let row = natural_base
+                        + crate::util::reverse_bits(j, 4) * *leaf_count;
+                    leaf.push(limb0[row]);
+                    leaf.push(limb1[row]);
+                }
+                leaf
             }
         }
     }
