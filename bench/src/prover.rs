@@ -909,6 +909,24 @@ fn prove_path(
                 // wires store because that one is the larger fault set and the
                 // block reaches it first.
                 plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
+                // The final block's three GPU quotient jobs each allocate a
+                // one-off ~32 MiB output (above the quotient pool cap) in the
+                // same serial window. Pre-fault them here too.
+                const FINAL_QUOTIENT_BYTES: u64 = (1 << 21) * 2 * 8;
+                for _ in 0..3 {
+                    plonky2::hash::poseidon2::prewarm_final_quotient_output(FINAL_QUOTIENT_BYTES);
+                }
+                // The final block also allocates and writes ~64 MiB of
+                // CPU-side quotient scratch: the point-major quotient values
+                // (2^21 points x 2 challenges x 8 B = 32 MiB) and the two
+                // challenge columns (2 x 16 MiB). These are jemalloc-backed,
+                // so touching and dropping a same-size scratch vector leaves
+                // the pages resident in the allocator's default decay window
+                // and the final-block allocations reuse them without fresh
+                // kernel zero-faults. A size mismatch or allocator policy
+                // change simply falls through to the normal allocation.
+                let final_cpu_scratch = vec![0u64; 8 << 20];
+                drop(final_cpu_scratch);
             })
             .ok();
     }
