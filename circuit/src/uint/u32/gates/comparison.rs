@@ -232,29 +232,41 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
         let chunk_size = 1usize << chunk_bits;
         let three = F::from_canonical_usize(3);
         let mut chunks_iter = combined_gate_constraints.chunks_exact_mut(n);
-        let mut scratch = vec![F::ZERO; n];
-        let mut most_significant_diff_so_far = vec![F::ZERO; n];
+        // Batches are 32 points in this prover; keep the scratch rows on the
+        // stack and fall back to the heap only for oversized batches.
+        let mut scratch_stack = [F::ZERO; 64];
+        let mut msd_stack = [F::ZERO; 64];
+        let mut scratch_heap;
+        let mut msd_heap;
+        let (scratch, most_significant_diff_so_far): (&mut [F], &mut [F]) = if n <= 64 {
+            (&mut scratch_stack[..n], &mut msd_stack[..n])
+        } else {
+            scratch_heap = vec![F::ZERO; n];
+            msd_heap = vec![F::ZERO; n];
+            (&mut scratch_heap, &mut msd_heap)
+        };
 
         // combined chunks - input, for both inputs, accumulated per point by
-        // Horner over the chunk columns from most to least significant.
-        for (input_wire, chunk_wire) in [
-            (
-                self.wire_first_input(),
-                &(0..self.num_chunks)
-                    .map(|i| self.wire_first_chunk_val(i))
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                self.wire_second_input(),
-                &(0..self.num_chunks)
-                    .map(|i| self.wire_second_chunk_val(i))
-                    .collect::<Vec<_>>(),
-            ),
-        ] {
+        // Horner over the chunk columns from most to least significant. The
+        // chunk-wire index is computed inline rather than collected, in the
+        // same most-to-least-significant order as before.
+        for second_input in [false, true] {
+            let input_wire = if second_input {
+                self.wire_second_input()
+            } else {
+                self.wire_first_input()
+            };
+            let chunk_wire = |i: usize| {
+                if second_input {
+                    self.wire_second_chunk_val(i)
+                } else {
+                    self.wire_first_chunk_val(i)
+                }
+            };
             let out = chunks_iter.next().unwrap();
-            scratch.copy_from_slice(col(chunk_wire[self.num_chunks - 1]));
-            for &wire in chunk_wire[..self.num_chunks - 1].iter().rev() {
-                let chunk = col(wire);
+            scratch.copy_from_slice(col(chunk_wire(self.num_chunks - 1)));
+            for i in (0..self.num_chunks - 1).rev() {
+                let chunk = col(chunk_wire(i));
                 for p in 0..n {
                     scratch[p] = scratch[p] * chunk_base + chunk[p];
                 }
