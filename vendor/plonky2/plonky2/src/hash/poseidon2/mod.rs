@@ -7,8 +7,8 @@ pub(crate) mod metal;
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 pub use metal::{
     is_exclusive_gpu_phase, prewarm as prewarm_gpu, prewarm_large_column_store,
-    prewarm_streamed_buffers, set_exclusive_gpu_phase, set_pipeline_archive_dir,
-    spine_backlog_add,
+    prewarm_streamed_buffers, set_exclusive_gpu_phase, set_light_spine_thread,
+    set_pipeline_archive_dir, spine_backlog_add,
 };
 
 /// No-op fallback so callers can toggle the exclusive-phase GPU routing hint
@@ -31,6 +31,11 @@ pub fn prewarm_gpu() {}
 /// without the Metal backend.
 #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
 pub fn spine_backlog_add(_delta: isize) {}
+
+/// No-op fallback for terminal-spine thread marking on platforms without the
+/// Metal backend.
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+pub fn set_light_spine_thread(_enabled: bool) {}
 
 /// No-op fallback for the large-store prewarm on platforms without the
 /// Metal backend.
