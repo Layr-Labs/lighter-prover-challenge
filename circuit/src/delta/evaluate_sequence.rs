@@ -138,6 +138,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for EvaluateSequen
         }
         constraints
     }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,

@@ -167,22 +167,23 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingGate<D
             F::Extension::from_basefield_array(arr)
         };
 
+        // Small evaluation batches dominate recursive proof work. Keeping their
+        // temporary rows on the worker stack removes three allocator round trips
+        // without changing the arithmetic or serialized circuit data.
         const STACK_POINTS: usize = 32;
         const STACK_BASE_VALUES: usize = 128;
-        let use_stack = reducing_stack_scratch_enabled()
-            && n <= STACK_POINTS
-            && D * n <= STACK_BASE_VALUES;
+        let use_stack =
+            reducing_stack_scratch_enabled() && n <= STACK_POINTS && D * n <= STACK_BASE_VALUES;
         let mut alpha_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
         let mut acc_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
         let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_BASE_VALUES];
         let mut alpha_heap;
         let mut acc_heap;
         let mut scratch_heap;
-        let (alphas, accs, scratch):
-            (&mut [F::Extension], &mut [F::Extension], &mut [F]) = if use_stack {
-                // SAFETY: every alpha/acc slot is assigned immediately below,
-                // and each scratch slot is assigned by every coefficient's
-                // point loop before the batch multiply reads it.
+        let (alphas, accs, scratch): (&mut [F::Extension], &mut [F::Extension], &mut [F]) =
+            if use_stack {
+                // Every alpha/accumulator is initialized below; every scratch slot
+                // is overwritten before its corresponding batch multiply reads it.
                 unsafe {
                     (
                         core::slice::from_raw_parts_mut(
@@ -209,7 +210,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingGate<D
             alphas[p] = ext(Self::wires_alpha().start, p);
             accs[p] = ext(Self::wires_old_acc().start, p);
         }
-
         for i in 0..self.num_coeffs {
             let coeff = &wires[(Self::START_COEFFS + i) * n..][..n];
             let acc_start = self.wires_accs(i).start;
