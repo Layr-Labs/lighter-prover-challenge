@@ -132,6 +132,34 @@ impl<F> EvenColumns<F> {
 }
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[inline]
+unsafe fn copy_even_fast<F: crate::hash::hash_types::RichField>(dst: *mut F, src: &[F], half_len: usize) {
+    if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+        use core::arch::aarch64::*;
+        let mut s = src.as_ptr() as *const u64;
+        let mut d = dst as *mut u64;
+        let chunks = half_len / 4;
+        for _ in 0..chunks {
+            let val = vld2q_u64(s);
+            vst1q_u64(d, val.0);
+            let val2 = vld2q_u64(s.add(4));
+            vst1q_u64(d.add(2), val2.0);
+            s = s.add(8);
+            d = d.add(4);
+        }
+        let remainder = half_len % 4;
+        for i in 0..remainder {
+            *d.add(i) = *s.add(2 * i);
+        }
+    } else {
+        let out = core::slice::from_raw_parts_mut(dst, half_len);
+        for (k, slot) in out.iter_mut().enumerate() {
+            *slot = src[2 * k];
+        }
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
     full: &crate::hash::poseidon2::metal::MetalColumns<F>,
 ) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
@@ -146,8 +174,8 @@ fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
         let src = full.col(j);
         debug_assert_eq!(src.len(), half * 2);
         debug_assert_eq!(dest.len(), half);
-        for (k, slot) in dest.iter_mut().enumerate() {
-            *slot = src[2 * k];
+        unsafe {
+            copy_even_fast(dest.as_mut_ptr(), src, half);
         }
     });
     Some(companion)
@@ -344,11 +372,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         // SAFETY: each column index is written by exactly one
                         // closure invocation (columns are disjoint), the
                         // companion outlives the fill, and `F` is plain data.
-                        let out = unsafe {
-                            core::slice::from_raw_parts_mut(ptrs[_column] as *mut F, half_len)
-                        };
-                        for (k, slot) in out.iter_mut().enumerate() {
-                            *slot = _destination[2 * k];
+                        unsafe {
+                            copy_even_fast(ptrs[_column] as *mut F, _destination, half_len);
                         }
                     }
                 };
@@ -363,7 +388,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &|group, destinations: &mut [&mut [F]]| {
                             destinations.par_iter_mut().enumerate().for_each(
                                 |(k, destination)| {
-                                    let polynomial = &polys[group * 8 + k];
+                                    let polynomial = &polys[group + k];
                                     assert_eq!(
                                         polynomial.len(),
                                         degree,
@@ -382,7 +407,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
+                                    copy_even(group + k, destination);
                                 },
                             );
                         },
