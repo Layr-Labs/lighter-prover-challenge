@@ -5,13 +5,12 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use core::{mem::MaybeUninit, ops::Range};
+use core::ops::Range;
 
 use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::types::Field;
 use crate::gates::gate::Gate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
@@ -30,19 +29,6 @@ use crate::util::serialization::{Buffer, IoResult, Read, Write};
 #[derive(Debug, Clone, Default)]
 pub struct ReducingExtensionGate<const D: usize> {
     pub num_coeffs: usize,
-}
-
-#[cfg(feature = "std")]
-fn reducing_extension_stack_scratch_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        !std::env::var_os("LIGHTER_REDUCING_STACK").is_some_and(|value| value == "0")
-    })
-}
-
-#[cfg(not(feature = "std"))]
-fn reducing_extension_stack_scratch_enabled() -> bool {
-    true
 }
 
 impl<const D: usize> ReducingExtensionGate<D> {
@@ -168,49 +154,12 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ReducingExtens
             F::Extension::from_basefield_array(arr)
         };
 
-        const STACK_POINTS: usize = 32;
-        const STACK_BASE_VALUES: usize = 128;
-        let use_stack = reducing_extension_stack_scratch_enabled()
-            && n <= STACK_POINTS
-            && D * n <= STACK_BASE_VALUES;
-        let mut alpha_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
-        let mut acc_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_POINTS];
-        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_BASE_VALUES];
-        let mut alpha_heap;
-        let mut acc_heap;
-        let mut scratch_heap;
-        let (alphas, accs, scratch):
-            (&mut [F::Extension], &mut [F::Extension], &mut [F]) = if use_stack {
-                // SAFETY: every alpha/acc slot is assigned immediately below,
-                // and each scratch slot is assigned by every coefficient's
-                // point loop before the batch multiply reads it.
-                unsafe {
-                    (
-                        core::slice::from_raw_parts_mut(
-                            alpha_stack.as_mut_ptr().cast::<F::Extension>(),
-                            n,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            acc_stack.as_mut_ptr().cast::<F::Extension>(),
-                            n,
-                        ),
-                        core::slice::from_raw_parts_mut(
-                            scratch_stack.as_mut_ptr().cast::<F>(),
-                            D * n,
-                        ),
-                    )
-                }
-            } else {
-                alpha_heap = vec![F::Extension::ZERO; n];
-                acc_heap = vec![F::Extension::ZERO; n];
-                scratch_heap = vec![F::ZERO; D * n];
-                (&mut alpha_heap, &mut acc_heap, &mut scratch_heap)
-            };
-        for p in 0..n {
-            alphas[p] = ext(Self::wires_alpha().start, p);
-            accs[p] = ext(Self::wires_old_acc().start, p);
-        }
+        let alphas: Vec<F::Extension> = (0..n).map(|p| ext(Self::wires_alpha().start, p)).collect();
+        let mut accs: Vec<F::Extension> = (0..n)
+            .map(|p| ext(Self::wires_old_acc().start, p))
+            .collect();
 
+        let mut scratch = vec![F::ZERO; D * n];
         for i in 0..self.num_coeffs {
             let coeff_start = Self::wires_coeff(i).start;
             let acc_start = self.wires_accs(i).start;
