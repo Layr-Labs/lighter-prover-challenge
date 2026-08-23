@@ -2585,26 +2585,28 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     }
     let (state_buffer, output_buffer) = buffers.as_mut()?;
 
-    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU''s
+    // Group-wise fill + absorb. The CPU fill of group g+1 overlaps the GPU's
     // absorption of group g: commands on one queue execute in submission
-    // order, and each pass is committed before the next group''s fill starts.
+    // order, and each pass is committed before the next group's fill starts.
+    const FILL_WIDTH: usize = 16;
     let groups = leaf_width.div_ceil(8);
     let base = columns.buffer.contents().cast::<F>();
     let mut absorb_commands: Vec<CommandBuffer> = Vec::with_capacity(groups);
     // Filled by the final group's encoder, which now carries the parent ladder
     // as well; see below.
     let mut level_offsets = Vec::with_capacity(leaf_count.ilog2() as usize + 1);
-    for group in 0..groups {
-        let col_start = group * 8;
-        let chunk = (leaf_width - col_start).min(8);
+    let mut fill_start = 0usize;
+    let mut group_idx = 0usize;
+    while fill_start < leaf_width {
+        let fill_chunk = (leaf_width - fill_start).min(FILL_WIDTH);
         {
             // SAFETY: each column slice covers a disjoint `leaf_count` range
             // of the shared buffer; the GPU only reads columns of groups
             // whose pass was already committed, after their fill completed.
-            let mut slices: Vec<&mut [F]> = (0..chunk)
+            let mut slices: Vec<&mut [F]> = (0..fill_chunk)
                 .map(|k| unsafe {
                     slice::from_raw_parts_mut(
-                        base.add((col_start + k) * leaf_count).cast::<F>(),
+                        base.add((fill_start + k) * leaf_count).cast::<F>(),
                         leaf_count,
                     )
                 })
@@ -2614,75 +2616,83 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             // ambiguous whether that time is CPU work or GPU queue wait.
             #[cfg(feature = "diagnostic_profile")]
             let _fill = crate::util::profile::span("streamed_fill", "fill_group");
-            fill_group(group, &mut slices);
+            fill_group(fill_start, &mut slices);
         }
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = context.queue.new_command_buffer();
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&columns.buffer), 0);
-            encoder.set_buffer(1, Some(state_buffer), 0);
-            encoder.set_buffer(2, Some(output_buffer), 0);
-            encoder.set_buffer(3, Some(&context.parameters), 0);
-            set_u32(encoder, 4, leaf_count as u32);
-            set_u32(encoder, 5, leaf_count.ilog2());
-            set_u32(encoder, 6, col_start as u32);
-            set_u32(encoder, 7, chunk as u32);
-            set_u32(encoder, 8, (group == 0) as u32);
-            set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch_hash(encoder, pipeline, leaf_count);
-            // Parent levels over the completed leaf digests. Only the final
-            // absorb group squeezes the sponge into `output_buffer`, so the
-            // ladder depends on this encoder's dispatch and on nothing later:
-            // carry it here, separated by the same resource barrier the
-            // promoted single-encoder tree build uses, instead of opening a
-            // second command buffer with one encoder per level. Identical
-            // shaders, dispatch counts and buffer offsets; strictly fewer
-            // command buffers and encoders.
-            if group == groups - 1 {
-                let mut level_offset = 0usize;
-                let mut child_count = leaf_count;
-                level_offsets.push(level_offset);
-                let output_resource: &metal::ResourceRef = output_buffer;
-                if child_count > cap_count {
-                    encoder.set_compute_pipeline_state(&context.parent_pipeline);
-                }
-                while child_count > cap_count {
-                    // Every parent level reads the output written by the
-                    // preceding dispatch; preserve both the leaf-to-parent and
-                    // the parent-to-parent hazard.
-                    encoder.memory_barrier_with_resources(&[output_resource]);
-
-                    let parent_count = child_count / 2;
-                    let child_offset = level_offset;
-                    level_offset += child_count * 4;
+        for sub in 0..fill_chunk.div_ceil(8) {
+            let col_start = fill_start + sub * 8;
+            let chunk = (leaf_width - col_start).min(8);
+            let is_first = group_idx == 0;
+            let is_last = group_idx == groups - 1;
+            let command_buffer = autoreleasepool(|| -> CommandBuffer {
+                let command_buffer = context.queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&columns.buffer), 0);
+                encoder.set_buffer(1, Some(state_buffer), 0);
+                encoder.set_buffer(2, Some(output_buffer), 0);
+                encoder.set_buffer(3, Some(&context.parameters), 0);
+                set_u32(encoder, 4, leaf_count as u32);
+                set_u32(encoder, 5, leaf_count.ilog2());
+                set_u32(encoder, 6, col_start as u32);
+                set_u32(encoder, 7, chunk as u32);
+                set_u32(encoder, 8, is_first as u32);
+                set_u32(encoder, 9, is_last as u32);
+                dispatch_hash(encoder, pipeline, leaf_count);
+                // Parent levels over the completed leaf digests. Only the final
+                // absorb group squeezes the sponge into `output_buffer`, so the
+                // ladder depends on this encoder's dispatch and on nothing later:
+                // carry it here, separated by the same resource barrier the
+                // promoted single-encoder tree build uses, instead of opening a
+                // second command buffer with one encoder per level. Identical
+                // shaders, dispatch counts and buffer offsets; strictly fewer
+                // command buffers and encoders.
+                if is_last {
+                    let mut level_offset = 0usize;
+                    let mut child_count = leaf_count;
                     level_offsets.push(level_offset);
+                    let output_resource: &metal::ResourceRef = output_buffer;
+                    if child_count > cap_count {
+                        encoder.set_compute_pipeline_state(&context.parent_pipeline);
+                    }
+                    while child_count > cap_count {
+                        // Every parent level reads the output written by the
+                        // preceding dispatch; preserve both the leaf-to-parent and
+                        // the parent-to-parent hazard.
+                        encoder.memory_barrier_with_resources(&[output_resource]);
 
-                    let parent_count_u32 = parent_count as u32;
-                    encoder.set_buffer(
-                        0,
-                        Some(output_buffer),
-                        (child_offset * size_of::<u64>()) as NSUInteger,
-                    );
-                    encoder.set_buffer(
-                        1,
-                        Some(output_buffer),
-                        (level_offset * size_of::<u64>()) as NSUInteger,
-                    );
-                    encoder.set_buffer(2, Some(&context.parameters), 0);
-                    set_u32(encoder, 3, parent_count_u32);
-                    dispatch(encoder, &context.parent_pipeline, parent_count);
+                        let parent_count = child_count / 2;
+                        let child_offset = level_offset;
+                        level_offset += child_count * 4;
+                        level_offsets.push(level_offset);
 
-                    child_count = parent_count;
+                        let parent_count_u32 = parent_count as u32;
+                        encoder.set_buffer(
+                            0,
+                            Some(output_buffer),
+                            (child_offset * size_of::<u64>()) as NSUInteger,
+                        );
+                        encoder.set_buffer(
+                            1,
+                            Some(output_buffer),
+                            (level_offset * size_of::<u64>()) as NSUInteger,
+                        );
+                        encoder.set_buffer(2, Some(&context.parameters), 0);
+                        set_u32(encoder, 3, parent_count_u32);
+                        dispatch(encoder, &context.parent_pipeline, parent_count);
+
+                        child_count = parent_count;
+                    }
                 }
-            }
-            encoder.end_encoding();
-            #[cfg(feature = "diagnostic_profile")]
-            profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
-            command_buffer.commit();
-            command_buffer.to_owned()
-        });
-        absorb_commands.push(command_buffer);
+                encoder.end_encoding();
+                #[cfg(feature = "diagnostic_profile")]
+                profile_command_buffer(command_buffer, "merkle_absorb", (leaf_count * chunk) as u64);
+                command_buffer.commit();
+                command_buffer.to_owned()
+            });
+            absorb_commands.push(command_buffer);
+            group_idx += 1;
+        }
+        fill_start += fill_chunk;
     }
 
     let all_ok = absorb_commands.iter().all(|command_buffer| {
@@ -7401,9 +7411,9 @@ kernel void goldilocks_mul_bench_native(
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
-            &|group, destinations| {
+            &|col_start, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    destination.fill(F::from_canonical_usize(col_start + index + 1));
                 }
             },
         )
