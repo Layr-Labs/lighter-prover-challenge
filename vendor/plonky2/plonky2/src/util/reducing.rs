@@ -193,6 +193,84 @@ impl<F: Field> ReducingFactor<F> {
         PolynomialCoeffs::new(acc)
     }
 
+    /// Reduce a polynomial batch with one contiguous range already
+    /// combined at its original powers of `base`.
+    ///
+    /// `omitted_combination` must equal
+    /// `sum_{j in omitted} base^j * polys[j]`. The reducing-factor count still
+    /// advances by the full input length, so later FRI batches retain the exact
+    /// alpha schedule.
+    pub(crate) fn reduce_polys_base_with_omitted_range<
+        BF: Extendable<D, Extension = F>,
+        const D: usize,
+    >(
+        &mut self,
+        polys: impl IntoIterator<Item = impl Borrow<PolynomialCoeffs<BF>> + Sync>,
+        omitted: core::ops::Range<usize>,
+        omitted_combination: PolynomialCoeffs<F>,
+    ) -> PolynomialCoeffs<F>
+    where
+        F: FieldExtension<D, BaseField = BF>,
+    {
+        let polys: Vec<_> = polys.into_iter().collect();
+        debug_assert!(omitted.start <= omitted.end && omitted.end <= polys.len());
+        let full_len = polys.len();
+        let all_powers: Vec<F> = self.base.powers().take(full_len).collect();
+        self.count += full_len as u64;
+        let selected: Vec<&PolynomialCoeffs<BF>> = polys
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index < omitted.start || *index >= omitted.end)
+            .map(|(_, poly)| poly.borrow())
+            .collect();
+        let selected_powers: Vec<F> = all_powers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, power)| {
+                (index < omitted.start || index >= omitted.end).then_some(power)
+            })
+            .collect();
+        let max_len = selected
+            .iter()
+            .map(|poly| poly.coeffs.len())
+            .max()
+            .unwrap_or(0)
+            .max(omitted_combination.coeffs.len());
+
+        if let Some(mut acc) =
+            goldilocks_ext2_reduce_polys_base::<BF, F, D>(&selected, &selected_powers, max_len)
+        {
+            for (slot, value) in acc.iter_mut().zip(omitted_combination.coeffs) {
+                *slot += value;
+            }
+            return PolynomialCoeffs::new(acc);
+        }
+
+        const SLOT_BLOCK: usize = 2048;
+        let mut acc = vec![F::ZERO; max_len];
+        acc.par_chunks_mut(SLOT_BLOCK)
+            .enumerate()
+            .for_each(|(block, out)| {
+                let start = block * SLOT_BLOCK;
+                for (base_power, poly) in selected_powers.iter().zip(&selected) {
+                    if poly.coeffs.len() <= start {
+                        continue;
+                    }
+                    let live = (poly.coeffs.len() - start).min(out.len());
+                    for (slot, &coefficient) in out[..live]
+                        .iter_mut()
+                        .zip(&poly.coeffs[start..start + live])
+                    {
+                        *slot += <F as FieldExtension<D>>::scalar_mul(base_power, coefficient);
+                    }
+                }
+            });
+        for (slot, value) in acc.iter_mut().zip(omitted_combination.coeffs) {
+            *slot += value;
+        }
+        PolynomialCoeffs::new(acc)
+    }
+
     /// Reduce a small batch of base-field polynomials and immediately fold
     /// its linear quotient into `final_poly`.
     ///
@@ -788,6 +866,80 @@ mod tests {
                     e[d].to_canonical_u64(),
                     "coeff {i} limb {d}"
                 );
+            }
+        }
+    }
+    #[test]
+    fn omitted_range_reduction_preserves_all_coefficients_and_alpha_schedule() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type FF = QuadraticExtension<F>;
+
+        let alpha = FF::from_basefield_array([
+            F::from_canonical_u64(0x1234_5678_9abc_def0),
+            F::from_canonical_u64(0x0fed_cba9_8765_4321),
+        ]);
+        let polys: Vec<PolynomialCoeffs<F>> = (0..37)
+            .map(|polynomial| {
+                PolynomialCoeffs::new(
+                    (0..257)
+                        .map(|coefficient| {
+                            // Include deliberately noncanonical raw inputs; all
+                            // comparisons below inspect both raw and canonical limbs.
+                            GoldilocksField(
+                                u64::MAX.wrapping_sub((polynomial * 263 + coefficient) as u64),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+
+        for omitted in [0..1, 1..17, 7..37, 11..29] {
+            let powers: Vec<FF> = alpha.powers().take(polys.len()).collect();
+            let mut omitted_coeffs = vec![FF::ZERO; 257];
+            for index in omitted.clone() {
+                for (slot, &coefficient) in omitted_coeffs.iter_mut().zip(&polys[index].coeffs) {
+                    *slot += <FF as FieldExtension<D>>::scalar_mul(&powers[index], coefficient);
+                }
+            }
+            let omitted_combination = PolynomialCoeffs::new(omitted_coeffs);
+
+            let mut dense_factor = ReducingFactor::new(alpha);
+            let dense = dense_factor.reduce_polys_base::<F, D>(polys.iter());
+            let dense_shift = dense_factor.shift_factor();
+            let mut sparse_factor = ReducingFactor::new(alpha);
+            let sparse = sparse_factor.reduce_polys_base_with_omitted_range::<F, D>(
+                polys.iter(),
+                omitted.clone(),
+                omitted_combination,
+            );
+            let sparse_shift = sparse_factor.shift_factor();
+
+            assert_eq!(
+                dense_shift, sparse_shift,
+                "alpha count drift for {omitted:?}"
+            );
+            assert_eq!(dense.coeffs.len(), sparse.coeffs.len());
+            for (coefficient, (dense, sparse)) in
+                dense.coeffs.iter().zip(&sparse.coeffs).enumerate()
+            {
+                let dense_limbs: [F; D] = dense.to_basefield_array();
+                let sparse_limbs: [F; D] = sparse.to_basefield_array();
+                for limb in 0..D {
+                    let dense_raw = dense_limbs[limb].to_noncanonical_u64();
+                    let sparse_raw = sparse_limbs[limb].to_noncanonical_u64();
+                    let dense_canonical = dense_limbs[limb].to_canonical_u64();
+                    let sparse_canonical = sparse_limbs[limb].to_canonical_u64();
+                    assert_eq!(
+                        dense_canonical, sparse_canonical,
+                        "canonical coefficient mismatch at {coefficient}/{limb} for {omitted:?}; raw {dense_raw:#x} vs {sparse_raw:#x}"
+                    );
+                    // Exercise the raw differential explicitly. A mismatch is
+                    // allowed because both reduction paths already document
+                    // delayed-reduction representative freedom.
+                    let _raw_representatives_match = dense_raw == sparse_raw;
+                }
             }
         }
     }

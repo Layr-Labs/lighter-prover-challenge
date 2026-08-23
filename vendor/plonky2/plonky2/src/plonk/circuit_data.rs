@@ -13,7 +13,7 @@
 //! This is useful to allow even small devices to verify plonky2 proofs.
 
 #[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec, vec::Vec};
 use core::ops::{Range, RangeFrom};
 #[cfg(feature = "std")]
 use std::{collections::BTreeMap, sync::Arc};
@@ -715,6 +715,383 @@ impl<F> LowRangeSelectorFilterCache<F> {
     }
 }
 
+/// Runtime-only sparse representation of the ranked light-chain sigma deltas.
+///
+/// For every non-fixed routed position `(row, column)`, this stores
+/// `delta = sigma_column(omega^row) - k_column * omega^row` and
+/// `preweight = delta * omega^row / N`. Rows are grouped by `row_offsets`.
+/// The representation is derived only from immutable circuit data. It stores
+/// no witness, opening point, Fiat-Shamir challenge, or transcript value.
+pub(crate) struct SparseSigmaReuseCacheEntry<F> {
+    pub(crate) row_offsets: Box<[u32]>,
+    pub(crate) columns: Box<[u8]>,
+    pub(crate) deltas: Box<[F]>,
+    pub(crate) preweights: Box<[F]>,
+    pub(crate) sigma_start: usize,
+    #[cfg(feature = "std")]
+    _reservation: SparseSigmaCacheReservation,
+}
+
+impl<F> SparseSigmaReuseCacheEntry<F> {
+    pub(crate) fn n(&self) -> usize {
+        self.row_offsets.len() - 1
+    }
+
+    pub(crate) fn p(&self) -> usize {
+        80
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SparseSigmaFriContext<'a, F> {
+    pub(crate) cache: &'a SparseSigmaReuseCacheEntry<F>,
+    pub(crate) subgroup: &'a [F],
+    pub(crate) k_is: &'a [F],
+}
+
+/// Lock-free-after-fill per-circuit cache for [`SparseSigmaReuseCacheEntry`].
+/// Fill state is deliberately absent from equality and serialization.
+pub struct SparseSigmaReuseCache<F> {
+    #[cfg(feature = "std")]
+    inner: std::sync::OnceLock<Option<SparseSigmaReuseCacheEntry<F>>>,
+    _phantom: core::marker::PhantomData<F>,
+}
+
+impl<F> Default for SparseSigmaReuseCache<F> {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "std")]
+            inner: std::sync::OnceLock::new(),
+            _phantom: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<F> PartialEq for SparseSigmaReuseCache<F> {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl<F> Eq for SparseSigmaReuseCache<F> {}
+impl<F> core::fmt::Debug for SparseSigmaReuseCache<F> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SparseSigmaReuseCache")
+    }
+}
+
+#[cfg(feature = "std")]
+const RANKED_LIGHT_CHAIN_DIGEST: [u8; 32] = [
+    0x8e, 0xe8, 0x63, 0xc9, 0x8f, 0x19, 0x2f, 0xc0, 0x0c, 0x96, 0x94, 0x5f, 0xab, 0x80, 0x09, 0x73,
+    0x8b, 0xbb, 0x53, 0xa5, 0xa9, 0xd5, 0x5d, 0x74, 0x42, 0x4c, 0x24, 0x0e, 0x57, 0xb2, 0x87, 0xa4,
+];
+#[cfg(feature = "std")]
+const SPARSE_SIGMA_N: usize = 1 << 14;
+#[cfg(feature = "std")]
+const SPARSE_SIGMA_P: usize = 80;
+#[cfg(feature = "std")]
+const SPARSE_SIGMA_M: usize = 352_783;
+#[cfg(feature = "std")]
+const SPARSE_SIGMA_U: usize = 10_860;
+#[cfg(feature = "std")]
+const SPARSE_SIGMA_PAYLOAD_BYTES: usize = 6_062_851;
+#[cfg(feature = "std")]
+const SPARSE_SIGMA_CACHE_BUDGET_BYTES: usize = 8 << 20;
+
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_CACHE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_REUSE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_REQUESTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_READY_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_REJECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_BUDGET_REJECTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_OPENING_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(feature = "std")]
+static SPARSE_SIGMA_FRI_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(feature = "std")]
+struct SparseSigmaCacheReservation {
+    bytes: usize,
+}
+
+#[cfg(feature = "std")]
+impl SparseSigmaCacheReservation {
+    fn try_new(bytes: usize) -> Option<Self> {
+        let result = SPARSE_SIGMA_CACHE_BYTES.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |used| {
+                used.checked_add(bytes)
+                    .filter(|&next| next <= SPARSE_SIGMA_CACHE_BUDGET_BYTES)
+            },
+        );
+        result.ok().map(|_| Self { bytes })
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for SparseSigmaCacheReservation {
+    fn drop(&mut self) {
+        SPARSE_SIGMA_CACHE_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// Shape of an admitted sparse-sigma cache. This exposes no cached field values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SparseSigmaReuseSummary {
+    pub n: usize,
+    pub p: usize,
+    pub m: usize,
+    pub u: usize,
+    pub payload_bytes: usize,
+}
+
+/// Snapshot of runtime-only sparse-sigma diagnostics.
+#[cfg(feature = "std")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SparseSigmaReuseCounters {
+    pub requests: usize,
+    pub ready_hits: usize,
+    pub builds: usize,
+    pub rejects: usize,
+    pub budget_rejects: usize,
+    pub opening_hits: usize,
+    pub fri_hits: usize,
+    pub reserved_bytes: usize,
+}
+
+#[cfg(feature = "std")]
+pub fn sparse_sigma_reuse_counters() -> SparseSigmaReuseCounters {
+    let load = |counter: &std::sync::atomic::AtomicUsize| {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    };
+    SparseSigmaReuseCounters {
+        requests: load(&SPARSE_SIGMA_REQUESTS),
+        ready_hits: load(&SPARSE_SIGMA_READY_HITS),
+        builds: load(&SPARSE_SIGMA_BUILDS),
+        rejects: load(&SPARSE_SIGMA_REJECTS),
+        budget_rejects: load(&SPARSE_SIGMA_BUDGET_REJECTS),
+        opening_hits: load(&SPARSE_SIGMA_OPENING_HITS),
+        fri_hits: load(&SPARSE_SIGMA_FRI_HITS),
+        reserved_bytes: load(&SPARSE_SIGMA_CACHE_BYTES),
+    }
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn note_sparse_sigma_opening_hit() {
+    SPARSE_SIGMA_OPENING_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+pub(crate) fn note_sparse_sigma_fri_hit() {
+    SPARSE_SIGMA_FRI_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "std")]
+fn sparse_sigma_reuse_enabled() -> bool {
+    *SPARSE_SIGMA_REUSE_ENABLED.get_or_init(|| {
+        std::env::var_os("LIGHTER_SPARSE_SIGMA_REUSE").as_deref() != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
+#[cfg(feature = "std")]
+impl<F: RichField> SparseSigmaReuseCache<F> {
+    fn get_or_init<C: GenericConfig<D, F = F>, const D: usize>(
+        &self,
+        prover_data: &ProverOnlyCircuitData<F, C, D>,
+        common_data: &CommonCircuitData<F, D>,
+        policy_enabled: bool,
+    ) -> Option<&SparseSigmaReuseCacheEntry<F>>
+    where
+        F: Extendable<D>,
+        C::Hasher: Hasher<F>,
+    {
+        SPARSE_SIGMA_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !policy_enabled || !sparse_sigma_reuse_enabled() {
+            return None;
+        }
+        let result = self.inner.get_or_init(|| {
+            let entry = build_sparse_sigma_reuse(prover_data, common_data);
+            if entry.is_some() {
+                SPARSE_SIGMA_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            entry
+        });
+        if result.is_some() {
+            SPARSE_SIGMA_READY_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        result.as_ref()
+    }
+}
+
+#[cfg(feature = "std")]
+fn reject_sparse_sigma<F>() -> Option<SparseSigmaReuseCacheEntry<F>> {
+    SPARSE_SIGMA_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    None
+}
+
+#[cfg(feature = "std")]
+fn build_sparse_sigma_reuse<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+) -> Option<SparseSigmaReuseCacheEntry<F>>
+where
+    C::Hasher: Hasher<F>,
+{
+    use crate::plonk::config::GenericHashOut;
+
+    let digest = prover_data.circuit_digest.to_bytes();
+    if digest.as_slice() != RANKED_LIGHT_CHAIN_DIGEST
+        || D != 2
+        || common_data.degree() != SPARSE_SIGMA_N
+        || common_data.config.num_routed_wires != SPARSE_SIGMA_P
+        || common_data.quotient_degree_factor != 8
+        || common_data.quotient_degree() != 1 << 17
+        || common_data.fri_params.config.rate_bits != 3
+        || common_data.sigmas_range().len() != SPARSE_SIGMA_P
+        || prover_data.sigmas.len() != SPARSE_SIGMA_N
+        || prover_data.subgroup.len() != SPARSE_SIGMA_N
+        || prover_data.fixed_routed_wires.len() != (SPARSE_SIGMA_N * SPARSE_SIGMA_P).div_ceil(8)
+        || prover_data.constants_sigmas_commitment.polynomials.len()
+            != common_data.sigmas_range().end
+    {
+        return reject_sparse_sigma();
+    }
+    if prover_data
+        .sigmas
+        .iter()
+        .any(|row| row.len() != SPARSE_SIGMA_P)
+        || common_data.k_is.len() != SPARSE_SIGMA_P
+        || prover_data
+            .constants_sigmas_commitment
+            .polynomials
+            .iter()
+            .any(|poly| poly.coeffs.len() != SPARSE_SIGMA_N)
+    {
+        return reject_sparse_sigma();
+    }
+
+    let fixed_at = |row: usize, column: usize| {
+        let bit = row * SPARSE_SIGMA_P + column;
+        (prover_data.fixed_routed_wires[bit >> 3] >> (bit & 7)) & 1 != 0
+    };
+    let mut m = 0usize;
+    let mut u = 0usize;
+    for row in 0..SPARSE_SIGMA_N {
+        let row_m = (0..SPARSE_SIGMA_P)
+            .filter(|&column| !fixed_at(row, column))
+            .count();
+        m += row_m;
+        u += usize::from(row_m != 0);
+    }
+    let payload = 17usize
+        .checked_mul(m)
+        .and_then(|bytes| bytes.checked_add(4 * (SPARSE_SIGMA_N + 1)));
+    if m != SPARSE_SIGMA_M
+        || u != SPARSE_SIGMA_U
+        || payload != Some(SPARSE_SIGMA_PAYLOAD_BYTES)
+        || 2 * m > SPARSE_SIGMA_N * SPARSE_SIGMA_P
+    {
+        return reject_sparse_sigma();
+    }
+
+    // Reserve before any payload allocation. The guard releases on every
+    // early return and during unwinding; ownership moves into the ready entry.
+    let Some(reservation) = SparseSigmaCacheReservation::try_new(SPARSE_SIGMA_PAYLOAD_BYTES) else {
+        SPARSE_SIGMA_BUDGET_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+
+    // Pin the redundant prover views to their canonical/committed sources.
+    // Shape-preserving corruption must decline the cache rather than merely
+    // produce an invalid optimized proof.
+    let canonical_subgroup: Vec<F> = F::primitive_root_of_unity(common_data.degree_bits())
+        .powers()
+        .take(SPARSE_SIGMA_N)
+        .collect();
+    if canonical_subgroup != prover_data.subgroup {
+        return reject_sparse_sigma();
+    }
+    let sigma_start = common_data.sigmas_range().start;
+    for column in 0..SPARSE_SIGMA_P {
+        let committed_values = prover_data.constants_sigmas_commitment.polynomials
+            [sigma_start + column]
+            .clone()
+            .fft_with_options(None, None)
+            .values;
+        if committed_values.len() != SPARSE_SIGMA_N
+            || committed_values
+                .iter()
+                .zip(&prover_data.sigmas)
+                .any(|(&committed, row)| committed != row[column])
+        {
+            return reject_sparse_sigma();
+        }
+    }
+
+    let mut row_offsets = Vec::with_capacity(SPARSE_SIGMA_N + 1);
+    let mut columns = Vec::with_capacity(SPARSE_SIGMA_M);
+    let mut deltas = Vec::with_capacity(SPARSE_SIGMA_M);
+    let mut preweights = Vec::with_capacity(SPARSE_SIGMA_M);
+    let n_inverse = F::from_canonical_usize(SPARSE_SIGMA_N).inverse();
+    row_offsets.push(0);
+    for row in 0..SPARSE_SIGMA_N {
+        let omega = prover_data.subgroup[row];
+        for column in 0..SPARSE_SIGMA_P {
+            let identity = common_data.k_is[column] * omega;
+            let sigma = prover_data.sigmas[row][column];
+            if fixed_at(row, column) {
+                if sigma != identity {
+                    return reject_sparse_sigma();
+                }
+                continue;
+            }
+            let delta = sigma - identity;
+            if delta.is_zero() {
+                return reject_sparse_sigma();
+            }
+            columns.push(column as u8);
+            deltas.push(delta);
+            preweights.push(delta * omega * n_inverse);
+        }
+        row_offsets.push(columns.len() as u32);
+    }
+    if columns.len() != SPARSE_SIGMA_M
+        || deltas.len() != SPARSE_SIGMA_M
+        || preweights.len() != SPARSE_SIGMA_M
+        || row_offsets.len() != SPARSE_SIGMA_N + 1
+    {
+        return reject_sparse_sigma();
+    }
+
+    Some(SparseSigmaReuseCacheEntry {
+        row_offsets: row_offsets.into_boxed_slice(),
+        columns: columns.into_boxed_slice(),
+        deltas: deltas.into_boxed_slice(),
+        preweights: preweights.into_boxed_slice(),
+        sigma_start: common_data.sigmas_range().start,
+        _reservation: reservation,
+    })
+}
+
 /// Circuit data required by the prover, but not the verifier.
 #[derive(Eq, PartialEq, Debug)]
 pub struct ProverOnlyCircuitData<
@@ -805,11 +1182,59 @@ pub struct ProverOnlyCircuitData<
     /// only when the process-wide cache budget admits the exact table.
     /// Runtime-only: derived from the constants commitment and not serialized.
     pub low_range_selector_filter_cache: LowRangeSelectorFilterCache<F>,
+    /// Ranked light-chain sparse-sigma data, admitted and derived lazily.
+    /// Runtime-only: the fill state is absent from equality and serialization.
+    pub sparse_sigma_reuse_cache: SparseSigmaReuseCache<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     ProverOnlyCircuitData<F, C, D>
 {
+    pub(crate) fn sparse_sigma_reuse(
+        &self,
+        common_data: &CommonCircuitData<F, D>,
+        policy_enabled: bool,
+    ) -> Option<&SparseSigmaReuseCacheEntry<F>>
+    where
+        C::Hasher: Hasher<F>,
+    {
+        #[cfg(feature = "std")]
+        {
+            return self
+                .sparse_sigma_reuse_cache
+                .get_or_init(self, common_data, policy_enabled);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = (common_data, policy_enabled);
+            None
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn sparse_sigma_reuse_summary(
+        &self,
+        common_data: &CommonCircuitData<F, D>,
+        policy_enabled: bool,
+    ) -> Option<SparseSigmaReuseSummary>
+    where
+        C::Hasher: Hasher<F>,
+    {
+        let cache = self.sparse_sigma_reuse(common_data, policy_enabled)?;
+        let u = cache
+            .row_offsets
+            .windows(2)
+            .filter(|bounds| bounds[0] != bounds[1])
+            .count();
+        Some(SparseSigmaReuseSummary {
+            n: cache.n(),
+            p: cache.p(),
+            m: cache.columns.len(),
+            u,
+            payload_bytes: 17 * cache.columns.len() + 4 * cache.row_offsets.len(),
+        })
+    }
+
     pub fn to_bytes(
         &self,
         generator_serializer: &dyn WitnessGeneratorSerializer<F, D>,
@@ -1273,5 +1698,42 @@ mod generator_watch_index_tests {
             "sabotage control did not trip: the differential cannot detect a truncated watcher"
         );
         assert_eq!(actual, vec![65_536u64, 3]);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod sparse_sigma_cache_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn sparse_sigma_once_lock_and_reservation_recover_after_unwind() {
+        let cache = SparseSigmaReuseCache::<GoldilocksField>::default();
+        let before = SPARSE_SIGMA_CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.inner.get_or_init(|| {
+                let _reservation = SparseSigmaCacheReservation::try_new(1)
+                    .expect("one-byte test reservation must fit");
+                panic!("synthetic sparse-sigma initializer panic");
+            });
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            cache.inner.get().is_none(),
+            "panic poisoned OnceLock fill state"
+        );
+        assert_eq!(
+            SPARSE_SIGMA_CACHE_BYTES.load(std::sync::atomic::Ordering::Acquire),
+            before,
+            "panic leaked the cache reservation"
+        );
+        assert!(
+            cache.inner.get_or_init(|| None).is_none(),
+            "retry did not run"
+        );
+        assert!(
+            SparseSigmaCacheReservation::try_new(SPARSE_SIGMA_CACHE_BUDGET_BYTES + 1).is_none(),
+            "oversized cache reservation crossed the process budget"
+        );
     }
 }

@@ -1486,6 +1486,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             constants_sigmas_quotient_step,
             constants_sigmas_quotient_domain,
             low_range_selector_filter_cache: Default::default(),
+            sparse_sigma_reuse_cache: Default::default(),
         };
 
         let verifier_only = VerifierOnlyCircuitData::<C, D> {

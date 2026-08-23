@@ -128,13 +128,40 @@ where
     C::Hasher: Hasher<F>,
     C::InnerHasher: Hasher<F>,
 {
+    prove_with_sparse_sigma_policy(prover_data, common_data, inputs, timing, true)
+}
+
+/// Diagnostic control for proving the same circuit with sparse-sigma reuse
+/// explicitly allowed or denied. The environment rollback remains authoritative.
+#[doc(hidden)]
+pub fn prove_with_sparse_sigma_policy<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    inputs: PartialWitness<F>,
+    timing: &mut TimingTree,
+    allow_sparse_sigma_reuse: bool,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
     let partition_witness = timed!(
         timing,
         "run generators",
         generate_partial_witness(inputs, prover_data, common_data)?
     );
 
-    prove_with_partition_witness(prover_data, common_data, partition_witness, timing)
+    prove_with_partition_witness_sparse_sigma_policy(
+        prover_data,
+        common_data,
+        partition_witness,
+        timing,
+        allow_sparse_sigma_reuse,
+    )
 }
 
 pub fn prove_with_partition_witness<
@@ -144,8 +171,33 @@ pub fn prove_with_partition_witness<
 >(
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+    partition_witness: PartitionWitness<F>,
+    timing: &mut TimingTree,
+) -> Result<ProofWithPublicInputs<F, C, D>>
+where
+    C::Hasher: Hasher<F>,
+    C::InnerHasher: Hasher<F>,
+{
+    prove_with_partition_witness_sparse_sigma_policy(
+        prover_data,
+        common_data,
+        partition_witness,
+        timing,
+        true,
+    )
+}
+
+#[doc(hidden)]
+pub fn prove_with_partition_witness_sparse_sigma_policy<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
     mut partition_witness: PartitionWitness<F>,
     timing: &mut TimingTree,
+    allow_sparse_sigma_reuse: bool,
 ) -> Result<ProofWithPublicInputs<F, C, D>>
 where
     C::Hasher: Hasher<F>,
@@ -468,22 +520,26 @@ where
     // `g * zeta`, are not in our subgroup `H`. It suffices to check `zeta` only, since
     // `(g * zeta)^n = zeta^n`, where `n` is the order of `g`.
     let g = F::Extension::primitive_root_of_unity(common_data.degree_bits());
+    let zeta_to_n = zeta.exp_power_of_2(common_data.degree_bits());
     ensure!(
-        zeta.exp_power_of_2(common_data.degree_bits()) != F::Extension::ONE,
+        zeta_to_n != F::Extension::ONE,
         "Opening point is in the subgroup."
     );
+    let sparse_sigma_reuse = prover_data.sparse_sigma_reuse(common_data, allow_sparse_sigma_reuse);
 
     let openings = timed!(
         timing,
         "construct the opening set, including lookups",
-        OpeningSet::new(
+        OpeningSet::new_with_sparse_sigma(
             zeta,
             g,
             &prover_data.constants_sigmas_commitment,
             &wires_commitment,
             &partial_products_zs_and_lookup_commitment,
             &quotient_polys_commitment,
-            common_data
+            common_data,
+            zeta_to_n,
+            sparse_sigma_reuse,
         )
     );
     challenger.observe_openings(&openings.to_fri_openings());
@@ -492,7 +548,7 @@ where
     let opening_proof = timed!(
         timing,
         "compute opening proofs",
-        PolynomialBatch::<F, C, D>::prove_openings(
+        PolynomialBatch::<F, C, D>::prove_openings_with_sparse_sigma(
             &instance,
             &[
                 &prover_data.constants_sigmas_commitment,
@@ -505,6 +561,13 @@ where
             None,
             None,
             timing,
+            sparse_sigma_reuse.map(|cache| {
+                crate::plonk::circuit_data::SparseSigmaFriContext {
+                    cache,
+                    subgroup: &prover_data.subgroup,
+                    k_is: &common_data.k_is,
+                }
+            }),
         )
     );
 
