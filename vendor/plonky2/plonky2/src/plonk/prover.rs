@@ -1605,7 +1605,14 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     filter_at: impl Fn(usize, usize) -> F,
 ) {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
+    debug_assert_eq!(chunk.len(), rows * 2);
+    // First gate assigns; later gates add. Drops the heap acc buffer and the
+    // trailing copy. Empty gate lists still leave a zeroed chunk, matching
+    // `vec![F::ZERO; chunk.len()]` + copy.
+    if num_gates == 0 {
+        chunk.fill(F::ZERO);
+        return;
+    }
     for g in 0..num_gates {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
@@ -1619,11 +1626,17 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            let v0 = filter * sv0;
+            let v1 = filter * sv1;
+            if g == 0 {
+                chunk[2 * r] = v0;
+                chunk[2 * r + 1] = v1;
+            } else {
+                chunk[2 * r] += v0;
+                chunk[2 * r + 1] += v1;
+            }
         }
     }
-    chunk.copy_from_slice(&acc);
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
