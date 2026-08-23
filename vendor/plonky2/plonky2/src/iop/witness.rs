@@ -355,6 +355,25 @@ pub struct PartitionWitness<'a, F: Field> {
     pub degree: usize,
 }
 
+/// Formatting a contradictory assignment is exceptionally rare in valid
+/// witness generation. Keeping it out of the setters lets their common path
+/// inline without carrying formatting code and its stack frame into every
+/// generator call site.
+#[cold]
+#[inline(never)]
+fn partition_witness_contradiction<F: Field>(
+    target: Target,
+    old_value: F,
+    value: F,
+) -> anyhow::Error {
+    anyhow!(
+        "Partition containing {:?} was set twice with different values: {} != {}",
+        target,
+        old_value,
+        value
+    )
+}
+
 impl<'a, F: Field> PartitionWitness<'a, F> {
     pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
         let len = representative_map.len();
@@ -386,32 +405,12 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0
     }
 
-    #[inline]
-    fn mark_set(&mut self, rep_index: usize) {
-        self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
-    }
-
     /// Set a `Target`. On success, returns the representative index of the newly-set target. If the
     /// target was already set, returns `None`.
+    #[inline(always)]
     pub fn set_target_returning_rep(&mut self, target: Target, value: F) -> Result<Option<usize>> {
         let rep_index = self.representative_map[self.target_index(target)] as usize;
-        if self.is_set_by_rep_index(rep_index) {
-            let old_value = self.values[rep_index];
-            if value != old_value {
-                return Err(anyhow!(
-                    "Partition containing {:?} was set twice with different values: {} != {}",
-                    target,
-                    old_value,
-                    value
-                ));
-            }
-
-            Ok(None)
-        } else {
-            self.values[rep_index] = value;
-            self.mark_set(rep_index);
-            Ok(Some(rep_index))
-        }
+        self.set_rep_index_returning_new(rep_index, target, value)
     }
 
     /// [`Self::set_target_returning_rep`] with the representative supplied by
@@ -425,27 +424,26 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     /// contradiction check, the store and the mark -- is the identical
     /// sequence on the identical slot, so the resulting witness is bit-for-bit
     /// what `set_target_returning_rep` would have produced.
+    #[inline(always)]
     pub fn set_rep_index_returning_new(
         &mut self,
         rep_index: usize,
         target: Target,
         value: F,
     ) -> Result<Option<usize>> {
-        if self.is_set_by_rep_index(rep_index) {
+        let word_index = rep_index >> 6;
+        let mask = 1u64 << (rep_index & 63);
+        let bitmap_word = self.set_bitmap[word_index];
+        if bitmap_word & mask != 0 {
             let old_value = self.values[rep_index];
             if value != old_value {
-                return Err(anyhow!(
-                    "Partition containing {:?} was set twice with different values: {} != {}",
-                    target,
-                    old_value,
-                    value
-                ));
+                return Err(partition_witness_contradiction(target, old_value, value));
             }
 
             Ok(None)
         } else {
             self.values[rep_index] = value;
-            self.mark_set(rep_index);
+            self.set_bitmap[word_index] = bitmap_word | mask;
             Ok(Some(rep_index))
         }
     }
@@ -558,4 +556,97 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
             None
         }
     }
+}
+
+#[cfg(test)]
+mod partition_setter_tests {
+    use super::{PartitionWitness, Witness};
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    use crate::field::types::Field;
+    use crate::iop::target::Target;
+
+    fn target(index: usize) -> Target {
+        Target::wire(index / 4, index % 4)
+    }
+
+    #[test]
+    fn partition_setter_preserves_alias_repeat_conflict_and_boundaries() {
+        let mut representative_map = (0..128u32).collect::<Vec<_>>();
+        representative_map[0] = 63;
+        representative_map[1] = 63;
+        representative_map[2] = 64;
+        representative_map[3] = 127;
+        let mut witness = PartitionWitness::new(4, 32, &representative_map);
+        let first = F::from_canonical_u64(17);
+        let different = F::from_canonical_u64(23);
+
+        assert_eq!(witness.set_target_returning_rep(target(0), first).unwrap(), Some(63));
+        assert_eq!(witness.set_target_returning_rep(target(1), first).unwrap(), None);
+        let error = witness
+            .set_target_returning_rep(target(1), different)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Partition containing {:?} was set twice with different values: {} != {}",
+                target(1),
+                first,
+                different
+            )
+        );
+        assert_eq!(witness.try_get_target(target(0)), Some(first));
+        assert_eq!(witness.try_get_target(target(1)), Some(first));
+
+        assert_eq!(
+            witness.set_target_returning_rep(target(2), different).unwrap(),
+            Some(64)
+        );
+        assert_eq!(
+            witness.set_target_returning_rep(target(3), first).unwrap(),
+            Some(127)
+        );
+        assert_eq!(witness.set_bitmap, [1u64 << 63, 1 | (1u64 << 63)]);
+    }
+
+    #[test]
+    fn preindexed_partition_setter_matches_mapped_setter() {
+        let mut representative_map = (0..128u32).collect::<Vec<_>>();
+        representative_map[0] = 63;
+        representative_map[1] = 63;
+        representative_map[2] = 64;
+        let mut mapped = PartitionWitness::new(4, 32, &representative_map);
+        let mut preindexed = PartitionWitness::new(4, 32, &representative_map);
+        let values = [
+            F::from_canonical_u64(5),
+            F::from_canonical_u64(5),
+            F::from_canonical_u64(9),
+        ];
+
+        for ((target, representative), value) in
+            [(target(0), 63), (target(1), 63), (target(2), 64)]
+                .into_iter()
+                .zip(values)
+        {
+            let mapped_result = mapped.set_target_returning_rep(target, value).unwrap();
+            let preindexed_result = preindexed
+                .set_rep_index_returning_new(representative, target, value)
+                .unwrap();
+            assert_eq!(mapped_result, preindexed_result);
+        }
+        assert_eq!(mapped.set_bitmap, preindexed.set_bitmap);
+        assert_eq!(mapped.values[63], preindexed.values[63]);
+        assert_eq!(mapped.values[64], preindexed.values[64]);
+
+        let conflict = F::from_canonical_u64(11);
+        let mapped_error = mapped
+            .set_target_returning_rep(target(1), conflict)
+            .unwrap_err();
+        let preindexed_error = preindexed
+            .set_rep_index_returning_new(63, target(1), conflict)
+            .unwrap_err();
+        assert_eq!(mapped_error.to_string(), preindexed_error.to_string());
+        assert_eq!(mapped.set_bitmap, preindexed.set_bitmap);
+        assert_eq!(mapped.values[63], preindexed.values[63]);
+    }
+
 }
