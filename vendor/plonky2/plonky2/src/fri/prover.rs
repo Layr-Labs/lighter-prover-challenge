@@ -625,11 +625,11 @@ fn fri_prover_query_round<
     mut x_index: usize,
     fri_params: &FriParams,
 ) -> FriQueryRound<F, C::Hasher, D> {
-    let mut query_steps = Vec::new();
-    let initial_proof = initial_merkle_trees
-        .iter()
-        .map(|t| (t.leaf_vec(x_index), t.prove(x_index)))
-        .collect::<Vec<_>>();
+    let mut query_steps = Vec::with_capacity(trees.len());
+    let mut initial_proof = Vec::with_capacity(initial_merkle_trees.len());
+    for tree in initial_merkle_trees {
+        initial_proof.push((tree.leaf_vec(x_index), tree.prove(x_index)));
+    }
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
         let evals = unflatten(tree.get(x_index >> arity_bits));

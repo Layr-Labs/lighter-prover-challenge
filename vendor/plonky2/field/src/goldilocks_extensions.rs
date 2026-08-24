@@ -783,15 +783,36 @@ pub fn ext2_base_scalar_dot_slots(
     polys: &[&[GoldilocksField]],
     powers: &[QuadraticExtension<GoldilocksField>],
 ) {
+    // Reusable per-thread bucketing scratch. The buckets depend only on
+    // `start`/`end` and the polynomial lengths, so the same two vectors are
+    // cleared and refilled on every call without reallocating the backing
+    // storage, avoiding per-slot-block allocator churn on the opening spine.
+    let mut full: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> =
+        Vec::with_capacity(polys.len());
+    let mut partial: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> = Vec::new();
+    ext2_base_scalar_dot_slots_buffered(out, start, polys, powers, &mut full, &mut partial);
+}
+
+/// `ext2_base_scalar_dot_slots` with caller-supplied bucket scratch, so a
+/// caller that fans out across slot blocks can clear and reuse the same
+/// vectors instead of reallocating per block.
+#[inline]
+pub fn ext2_base_scalar_dot_slots_buffered<'a>(
+    out: &mut [QuadraticExtension<GoldilocksField>],
+    start: usize,
+    polys: &[&'a [GoldilocksField]],
+    powers: &[QuadraticExtension<GoldilocksField>],
+    full: &mut Vec<(&'a [GoldilocksField], QuadraticExtension<GoldilocksField>)>,
+    partial: &mut Vec<(&'a [GoldilocksField], QuadraticExtension<GoldilocksField>)>,
+) {
     assert_eq!(polys.len(), powers.len());
     assert!(polys.len() < 1 << 24);
     let end = start + out.len();
     // Split once so the dense inner loop over fully-covering polynomials
     // runs without per-slot bounds checks; only boundary-length polynomials
     // take the checked loop.
-    let mut full: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> =
-        Vec::with_capacity(polys.len());
-    let mut partial: Vec<(&[GoldilocksField], QuadraticExtension<GoldilocksField>)> = Vec::new();
+    full.clear();
+    partial.clear();
     for (&p, &pw) in polys.iter().zip(powers) {
         if p.len() >= end {
             full.push((&p[start..end], pw));
@@ -802,13 +823,13 @@ pub fn ext2_base_scalar_dot_slots(
     for (i, o) in out.iter_mut().enumerate() {
         let (mut lo0, mut hi0) = (0u128, 0u32);
         let (mut lo1, mut hi1) = (0u128, 0u32);
-        for &(p, QuadraticExtension([b0, b1])) in &full {
+        for &(p, QuadraticExtension([b0, b1])) in full.iter() {
             // SAFETY: every slice in `full` has length exactly `out.len()`.
             let c = unsafe { p.get_unchecked(i).0 };
             u160_add_product(&mut lo0, &mut hi0, b0.0, c);
             u160_add_product(&mut lo1, &mut hi1, b1.0, c);
         }
-        for &(p, QuadraticExtension([b0, b1])) in &partial {
+        for &(p, QuadraticExtension([b0, b1])) in partial.iter() {
             if i < p.len() {
                 let c = p[i].0;
                 u160_add_product(&mut lo0, &mut hi0, b0.0, c);
