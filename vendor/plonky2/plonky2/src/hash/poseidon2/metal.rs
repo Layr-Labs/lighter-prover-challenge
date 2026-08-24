@@ -2630,7 +2630,7 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
-            dispatch(encoder, pipeline, leaf_count);
+            dispatch_hash(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
             // ladder depends on this encoder's dispatch and on nothing later:
@@ -4458,10 +4458,38 @@ fn dispatch(
     pipeline: &ComputePipelineState,
     thread_count: usize,
 ) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, 128);
+}
+
+fn dispatch_hash(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+) {
+    dispatch_with_group_cap(encoder, pipeline, thread_count, hash_threadgroup_cap());
+}
+
+fn hash_threadgroup_cap() -> NSUInteger {
+    static CAP: std::sync::OnceLock<NSUInteger> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("LIGHTER_HASH_TG")
+            .ok()
+            .and_then(|value| value.parse::<NSUInteger>().ok())
+            .filter(|&value| (32..=1024).contains(&value) && value.is_power_of_two())
+            .unwrap_or(256)
+    })
+}
+
+fn dispatch_with_group_cap(
+    encoder: &metal::ComputeCommandEncoderRef,
+    pipeline: &ComputePipelineState,
+    thread_count: usize,
+    cap: NSUInteger,
+) {
     let execution_width = pipeline.thread_execution_width();
     let group_width = pipeline
         .max_total_threads_per_threadgroup()
-        .min(128)
+        .min(cap)
         .max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
