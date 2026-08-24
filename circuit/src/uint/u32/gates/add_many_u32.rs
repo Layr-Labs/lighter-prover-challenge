@@ -169,8 +169,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
         let base32 = F::from_canonical_u64(1 << 32u64);
         let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
         let mut chunks = res.chunks_exact_mut(n);
-        let mut combined_result = vec![F::ZERO; n];
-        let mut combined_carry = vec![F::ZERO; n];
+        let mut combined_result_stack = [F::ZERO; 64];
+        let mut combined_carry_stack = [F::ZERO; 64];
+        let mut combined_result_heap;
+        let mut combined_carry_heap;
+        let (combined_result, combined_carry): (&mut [F], &mut [F]) = if n <= 64 {
+            (&mut combined_result_stack[..n], &mut combined_carry_stack[..n])
+        } else {
+            combined_result_heap = vec![F::ZERO; n];
+            combined_carry_heap = vec![F::ZERO; n];
+            (&mut combined_result_heap, &mut combined_carry_heap)
+        };
 
         for i in 0..self.num_ops {
             let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
@@ -204,9 +213,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
                     out[p] = y * (y + F::TWO);
                 }
                 let combined = if j < Self::num_result_limbs() {
-                    &mut combined_result
+                    &mut *combined_result
                 } else {
-                    &mut combined_carry
+                    &mut *combined_carry
                 };
                 for p in 0..n {
                     combined[p] = combined[p] * base_limb + limb[p];
