@@ -13,6 +13,7 @@ use crate::field::fft::{
     FftRootTable, cached_fft_root_table, fft_in_place_with_options,
     fft_in_place_with_options_parallel,
 };
+use crate::field::fft::lab::{coset_folded_root_table, fft_classic_coset_folded};
 use crate::field::goldilocks_extensions::ext2_mul_add;
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
@@ -209,6 +210,42 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
     }
 }
 
+/// Lab-B leftover: zero-padded FFT with a coset-folded root table so the
+/// live prefix can stay unscaled. Covers production LDE cache-block shapes
+/// on Goldilocks only; anything else falls back to scale-then-FFT.
+fn try_fft_classic_coset_folded<F: Field>(
+    dest: &mut [F],
+    live: usize,
+    rate_bits: usize,
+    folded: &FftRootTable<F>,
+    shift: F,
+) -> bool {
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return false;
+    }
+    let n = dest.len();
+    if rate_bits == 0 || live < 2 || n != live << rate_bits {
+        return false;
+    }
+    let lg_n = n.trailing_zeros() as usize;
+    if n != 1usize << lg_n {
+        return false;
+    }
+    let lg_block_n = match core::mem::size_of::<F>() {
+        0..=8 => 13,
+        9..=16 => 12,
+        _ => 11,
+    };
+    let r = rate_bits;
+    // Goldilocks packing WIDTH is 4.
+    let lg_packed = 2usize;
+    if !(r > 0 && r >= lg_packed && r < lg_n && r + 1 < lg_block_n && lg_block_n <= lg_n) {
+        return false;
+    }
+    fft_classic_coset_folded(dest, r, folded, shift);
+    true
+}
+
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
     PolynomialBatch<F, C, D>
 {
@@ -381,6 +418,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+                    let shift = F::coset_shift();
+                    let folded = coset_folded_root_table(degree << rate_bits, shift);
                     let polys = &polynomials;
                     C::Hasher::try_build_merkle_tree_column_store_streamed(
                         &columns,
@@ -394,19 +433,24 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         degree,
                                         "Polynomial degrees inconsistent"
                                     );
-                                    batch_multiply_into(
-                                        &mut destination[..degree],
-                                        &polynomial.coeffs,
-                                        &coset_powers,
-                                    );
+                                    destination[..degree].copy_from_slice(&polynomial.coeffs);
                                     if rate_bits == 0 || degree < 2 {
                                         destination[degree..].fill(F::ZERO);
                                     }
-                                    fft_in_place_with_options(
-                                        destination,
-                                        Some(rate_bits),
-                                        fft_root_table,
-                                    );
+                                    if !try_fft_classic_coset_folded(
+                                        destination, degree, rate_bits, &folded, shift,
+                                    ) {
+                                        batch_multiply_into(
+                                            &mut destination[..degree],
+                                            &polynomial.coeffs,
+                                            &coset_powers,
+                                        );
+                                        fft_in_place_with_options(
+                                            destination,
+                                            Some(rate_bits),
+                                            fft_root_table,
+                                        );
+                                    }
                                     copy_even(group * 8 + k, destination);
                                 },
                             );
@@ -508,6 +552,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         // computing it here): the three commitments per proof share one table
         // per degree instead of each rebuilding the serial power chain.
         let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+        let lde_len = degree << rate_bits;
+        let shift = F::coset_shift();
+        let folded = coset_folded_root_table(lde_len, shift);
 
         // If blinding, salt with two random elements to each leaf vector.
         let salt_size = if blinding { SALT_SIZE } else { 0 };
@@ -516,36 +563,21 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                // Fused zero-pad + shared-coset-powers multiply: one LDE-sized
-                // buffer (instead of `lde()` + `coset_fft` each allocating),
-                // with the packed batch multiply over the precomputed table.
-                let lde_len = degree << rate_bits;
                 let mut buffer = Vec::with_capacity(lde_len);
                 // SAFETY: capacity is exactly `lde_len >= degree` and `F` is
-                // `Copy`. The `degree` live slots are *assigned* by the
-                // `batch_multiply_into` immediately below, which never reads
-                // its destination.
+                // `Copy`. Live slots are assigned by the copy immediately below.
                 unsafe { buffer.set_len(degree) };
-                // Fused copy-and-scale, the twin of the column-store path: the
-                // unscaled coefficient image the `extend_from_slice` used to
-                // materialize here is never observed (only the coset-scaled
-                // values reach the FFT), so writing the product directly deletes
-                // one read+write pass over `degree` words per polynomial.
-                // `batch_multiply_into` uses the same packed-prefix/scalar-tail
-                // schedule as the `batch_multiply_inplace` it replaces, over
-                // slices of equal length, so every word is bit-identical.
-                batch_multiply_into(&mut buffer[..degree], &p.coeffs, &coset_powers);
+                buffer[..degree].copy_from_slice(&p.coeffs);
                 if rate_bits == 0 || degree < 2 {
                     buffer.resize(lde_len, F::ZERO);
                 } else {
-                    // SAFETY: capacity is exactly `lde_len`. With `Some(rate_bits)`
-                    // the zero-padded FFT reads only the first `degree` coefficients
-                    // and writes every tail element before reading it (all expansion
-                    // paths fill back-to-front), so the tail never needs the memset.
-                    // `degree < 2` is excluded: the first-layer block writes nothing
-                    // for a single live coefficient.
+                    // SAFETY: expansion writes every tail element before reading it.
                     unsafe { buffer.set_len(lde_len) };
                 }
+                if try_fft_classic_coset_folded(&mut buffer, degree, rate_bits, &folded, shift) {
+                    return buffer;
+                }
+                batch_multiply_into(&mut buffer[..degree], &p.coeffs, &coset_powers);
                 PolynomialCoeffs::new(buffer)
                     .fft_with_options(Some(rate_bits), fft_root_table)
                     .values
@@ -568,6 +600,8 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         let degree = polynomials[0].len();
         let lde_len = degree << rate_bits;
         let coset_powers = crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
+        let shift = F::coset_shift();
+        let folded = coset_folded_root_table(lde_len, shift);
         let Some(destinations) = columns.columns_mut() else {
             return false;
         };
@@ -589,18 +623,18 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // packed-prefix/scalar-tail schedule as the
                 // `batch_multiply_inplace` it replaces, and it never reads the
                 // (possibly uninitialized) destination.
-                batch_multiply_into(
-                    &mut destination[..degree],
-                    &polynomial.coeffs,
-                    &coset_powers,
-                );
+                destination[..degree].copy_from_slice(&polynomial.coeffs);
                 if rate_bits == 0 || degree < 2 {
                     destination[degree..].fill(F::ZERO);
                 }
-                // For a nontrivial zero-padded FFT, the expansion path writes
-                // every tail element before reading it. This is the same
-                // invariant used by `lde_values` to avoid a dead tail memset.
-                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                if !try_fft_classic_coset_folded(destination, degree, rate_bits, &folded, shift) {
+                    batch_multiply_into(
+                        &mut destination[..degree],
+                        &polynomial.coeffs,
+                        &coset_powers,
+                    );
+                    fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
+                }
                 copy_even(column, destination);
             });
         true
