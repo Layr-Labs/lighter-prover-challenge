@@ -8,6 +8,10 @@ use super::circuit_builder::{LookupChallenges, NUM_COINS_LOOKUP};
 use super::vars::EvaluationVarsBase;
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::{Extendable, FieldExtension};
+#[cfg(target_arch = "aarch64")]
+use crate::field::packable::Packable;
+#[cfg(target_arch = "aarch64")]
+use crate::field::packed::PackedField;
 use crate::field::types::{Field, PrimeField64};
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
 use crate::gates::gate::InterleavePairGate;
@@ -489,6 +493,49 @@ fn fill_shared_gate_filters<F: RichField + Extendable<D>, const D: usize>(
     }
 }
 
+/// Computes `bit * (bit - 1)` in the field's preferred AArch64 packing and
+/// multiply-accumulates it into one or more disjoint output rows. The packed
+/// prefix preserves the old `PackedField::multiply_accumulate` association;
+/// the ragged suffix preserves the old scalar `+= boolean * filter` association.
+/// Keeping the Boolean value local lets the two-row case reuse it without a
+/// scratch write/read round trip.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn batch_boolean_multiply_add<F: Field, const N: usize>(
+    outputs: [&mut [F]; N],
+    bits: &[F],
+    filters: [&[F]; N],
+) {
+    type Packing<F> = <F as Packable>::Packing;
+
+    assert!(N > 0);
+    let len = bits.len();
+    for lane in 0..N {
+        assert_eq!(outputs[lane].len(), len);
+        assert_eq!(filters[lane].len(), len);
+    }
+
+    let width = Packing::<F>::WIDTH;
+    let packed_len = len - len % width;
+    for base in (0..packed_len).step_by(width) {
+        let bit = *Packing::<F>::from_slice(&bits[base..base + width]);
+        let boolean = bit * (bit - F::ONE);
+        for lane in 0..N {
+            let filter = *Packing::<F>::from_slice(&filters[lane][base..base + width]);
+            let output = Packing::<F>::from_slice_mut(&mut outputs[lane][base..base + width]);
+            *output = output.multiply_accumulate(boolean, filter);
+        }
+    }
+
+    for point in packed_len..len {
+        let bit = bits[point];
+        let boolean = bit * (bit - F::ONE);
+        for lane in 0..N {
+            outputs[lane][point] += boolean * filters[lane][point];
+        }
+    }
+}
+
 /// Evaluates the exact Interleave(4) + Uninterleave(2) pair with one traversal
 /// of their shared 128 bit columns while retaining the ordinary 136-row dense
 /// matrix and its existing alpha reducer.
@@ -502,7 +549,9 @@ fn fill_shared_gate_filters<F: RichField + Extendable<D>, const D: usize>(
 /// parity columns) are accumulated in 128 bit integers and reduced once per
 /// chain instead of once per bit. Each accumulator is written and read only by
 /// its own recurrence inside the bit loop, so deferring its reduction reorders
-/// nothing; the range column and the packed MACs are untouched.
+/// nothing. On AArch64 the independent Boolean constraint is evaluated in the
+/// field's packing and fed straight to the same packed MAC association; all
+/// other constraints retain the range scratch path.
 ///
 /// Bounds, derived from `raw < 2^64` only — bit wires are *not* restricted to
 /// `{0, 1}` on the quotient domain, so no Boolean argument is used:
@@ -587,7 +636,10 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
                 wide_x[point] = (wide_x[point] << 1) + raw;
                 wide_spread[point] = (wide_spread[point] << 2) + raw;
                 parity[point] = (parity[point] << 1) + raw;
-                range[point] = bit * (bit - F::ONE);
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    range[point] = bit * (bit - F::ONE);
+                }
             }
             if bit_index % BASE4_SPREAD_STAGE == BASE4_SPREAD_STAGE - 1 {
                 for point in 0..batch_size {
@@ -598,15 +650,37 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
             }
 
             let row = interleave_row + 2 + bit_index;
-            let interleave_output = &mut combined[row * batch_size..(row + 1) * batch_size];
-            if operation % 2 == 0 {
-                batch_multiply_add_inplace(interleave_output, range, interleave_filter);
-                let uninterleave_row = row + 2;
-                let uninterleave_output = &mut combined
-                    [uninterleave_row * batch_size..(uninterleave_row + 1) * batch_size];
-                batch_multiply_add_inplace(uninterleave_output, range, uninterleave_filter);
-            } else {
-                batch_multiply_add_inplace(interleave_output, range, summed_filter);
+            #[cfg(target_arch = "aarch64")]
+            {
+                if operation % 2 == 0 {
+                    let uninterleave_start = (row + 2) * batch_size;
+                    let (before_uninterleave, from_uninterleave) =
+                        combined.split_at_mut(uninterleave_start);
+                    let interleave_output =
+                        &mut before_uninterleave[row * batch_size..(row + 1) * batch_size];
+                    let uninterleave_output = &mut from_uninterleave[..batch_size];
+                    batch_boolean_multiply_add(
+                        [interleave_output, uninterleave_output],
+                        bit_col,
+                        [interleave_filter, uninterleave_filter],
+                    );
+                } else {
+                    let interleave_output = &mut combined[row * batch_size..(row + 1) * batch_size];
+                    batch_boolean_multiply_add([interleave_output], bit_col, [summed_filter]);
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                let interleave_output = &mut combined[row * batch_size..(row + 1) * batch_size];
+                if operation % 2 == 0 {
+                    batch_multiply_add_inplace(interleave_output, range, interleave_filter);
+                    let uninterleave_row = row + 2;
+                    let uninterleave_output = &mut combined
+                        [uninterleave_row * batch_size..(uninterleave_row + 1) * batch_size];
+                    batch_multiply_add_inplace(uninterleave_output, range, uninterleave_filter);
+                } else {
+                    batch_multiply_add_inplace(interleave_output, range, summed_filter);
+                }
             }
         }
 
@@ -687,6 +761,7 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
 /// on this walk rather than in a separate pass is what makes it nearly free:
 /// the line is already resident and dirty from the read. Callers that do not
 /// own the buffer, or that want to inspect it afterwards, pass `false`.
+#[cfg(test)]
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &mut [F],
     batch_size: usize,
@@ -779,6 +854,93 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+/// Initializes an uninitialized output buffer with the first reversed gate row,
+/// then continues the same Horner reduction through ordinary typed values.
+fn reduce_gate_constraints_base_batch_uninit<F: Field>(
+    constraint_terms_batch: &mut [F],
+    batch_size: usize,
+    alphas: &[F],
+    res_out: &mut [core::mem::MaybeUninit<F>],
+    clear_as_consumed: bool,
+) {
+    assert!(batch_size > 0);
+    assert_eq!(constraint_terms_batch.len() % batch_size, 0);
+    assert_eq!(res_out.len(), batch_size * alphas.len());
+
+    let mut rows = constraint_terms_batch.chunks_exact_mut(batch_size).rev();
+    if alphas.len() == 2 {
+        let alpha_0 = alphas[0];
+        let alpha_1 = alphas[1];
+        match rows.next() {
+            Some(first_row) => {
+                for (term_slot, result) in first_row.iter_mut().zip(res_out.chunks_exact_mut(2)) {
+                    let term = *term_slot;
+                    result[0].write(term);
+                    result[1].write(term);
+                    if clear_as_consumed {
+                        *term_slot = F::ZERO;
+                    }
+                }
+            }
+            None => {
+                for slot in res_out.iter_mut() {
+                    slot.write(F::ZERO);
+                }
+            }
+        }
+        // SAFETY: the first-row or empty-row branch initialized every slot.
+        let res_out = unsafe {
+            core::slice::from_raw_parts_mut(res_out.as_mut_ptr().cast::<F>(), res_out.len())
+        };
+        for constraint_row in rows {
+            for (term_slot, result) in constraint_row.iter_mut().zip(res_out.chunks_exact_mut(2)) {
+                let term = *term_slot;
+                result[0] = term.multiply_accumulate(result[0], alpha_0);
+                result[1] = term.multiply_accumulate(result[1], alpha_1);
+                if clear_as_consumed {
+                    *term_slot = F::ZERO;
+                }
+            }
+        }
+        return;
+    }
+
+    match rows.next() {
+        Some(first_row) => {
+            for (point, term_slot) in first_row.iter_mut().enumerate() {
+                let term = *term_slot;
+                let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+                for slot in result {
+                    slot.write(term);
+                }
+                if clear_as_consumed {
+                    *term_slot = F::ZERO;
+                }
+            }
+        }
+        None => {
+            for slot in res_out.iter_mut() {
+                slot.write(F::ZERO);
+            }
+        }
+    }
+    // SAFETY: the first-row or empty-row branch initialized every slot.
+    let res_out =
+        unsafe { core::slice::from_raw_parts_mut(res_out.as_mut_ptr().cast::<F>(), res_out.len()) };
+    for constraint_row in rows {
+        for (point, term_slot) in constraint_row.iter_mut().enumerate() {
+            let term = *term_slot;
+            let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+            for (value, &alpha) in result.iter_mut().zip(alphas) {
+                *value = term.multiply_accumulate(*value, alpha);
+            }
+            if clear_as_consumed {
+                *term_slot = F::ZERO;
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
     wire.multiply_accumulate(beta, point) + gamma
@@ -787,8 +949,8 @@ fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
-/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
-/// zero-initialized by the caller.
+/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. The caller provides
+/// uninitialized output slots; this function initializes all of them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
@@ -811,7 +973,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
-    res_out: &mut [F],
+    res_out: &mut [core::mem::MaybeUninit<F>],
 ) {
     let has_lookup = common_data.num_lookup_polys != 0;
 
@@ -853,10 +1015,16 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
+    assert_eq!(alphas.len(), num_challenges);
+    assert_eq!(res_out.len(), n * num_challenges);
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true, true);
+    reduce_gate_constraints_base_batch_uninit(constraint_terms_batch, n, alphas, res_out, true);
+    // SAFETY: the reduction above initialized every output slot before any
+    // later permutation or lookup term reads and updates the accumulator.
+    let res_out =
+        unsafe { core::slice::from_raw_parts_mut(res_out.as_mut_ptr().cast::<F>(), res_out.len()) };
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -2105,7 +2273,7 @@ pub(crate) fn eval_vanishing_poly_circuit<F: RichField + Extendable<D>, const D:
 #[cfg(test)]
 mod tests {
     use plonky2_field::goldilocks_field::GoldilocksField;
-    use plonky2_field::types::PrimeField64;
+    use plonky2_field::types::{Field64, PrimeField64};
 
     use super::*;
 
@@ -2187,6 +2355,56 @@ mod tests {
     }
 
     #[test]
+    fn uninitialized_reduction_matches_zero_seed_in_raw_limbs() {
+        type F = GoldilocksField;
+
+        for alpha_count in [1usize, 2, 3] {
+            let alphas = (0..alpha_count)
+                .map(|i| F::from_canonical_usize(i * 13 + 3))
+                .collect::<Vec<_>>();
+            for batch_size in [1usize, 7, 32] {
+                for num_constraints in [0usize, 1, 7] {
+                    let terms = (0..batch_size * num_constraints)
+                        .map(|i| F::from_canonical_usize(i * 17 + 5))
+                        .collect::<Vec<_>>();
+                    let mut expected_terms = terms.clone();
+                    let mut actual_terms = terms;
+                    let output_len = batch_size * alpha_count;
+                    let mut expected = vec![F::ZERO; output_len];
+                    reduce_gate_constraints_base_batch(
+                        &mut expected_terms,
+                        batch_size,
+                        &alphas,
+                        &mut expected,
+                        true,
+                        true,
+                    );
+                    let mut actual = vec![core::mem::MaybeUninit::<F>::uninit(); output_len];
+                    reduce_gate_constraints_base_batch_uninit(
+                        &mut actual_terms,
+                        batch_size,
+                        &alphas,
+                        &mut actual,
+                        true,
+                    );
+                    // SAFETY: the uninitialized reducer must initialize every
+                    // output slot, including the no-constraint case.
+                    let actual = unsafe {
+                        core::slice::from_raw_parts(actual.as_ptr().cast::<F>(), actual.len())
+                    };
+                    assert_eq!(actual_terms, expected_terms);
+                    for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            actual.0, expected.0,
+                            "raw mismatch at {i}, alphas={alpha_count}, batch={batch_size}, rows={num_constraints}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn constraint_major_reduction_preserves_pointwise_horner_order() {
         type F = GoldilocksField;
 
@@ -2224,7 +2442,7 @@ mod tests {
                 for constraint_row in terms.chunks_exact(batch_size).rev() {
                     let term = constraint_row[point];
                     for (result, &alpha) in point_result.iter_mut().zip(&alphas) {
-                        *result = term.multiply_accumulate(*result, alpha);
+                        *result = Field::multiply_accumulate(&term, *result, alpha);
                     }
                 }
             }
@@ -2349,6 +2567,122 @@ mod tests {
         }
     }
 
+    /// Localizes the AArch64 packed Boolean/MAC seam against the old per-cell
+    /// association. The oracle computes the Boolean term scalar and then uses
+    /// scalar `multiply_accumulate` only for points in the packed prefix; it
+    /// does not call the candidate helper.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn packed_boolean_multiply_add_matches_scalar_raw_limbs() {
+        type F = GoldilocksField;
+        type Packing = <F as Packable>::Packing;
+
+        let boundary = [
+            0,
+            1,
+            2,
+            (u32::MAX as u64) - 1,
+            u32::MAX as u64,
+            1u64 << 32,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            F::ORDER + 2,
+            1u64 << 63,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        let mut state = 0x510e_527f_ade6_82d1u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for len in [1usize, 3, 4, 31, 32, 33] {
+            for trial in 0..8usize {
+                let mut draw = |offset: usize| {
+                    let raw = if trial == 0 {
+                        boundary[offset % boundary.len()]
+                    } else {
+                        let random = next();
+                        if random.wrapping_add(offset as u64) % 3 == 0 {
+                            boundary[random.wrapping_add(offset as u64) as usize % boundary.len()]
+                        } else {
+                            random
+                        }
+                    };
+                    GoldilocksField(raw)
+                };
+
+                let mut bits = (0..len).map(|i| draw(3 * i)).collect::<Vec<_>>();
+                let mut filter_0 = (0..len).map(|i| draw(3 * i + 1)).collect::<Vec<_>>();
+                let mut filter_1 = (0..len).map(|i| draw(3 * i + 2)).collect::<Vec<_>>();
+                let mut seed_0 = (0..len).map(|i| draw(5 * i + 3)).collect::<Vec<_>>();
+                let mut seed_1 = (0..len).map(|i| draw(5 * i + 4)).collect::<Vec<_>>();
+
+                // Every shape/trial contains non-canonical bits, filters and
+                // output seeds, including the one-element ragged shape.
+                bits[0] = GoldilocksField(F::ORDER + 1 + trial as u64);
+                filter_0[0] = GoldilocksField(u64::MAX - trial as u64);
+                filter_1[0] = GoldilocksField(F::ORDER + 17 + trial as u64);
+                seed_0[0] = GoldilocksField(F::ORDER + 33 + trial as u64);
+                seed_1[0] = GoldilocksField(u64::MAX - 31 - trial as u64);
+
+                let packed_len = len - len % Packing::WIDTH;
+                let old_cell = |acc: F, bit: F, filter: F, point: usize| {
+                    let boolean = bit * (bit - F::ONE);
+                    if point < packed_len {
+                        Field::multiply_accumulate(&acc, boolean, filter)
+                    } else {
+                        acc + boolean * filter
+                    }
+                };
+
+                let mut expected_single = seed_0.clone();
+                for point in 0..len {
+                    expected_single[point] =
+                        old_cell(expected_single[point], bits[point], filter_0[point], point);
+                }
+                let mut actual_single = seed_0.clone();
+                batch_boolean_multiply_add([actual_single.as_mut_slice()], &bits, [&filter_0]);
+                for point in 0..len {
+                    assert_eq!(
+                        actual_single[point].0, expected_single[point].0,
+                        "single raw mismatch: len={len}, trial={trial}, point={point}"
+                    );
+                }
+
+                let mut expected_0 = seed_0.clone();
+                let mut expected_1 = seed_1.clone();
+                for point in 0..len {
+                    expected_0[point] =
+                        old_cell(expected_0[point], bits[point], filter_0[point], point);
+                    expected_1[point] =
+                        old_cell(expected_1[point], bits[point], filter_1[point], point);
+                }
+                let mut actual_0 = core::mem::take(&mut seed_0);
+                let mut actual_1 = core::mem::take(&mut seed_1);
+                batch_boolean_multiply_add(
+                    [actual_0.as_mut_slice(), actual_1.as_mut_slice()],
+                    &bits,
+                    [&filter_0, &filter_1],
+                );
+                for point in 0..len {
+                    assert_eq!(
+                        actual_0[point].0, expected_0[point].0,
+                        "pair lane 0 raw mismatch: len={len}, trial={trial}, point={point}"
+                    );
+                    assert_eq!(
+                        actual_1[point].0, expected_1[point].0,
+                        "pair lane 1 raw mismatch: len={len}, trial={trial}, point={point}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Raw-limb differential between the delayed and the per-bit reduction in
     /// the fused interleave pair, over arbitrary `u64` representatives:
     /// canonical, non-canonical and boundary. Bit wires are deliberately NOT
@@ -2386,9 +2720,9 @@ mod tests {
             state
         };
 
-        // 32 is the production batch width of the quotient walker; 1 and 7
-        // exercise the tail, 33 forces the heap scratch path.
-        for batch_size in [32usize, 1, 7, 33] {
+        // 32 is the production quotient width; 1/3/31 exercise packed
+        // remainders, 4 is one complete pack, and 33 forces heap scratch.
+        for batch_size in [1usize, 3, 4, 7, 31, 32, 33] {
             for trial in 0..16usize {
                 let mut draw = |k: usize| -> F {
                     if trial == 0 {

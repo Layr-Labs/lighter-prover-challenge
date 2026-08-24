@@ -241,27 +241,25 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
         if TypeId::of::<F::Extension>() == TypeId::of::<GoldilocksExt2>() {
             let folded_len = terms.len() / 16;
             let mut folded: Vec<F::Extension> = Vec::with_capacity(folded_len);
-            // SAFETY: ext2_fri_fold_arity16_batch initializes every element below.
-            unsafe { folded.set_len(folded_len) };
-            // SAFETY: TypeId equality proves all three element types exactly.
+            // SAFETY: TypeId equality proves the source, power, and output slot
+            // element types exactly. The batch kernel writes every output slot;
+            // only after the parallel join do we declare the Vec initialized.
             let terms_ext2 = unsafe {
-                core::slice::from_raw_parts(
-                    terms.as_ptr().cast::<GoldilocksExt2>(),
-                    terms.len(),
-                )
+                core::slice::from_raw_parts(terms.as_ptr().cast::<GoldilocksExt2>(), terms.len())
             };
             let powers_ext2 = unsafe {
-                &*(beta_powers as *const [F::Extension; 16]
-                    as *const [GoldilocksExt2; 16])
+                &*(beta_powers as *const [F::Extension; 16] as *const [GoldilocksExt2; 16])
             };
-            let folded_len = folded.len();
-            let folded_ext2 = unsafe {
+            let folded_ext2_slots = unsafe {
                 core::slice::from_raw_parts_mut(
-                    folded.as_mut_ptr().cast::<GoldilocksExt2>(),
+                    folded
+                        .spare_capacity_mut()
+                        .as_mut_ptr()
+                        .cast::<core::mem::MaybeUninit<GoldilocksExt2>>(),
                     folded_len,
                 )
             };
-            folded_ext2
+            folded_ext2_slots
                 .par_chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
                 .enumerate()
                 .for_each(|(batch, output)| {
@@ -272,6 +270,8 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
                         output,
                     );
                 });
+            // SAFETY: the batch kernel initialized every slot in 0..folded_len.
+            unsafe { folded.set_len(folded_len) };
             return folded;
         }
     }

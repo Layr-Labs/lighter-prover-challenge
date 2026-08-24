@@ -733,7 +733,7 @@ fn ext2_dot_product_arity16_pair(
 pub fn ext2_fri_fold_arity16_batch(
     terms: &[QuadraticExtension<GoldilocksField>],
     powers: &[QuadraticExtension<GoldilocksField>; 16],
-    output: &mut [QuadraticExtension<GoldilocksField>],
+    output: &mut [core::mem::MaybeUninit<QuadraticExtension<GoldilocksField>>],
 ) {
     assert_eq!(terms.len(), output.len() * 16);
     let paired = output.len() & !1;
@@ -742,13 +742,13 @@ pub fn ext2_fri_fold_arity16_batch(
         let terms0 = terms[start..start + 16].try_into().unwrap();
         let terms1 = terms[start + 16..start + 32].try_into().unwrap();
         let pair = ext2_dot_product_arity16_pair(terms0, terms1, powers);
-        output[row] = pair[0];
-        output[row + 1] = pair[1];
+        output[row].write(pair[0]);
+        output[row + 1].write(pair[1]);
     }
     if paired != output.len() {
         let start = paired * 16;
         let tail = terms[start..start + 16].try_into().unwrap();
-        output[paired] = ext2_dot_product_arity16(tail, powers);
+        output[paired].write(ext2_dot_product_arity16(tail, powers));
     }
 }
 
