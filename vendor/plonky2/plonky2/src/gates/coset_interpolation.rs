@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -322,8 +323,42 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        // Same stack-scratch pattern as ReducingGate on tip: production
+        // batches are 32 points and CosetInterpolation shapes fit a few KiB.
+        // Heap fallback keeps odd oversized evals correct.
+        const STACK_POINTS: usize = 32;
+        const STACK_VALUES: usize = 32;
+        const STACK_SCRATCH: usize = 4096;
+        let n_points = self.num_points();
+        let scratch_len = num_constraints * n;
+        let use_stack = n <= STACK_POINTS
+            && n_points <= STACK_VALUES
+            && scratch_len <= STACK_SCRATCH;
+        let mut values_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_VALUES];
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut values_heap;
+        let mut scratch_heap;
+        let (values, scratch): (&mut [F::Extension], &mut [F]) = if use_stack {
+            // SAFETY: every values[i] is written in the point loop before
+            // interpolate reads it; every scratch[j*n+p] is written before
+            // batch_multiply_add_inplace.
+            unsafe {
+                (
+                    core::slice::from_raw_parts_mut(
+                        values_stack.as_mut_ptr().cast::<F::Extension>(),
+                        n_points,
+                    ),
+                    core::slice::from_raw_parts_mut(
+                        scratch_stack.as_mut_ptr().cast::<F>(),
+                        scratch_len,
+                    ),
+                )
+            }
+        } else {
+            values_heap = vec![F::Extension::ZERO; n_points];
+            scratch_heap = vec![F::ZERO; scratch_len];
+            (&mut values_heap, &mut scratch_heap)
+        };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];
