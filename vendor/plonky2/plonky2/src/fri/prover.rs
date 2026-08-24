@@ -27,7 +27,7 @@ use crate::timed;
 use crate::util::timing::TimingTree;
 use crate::util::{log2_strict, reverse_bits};
 
-const FRI_FOLD_ARITY16_BATCH_WIDTH: usize = 8;
+const FRI_FOLD_ARITY16_BATCH_WIDTH: usize = 32;
 
 /// Builds a FRI proof.
 pub fn fri_proof<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
