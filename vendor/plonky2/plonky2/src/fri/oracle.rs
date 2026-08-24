@@ -62,6 +62,10 @@ pub(crate) enum BatchLayout {
 pub struct EvenColumns<F> {
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     inner: std::sync::OnceLock<Option<crate::hash::poseidon2::metal::MetalColumns<F>>>,
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    constant_prefix: std::sync::OnceLock<
+        Option<crate::hash::poseidon2::metal::MetalColumns<F>>,
+    >,
     _phantom: core::marker::PhantomData<F>,
 }
 
@@ -70,6 +74,8 @@ impl<F> Default for EvenColumns<F> {
         Self {
             #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
             inner: std::sync::OnceLock::new(),
+            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+            constant_prefix: std::sync::OnceLock::new(),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -100,6 +106,7 @@ impl<F> EvenColumns<F> {
         let _ = inner.set(columns);
         Self {
             inner,
+            constant_prefix: std::sync::OnceLock::new(),
             _phantom: core::marker::PhantomData,
         }
     }
@@ -126,8 +133,37 @@ impl<F> EvenColumns<F> {
         F: crate::hash::hash_types::RichField,
     {
         self.inner
-            .get_or_init(|| fill_even_companion_from_full(full))
+            .get_or_init(|| fill_even_companion_from_full(full, full.cols()))
             .as_ref()
+    }
+
+    /// Derive only the constants prefix needed by the exact MulExtension
+    /// qsplit addition. This is intentionally independent of `inner`: failure
+    /// to retain the full constants-and-sigmas companion must not change the
+    /// promoted Range/U32 routing selected by `get_or_fill_even_rows`.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    pub(crate) fn get_or_fill_even_constant_prefix(
+        &self,
+        full: &crate::hash::poseidon2::metal::MetalColumns<F>,
+        required_cols: usize,
+    ) -> Option<&crate::hash::poseidon2::metal::MetalColumns<F>>
+    where
+        F: crate::hash::hash_types::RichField,
+    {
+        if full.rows() < 2
+            || full.rows() % 2 != 0
+            || required_cols == 0
+            || required_cols > full.cols()
+        {
+            return None;
+        }
+        let expected_rows = full.rows() / 2;
+        self.constant_prefix
+            .get_or_init(|| fill_even_companion_from_full(full, required_cols))
+            .as_ref()
+            .filter(|columns| {
+                columns.rows() == expected_rows && columns.cols() >= required_cols
+            })
     }
 }
 
@@ -162,13 +198,18 @@ unsafe fn copy_even_fast<F: crate::hash::hash_types::RichField>(dst: *mut F, src
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn fill_even_companion_from_full<F: crate::hash::hash_types::RichField>(
     full: &crate::hash::poseidon2::metal::MetalColumns<F>,
+    required_cols: usize,
 ) -> Option<crate::hash::poseidon2::metal::MetalColumns<F>> {
-    if full.rows() < 2 || full.rows() % 2 != 0 || full.cols() == 0 {
+    if full.rows() < 2
+        || full.rows() % 2 != 0
+        || required_cols == 0
+        || required_cols > full.cols()
+    {
         return None;
     }
     let half = full.rows() / 2;
     let mut companion =
-        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(full.cols(), half)?;
+        crate::hash::poseidon2::metal::allocate_plain_columns::<F>(required_cols, half)?;
     let dests = companion.columns_mut()?;
     dests.into_par_iter().enumerate().for_each(|(j, dest)| {
         let src = full.col(j);

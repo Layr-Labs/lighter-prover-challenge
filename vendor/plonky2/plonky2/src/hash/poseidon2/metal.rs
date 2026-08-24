@@ -108,6 +108,22 @@ const SHADER_SOURCE: &str = include_str!("poseidon2.metal");
 /// `metallib_matches_shader_source` test enforces it.
 const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
+/// The previously M4-validated extension-arithmetic library from the dedicated
+/// Metal implementation. Only `extension_arith_gate_quotient` is resolved from
+/// this artifact; the promoted Poseidon/Range library above remains byte-for-
+/// byte unchanged, so all of its existing archive keys remain valid.
+///
+/// SHA-256: 0ef49daf347e95cdf970ea3b18616da6c97bbcd0ab411afb6a93ce82bd8cf26c
+const EXTENSION_SHADER_METALLIB: &[u8] = include_bytes!("poseidon2-extension.metallib");
+/// Same source compiled as Metal 3.1 / macOS 15 for development hosts whose
+/// runtime cannot load Metal 4 AIR. Yukon loads the primary artifact above;
+/// this fallback exists so the exact GPU differential remains executable on
+/// older Apple Silicon Macs.
+/// SHA-256: 4dc92f02df4a08a7e880692dcc49f50916d2fa88e0200fab4899f254e4fa0ee1
+const EXTENSION_SHADER_METALLIB_METAL31: &[u8] =
+    include_bytes!("poseidon2-extension-metal31.metallib");
+const EXTENSION_QUOTIENT_KERNEL: &str = "extension_arith_gate_quotient";
+
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
     "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
@@ -700,6 +716,20 @@ pub(crate) struct U32QuotientSpec {
     pub include_unused_selector: bool,
     pub num_ops: usize,
     pub kind: U32QuotientKind,
+}
+
+/// Exact production `MulExtensionGate<2>` routed only through the half-domain
+/// quotient split. It intentionally is not a `U32QuotientKind`: a missing
+/// compact constants store or extension pipeline must leave this gate on the
+/// generic CPU evaluator, never send it through the whole-domain Range job.
+#[derive(Clone, Debug)]
+pub(crate) struct MulExtensionQuotientSpec {
+    pub selector_column: usize,
+    pub gate_index: usize,
+    pub group: core::ops::Range<usize>,
+    pub include_unused_selector: bool,
+    pub num_ops: usize,
+    pub constant_base: usize,
 }
 
 /// Bounded exact-size cache of shared column-store buffers.
@@ -1418,6 +1448,7 @@ impl LazyPipeline {
 static POSEIDON_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static RANGE_CHECK_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static PERMUTATION_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
+static EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE: LazyPipeline = LazyPipeline::new();
 static ABSORB_PASS_PIPELINE: LazyPipeline = LazyPipeline::new();
 
 fn poseidon_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1430,6 +1461,10 @@ fn range_check_gate_quotient_pipeline() -> Option<&'static ComputePipelineState>
 
 fn permutation_quotient_pipeline() -> Option<&'static ComputePipelineState> {
     PERMUTATION_QUOTIENT_PIPELINE.get()
+}
+
+fn extension_arith_gate_quotient_pipeline() -> Option<&'static ComputePipelineState> {
+    EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE.get()
 }
 
 fn absorb_pass_pipeline() -> Option<&'static ComputePipelineState> {
@@ -1489,6 +1524,60 @@ fn spawn_optional_pipelines(
                 let _ = slot.built.set(None);
                 note_pipeline_settled();
             }
+        }
+    }
+}
+
+/// Materializes the one delta-library pipeline independently of the ten
+/// promoted base pipelines. The reused macOS 26.5 artifact is a fat metallib
+/// with a native GPU slice, so it does not need to replace or extend the proven
+/// base archive. It deliberately does not call `note_pipeline_settled`: that
+/// counter and its public startup report describe the fixed base kernel set.
+fn spawn_extension_pipeline(device: &Device, library: Option<metal::Library>) {
+    let device = device.clone();
+    let spawned = std::thread::Builder::new()
+        .name("poseidon2-metal-extension-arith-gate-quotient".to_string())
+        .spawn(move || {
+            let pipeline = autoreleasepool(|| {
+                library
+                    .as_ref()
+                    .and_then(|library| {
+                        build_pipeline(&device, library, None, EXTENSION_QUOTIENT_KERNEL).ok()
+                    })
+                    .or_else(|| {
+                        // A newer fat metallib can load on an older runtime
+                        // even when that runtime cannot materialize its
+                        // function. Retry at the pipeline boundary, not only
+                        // at the earlier library-load boundary.
+                        device
+                            .new_library_with_data(EXTENSION_SHADER_METALLIB_METAL31)
+                            .ok()
+                            .and_then(|library| {
+                                build_pipeline(
+                                    &device,
+                                    &library,
+                                    None,
+                                    EXTENSION_QUOTIENT_KERNEL,
+                                )
+                                .ok()
+                            })
+                    })
+            });
+            if pipeline.is_none() {
+                log::debug!(
+                    "extension-arith quotient pipeline unavailable; evaluating MulExtension on CPU"
+                );
+            }
+            let _ = EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE.built.set(pipeline);
+        });
+    match spawned {
+        Ok(handle) => {
+            if let Ok(mut builder) = EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE.builder.lock() {
+                *builder = Some(handle);
+            }
+        }
+        Err(_) => {
+            let _ = EXTENSION_ARITH_GATE_QUOTIENT_PIPELINE.built.set(None);
         }
     }
 }
@@ -2026,6 +2115,15 @@ struct RangeQuotientDispatchArgs {
     alpha_stride: usize,
 }
 
+/// Validated inline arguments for one exact MulExtension<2> dispatch. The
+/// delta kernel shares the output layout with Range/U32 but has its older,
+/// ten-buffer ABI and therefore is encoded separately after the base groups.
+struct MulExtensionDispatchArgs {
+    metadata: [u32; 10],
+    alpha_powers: Vec<u64>,
+    alpha_stride: usize,
+}
+
 fn range_quotient_shape_ok<F: RichField>(
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
@@ -2097,17 +2195,44 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
+    start_range_check_gate_quotient_multi_with_mul_extension(
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        groups,
+        None,
+        alphas,
+        alpha_offset,
+    )
+}
+
+/// Combined qsplit launch whose optional final slice is the exact production
+/// `MulExtensionGate<2>`. This entry point is split-only by construction; the
+/// ordinary whole-domain launcher has no extension argument.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_range_check_gate_quotient_multi_with_mul_extension<F: RichField>(
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    groups: &[(Vec<RangeCheckQuotientSpec>, Vec<U32QuotientSpec>)],
+    mul_extension: Option<&MulExtensionQuotientSpec>,
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<RangeCheckGateQuotientJob<F>> {
     // The wires store may be a compact even-row copy. The kernel indexes
     // both buffers with `lde_rows = wires.rows` (`col * wires.rows + row`).
     // Constant-reading gates therefore require a matching even-row constants
     // companion; selector-only / unfiltered gates tolerate a taller full
     // store (`constants.rows >= wires.rows`) because they do not load it.
-    if groups.is_empty()
+    if (groups.is_empty() && mul_extension.is_none())
         || F::ORDER != 0xffff_ffff_0000_0001
         || size_of::<F>() != size_of::<u64>()
         || alphas.len() != 2
         || wires.rows == 0
         || constants.rows < wires.rows
+        || (mul_extension.is_some() && constants.rows != wires.rows)
         || quotient_rows == 0
         || step == 0
         || quotient_rows.checked_mul(step) != Some(wires.rows)
@@ -2115,6 +2240,17 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
         || quotient_rows > u32::MAX as usize
         || step > u32::MAX as usize
     {
+        if mul_extension.is_some() && metal_range_quotient_diagnostics_enabled() {
+            eprintln!(
+                "[metal-mul-extension] launch guard rejected: wire_shape={}x{} \
+                 constant_shape={}x{} rows={quotient_rows} step={step} groups={}",
+                wires.cols,
+                wires.rows,
+                constants.cols,
+                constants.rows,
+                groups.len(),
+            );
+        }
         return None;
     }
     let mut dispatches = Vec::with_capacity(groups.len());
@@ -2124,6 +2260,34 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
         )?;
         dispatches.push((args, specs.len(), u32_specs.len()));
     }
+    let mul_extension = match mul_extension {
+        Some(spec) => match build_mul_extension_dispatch_args(
+            wires,
+            constants,
+            spec,
+            alphas,
+            alpha_offset,
+        ) {
+            Some(args) => Some(args),
+            None => {
+                if metal_range_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[metal-mul-extension] metadata rejected: wire_cols={} constant_cols={} \
+                         selector={} gate={} group={:?} constant_base={} num_ops={}",
+                        wires.cols,
+                        constants.cols,
+                        spec.selector_column,
+                        spec.gate_index,
+                        spec.group,
+                        spec.constant_base,
+                        spec.num_ops,
+                    );
+                }
+                return None;
+            }
+        },
+        None => None,
+    };
     let context = shared_context()?;
     match context.start_range_check_gate_quotient_multi(
         wires,
@@ -2131,15 +2295,27 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
         quotient_rows,
         step,
         &dispatches,
+        mul_extension.as_ref(),
     ) {
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!(
                 "Metal RangeCheck gate quotient (multi) unavailable; using CPU path: {error}"
             );
+            if mul_extension.is_some() && metal_range_quotient_diagnostics_enabled() {
+                eprintln!("[metal-mul-extension] combined launch unavailable: {error}");
+            }
             None
         }
     }
+}
+
+fn metal_range_quotient_diagnostics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PLONKY2_GPU_RANGE_DIAGNOSTICS")
+            .is_some_and(|value| value != "0")
+    })
 }
 
 fn build_range_quotient_dispatch_args<F: RichField>(
@@ -2433,6 +2609,67 @@ fn build_range_quotient_dispatch_args<F: RichField>(
         metadata,
         alpha_powers,
         alpha_stride,
+    })
+}
+
+fn build_mul_extension_dispatch_args<F: RichField>(
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    spec: &MulExtensionQuotientSpec,
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<MulExtensionDispatchArgs> {
+    const NUM_OPS: usize = 13;
+    const WIRE_COUNT: usize = 78;
+    const CONSTRAINT_COUNT: usize = 26;
+
+    let gate_end = spec.gate_index.checked_add(1)?;
+    if F::ORDER != 0xffff_ffff_0000_0001
+        || size_of::<F>() != size_of::<u64>()
+        || alphas.len() != 2
+        || wires.rows == 0
+        || constants.rows != wires.rows
+        || spec.num_ops != NUM_OPS
+        || WIRE_COUNT > wires.cols
+        || spec.selector_column >= constants.cols
+        || spec.constant_base.checked_add(1)? > constants.cols
+        || spec.group.start > spec.gate_index
+        || spec.gate_index >= spec.group.end
+        || spec.selector_column > u32::MAX as usize
+        || gate_end > u32::MAX as usize
+        || spec.constant_base > u32::MAX as usize
+    {
+        return None;
+    }
+
+    let mut alpha_powers = Vec::with_capacity(2 * CONSTRAINT_COUNT);
+    for &alpha in alphas {
+        let mut power = alpha.exp_u64(alpha_offset as u64);
+        for _ in 0..CONSTRAINT_COUNT {
+            alpha_powers.push(power.to_canonical_u64());
+            power *= alpha;
+        }
+    }
+
+    Some(MulExtensionDispatchArgs {
+        // Singleton group + no UNUSED factor evaluates the unfiltered gate
+        // sum on even rows. The original group retained in `spec` is applied
+        // after the IFFT/FFT reconstruction, exactly like every other qsplit
+        // slice.
+        metadata: [
+            spec.selector_column as u32,
+            spec.gate_index as u32,
+            spec.gate_index as u32,
+            gate_end as u32,
+            0,
+            1, // old extension kernel kind: MulExtension
+            NUM_OPS as u32,
+            spec.constant_base as u32,
+            0,
+            0,
+        ],
+        alpha_powers,
+        alpha_stride: CONSTRAINT_COUNT,
     })
 }
 
@@ -2902,6 +3139,17 @@ impl MetalShared {
                     },
                     Ok,
                 )?;
+            // This artifact is intentionally independent from the promoted
+            // library above. Failure to load or resolve its sole consumer is
+            // a local optimization miss: MulExtension remains on the CPU.
+            let extension_library = device
+                .new_library_with_data(EXTENSION_SHADER_METALLIB)
+                .ok()
+                .filter(|library| {
+                    library
+                        .get_function(EXTENSION_QUOTIENT_KERNEL, None)
+                        .is_ok()
+                });
             // Build the compute pipelines concurrently, one thread each.
             //
             // Every `newComputePipelineStateWithFunction:` lowers that kernel's
@@ -3030,6 +3278,7 @@ impl MetalShared {
             let ifft_finalize_pipeline = ifft_finalize_pipeline?;
 
             spawn_optional_pipelines(&device, &library, archive.as_ref());
+            spawn_extension_pipeline(&device, extension_library);
 
             let mut parameter_values = Vec::with_capacity(130);
             parameter_values.extend(EXTERNAL_CONSTANTS.into_iter().flatten());
@@ -3261,9 +3510,24 @@ impl MetalShared {
         quotient_rows: usize,
         step: usize,
         dispatches: &[(RangeQuotientDispatchArgs, usize, usize)],
+        mul_extension: Option<&MulExtensionDispatchArgs>,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
-        let pipeline = range_check_gate_quotient_pipeline()
-            .ok_or("RangeCheck gate quotient pipeline unavailable")?;
+        let range_pipeline = if dispatches.is_empty() {
+            None
+        } else {
+            Some(
+                range_check_gate_quotient_pipeline()
+                    .ok_or("RangeCheck gate quotient pipeline unavailable")?,
+            )
+        };
+        let extension_pipeline = if mul_extension.is_some() {
+            Some(
+                extension_arith_gate_quotient_pipeline()
+                    .ok_or("extension-arith gate quotient pipeline unavailable")?,
+            )
+        } else {
+            None
+        };
         for (args, range_count, u32_count) in dispatches {
             if args.metadata.len() != (range_count + u32_count) * 10
                 || args.alpha_powers.len() != args.alpha_stride * 2
@@ -3271,11 +3535,20 @@ impl MetalShared {
                 return Err("invalid RangeCheck quotient metadata".to_string());
             }
         }
+        if let Some(args) = mul_extension {
+            if args.alpha_stride != 26 || args.alpha_powers.len() != 52 {
+                return Err("invalid MulExtension quotient metadata".to_string());
+            }
+        }
         let slice_len = quotient_rows
             .checked_mul(2)
             .ok_or("RangeCheck gate quotient output length overflow")?;
+        let slice_count = dispatches
+            .len()
+            .checked_add(usize::from(mul_extension.is_some()))
+            .ok_or("RangeCheck gate quotient output length overflow")?;
         let len = slice_len
-            .checked_mul(dispatches.len())
+            .checked_mul(slice_count)
             .ok_or("RangeCheck gate quotient output length overflow")?;
         let bytes = len
             .checked_mul(size_of::<u64>())
@@ -3286,14 +3559,42 @@ impl MetalShared {
         let command_buffer = autoreleasepool(|| -> CommandBuffer {
             let command_buffer = self.queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(pipeline);
-            encoder.set_buffer(0, Some(&wires.buffer), 0);
-            encoder.set_buffer(1, Some(&constants.buffer), 0);
-            set_u32(encoder, 5, wires.rows as u32);
-            set_u32(encoder, 6, quotient_rows as u32);
-            set_u32(encoder, 7, step as u32);
-            for (k, (args, range_count, u32_count)) in dispatches.iter().enumerate() {
-                encoder.set_buffer(2, Some(&output), (k * slice_bytes) as NSUInteger);
+            if let Some(pipeline) = range_pipeline {
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&wires.buffer), 0);
+                encoder.set_buffer(1, Some(&constants.buffer), 0);
+                set_u32(encoder, 5, wires.rows as u32);
+                set_u32(encoder, 6, quotient_rows as u32);
+                set_u32(encoder, 7, step as u32);
+                for (k, (args, range_count, u32_count)) in dispatches.iter().enumerate() {
+                    encoder.set_buffer(2, Some(&output), (k * slice_bytes) as NSUInteger);
+                    encoder.set_bytes(
+                        3,
+                        size_of_val(args.alpha_powers.as_slice()) as NSUInteger,
+                        args.alpha_powers.as_ptr().cast::<c_void>(),
+                    );
+                    encoder.set_bytes(
+                        4,
+                        size_of_val(args.metadata.as_slice()) as NSUInteger,
+                        args.metadata.as_ptr().cast::<c_void>(),
+                    );
+                    set_u32(encoder, 8, args.alpha_stride as u32);
+                    set_u32(encoder, 9, *range_count as u32);
+                    set_u32(encoder, 10, *u32_count as u32);
+                    dispatch(encoder, pipeline, quotient_rows);
+                }
+            }
+            if let (Some(args), Some(pipeline)) = (mul_extension, extension_pipeline) {
+                // Rebind the entire extension ABI after switching pipelines;
+                // no binding is allowed to depend on residual encoder state.
+                encoder.set_compute_pipeline_state(pipeline);
+                encoder.set_buffer(0, Some(&wires.buffer), 0);
+                encoder.set_buffer(1, Some(&constants.buffer), 0);
+                encoder.set_buffer(
+                    2,
+                    Some(&output),
+                    (dispatches.len() * slice_bytes) as NSUInteger,
+                );
                 encoder.set_bytes(
                     3,
                     size_of_val(args.alpha_powers.as_slice()) as NSUInteger,
@@ -3301,12 +3602,14 @@ impl MetalShared {
                 );
                 encoder.set_bytes(
                     4,
-                    size_of_val(args.metadata.as_slice()) as NSUInteger,
+                    size_of_val(&args.metadata) as NSUInteger,
                     args.metadata.as_ptr().cast::<c_void>(),
                 );
+                set_u32(encoder, 5, wires.rows as u32);
+                set_u32(encoder, 6, quotient_rows as u32);
+                set_u32(encoder, 7, step as u32);
                 set_u32(encoder, 8, args.alpha_stride as u32);
-                set_u32(encoder, 9, *range_count as u32);
-                set_u32(encoder, 10, *u32_count as u32);
+                set_u32(encoder, 9, 1);
                 dispatch(encoder, pipeline, quotient_rows);
             }
             encoder.end_encoding();
@@ -3314,13 +3617,21 @@ impl MetalShared {
             profile_command_buffer(
                 command_buffer,
                 "range_u32_quotient_split",
-                (quotient_rows * dispatches.len()) as u64,
+                (quotient_rows * slice_count) as u64,
             );
             command_buffer.commit();
             command_buffer.to_owned()
         });
         #[cfg(test)]
-        let failure_observer = None;
+        let failure_observer = FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
+            let observer = fault.borrow().clone();
+            if let Some(observer) = &observer {
+                observer
+                    .captured
+                    .store(true, core::sync::atomic::Ordering::Relaxed);
+            }
+            observer
+        });
         Ok(RangeCheckGateQuotientJob {
             command_buffer,
             output: Some(output),
@@ -4566,6 +4877,7 @@ mod tests {
     use crate::field::goldilocks_field::GoldilocksField;
     use crate::field::types::{Field64, PrimeField64};
     use crate::gates::gate::Gate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
     use crate::gates::poseidon2::Poseidon2Gate;
 
     /// The prebuilt AIR library is only sound while it is the compiled form of
@@ -4722,7 +5034,7 @@ mod tests {
             regions += 1;
         }
         assert_eq!(
-            regions, 19,
+            regions, 20,
             "the number of production dispatch sites changed; each one is audited \
              above, so update this count deliberately rather than by reflex."
         );
@@ -4763,6 +5075,218 @@ mod tests {
                 library.get_function(name, None).is_ok(),
                 "prebuilt metallib is missing kernel {name}"
             );
+        }
+    }
+
+    #[test]
+    fn extension_metallib_hash_and_kernel_are_pinned() {
+        for (name, expected) in [
+            (
+                "poseidon2-extension.metallib",
+                "0ef49daf347e95cdf970ea3b18616da6c97bbcd0ab411afb6a93ce82bd8cf26c",
+            ),
+            (
+                "poseidon2-extension-metal31.metallib",
+                "4dc92f02df4a08a7e880692dcc49f50916d2fa88e0200fab4899f254e4fa0ee1",
+            ),
+        ] {
+            let path = format!(
+                "{}/src/hash/poseidon2/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let output = std::process::Command::new("/usr/bin/shasum")
+                .args(["-a", "256", &path])
+                .output()
+                .expect("shasum must be available to verify the extension metallib");
+            assert!(output.status.success(), "shasum failed");
+            let digest = String::from_utf8(output.stdout).expect("shasum output is not utf-8");
+            assert_eq!(digest.split_whitespace().next(), Some(expected));
+        }
+
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        let library = device
+            .new_library_with_data(EXTENSION_SHADER_METALLIB)
+            .or_else(|_| device.new_library_with_data(EXTENSION_SHADER_METALLIB_METAL31))
+            .expect("one pinned extension metallib must load");
+        library
+            .get_function(EXTENSION_QUOTIENT_KERNEL, None)
+            .expect("extension metallib must expose its quotient kernel");
+    }
+
+    #[test]
+    fn metal_qsplit_mul_extension_matches_cpu() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+        const ROWS: usize = 64;
+        const ALPHA_OFFSET: usize = 13;
+        const NUM_OPS: usize = 13;
+        const WIRES: usize = 78;
+        const CONSTRAINTS: usize = 26;
+        const CONSTANT_BASE: usize = 2;
+
+        let context = shared_context().expect("Metal context must initialize");
+        let mul_gate = MulExtensionGate::<D> { num_ops: NUM_OPS };
+        assert_eq!(Gate::<F, D>::num_wires(&mul_gate), WIRES);
+        assert_eq!(Gate::<F, D>::num_constraints(&mul_gate), CONSTRAINTS);
+        let range = RangeCheckQuotientSpec {
+            selector_column: 0,
+            gate_index: 3,
+            group: 3..4,
+            include_unused_selector: false,
+            num_ops: 1,
+            bit_size: 4,
+        };
+        let mul = MulExtensionQuotientSpec {
+            selector_column: 1,
+            gate_index: 8,
+            group: 7..10,
+            include_unused_selector: true,
+            num_ops: NUM_OPS,
+            constant_base: CONSTANT_BASE,
+        };
+        let alphas = [F::from_canonical_u64(13), F::from_canonical_u64(17)];
+        let boundary = [
+            0u64,
+            1,
+            2,
+            F::ORDER - 1,
+            F::ORDER,
+            F::ORDER + 1,
+            u32::MAX as u64,
+            1 << 32,
+            u64::MAX,
+            14_479_013_849_828_404_771,
+        ];
+
+        for step in [1, 2] {
+            let full_rows = ROWS * step;
+            let mut wires = context
+                .allocate_columns::<F>(full_rows, WIRES)
+                .expect("wire columns must allocate");
+            let mut constants = context
+                .allocate_columns::<F>(full_rows, CONSTANT_BASE + 1)
+                .expect("constant columns must allocate");
+            let mut rng = StdRng::seed_from_u64(0x6d75_6c32_0000 + step as u64);
+            for (column, values) in wires
+                .columns_mut()
+                .expect("unique wire columns")
+                .into_iter()
+                .enumerate()
+            {
+                for (row, value) in values.iter_mut().enumerate() {
+                    *value = if (row + column) % 4 == 0 {
+                        GoldilocksField(boundary[(row + 3 * column) % boundary.len()])
+                    } else {
+                        GoldilocksField(rng.next_u64())
+                    };
+                }
+            }
+            for (column, values) in constants
+                .columns_mut()
+                .expect("unique constant columns")
+                .into_iter()
+                .enumerate()
+            {
+                for (row, value) in values.iter_mut().enumerate() {
+                    *value = GoldilocksField(boundary[(row + 5 * column) % boundary.len()]);
+                }
+            }
+
+            let mut gathered_wires = Vec::with_capacity(WIRES * ROWS);
+            for column in 0..WIRES {
+                gathered_wires.extend((0..ROWS).map(|row| wires.col(column)[row * step]));
+            }
+            let gathered_constant = (0..ROWS)
+                .map(|row| constants.col(CONSTANT_BASE)[row * step])
+                .collect::<Vec<_>>();
+            let vars = EvaluationVarsBaseBatch::new(
+                ROWS,
+                &gathered_constant,
+                &gathered_wires,
+                &HashOut::ZERO,
+            );
+            let mut constraints = vec![F::ZERO; CONSTRAINTS * ROWS];
+            let filters = vec![F::ONE; ROWS];
+            Gate::<F, D>::eval_unfiltered_base_batch_accumulate(
+                &mul_gate,
+                vars,
+                &filters,
+                &mut constraints,
+            );
+            let mut expected = vec![F::ZERO; ROWS * 2];
+            for row in 0..ROWS {
+                for (challenge, &alpha) in alphas.iter().enumerate() {
+                    let mut power = alpha.exp_u64(ALPHA_OFFSET as u64);
+                    for constraint in 0..CONSTRAINTS {
+                        expected[row * 2 + challenge] +=
+                            constraints[constraint * ROWS + row] * power;
+                        power *= alpha;
+                    }
+                }
+            }
+
+            let base = start_range_check_gate_quotient(
+                &wires,
+                &constants,
+                ROWS,
+                step,
+                core::slice::from_ref(&range),
+                &[],
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("base Range quotient job must start");
+            let base_values = base.finish().expect("base Range quotient must finish");
+            let groups = [(vec![range.clone()], Vec::new())];
+            let combined = start_range_check_gate_quotient_multi_with_mul_extension(
+                &wires,
+                &constants,
+                ROWS,
+                step,
+                &groups,
+                Some(&mul),
+                &alphas,
+                ALPHA_OFFSET,
+            )
+            .expect("combined qsplit MulExtension job must start");
+            let actual = combined.finish().expect("combined job must finish");
+            assert_eq!(actual.len(), 2 * ROWS * 2);
+            assert_eq!(
+                &actual[..ROWS * 2],
+                base_values,
+                "existing Range slice changed at step {step}"
+            );
+            for (word, (&actual, &expected)) in actual[ROWS * 2..]
+                .iter()
+                .zip(&expected)
+                .enumerate()
+            {
+                assert_eq!(
+                    actual.to_canonical_u64(),
+                    expected.to_canonical_u64(),
+                    "MulExtension mismatch at word {word}, step {step}"
+                );
+            }
+
+            if step == 2 {
+                let fault = force_range_quotient_finish_failure_for_tests();
+                let forced = start_range_check_gate_quotient_multi_with_mul_extension(
+                    &wires,
+                    &constants,
+                    ROWS,
+                    step,
+                    &groups,
+                    Some(&mul),
+                    &alphas,
+                    ALPHA_OFFSET,
+                )
+                .expect("combined qsplit MulExtension failure-seam job must start");
+                assert!(fault.captured());
+                assert!(forced.finish().is_err());
+                assert!(fault.forced());
+            }
         }
     }
 

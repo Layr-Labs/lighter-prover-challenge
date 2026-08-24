@@ -1417,6 +1417,16 @@ fn low_range_selector_filter_cache_enabled() -> bool {
     })
 }
 
+/// Same-binary control for the exact MulExtension qsplit addition. Disabling
+/// this leaves both the promoted Range/U32 split and the CPU Mul evaluator
+/// unchanged.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn range_quotient_mul_extension_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| !std::env::var_os("LIGHTER_QSPLIT_MUL_EXT").is_some_and(|v| v == "0"))
+}
+
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 fn reserve_low_range_selector_filter_cache(bytes: usize) -> bool {
     use core::sync::atomic::Ordering;
@@ -1975,10 +1985,11 @@ fn start_gpu_range_check_gate_quotient<
     use crate::gates::equality_base::EqualityGate;
     use crate::gates::exponentiation::ExponentiationGate;
     use crate::gates::gate::U32QuotientGate;
+    use crate::gates::multiplication_extension::MulExtensionGate;
     use crate::gates::reducing::ReducingGate;
     use crate::gates::reducing_extension::ReducingExtensionGate;
     use crate::hash::poseidon2::metal::{
-        RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
+        MulExtensionQuotientSpec, RangeCheckQuotientSpec, U32QuotientKind, U32QuotientSpec,
     };
 
     GPU_RANGE_QUOTIENT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -2014,6 +2025,11 @@ fn start_gpu_range_check_gate_quotient<
     let mut u32_specs = Vec::new();
     let mut spec_degrees = Vec::new();
     let mut u32_spec_degrees = Vec::new();
+    // Kept outside the ordinary vectors and exclusion list until the complete
+    // split command (including any high-degree companion) has been accepted.
+    let mut mul_extension_spec = None;
+    let mut mul_extension_gate_index = None;
+    let mut multiple_mul_extension_gates = false;
     for (gate_index, gate) in common_data.gates.iter().enumerate() {
         let range = gate.0.range_check_quotient_gate();
         let u32_gate = gate.0.u32_quotient_gate();
@@ -2024,6 +2040,53 @@ fn start_gpu_range_check_gate_quotient<
                 );
             }
             return None;
+        }
+        if range_quotient_mul_extension_enabled() && D == 2 {
+            if let Some(mul) = gate.0.as_any().downcast_ref::<MulExtensionGate<D>>() {
+                let exact_layout = mul.num_ops == 13
+                    && gate.0.num_wires() == 78
+                    && gate.0.num_constraints() == 26
+                    && gate.0.num_constants() == 1
+                    && gate.0.degree() == 3
+                    && raw_constant_base
+                        .checked_add(1)
+                        .is_some_and(|end| end <= common_data.num_constants);
+                if gpu_poseidon_quotient_diagnostics_enabled() {
+                    eprintln!(
+                        "[gpu-range-quotient] MulExtension admission gate={gate_index} \
+                         exact={exact_layout} ops={} wires={} constraints={} constants={} \
+                         degree={} raw_constant_base={raw_constant_base} num_constants={}",
+                        mul.num_ops,
+                        gate.0.num_wires(),
+                        gate.0.num_constraints(),
+                        gate.0.num_constants(),
+                        gate.0.degree(),
+                        common_data.num_constants,
+                    );
+                }
+                if exact_layout && !multiple_mul_extension_gates {
+                    if mul_extension_spec.is_some() {
+                        // The production shapes contain exactly one. Multiple
+                        // gates would require multiple output slices; keep all
+                        // of them on the CPU instead of partially excluding.
+                        mul_extension_spec = None;
+                        mul_extension_gate_index = None;
+                        multiple_mul_extension_gates = true;
+                    } else {
+                        let selector_column =
+                            common_data.selectors_info.selector_indices[gate_index];
+                        mul_extension_spec = Some(MulExtensionQuotientSpec {
+                            selector_column,
+                            gate_index,
+                            group: common_data.selectors_info.groups[selector_column].clone(),
+                            include_unused_selector,
+                            num_ops: mul.num_ops,
+                            constant_base: raw_constant_base,
+                        });
+                        mul_extension_gate_index = Some(gate_index);
+                    }
+                }
+            }
         }
         if let Some(range) = range {
             if range.bit_size == 0 || range.bit_size > 64 || range.num_ops == 0 {
@@ -2397,6 +2460,7 @@ fn start_gpu_range_check_gate_quotient<
     // other row; the rest keep the full-domain filtered dispatch. Falls back
     // to the whole-domain job if the multi launch is declined.
     let mut split_job = None;
+    let mut split_mul_gate_index = None;
     let even_wires = wires_commitment.even_columns.get();
     if let (true, Some(even_wires)) = (
         range_quotient_split_enabled() && quotient_rows % 2 == 0 && quotient_rows >= 4 && step == 1,
@@ -2411,6 +2475,20 @@ fn start_gpu_range_check_gate_quotient<
             .constants_sigmas_commitment
             .even_columns
             .get_or_fill_even_rows(constants);
+        // Keep the promoted full constants-and-sigmas cache and its routing
+        // semantics untouched. If that large allocation was unavailable,
+        // MulExtension may still use a separate compact prefix containing
+        // exactly the circuit constants (selectors and local constants).
+        let mul_constants = if even_constants.is_some() {
+            even_constants
+        } else if mul_extension_spec.is_some() {
+            prover_data
+                .constants_sigmas_commitment
+                .even_columns
+                .get_or_fill_even_constant_prefix(constants, common_data.num_constants)
+        } else {
+            None
+        };
         // Without a constants companion, kinds that read gate constants
         // stay on the full-domain dispatch (the kernel would otherwise
         // index `col * half_rows + k` into a full-stride store).
@@ -2460,15 +2538,40 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         if !low_groups.is_empty() {
-            if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
-                even_wires,
-                even_constants.unwrap_or(constants),
-                quotient_rows / 2,
-                1,
-                &low_groups,
-                alphas,
-                alpha_offset,
-            ) {
+            let base_low_constants = even_constants.unwrap_or(constants);
+            // MulExtension reads its local constant, so it is admitted only
+            // with the compact constants companion. If the combined launch is
+            // rejected (artifact/pipeline/metadata), immediately retry the
+            // promoted base split and leave Mul on the CPU.
+            let mul_candidate = mul_constants
+                .is_some()
+                .then_some(mul_extension_spec.as_ref())
+                .flatten();
+            let combined_low = mul_candidate.and_then(|mul| {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi_with_mul_extension(
+                    even_wires,
+                    mul_constants.expect("Mul candidate requires compact constants"),
+                    quotient_rows / 2,
+                    1,
+                    &low_groups,
+                    Some(mul),
+                    alphas,
+                    alpha_offset,
+                )
+            });
+            let mul_started = combined_low.is_some();
+            let low = combined_low.or_else(|| {
+                crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                    even_wires,
+                    base_low_constants,
+                    quotient_rows / 2,
+                    1,
+                    &low_groups,
+                    alphas,
+                    alpha_offset,
+                )
+            });
+            if let Some(low) = low {
                 let high = if high_specs.is_empty() && high_u32_specs.is_empty() {
                     None
                 } else {
@@ -2484,6 +2587,16 @@ fn start_gpu_range_check_gate_quotient<
                     )
                 };
                 if high.is_some() || (high_specs.is_empty() && high_u32_specs.is_empty()) {
+                    if mul_started {
+                        let mul = mul_candidate.expect("combined Mul launch had a spec");
+                        low_gates.push(LowDegreeRangeGate {
+                            gate_index: mul.gate_index,
+                            selector_column: mul.selector_column,
+                            group: mul.group.clone(),
+                            include_unused_selector: mul.include_unused_selector,
+                        });
+                        split_mul_gate_index = mul_extension_gate_index;
+                    }
                     split_job = Some(RangeQuotientJobs::Split {
                         low,
                         low_gates,
@@ -2520,6 +2633,9 @@ fn start_gpu_range_check_gate_quotient<
         }
         return None;
     };
+    if let Some(gate_index) = split_mul_gate_index {
+        gate_indices.push(gate_index);
+    }
     gate_indices.extend(random_access_gate_indices);
     let started = GPU_RANGE_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
