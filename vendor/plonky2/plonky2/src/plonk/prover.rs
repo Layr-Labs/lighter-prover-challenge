@@ -1356,7 +1356,7 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
             std::env::var("LIGHTER_QSPLIT_MIN_LDE_BITS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(19)
+                .unwrap_or(17)
         });
         // Upper bound as well as a lower one. The split pays for itself only
         // where its companion fill and extension can hide behind other work.
