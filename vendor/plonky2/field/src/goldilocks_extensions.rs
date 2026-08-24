@@ -572,6 +572,31 @@ pub fn ext2_mul_add(
     QuadraticExtension([c0, c1])
 }
 
+/// `a * b + c` for the Goldilocks quadratic-over-quadratic algebra
+/// `ExtensionAlgebra<QuadraticExtension<GoldilocksField>, 2>`:
+/// `F_2[X]/(X^2-W)` with `W=7`. Same delayed-reduction `ext2_mul_add`
+/// as the FRI synthetic-division path, lifted one algebra level.
+/// Field-exact, not representative-exact (see `ext2_mul_add`).
+#[inline(always)]
+pub fn ext2_algebra2_mul_add(
+    a: [QuadraticExtension<GoldilocksField>; 2],
+    b: [QuadraticExtension<GoldilocksField>; 2],
+    c: [QuadraticExtension<GoldilocksField>; 2],
+) -> [QuadraticExtension<GoldilocksField>; 2] {
+    const_assert!(<GoldilocksField as Extendable<2>>::W.0 == 7u64);
+    let w = QuadraticExtension([GoldilocksField(7), GoldilocksField(0)]);
+    let [a0, a1] = a;
+    let [b0, b1] = b;
+    let [c0, c1] = c;
+    // res0 = a0*b0 + W*a1*b1 + c0
+    let a0b0_c0 = ext2_mul_add(a0, b0, c0);
+    let a1b1 = ext2_mul_add(a1, b1, QuadraticExtension([GoldilocksField(0), GoldilocksField(0)]));
+    let res0 = ext2_mul_add(a1b1, w, a0b0_c0);
+    // res1 = a0*b1 + a1*b0 + c1
+    let res1 = ext2_mul_add(a0, b1, ext2_mul_add(a1, b0, c1));
+    [res0, res1]
+}
+
 /// Compute `sum_i terms[i] * powers[i]` in GF(p^2), delaying reduction
 /// across the complete production FRI arity. For raw limbs below 2^64,
 ///

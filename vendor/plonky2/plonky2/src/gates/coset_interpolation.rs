@@ -5,6 +5,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::any::TypeId;
 use core::marker::PhantomData;
 use core::ops::Range;
 
@@ -12,7 +13,10 @@ use anyhow::Result;
 
 use crate::field::batch_util::batch_multiply_add_inplace;
 use crate::field::extension::algebra::ExtensionAlgebra;
+use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension, OEF};
+use crate::field::goldilocks_extensions::ext2_algebra2_mul_add;
+use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::interpolation::barycentric_weights;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
@@ -683,6 +687,47 @@ fn partial_interpolate_ext_algebra<F: OEF<D>, const D: usize>(
     initial_eval: ExtensionAlgebra<F, D>,
     initial_partial_prod: ExtensionAlgebra<F, D>,
 ) -> (ExtensionAlgebra<F, D>, ExtensionAlgebra<F, D>) {
+    type GoldilocksExt2 = QuadraticExtension<GoldilocksField>;
+    if D == 2 && TypeId::of::<F>() == TypeId::of::<GoldilocksExt2>() {
+        // SAFETY: TypeId proves F is Goldilocks quadratic, D is 2, so
+        // ExtensionAlgebra<F, 2> is `[F; 2]` of that type.
+        let domain_base = unsafe {
+            core::slice::from_raw_parts(
+                domain.as_ptr().cast::<GoldilocksField>(),
+                domain.len(),
+            )
+        };
+        let values_alg = unsafe {
+            core::slice::from_raw_parts(
+                values.as_ptr().cast::<[GoldilocksExt2; 2]>(),
+                values.len(),
+            )
+        };
+        let weights_base = unsafe {
+            core::slice::from_raw_parts(
+                barycentric_weights.as_ptr().cast::<GoldilocksField>(),
+                barycentric_weights.len(),
+            )
+        };
+        let x_alg = unsafe { *(&x as *const ExtensionAlgebra<F, D>).cast::<[GoldilocksExt2; 2]>() };
+        let eval0 = unsafe {
+            *(&initial_eval as *const ExtensionAlgebra<F, D>).cast::<[GoldilocksExt2; 2]>()
+        };
+        let prod0 = unsafe {
+            *(&initial_partial_prod as *const ExtensionAlgebra<F, D>).cast::<[GoldilocksExt2; 2]>()
+        };
+        let (eval, prod) = goldilocks_partial_interpolate_ext_algebra(
+            domain_base,
+            values_alg,
+            weights_base,
+            x_alg,
+            eval0,
+            prod0,
+        );
+        let eval_out = unsafe { *(&eval as *const [GoldilocksExt2; 2]).cast::<ExtensionAlgebra<F, D>>() };
+        let prod_out = unsafe { *(&prod as *const [GoldilocksExt2; 2]).cast::<ExtensionAlgebra<F, D>>() };
+        return (eval_out, prod_out);
+    }
     let n = domain.len();
     assert_ne!(n, 0);
     assert_eq!(n, values.len());
@@ -704,6 +749,45 @@ fn partial_interpolate_ext_algebra<F: OEF<D>, const D: usize>(
     )
 }
 
+
+fn goldilocks_partial_interpolate_ext_algebra(
+    domain: &[GoldilocksField],
+    values: &[[QuadraticExtension<GoldilocksField>; 2]],
+    barycentric_weights: &[GoldilocksField],
+    x: [QuadraticExtension<GoldilocksField>; 2],
+    initial_eval: [QuadraticExtension<GoldilocksField>; 2],
+    initial_partial_prod: [QuadraticExtension<GoldilocksField>; 2],
+) -> (
+    [QuadraticExtension<GoldilocksField>; 2],
+    [QuadraticExtension<GoldilocksField>; 2],
+) {
+    let n = domain.len();
+    debug_assert_ne!(n, 0);
+    debug_assert_eq!(n, values.len());
+    debug_assert_eq!(n, barycentric_weights.len());
+    let zero = [
+        QuadraticExtension([GoldilocksField(0), GoldilocksField(0)]),
+        QuadraticExtension([GoldilocksField(0), GoldilocksField(0)]),
+    ];
+    let mut eval = initial_eval;
+    let mut prod = initial_partial_prod;
+    for i in 0..n {
+        let xi = QuadraticExtension([domain[i], GoldilocksField(0)]);
+        let term = [
+            x[0] - xi,
+            x[1],
+        ];
+        let w = barycentric_weights[i];
+        let val = [
+            values[i][0] * QuadraticExtension([w, GoldilocksField(0)]),
+            values[i][1] * QuadraticExtension([w, GoldilocksField(0)]),
+        ];
+        let vp = ext2_algebra2_mul_add(val, prod, zero);
+        eval = ext2_algebra2_mul_add(eval, term, vp);
+        prod = ext2_algebra2_mul_add(prod, term, zero);
+    }
+    (eval, prod)
+}
 fn partial_interpolate_ext_algebra_target<F: RichField + Extendable<D>, const D: usize>(
     builder: &mut CircuitBuilder<F, D>,
     domain: &[F],
