@@ -162,7 +162,14 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U48Subtraction
         let base = F::from_canonical_u64(1 << 48u64);
         let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
         let mut chunks = res.chunks_exact_mut(n);
-        let mut combined_limbs = vec![F::ZERO; n];
+        let mut combined_limbs_stack = [F::ZERO; 64];
+        let mut combined_limbs_heap;
+        let combined_limbs: &mut [F] = if n <= 64 {
+            &mut combined_limbs_stack[..n]
+        } else {
+            combined_limbs_heap = vec![F::ZERO; n];
+            &mut combined_limbs_heap
+        };
 
         for i in 0..self.num_ops {
             let input_x = &wires[self.wire_ith_input_x(i) * n..][..n];
