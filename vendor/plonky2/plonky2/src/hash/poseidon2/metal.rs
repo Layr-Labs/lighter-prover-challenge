@@ -4435,10 +4435,17 @@ fn dispatch2d(
     height: usize,
 ) {
     let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
+    let cap = pipeline
         .max_total_threads_per_threadgroup()
         .min(64)
         .max(execution_width);
+    // Tiny 2-D NTT/LDE stages (width << cap) used to launch a 64-wide group
+    // with mostly idle lanes. Round live `width` up to SIMD and clamp the
+    // group to that. Fat stages still get `cap` (64), same as tip.
+    let simd = (execution_width as u64).max(1);
+    let live = (width as u64).max(1);
+    let rounded = live.div_ceil(simd) * simd;
+    let group_width = cap.min(rounded).max(execution_width);
     encoder.dispatch_threads(
         MTLSize {
             width: width as NSUInteger,
