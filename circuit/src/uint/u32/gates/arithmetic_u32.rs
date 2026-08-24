@@ -191,8 +191,20 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
         let midpoint = Self::num_limbs() / 2;
         let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
         let mut chunks = res.chunks_exact_mut(n);
-        let mut combined_low = vec![F::ZERO; n];
-        let mut combined_high = vec![F::ZERO; n];
+        // Batches are 32 points in this prover; keep the recomposition rows on
+        // the stack and fall back to the heap only for oversized batches.
+        // Same leftover as the tip's u16 arithmetic / comparison stack rows.
+        let mut combined_low_stack = [F::ZERO; 64];
+        let mut combined_high_stack = [F::ZERO; 64];
+        let mut combined_low_heap;
+        let mut combined_high_heap;
+        let (mut combined_low, mut combined_high): (&mut [F], &mut [F]) = if n <= 64 {
+            (&mut combined_low_stack[..n], &mut combined_high_stack[..n])
+        } else {
+            combined_low_heap = vec![F::ZERO; n];
+            combined_high_heap = vec![F::ZERO; n];
+            (&mut combined_low_heap, &mut combined_high_heap)
+        };
 
         for i in 0..self.num_ops {
             let multiplicand_0 = &wires[self.wire_ith_multiplicand_0(i) * n..][..n];
