@@ -638,11 +638,12 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// Fusing collapses two full traversals of the witness and sigma matrices, and
 /// two Rayon fork/joins over the subgroup, into one.
 ///
-/// Value-exactness: each challenge keeps its own accumulators, its own
+/// Field-value exactness: each challenge keeps its own accumulators, its own
 /// numerator/denominator multiplication order (`for j in start..end`), its own
-/// inversion batch in the same push order, and its own Z chain. Only the
-/// memory traversal and the Rayon scheduling are shared, so every output limb
-/// is bit-identical to running the per-challenge path twice.
+/// inversion batch in the same push order, and its own Z chain. The inner
+/// factors reuse `wire + gamma` and may therefore choose a different
+/// noncanonical Goldilocks representative, but the canonical field values are
+/// identical to running the per-challenge path twice.
 fn two_challenge_wires_permutation_partial_products_and_zs<
     F: RichField + Extendable<D>,
     C: GenericConfig<D, F = F>,
@@ -726,10 +727,30 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                                 }
                                 let wire_value = witness.get_wire(i, j);
                                 let sigma = s_sigmas[j];
-                                numerator_0 *= wire_value + beta_k_is_0[j] * x + gamma_0;
-                                numerator_1 *= wire_value + beta_k_is_1[j] * x + gamma_1;
-                                denominator_0 *= wire_value + beta_0 * sigma + gamma_0;
-                                denominator_1 *= wire_value + beta_1 * sigma + gamma_1;
+                                let base_0 = wire_value + gamma_0;
+                                let base_1 = wire_value + gamma_1;
+                                let (num_factor_0, num_factor_1) =
+                                    F::multiply_accumulate_pair(
+                                        base_0,
+                                        beta_k_is_0[j],
+                                        x,
+                                        base_1,
+                                        beta_k_is_1[j],
+                                        x,
+                                    );
+                                let (den_factor_0, den_factor_1) =
+                                    F::multiply_accumulate_pair(
+                                        base_0,
+                                        beta_0,
+                                        sigma,
+                                        base_1,
+                                        beta_1,
+                                        sigma,
+                                    );
+                                numerator_0 *= num_factor_0;
+                                numerator_1 *= num_factor_1;
+                                denominator_0 *= den_factor_0;
+                                denominator_1 *= den_factor_1;
                             }
                             let output = t * num_chunks + chunk;
                             products_0[output].write(numerator_0);
@@ -1605,7 +1626,26 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
     filter_at: impl Fn(usize, usize) -> F,
 ) {
     let rows = chunk.len() / 2;
-    let mut acc = vec![F::ZERO; chunk.len()];
+    if num_gates == 0 {
+        // The old shape copied its zeroed temporary back untouched here,
+        // so an empty gate set must still leave the chunk zeroed rather
+        // than uninitialised.
+        chunk.fill(F::ZERO);
+        return;
+    }
+    // Accumulate straight into the destination instead of into a temporary.
+    //
+    // The old shape allocated a zeroed `Vec` the size of the chunk, summed
+    // the gate contributions into it, then copied the whole thing back over
+    // `chunk`. Per chunk that is one allocation, one zero-fill and one
+    // full-width copy — all three deletable, because the first gate can
+    // simply *assign* where later gates add. Every index `2r` and `2r + 1`
+    // for `r in 0..rows` is written on the `g == 0` pass, so the
+    // destination's prior contents are never read.
+    //
+    // Value-identical: same gate order, same per-gate expressions, same
+    // running sum. Replacing `0 + a` with `a` on the first gate uses the
+    // additive identity; it is not a reassociation.
     for g in 0..num_gates {
         let odd0 = &odd[g * 2];
         let odd1 = &odd[g * 2 + 1];
@@ -1619,11 +1659,15 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
                 (odd0[i >> 1], odd1[i >> 1])
             };
             let filter = filter_at(g, r);
-            acc[2 * r] += filter * sv0;
-            acc[2 * r + 1] += filter * sv1;
+            if g == 0 {
+                chunk[2 * r] = filter * sv0;
+                chunk[2 * r + 1] = filter * sv1;
+            } else {
+                chunk[2 * r] += filter * sv0;
+                chunk[2 * r + 1] += filter * sv1;
+            }
         }
     }
-    chunk.copy_from_slice(&acc);
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -4570,15 +4614,14 @@ mod l_0_table_tests {
     }
 }
 
-/// Value-exactness gate for the fused two-challenge permutation path.
+/// Field-value exactness gate for the fused two-challenge permutation path.
 ///
 /// `two_challenge_wires_permutation_partial_products_and_zs` must be a pure
-/// traversal/scheduling change: for the same witness, sigmas, subgroup and
-/// challenges it has to reproduce, **limb for limb**, what two independent
-/// `wires_permutation_partial_products_and_zs` calls produce. Goldilocks
-/// canonicalises inside `PartialEq`, so field equality would hide a path that
-/// returned a different representative of the same residue; the primary
-/// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
+/// algebraic reformulation: for the same witness, sigmas, subgroup and
+/// challenges it has to reproduce the same field elements as two independent
+/// `wires_permutation_partial_products_and_zs` calls. The paired path may use a
+/// different noncanonical Goldilocks representative because it forms
+/// `wire + gamma` before the challenge product, so compare canonical residues.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
     use crate::field::polynomial::PolynomialValues;
@@ -4659,9 +4702,9 @@ mod permutation_pairing_tests {
         builder.build::<C>()
     }
 
-    /// Flatten a `Vec<Vec<PolynomialValues>>` to raw limbs, with the shape
+    /// Flatten a `Vec<Vec<PolynomialValues>>` to canonical limbs, with the shape
     /// recorded so a structural difference cannot be flattened away.
-    fn raw_limbs(polys: &[Vec<PolynomialValues<F>>]) -> Vec<(usize, usize, Vec<u64>)> {
+    fn canonical_limbs(polys: &[Vec<PolynomialValues<F>>]) -> Vec<(usize, usize, Vec<u64>)> {
         polys
             .iter()
             .enumerate()
@@ -4672,7 +4715,7 @@ mod permutation_pairing_tests {
                         column,
                         poly.values
                             .iter()
-                            .map(|v| v.to_noncanonical_u64())
+                            .map(|v| v.to_canonical_u64())
                             .collect::<Vec<u64>>(),
                     )
                 })
@@ -4733,7 +4776,7 @@ mod permutation_pairing_tests {
     }
 
     #[test]
-    fn paired_two_challenge_path_is_limb_identical_to_general_loop() {
+    fn paired_two_challenge_path_is_field_identical_to_general_loop() {
         let mut data = build_circuit();
         // This differential replaces the circuit's subgroup and sigmas with arbitrary values,
         // so its builder-derived fixed mask no longer describes those injected sigma rows. Keep
@@ -4775,7 +4818,8 @@ mod permutation_pairing_tests {
                 .collect();
 
             // At least one adversarial representative must actually be in play,
-            // otherwise the raw-limb comparison proves nothing extra.
+            // otherwise this would not exercise the noncanonical inputs whose
+            // representatives are deliberately allowed to differ.
             let noncanonical_inputs = subgroup
                 .iter()
                 .chain(sigmas.iter().flatten())
@@ -4822,8 +4866,8 @@ mod permutation_pairing_tests {
                 }
             }
             assert_eq!(
-                raw_limbs(&paired),
-                raw_limbs(&general),
+                canonical_limbs(&paired),
+                canonical_limbs(&general),
                 "fused path diverged from the general loop at {n_points} points"
             );
 
@@ -4846,8 +4890,8 @@ mod permutation_pairing_tests {
                 "dispatcher did not take the fused path at num_challenges = 2"
             );
             assert_eq!(
-                raw_limbs(&dispatched),
-                raw_limbs(&paired),
+                canonical_limbs(&dispatched),
+                canonical_limbs(&paired),
                 "dispatcher output differs from the fused path"
             );
 
@@ -4887,8 +4931,8 @@ mod permutation_pairing_tests {
             // The first two challenges of the 3-challenge general run use the
             // same betas/gammas, so they must still match the fused output.
             assert_eq!(
-                raw_limbs(&general3[..2]),
-                raw_limbs(&paired),
+                canonical_limbs(&general3[..2]),
+                canonical_limbs(&paired),
                 "general 3-challenge loop disagrees with the fused pair"
             );
 
