@@ -1,6 +1,6 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
-// Redraw marker reducing-scratch-r1 1787499809993 (same-account archive-dedup convention; inert)
+// a0d1a1b25d37177acbcc0578
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
