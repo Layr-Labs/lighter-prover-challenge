@@ -531,6 +531,23 @@ pub trait Field:
         // Default implementation.
         *self + x * y
     }
+
+    /// Evaluate two independent multiply-accumulates together.
+    #[doc(hidden)]
+    #[inline]
+    fn multiply_accumulate_pair(
+        acc0: Self,
+        x0: Self,
+        y0: Self,
+        acc1: Self,
+        x1: Self,
+        y1: Self,
+    ) -> (Self, Self) {
+        (
+            acc0.multiply_accumulate(x0, y0),
+            acc1.multiply_accumulate(x1, y1),
+        )
+    }
 }
 
 pub trait PrimeField: Field {
