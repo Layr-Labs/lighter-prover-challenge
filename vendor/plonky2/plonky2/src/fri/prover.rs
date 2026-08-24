@@ -467,12 +467,12 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     (trees, coeffs)
 }
 
-const POW_LANES: usize = 4;
+const POW_LANES: usize = 8;
 const POW_QUAD_DISABLE_ENV: &str = "LIGHTER_DISABLE_POW_QUAD";
 
-/// The four-lane path is the delivery default. Only the exact diagnostic value
-/// `LIGHTER_DISABLE_POW_QUAD=1` selects the scalar control; missing, empty,
-/// non-Unicode, and all other values keep the candidate enabled.
+/// The grouped `permute_quad` path is the delivery default. Only the exact
+/// diagnostic value `LIGHTER_DISABLE_POW_QUAD=1` selects the scalar control;
+/// missing, empty, non-Unicode, and all other values keep it enabled.
 #[cfg(feature = "std")]
 #[inline]
 fn pow_quad_enabled_from_env_value(value: Option<&std::ffi::OsStr>) -> bool {
@@ -504,10 +504,15 @@ const fn pow_quad_enabled() -> bool {
 #[inline]
 fn pow_candidate_quad(quad_index: u64, max_candidate: u64) -> ([u64; POW_LANES], usize) {
     debug_assert!(quad_index <= max_candidate / POW_LANES as u64);
+    debug_assert!(POW_LANES % 4 == 0);
     let start = quad_index * POW_LANES as u64;
     let remaining = max_candidate - start;
     if remaining >= (POW_LANES - 1) as u64 {
-        ([start, start + 1, start + 2, start + 3], POW_LANES)
+        let mut candidates = [start; POW_LANES];
+        for (lane, slot) in candidates.iter_mut().enumerate() {
+            *slot = start + lane as u64;
+        }
+        (candidates, POW_LANES)
     } else {
         let active_lanes = remaining as usize + 1;
         let mut candidates = [start; POW_LANES];
@@ -563,7 +568,11 @@ pub(crate) fn fri_proof_of_work<
                 for (duplex_state, candidate) in duplex_states.iter_mut().zip(candidates) {
                     duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
                 }
-                <C::Hasher as Hasher<F>>::Permutation::permute_quad(&mut duplex_states);
+                for quad in duplex_states.chunks_exact_mut(4) {
+                    <C::Hasher as Hasher<F>>::Permutation::permute_quad(
+                        quad.try_into().expect("chunk of four"),
+                    );
+                }
 
                 (0..active_lanes).find_map(|lane| {
                     let pow_response = duplex_states[lane].squeeze().iter().last().unwrap();
@@ -815,8 +824,8 @@ mod tests {
             assert_eq!(actual, (0..=max_candidate).collect::<Vec<_>>());
         }
 
-        // These final groups exercise 1, 2, 3, and 4 active lanes immediately
-        // below the largest u64, including the inclusive u64::MAX endpoint.
+        // These final groups exercise the upper tail immediately below the
+        // largest u64, including a full group ending at u64::MAX.
         for max_candidate in (u64::MAX - 3)..=u64::MAX {
             let quad_index = max_candidate / POW_LANES as u64;
             let (candidates, active_lanes) = pow_candidate_quad(quad_index, max_candidate);
