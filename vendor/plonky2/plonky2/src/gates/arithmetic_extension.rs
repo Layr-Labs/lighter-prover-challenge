@@ -151,22 +151,16 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
         // proof, and each call was paying a malloc, a free, and a `D * n` memset
         // for a block it immediately overwrote.
         const STACK_SCRATCH: usize = 128;
-        let scratch_len = D * n;
+        let scratch_len = D
+            .checked_mul(n)
+            .expect("arithmetic extension scratch length overflow");
         let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
         let mut scratch_heap;
-        let scratch: &mut [F] = if scratch_len <= STACK_SCRATCH {
-            // SAFETY: `MaybeUninit<F>` has the same layout and alignment as `F`,
-            // and every element of `[..scratch_len]` is written by the point loop
-            // below before any is read. Same idiom as `RandomAccessGate`'s
-            // stack-or-heap scratch.
-            unsafe {
-                core::slice::from_raw_parts_mut(
-                    scratch_stack[..scratch_len].as_mut_ptr().cast::<F>(),
-                    scratch_len,
-                )
-            }
+        let scratch_slots: &mut [MaybeUninit<F>] = if scratch_len <= STACK_SCRATCH {
+            &mut scratch_stack[..scratch_len]
         } else {
-            scratch_heap = vec![F::ZERO; scratch_len];
+            // Preserve the heap fallback's length and valid ZERO initialization.
+            scratch_heap = vec![MaybeUninit::new(F::ZERO); scratch_len];
             &mut scratch_heap
         };
         for i in 0..self.num_ops {
@@ -183,13 +177,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ArithmeticExte
                     + addend.scalar_mul(const_1[p]);
                 let arr = (output - computed_output).to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
+                    scratch_slots[d * n + p].write(*a);
                 }
             }
             for d in 0..D {
+                let row_slots = &scratch_slots[d * n..][..n];
+                // SAFETY: this operation's point loop initialized every slot
+                // in every active row. This shared view ends with the batch
+                // read, before the next operation writes the slots again.
+                let scratch_row: &[F] =
+                    unsafe { core::slice::from_raw_parts(row_slots.as_ptr().cast::<F>(), n) };
                 batch_multiply_add_inplace(
                     &mut combined_gate_constraints[(i * D + d) * n..][..n],
-                    &scratch[d * n..][..n],
+                    scratch_row,
                     filters,
                 );
             }

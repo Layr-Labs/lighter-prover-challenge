@@ -11,6 +11,9 @@ use plonky2_maybe_rayon::*;
 use super::circuit_builder::{LookupChallenges, LookupWire};
 use crate::field::extension::Extendable;
 use crate::field::fft::ifft_borrowed;
+use crate::field::packable::Packable;
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+use crate::field::packed::PackedField;
 use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
 use crate::field::types::Field;
 use crate::field::zero_poly_coset::ZeroPolyOnCoset;
@@ -628,6 +631,75 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
     columns.into_iter().map(PolynomialValues::new).collect()
 }
 
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+const PERMUTATION_CHALLENGE4_WIDTH: usize = 4;
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+const PERMUTATION_CHALLENGE4_DISABLE_ENV: &str = "LIGHTER_PERM_CHALLENGE4";
+
+/// Missing and every value except exact `0` select the packed production path.
+/// `OnceLock` deliberately makes rollback a per-process decision, so no proof
+/// can change arithmetic implementation after its first permutation batch.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+fn permutation_challenge4_requested() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os(PERMUTATION_CHALLENGE4_DISABLE_ENV).as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
+#[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+const fn permutation_challenge4_requested() -> bool {
+    false
+}
+
+/// Evaluate one row/chunk with lanes `[numerator 0, numerator 1,
+/// denominator 0, denominator 1]`. Unlike adjacent-row packing, every lane has
+/// the same circuit-fixed skip decision and both witness and sigma stay on the
+/// inherited same-row access pattern.
+///
+/// The expression is deliberately written as `(wire + scale * variable) +
+/// gamma`, followed by the accumulator multiplication. This preserves the
+/// scalar association and the dependent `j` order in every lane; in particular
+/// it does not use `multiply_accumulate`, reassociate `wire + gamma`, or form a
+/// typed reference to uninitialized output storage.
+#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+#[inline]
+fn two_challenge_permutation_chunk_challenge4<F, P>(
+    witness: &MatrixWitness<F>,
+    s_sigmas: &[F],
+    fixed_routed_wires: &[u8],
+    packed_scales: &[P],
+    packed_gammas: P,
+    row: usize,
+    x: F,
+    start: usize,
+    end: usize,
+    num_routed_wires: usize,
+) -> P
+where
+    F: Field,
+    P: PackedField<Scalar = F>,
+{
+    debug_assert_eq!(P::WIDTH, PERMUTATION_CHALLENGE4_WIDTH);
+    let routed_base = row * num_routed_wires;
+    let mut products = P::ONES;
+    for j in start..end {
+        // A singleton routed component cancels symbolically for both challenges
+        // and both numerator/denominator lanes, including a common zero factor.
+        if fixed_routed_wire(fixed_routed_wires, routed_base + j) {
+            continue;
+        }
+        let wire_value = witness.get_wire(row, j);
+        let sigma = s_sigmas[j];
+        let variables = [x, x, sigma, sigma];
+        let factors =
+            P::from(wire_value) + packed_scales[j] * *P::from_slice(&variables) + packed_gammas;
+        products *= factors;
+    }
+    products
+}
+
 /// Compute both production permutation challenges in one pass over the witness
 /// and sigma rows.
 ///
@@ -644,7 +716,7 @@ fn z_polynomials_from_quotient_chunk_products<F: Field>(
 /// memory traversal and the Rayon scheduling are shared, so every output limb
 /// is bit-identical to running the per-challenge path twice.
 fn two_challenge_wires_permutation_partial_products_and_zs<
-    F: RichField + Extendable<D>,
+    F: RichField + Extendable<D> + Packable,
     C: GenericConfig<D, F = F>,
     const D: usize,
 >(
@@ -654,6 +726,33 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     gammas: &[F],
     prover_data: &ProverOnlyCircuitData<F, C, D>,
     common_data: &CommonCircuitData<F, D>,
+) -> Vec<Vec<PolynomialValues<F>>> {
+    two_challenge_wires_permutation_partial_products_and_zs_with_challenge4(
+        witness,
+        betas,
+        beta_k_is,
+        gammas,
+        prover_data,
+        common_data,
+        permutation_challenge4_requested(),
+    )
+}
+
+/// Exact same-binary differential seam. `request_challenge4 = false` is the
+/// inherited scalar loop; `true` still requires the exact Apple-AArch64
+/// Goldilocks packing guard below.
+fn two_challenge_wires_permutation_partial_products_and_zs_with_challenge4<
+    F: RichField + Extendable<D> + Packable,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    witness: &MatrixWitness<F>,
+    betas: &[F],
+    beta_k_is: &[F],
+    gammas: &[F],
+    prover_data: &ProverOnlyCircuitData<F, C, D>,
+    common_data: &CommonCircuitData<F, D>,
+    request_challenge4: bool,
 ) -> Vec<Vec<PolynomialValues<F>>> {
     debug_assert_eq!(betas.len(), 2);
     debug_assert_eq!(gammas.len(), 2);
@@ -667,6 +766,31 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
     let (beta_k_is_0, beta_k_is_1) = beta_k_is.split_at(num_routed_wires);
     let (beta_0, beta_1) = (betas[0], betas[1]);
     let (gamma_0, gamma_1) = (gammas[0], gammas[1]);
+
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let use_challenge4 = request_challenge4
+        && core::any::TypeId::of::<F>()
+            == core::any::TypeId::of::<crate::field::goldilocks_field::GoldilocksField>()
+        && <<F as Packable>::Packing as PackedField>::WIDTH == PERMUTATION_CHALLENGE4_WIDTH;
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let (challenge4_scales, challenge4_gammas): (
+        Vec<<F as Packable>::Packing>,
+        Option<<F as Packable>::Packing>,
+    ) = if use_challenge4 {
+        let scales = (0..num_routed_wires)
+            .map(|j| {
+                let lanes = [beta_k_is_0[j], beta_k_is_1[j], beta_0, beta_1];
+                *<<F as Packable>::Packing as PackedField>::from_slice(&lanes)
+            })
+            .collect();
+        let gamma_lanes = [gamma_0, gamma_1, gamma_0, gamma_1];
+        let packed_gammas = *<<F as Packable>::Packing as PackedField>::from_slice(&gamma_lanes);
+        (scales, Some(packed_gammas))
+    } else {
+        (Vec::new(), None)
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let _ = request_challenge4;
 
     const INV_BATCH: usize = 128;
     let product_count = subgroup.len() * num_chunks;
@@ -708,6 +832,38 @@ fn two_challenge_wires_permutation_partial_products_and_zs<
                         for chunk in 0..num_chunks {
                             let start = chunk * degree;
                             let end = min(start + degree, num_routed_wires);
+                            #[cfg(all(
+                                feature = "std",
+                                target_arch = "aarch64",
+                                target_os = "macos"
+                            ))]
+                            if use_challenge4 {
+                                let packed = two_challenge_permutation_chunk_challenge4::<
+                                    F,
+                                    <F as Packable>::Packing,
+                                >(
+                                    witness,
+                                    s_sigmas,
+                                    &prover_data.fixed_routed_wires,
+                                    &challenge4_scales,
+                                    challenge4_gammas
+                                        .expect("enabled challenge4 path has packed gammas"),
+                                    i,
+                                    x,
+                                    start,
+                                    end,
+                                    num_routed_wires,
+                                );
+                                let lanes = packed.as_slice();
+                                let output = t * num_chunks + chunk;
+                                products_0[output].write(lanes[0]);
+                                products_1[output].write(lanes[1]);
+                                // Keep the inherited denominator order exactly:
+                                // row, quotient chunk, then challenge 0/1.
+                                denominators.push(lanes[2]);
+                                denominators.push(lanes[3]);
+                                continue;
+                            }
                             let mut numerator_0 = F::ONE;
                             let mut numerator_1 = F::ONE;
                             let mut denominator_0 = F::ONE;
@@ -1596,7 +1752,7 @@ fn build_low_range_selector_filter_cache<F: RichField>(
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 #[inline(always)]
 fn accumulate_low_range_quotient_chunk<F: RichField>(
-    chunk: &mut [F],
+    chunk: &mut [core::mem::MaybeUninit<F>],
     row0: usize,
     half_rows: usize,
     num_gates: usize,
@@ -1623,7 +1779,9 @@ fn accumulate_low_range_quotient_chunk<F: RichField>(
             acc[2 * r + 1] += filter * sv1;
         }
     }
-    chunk.copy_from_slice(&acc);
+    for (slot, value) in chunk.iter_mut().zip(acc) {
+        slot.write(value);
+    }
 }
 
 /// Applies selector filters and combines already-extended low-gate values.
@@ -1669,13 +1827,15 @@ fn combine_low_range_quotient<F: RichField>(
         })
         .map(|entry| entry.filters.as_slice());
 
-    let mut out: Vec<F> = Vec::with_capacity(full_rows * 2);
-    // SAFETY: both disjoint parallel branches below write every output slot
-    // before the vector is returned, exactly as the pre-cache implementation.
-    unsafe { out.set_len(full_rows * 2) };
+    let out_len = full_rows
+        .checked_mul(2)
+        .expect("low-range quotient output length overflow");
+    let mut out: Vec<F> = Vec::with_capacity(out_len);
+    let out_slots = &mut out.spare_capacity_mut()[..out_len];
     let num_gates = gates.len();
-    if let Some(filters) = cached_filters {
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
+    let used_cache = if let Some(filters) = cached_filters {
+        out_slots
+            .par_chunks_mut(2 * ROWS_PER_CHUNK)
             .enumerate()
             .for_each(|(chunk_i, chunk)| {
                 let row0 = chunk_i * ROWS_PER_CHUNK;
@@ -1689,10 +1849,11 @@ fn combine_low_range_quotient<F: RichField>(
                     |g, r| filters[g][row0 + r],
                 );
             });
-        (out, true)
+        true
     } else {
         let unused = F::from_canonical_u64(u32::MAX as u64);
-        out.par_chunks_mut(2 * ROWS_PER_CHUNK)
+        out_slots
+            .par_chunks_mut(2 * ROWS_PER_CHUNK)
             .enumerate()
             .for_each(|(chunk_i, chunk)| {
                 let row0 = chunk_i * ROWS_PER_CHUNK;
@@ -1738,8 +1899,11 @@ fn combine_low_range_quotient<F: RichField>(
                     |g, r| filters[g * ROWS_PER_CHUNK + r],
                 );
             });
-        (out, false)
-    }
+        false
+    };
+    // SAFETY: the selected parallel branch initialized every output slot.
+    unsafe { out.set_len(out_len) };
+    (out, used_cache)
 }
 
 /// Extends the per-gate half-domain sums to the odd rows and applies the
@@ -1776,12 +1940,12 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
             let base = g * half_rows * 2;
             let src = &low[base..base + half_rows * 2];
             let mut values: Vec<F> = Vec::with_capacity(half_rows);
-            unsafe { values.set_len(half_rows); }
-            if size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
+            let value_slots = &mut values.spare_capacity_mut()[..half_rows];
+            if core::mem::size_of::<F>() == 8 && core::mem::align_of::<F>() >= 8 {
                 unsafe {
                     use core::arch::aarch64::*;
                     let mut src_base = src.as_ptr() as *const u64;
-                    let mut dst_ptr = values.as_mut_ptr() as *mut u64;
+                    let mut dst_ptr = value_slots.as_mut_ptr().cast::<u64>();
                     let chunks = half_rows / 4;
                     for _ in 0..chunks {
                         let val = vld2q_u64(src_base);
@@ -1802,10 +1966,12 @@ fn extend_and_combine_low_range_quotient<F: RichField>(
                     }
                 }
             } else {
-                for (k, out) in values.iter_mut().enumerate() {
-                    *out = src[k * 2 + c];
+                for (k, out) in value_slots.iter_mut().enumerate() {
+                    out.write(src[k * 2 + c]);
                 }
             }
+            // SAFETY: both branches initialize every slot in 0..half_rows.
+            unsafe { values.set_len(half_rows) };
             PolynomialValues::new(values)
                 .coset_ifft_with_prescaled_powers(omega_powers_scaled.as_slice())
                 .fft()
@@ -2878,12 +3044,11 @@ fn compute_quotient_polys<
     // flag below is exactly "something still reads Z(g x)".
     let needs_next_zs = !permutation_products_offloaded;
 
-    let quotient_len = points.len() * num_challenges;
+    let quotient_len = points
+        .len()
+        .checked_mul(num_challenges)
+        .expect("quotient output length overflow");
     let mut quotient_values: Vec<F> = Vec::with_capacity(quotient_len);
-    // SAFETY: capacity is exactly `quotient_len`, and the parallel pass below
-    // writes every element before any is read (see above). Same idiom as the
-    // promoted zero-tail fast path in `fri/oracle.rs`.
-    unsafe { quotient_values.set_len(quotient_len) };
     // The half-domain range job's CPU extension runs concurrently with the
     // CPU gate batch loop below (both on the pool), so its latency hides
     // behind work the proof does anyway; its result is consumed after.
@@ -2912,7 +3077,7 @@ fn compute_quotient_polys<
     };
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
     let low_extension = || -> core::result::Result<Option<Vec<F>>, String> { Ok(None) };
-    let quotient_values_ref = &mut quotient_values;
+    let quotient_values_ref = &mut quotient_values.spare_capacity_mut()[..quotient_len];
     let z_h_on_coset_ref = &z_h_on_coset;
     let run_batches = move || quotient_values_ref
         .par_chunks_mut(BATCH_SIZE * num_challenges)
@@ -3195,6 +3360,9 @@ fn compute_quotient_polys<
             },
         );
     let ((), low_extension_result) = plonky2_maybe_rayon::join(run_batches, low_extension);
+    // SAFETY: every disjoint batch initialized its complete active output slice,
+    // and the parallel join completed before the vector length changes.
+    unsafe { quotient_values.set_len(quotient_len) };
 
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_poseidon_values = if let Some((_, job)) = &gpu_poseidon {
@@ -3337,23 +3505,20 @@ fn compute_quotient_polys<
         None
     };
 
-    debug_assert_eq!(quotient_values.len(), points.len() * num_challenges);
+    assert!(num_challenges > 0, "quotient scatter needs a challenge");
+    assert_eq!(quotient_values.len(), quotient_len);
     struct ColPtr<T>(*mut T);
     unsafe impl<T> Send for ColPtr<T> {}
     unsafe impl<T> Sync for ColPtr<T> {}
     let mut challenge_columns: Vec<Vec<F>> = (0..num_challenges)
-        .map(|_| {
-            let mut column = Vec::with_capacity(points.len());
-            // SAFETY: the disjoint parallel scatter below writes every element
-            // exactly once before any read; `F` is plain data. Same idiom as
-            // the zero-tail fast path in `fri/oracle.rs`.
-            unsafe { column.set_len(points.len()) };
-            column
-        })
+        .map(|_| Vec::with_capacity(points.len()))
         .collect();
     let column_ptrs: Vec<ColPtr<F>> = challenge_columns
         .iter_mut()
-        .map(|column| ColPtr(column.as_mut_ptr()))
+        .map(|column| {
+            assert!(column.capacity() >= points.len());
+            ColPtr(column.spare_capacity_mut().as_mut_ptr().cast::<F>())
+        })
         .collect();
     let column_ptrs = &column_ptrs;
 
@@ -3476,6 +3641,11 @@ fn compute_quotient_polys<
                     }
                 }
             });
+    }
+    // SAFETY: each scatter branch wrote every point in every challenge column,
+    // and all parallel workers completed before lengths become visible.
+    for column in &mut challenge_columns {
+        unsafe { column.set_len(points.len()) };
     }
     let inverse_coset_shift_powers =
         precomputed::inverse_coset_shift_powers_scaled::<F>(points.len());
@@ -4581,18 +4751,18 @@ mod l_0_table_tests {
 /// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
+    use super::{
+        all_wires_permutation_partial_products, paired_permutation_batch_count,
+        two_challenge_wires_permutation_partial_products_and_zs,
+        two_challenge_wires_permutation_partial_products_and_zs_with_challenge4,
+        wires_permutation_partial_products_and_zs,
+    };
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::iop::witness::MatrixWitness;
     use crate::plonk::circuit_builder::CircuitBuilder;
     use crate::plonk::circuit_data::{CircuitConfig, CircuitData};
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
-
-    use super::{
-        all_wires_permutation_partial_products, paired_permutation_batch_count,
-        two_challenge_wires_permutation_partial_products_and_zs,
-        wires_permutation_partial_products_and_zs,
-    };
     use crate::plonk::permutation_argument::fixed_routed_wire;
 
     const D: usize = 2;
@@ -4813,6 +4983,35 @@ mod permutation_pairing_tests {
                 &data.prover_only,
                 &data.common,
             );
+            // Force both sides in one process. On Apple AArch64 the `true`
+            // side takes challenge/component packing; elsewhere its exact-type
+            // guard deliberately retains the scalar control. These are full
+            // quotient-product, batch-inverse, partial-product and Z outputs.
+            let frozen_scalar =
+                two_challenge_wires_permutation_partial_products_and_zs_with_challenge4(
+                    &witness,
+                    &betas,
+                    &beta_k_is,
+                    &gammas,
+                    &data.prover_only,
+                    &data.common,
+                    false,
+                );
+            let challenge4 =
+                two_challenge_wires_permutation_partial_products_and_zs_with_challenge4(
+                    &witness,
+                    &betas,
+                    &beta_k_is,
+                    &gammas,
+                    &data.prover_only,
+                    &data.common,
+                    true,
+                );
+            assert_eq!(
+                raw_limbs(&challenge4),
+                raw_limbs(&frozen_scalar),
+                "challenge4 changed a raw output limb at {n_points} points"
+            );
 
             assert_eq!(paired.len(), 2);
             for challenge in 0..2 {
@@ -4997,6 +5196,34 @@ mod permutation_pairing_tests {
             &gammas,
             &data.prover_only,
             &data.common,
+        );
+        let frozen_scalar = two_challenge_wires_permutation_partial_products_and_zs_with_challenge4(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+            false,
+        );
+        let challenge4 = two_challenge_wires_permutation_partial_products_and_zs_with_challenge4(
+            &witness,
+            &betas,
+            &beta_k_is,
+            &gammas,
+            &data.prover_only,
+            &data.common,
+            true,
+        );
+        assert_eq!(
+            raw_limbs(&challenge4),
+            raw_limbs(&frozen_scalar),
+            "fixed masks changed a raw challenge4 output limb"
+        );
+        assert_eq!(
+            raw_limbs(&paired),
+            raw_limbs(&frozen_scalar),
+            "default dispatch differs from the frozen masked scalar loop"
         );
         for challenge in 0..2 {
             let reference = naive_reference(

@@ -687,6 +687,7 @@ fn eval_interleave_pair_dense_fused<F: PrimeField64>(
 /// on this walk rather than in a separate pass is what makes it nearly free:
 /// the line is already resident and dirty from the read. Callers that do not
 /// own the buffer, or that want to inspect it afterwards, pass `false`.
+#[cfg(test)]
 fn reduce_gate_constraints_base_batch<F: Field>(
     constraint_terms_batch: &mut [F],
     batch_size: usize,
@@ -779,6 +780,93 @@ fn reduce_gate_constraints_base_batch<F: Field>(
     }
 }
 
+/// Initializes an uninitialized output buffer with the first reversed gate row,
+/// then continues the same Horner reduction through ordinary typed values.
+fn reduce_gate_constraints_base_batch_uninit<F: Field>(
+    constraint_terms_batch: &mut [F],
+    batch_size: usize,
+    alphas: &[F],
+    res_out: &mut [core::mem::MaybeUninit<F>],
+    clear_as_consumed: bool,
+) {
+    assert!(batch_size > 0);
+    assert_eq!(constraint_terms_batch.len() % batch_size, 0);
+    assert_eq!(res_out.len(), batch_size * alphas.len());
+
+    let mut rows = constraint_terms_batch.chunks_exact_mut(batch_size).rev();
+    if alphas.len() == 2 {
+        let alpha_0 = alphas[0];
+        let alpha_1 = alphas[1];
+        match rows.next() {
+            Some(first_row) => {
+                for (term_slot, result) in first_row.iter_mut().zip(res_out.chunks_exact_mut(2)) {
+                    let term = *term_slot;
+                    result[0].write(term);
+                    result[1].write(term);
+                    if clear_as_consumed {
+                        *term_slot = F::ZERO;
+                    }
+                }
+            }
+            None => {
+                for slot in res_out.iter_mut() {
+                    slot.write(F::ZERO);
+                }
+            }
+        }
+        // SAFETY: the first-row or empty-row branch initialized every slot.
+        let res_out = unsafe {
+            core::slice::from_raw_parts_mut(res_out.as_mut_ptr().cast::<F>(), res_out.len())
+        };
+        for constraint_row in rows {
+            for (term_slot, result) in constraint_row.iter_mut().zip(res_out.chunks_exact_mut(2)) {
+                let term = *term_slot;
+                result[0] = term.multiply_accumulate(result[0], alpha_0);
+                result[1] = term.multiply_accumulate(result[1], alpha_1);
+                if clear_as_consumed {
+                    *term_slot = F::ZERO;
+                }
+            }
+        }
+        return;
+    }
+
+    match rows.next() {
+        Some(first_row) => {
+            for (point, term_slot) in first_row.iter_mut().enumerate() {
+                let term = *term_slot;
+                let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+                for slot in result {
+                    slot.write(term);
+                }
+                if clear_as_consumed {
+                    *term_slot = F::ZERO;
+                }
+            }
+        }
+        None => {
+            for slot in res_out.iter_mut() {
+                slot.write(F::ZERO);
+            }
+        }
+    }
+    // SAFETY: the first-row or empty-row branch initialized every slot.
+    let res_out =
+        unsafe { core::slice::from_raw_parts_mut(res_out.as_mut_ptr().cast::<F>(), res_out.len()) };
+    for constraint_row in rows {
+        for (point, term_slot) in constraint_row.iter_mut().enumerate() {
+            let term = *term_slot;
+            let result = &mut res_out[point * alphas.len()..(point + 1) * alphas.len()];
+            for (value, &alpha) in result.iter_mut().zip(alphas) {
+                *value = term.multiply_accumulate(*value, alpha);
+            }
+            if clear_as_consumed {
+                *term_slot = F::ZERO;
+            }
+        }
+    }
+}
+
 #[inline(always)]
 fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
     wire.multiply_accumulate(beta, point) + gamma
@@ -787,8 +875,8 @@ fn permutation_factor_fma<F: Field>(wire: F, beta: F, point: F, gamma: F) -> F {
 /// Like `eval_vanishing_poly`, but specialized for base field points. Batched.
 ///
 /// Results are stored point-major: the challenges for point `k` occupy
-/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. `res_out` must be
-/// zero-initialized by the caller.
+/// `res_out[k * num_challenges..(k + 1) * num_challenges]`. The caller provides
+/// uninitialized output slots; this function initializes all of them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const D: usize>(
     common_data: &CommonCircuitData<F, D>,
@@ -811,7 +899,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
     z_h_on_coset: &ZeroPolyOnCoset<F>,
     lut_re_poly_evals: &[&[F]],
     scratch: &mut VanishingScratch<F>,
-    res_out: &mut [F],
+    res_out: &mut [core::mem::MaybeUninit<F>],
 ) {
     let has_lookup = common_data.num_lookup_polys != 0;
 
@@ -853,10 +941,16 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
 
     let num_challenges = common_data.config.num_challenges;
     let num_routed_wires = common_data.config.num_routed_wires;
+    assert_eq!(alphas.len(), num_challenges);
+    assert_eq!(res_out.len(), n * num_challenges);
     debug_assert_eq!(betas.len(), num_challenges);
     debug_assert_eq!(gammas.len(), num_challenges);
     debug_assert_eq!(beta_k_is.len(), num_challenges * num_routed_wires);
-    reduce_gate_constraints_base_batch(constraint_terms_batch, n, alphas, res_out, true, true);
+    reduce_gate_constraints_base_batch_uninit(constraint_terms_batch, n, alphas, res_out, true);
+    // SAFETY: the reduction above initialized every output slot before any
+    // later permutation or lookup term reads and updates the accumulator.
+    let res_out =
+        unsafe { core::slice::from_raw_parts_mut(res_out.as_mut_ptr().cast::<F>(), res_out.len()) };
 
     if permutation_products_offloaded {
         assert!(!has_lookup, "lookup permutation products stay on the CPU");
@@ -2184,6 +2278,56 @@ mod tests {
         assert!(shared_selector_group_is_cheaper(4, 4, false));
         assert!(shared_selector_group_is_cheaper(8, 6, true));
         assert!(!shared_selector_group_is_cheaper(8, 1, true));
+    }
+
+    #[test]
+    fn uninitialized_reduction_matches_zero_seed_in_raw_limbs() {
+        type F = GoldilocksField;
+
+        for alpha_count in [1usize, 2, 3] {
+            let alphas = (0..alpha_count)
+                .map(|i| F::from_canonical_usize(i * 13 + 3))
+                .collect::<Vec<_>>();
+            for batch_size in [1usize, 7, 32] {
+                for num_constraints in [0usize, 1, 7] {
+                    let terms = (0..batch_size * num_constraints)
+                        .map(|i| F::from_canonical_usize(i * 17 + 5))
+                        .collect::<Vec<_>>();
+                    let mut expected_terms = terms.clone();
+                    let mut actual_terms = terms;
+                    let output_len = batch_size * alpha_count;
+                    let mut expected = vec![F::ZERO; output_len];
+                    reduce_gate_constraints_base_batch(
+                        &mut expected_terms,
+                        batch_size,
+                        &alphas,
+                        &mut expected,
+                        true,
+                        true,
+                    );
+                    let mut actual = vec![core::mem::MaybeUninit::<F>::uninit(); output_len];
+                    reduce_gate_constraints_base_batch_uninit(
+                        &mut actual_terms,
+                        batch_size,
+                        &alphas,
+                        &mut actual,
+                        true,
+                    );
+                    // SAFETY: the uninitialized reducer must initialize every
+                    // output slot, including the no-constraint case.
+                    let actual = unsafe {
+                        core::slice::from_raw_parts(actual.as_ptr().cast::<F>(), actual.len())
+                    };
+                    assert_eq!(actual_terms, expected_terms);
+                    for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                        assert_eq!(
+                            actual.0, expected.0,
+                            "raw mismatch at {i}, alphas={alpha_count}, batch={batch_size}, rows={num_constraints}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
