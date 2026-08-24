@@ -4434,11 +4434,16 @@ fn dispatch2d(
     width: usize,
     height: usize,
 ) {
-    let execution_width = pipeline.thread_execution_width();
-    let group_width = pipeline
-        .max_total_threads_per_threadgroup()
-        .min(64)
-        .max(execution_width);
+    let execution_width = pipeline.thread_execution_width().max(1);
+    let pso_ceiling = pipeline.max_total_threads_per_threadgroup();
+    // NTT/LDE kernels are gid-bounded with zero threadgroup memory.
+    // Tip hard-caps 2-D groups at 64; M-series PSO ceiling is 1024.
+    // Isolate 256 (not hash 1-D 1024, which scored 32.349 and is dead).
+    let cap = pso_ceiling.min(256).max(execution_width);
+    let live = (width as NSUInteger).saturating_mul(height as NSUInteger).max(1);
+    let simd = execution_width;
+    let rounded = ((live + simd - 1) / simd) * simd;
+    let group_width = cap.min(rounded.max(simd));
     encoder.dispatch_threads(
         MTLSize {
             width: width as NSUInteger,
