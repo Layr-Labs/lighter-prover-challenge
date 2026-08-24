@@ -107,6 +107,26 @@ impl PathCircuits {
 }
 
 impl Circuits {
+    /// Returns proof-only routed-index metadata after this circuit has produced
+    /// its final proof.
+    ///
+    /// `representative_map` is read while generators populate the partition and
+    /// once more while `PartitionWitness::full_witness` materializes the wire
+    /// columns. `fixed_routed_wires` is read later by the permutation product,
+    /// so neither may be retired during a proof. At each call site below the
+    /// circuit's final proof has completed and the exclusive `RwLock` guard (or
+    /// `&mut self` for `pre_data`) proves that no reader remains. Replacing the
+    /// vectors, rather than clearing them, returns their backing allocations.
+    ///
+    /// The tables are deterministic circuit metadata and are not part of a
+    /// proof or verifier input. Retiring them changes neither proof values nor
+    /// the serialized circuit format, and assigning an empty vector is
+    /// intentionally idempotent for the final backstop.
+    pub(crate) fn release_routed_index_metadata(data: &mut CircuitData<F, C, D>) {
+        data.prover_only.representative_map = Vec::new();
+        data.prover_only.fixed_routed_wires = Vec::new();
+    }
+
     pub fn new() -> Self {
         let ((pre_target, pre_data), (heavy, light)) = rayon::join(
             || {
@@ -173,6 +193,7 @@ impl Circuits {
     pub fn release_finished_circuit_extensions(&mut self) {
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
+        Self::release_routed_index_metadata(&mut self.pre_data);
         for lock in [
             &mut self.light_tx_data,
             &mut self.light_chain_data,
@@ -187,6 +208,7 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_routed_index_metadata(data);
         }
     }
 
@@ -223,6 +245,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_routed_index_metadata(&mut data);
         }
     }
 
@@ -247,6 +270,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_routed_index_metadata(&mut data);
         }
     }
 
@@ -309,6 +333,32 @@ mod build_timing {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn routed_index_metadata_release_returns_allocations_and_is_idempotent() {
+        use plonky2::iop::target::Target;
+        use plonky2::plonk::circuit_builder::CircuitBuilder;
+
+        let mut builder = CircuitBuilder::<F, D>::new(CIRCUIT_CONFIG);
+        let left = builder.add_virtual_target();
+        let right = builder.add_virtual_target();
+        builder.connect(left, right);
+        builder.register_public_input(Target::VirtualTarget { index: 0 });
+        let mut data = builder.build::<C>();
+
+        assert!(!data.prover_only.representative_map.is_empty());
+        assert!(!data.prover_only.fixed_routed_wires.is_empty());
+
+        Circuits::release_routed_index_metadata(&mut data);
+        assert!(data.prover_only.representative_map.is_empty());
+        assert_eq!(data.prover_only.representative_map.capacity(), 0);
+        assert!(data.prover_only.fixed_routed_wires.is_empty());
+        assert_eq!(data.prover_only.fixed_routed_wires.capacity(), 0);
+
+        Circuits::release_routed_index_metadata(&mut data);
+        assert_eq!(data.prover_only.representative_map.capacity(), 0);
+        assert_eq!(data.prover_only.fixed_routed_wires.capacity(), 0);
+    }
 
     /// Manual timing harness for the startup circuit builds, which run once per
     /// worker spawn inside the ranked timed window (five spawns per run). Run:

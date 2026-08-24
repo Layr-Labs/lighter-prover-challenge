@@ -173,6 +173,13 @@ fn main() {
                 // quantity is computed differently and no work is added — storage
                 // that no subsequent read can reach is returned earlier.
                 pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
+                // The proof has also completed the last reads of its routed
+                // target-to-representative table (`full_witness`) and fixed
+                // routed-wire mask (permutation product). The later block
+                // circuit construction reads only `common`/`verifier_only`, so
+                // return these CPU allocations at the same exact last-use
+                // boundary instead of carrying them through the whole pipeline.
+                Circuits::release_routed_index_metadata(&mut pre_data);
                 (pre_target, pre_data, pre_proof)
             })
             .expect("pre-execution startup thread must start");
