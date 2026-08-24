@@ -232,18 +232,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
         let chunk_size = 1usize << chunk_bits;
         let three = F::from_canonical_usize(3);
         let mut chunks_iter = combined_gate_constraints.chunks_exact_mut(n);
-        // Batches are 32 points in this prover; keep the scratch rows on the
+        // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
         let mut scratch_stack = [F::ZERO; 64];
-        let mut msd_stack = [F::ZERO; 64];
         let mut scratch_heap;
-        let mut msd_heap;
-        let (scratch, most_significant_diff_so_far): (&mut [F], &mut [F]) = if n <= 64 {
-            (&mut scratch_stack[..n], &mut msd_stack[..n])
+        let scratch: &mut [F] = if n <= 64 {
+            &mut scratch_stack[..n]
         } else {
             scratch_heap = vec![F::ZERO; n];
-            msd_heap = vec![F::ZERO; n];
-            (&mut scratch_heap, &mut msd_heap)
+            &mut scratch_heap
         };
 
         // combined chunks - input, for both inputs, accumulated per point by
@@ -276,6 +273,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
                 out[p] += filters[p] * (scratch[p] - input[p]);
             }
         }
+
+        // Input recomposition no longer needs `scratch`. The MSD recurrence
+        // starts from zero, so clear the row exactly at the boundary between
+        // those disjoint live ranges before reusing it as the recurrence state.
+        scratch.fill(F::ZERO);
 
         for i in 0..self.num_chunks {
             let first = col(self.wire_first_chunk_val(i));
@@ -325,17 +327,16 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
             }
             let out = chunks_iter.next().unwrap();
             for p in 0..n {
-                out[p] += filters[p]
-                    * (intermediate_value[p] - chunks_equal[p] * most_significant_diff_so_far[p]);
-                most_significant_diff_so_far[p] = intermediate_value[p]
-                    + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
+                out[p] += filters[p] * (intermediate_value[p] - chunks_equal[p] * scratch[p]);
+                scratch[p] =
+                    intermediate_value[p] + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
             }
         }
 
         let most_significant_diff = col(self.wire_most_significant_diff());
         let out = chunks_iter.next().unwrap();
         for p in 0..n {
-            out[p] += filters[p] * (most_significant_diff[p] - most_significant_diff_so_far[p]);
+            out[p] += filters[p] * (most_significant_diff[p] - scratch[p]);
         }
 
         for i in 0..chunk_bits + 1 {
@@ -726,5 +727,71 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         let row = src.read_usize()?;
         let gate = ComparisonGate::deserialize(src, common_data)?;
         Ok(Self { row, gate })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plonky2::field::goldilocks_field::GoldilocksField;
+    use plonky2::field::types::{Field64, PrimeField64};
+    use plonky2::hash::hash_types::HashOut;
+
+    use super::*;
+
+    #[test]
+    fn coalesced_scratch_zero_boundary_matches_default_on_stack_and_heap() {
+        type F = GoldilocksField;
+        const D: usize = 2;
+
+        let gate = ComparisonGate::<F, D>::new(32, 16);
+        let raw_chunks = [
+            GoldilocksField(1),
+            GoldilocksField(F::ORDER + 1),
+            GoldilocksField(u64::MAX),
+        ];
+        let hash = HashOut::<F>::ZERO;
+
+        for n in [1, 32, 64, 65] {
+            let mut wires = vec![F::ZERO; gate.num_wires() * n];
+            for p in 0..n {
+                let chunk = raw_chunks[p % raw_chunks.len()];
+                for i in 0..gate.num_chunks {
+                    wires[gate.wire_first_chunk_val(i) * n + p] = chunk;
+                    wires[gate.wire_second_chunk_val(i) * n + p] = chunk;
+                    wires[gate.wire_chunks_equal(i) * n + p] = F::ONE;
+                }
+            }
+            let filters = vec![F::ONE; n];
+            let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &hash);
+
+            let materialized = gate.eval_unfiltered_base_batch(vars);
+            let mut expected = vec![F::ZERO; gate.num_constraints() * n];
+            for (combined, row) in expected
+                .chunks_exact_mut(n)
+                .zip(materialized.chunks_exact(n))
+            {
+                for p in 0..n {
+                    combined[p] += filters[p] * row[p];
+                }
+            }
+
+            let mut actual = vec![F::ZERO; expected.len()];
+            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+            assert_eq!(actual, expected, "accumulate mismatch at batch size {n}");
+
+            // Rows 0 and 1 are input recomposition; each chunk then emits two
+            // range, two equality, and one MSD-recurrence constraint. The first
+            // recurrence row must see the explicit zero at the scratch/MSD
+            // lifetime boundary, even though input recomposition left nonzero
+            // raw representatives in the same storage.
+            let first_msd_recurrence_row = 2 + 4;
+            for p in 0..n {
+                assert_eq!(
+                    actual[first_msd_recurrence_row * n + p].to_noncanonical_u64(),
+                    0,
+                    "nonzero initial MSD state at batch size {n}, point {p}"
+                );
+            }
+        }
     }
 }

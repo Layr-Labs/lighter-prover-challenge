@@ -223,8 +223,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
             // in the same descending order as `eval_unfiltered`, accumulating
             // the low/high recompositions along the way.
-            combined_low.fill(0);
-            combined_high.fill(0);
+            // Both stack and heap rows are zero-created, so op 0 already has
+            // the required Horner seed. Every later op must clear the prior
+            // recomposition before reading its first limb.
+            if i != 0 {
+                combined_low.fill(0);
+                combined_high.fill(0);
+            }
             for j in (0..Self::num_limbs()).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 let out = chunks.next().unwrap();
@@ -574,9 +579,11 @@ mod tests {
         type F = GoldilocksField;
         const D: usize = 2;
         // CIRCUIT_CONFIG: num_wires 136, num_routed_wires 80 => num_ops 10.
-        // The quotient walker evaluates 32 points per batch.
         const NUM_OPS: usize = 10;
-        const N: usize = 32;
+        // Keep the full randomized coverage at the production batch size. One
+        // boundary sweep is enough to exercise short, stack-limit, and first
+        // heap-fallback shapes without multiplying the test's runtime.
+        const BATCH_SHAPES: [(usize, usize); 4] = [(1, 1), (32, 64), (64, 1), (65, 1)];
 
         let boundary: [u64; 15] = [
             0,
@@ -612,40 +619,42 @@ mod tests {
             state
         };
 
-        for trial in 0..64usize {
-            // Trial 0 is a pure boundary sweep; every later trial mixes
-            // boundary and uniform raw representatives.
-            let mut draw = |k: usize| -> F {
-                if trial == 0 {
-                    GoldilocksField(boundary[k % boundary.len()])
-                } else {
-                    let r = next();
-                    if r % 3 == 0 {
-                        GoldilocksField(boundary[(r >> 2) as usize % boundary.len()])
+        for (n, num_trials) in BATCH_SHAPES {
+            for trial in 0..num_trials {
+                // Trial 0 is a pure boundary sweep; every later trial mixes
+                // boundary and uniform raw representatives.
+                let mut draw = |k: usize| -> F {
+                    if trial == 0 {
+                        GoldilocksField(boundary[k % boundary.len()])
                     } else {
-                        GoldilocksField(r)
+                        let r = next();
+                        if r % 3 == 0 {
+                            GoldilocksField(boundary[(r >> 2) as usize % boundary.len()])
+                        } else {
+                            GoldilocksField(r)
+                        }
                     }
+                };
+
+                let wires: Vec<F> = (0..num_wires * n).map(&mut draw).collect();
+                let filters: Vec<F> = (0..n).map(&mut draw).collect();
+                let seed: Vec<F> = (0..num_constraints * n).map(&mut draw).collect();
+
+                let vars = EvaluationVarsBaseBatch::new(n, &[], &wires, &hash);
+
+                let mut expected = seed.clone();
+                eval_accumulate_termwise_reference(&gate, vars, &filters, &mut expected);
+
+                let mut actual = seed;
+                gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
+
+                for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                    assert_eq!(
+                        a.to_noncanonical_u64(),
+                        e.to_noncanonical_u64(),
+                        "raw-limb mismatch at slot {index} (batch {n}, trial {trial})"
+                    );
                 }
-            };
-
-            let wires: Vec<F> = (0..num_wires * N).map(&mut draw).collect();
-            let filters: Vec<F> = (0..N).map(&mut draw).collect();
-            let seed: Vec<F> = (0..num_constraints * N).map(&mut draw).collect();
-
-            let vars = EvaluationVarsBaseBatch::new(N, &[], &wires, &hash);
-
-            let mut expected = seed.clone();
-            eval_accumulate_termwise_reference(&gate, vars, &filters, &mut expected);
-
-            let mut actual = seed;
-            gate.eval_unfiltered_base_batch_accumulate(vars, &filters, &mut actual);
-
-            for (index, (a, e)) in actual.iter().zip(&expected).enumerate() {
-                assert_eq!(
-                    a.to_noncanonical_u64(),
-                    e.to_noncanonical_u64(),
-                    "raw-limb mismatch at slot {index} (trial {trial})"
-                );
             }
         }
     }
