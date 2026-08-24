@@ -14,9 +14,9 @@ use objc::runtime::Sel;
 #[cfg(feature = "diagnostic_profile")]
 use objc::Message;
 use metal::{
-    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
-    ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
+    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CommandQueueRef,
+    CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
+    MTLCommandBufferStatus, MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
 use plonky2_maybe_rayon::*;
@@ -346,11 +346,15 @@ const MIN_GPU_PERMUTATIONS: usize = 1 << 19;
 // still keeping the genuinely CPU-favored tiny shapes (2^15 width-8 measured
 // 1.37) on the CPU.
 const EXCLUSIVE_PHASE_MIN_GPU_PERMUTATIONS: usize = 1 << 16;
-/// Upper bound on concurrently in-flight GPU tree builds. One set serializes
-/// GPU tree builds exactly like the promoted base's global context mutex: a
+/// Upper bound on concurrently in-flight *bulk* GPU tree builds. One set
+/// serializes them exactly like the promoted base's global context mutex: a
 /// 3-set experiment measured 13-18% faster locally but scored -21.6% on the
-/// official ranked host (submission 41467098), so concurrent GPU submission is
-/// intentionally disabled.
+/// official ranked host (submission 41467098), so concurrent *bulk* GPU
+/// submission is intentionally disabled. The serial-critical 2^17 spine trees
+/// are the one exception: they run on their own dedicated lane (see
+/// `MetalShared::spine_lane`) so the strictly serial chain path never parks
+/// behind an in-flight bulk build — at most one small spine build co-resides
+/// with one bulk build, and only while the chain is the pipeline's laggard.
 const MAX_BUFFER_SETS: usize = 1;
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;
@@ -371,6 +375,14 @@ const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
 struct MetalShared {
     device: Device,
     queue: CommandQueue,
+    /// Dedicated command queue for the serial-critical 2^17 spine trees.
+    /// Command buffers execute FIFO *per queue*; a separate queue is the only
+    /// way a spine tree can start while a bulk chunk command buffer is already
+    /// committed ahead of it (the wait-queue priority this replaces could
+    /// reorder waiters for the buffer set, but never preempt in-flight work:
+    /// fold commit phases measured 200-320 ms under pipeline load vs 10-50 ms
+    /// alone, and that gap sits on the strictly serial chain spine).
+    spine_queue: CommandQueue,
     leaf_pipeline: ComputePipelineState,
     leaf_colmajor_pipeline: ComputePipelineState,
     parent_pipeline: ComputePipelineState,
@@ -379,6 +391,13 @@ struct MetalShared {
     ifft_finalize_pipeline: ComputePipelineState,
     parameters: Buffer,
     pool: Mutex<BufferPool>,
+    /// Retained buffer set owned by the spine lane. Spine proofs are
+    /// serialized by construction, so at most one spine build exists at a
+    /// time; a plain mutex (no condvar) is enough, and the lane never touches
+    /// the bulk pool above. Spine trees arrive as `LeafSource::Shared`
+    /// columns (no staging input), so the retained footprint is the ~8 MiB
+    /// level-order digest output of a 2^17-leaf tree.
+    spine_lane: Mutex<BufferSet>,
     /// Small, nonblocking cache for completed gate-quotient output buffers.
     /// Kept separate from the tree pool so quotient allocation never delays
     /// Merkle admission or contends on its condition variable.
@@ -1070,19 +1089,6 @@ struct BufferPool {
     free: Vec<BufferSet>,
     created: usize,
     waiters: usize,
-    /// Waiters for serial-critical-path (2^17 spine) tree builds. While one is
-    /// queued, non-spine acquisitions defer, so a freed set always goes to the
-    /// spine first: command buffers execute FIFO per queue, so this is the only
-    /// place the chain-step wires tree can jump the pipelined chunk trees it
-    /// otherwise parks behind (fold commit phases measured 200-320 ms under
-    /// pipeline load vs 10-50 ms alone — that gap is queue wait, and it sits
-    /// on the strictly serial chain spine). Still exactly one build in flight:
-    /// this reorders the wait queue and never adds GPU concurrency (the
-    /// 3-set experiment scored -21.6% ranked; MAX_BUFFER_SETS stays 1).
-    /// Starvation is bounded by construction: spine proofs are serialized, so
-    /// at most one spine build exists at a time and a chunk waiter defers by
-    /// at most one ~8-50 ms spine build per wake.
-    spine_waiters: usize,
     /// Retained replacement buffers for detached readbacks (bounded by
     /// [`MAX_DETACHED_READBACKS`]).
     spare_outputs: Vec<Buffer>,
@@ -1633,9 +1639,11 @@ pub fn is_exclusive_gpu_phase() -> bool {
 /// chain step's transaction proof is ready (the step could prove right now),
 /// decremented when its proof completes. While this backlog is at or above
 /// [`SPINE_URGENT_BACKLOG`], the chain is the pipeline's laggard and its
-/// 2^17 spine trees take priority for the single GPU buffer set; below it,
-/// chunk trees keep plain FIFO so the transaction pipeline is not slowed on
-/// the spine's behalf while the spine has slack. A plain unconditional
+/// 2^17 spine trees run on the dedicated spine lane (own command queue, own
+/// retained buffer set; see `MetalShared::spine_lane`) instead of waiting for
+/// the single bulk set; below it, spine trees keep plain FIFO through the
+/// bulk set so the transaction pipeline is not contended on the spine's
+/// behalf while the spine has slack. A plain unconditional
 /// priority measured both directions: the chain's predecessor waits fell but
 /// the deferred chunk trees stretched the light path — this backlog gate is
 /// the balance point.
@@ -3044,6 +3052,7 @@ impl MetalShared {
 
             Ok(Self {
                 queue: device.new_command_queue(),
+                spine_queue: device.new_command_queue(),
                 device,
                 leaf_pipeline,
                 leaf_colmajor_pipeline,
@@ -3056,9 +3065,12 @@ impl MetalShared {
                     free: Vec::new(),
                     created: 0,
                     waiters: 0,
-                    spine_waiters: 0,
                     spare_outputs: Vec::new(),
                     detached_readbacks: 0,
+                }),
+                spine_lane: Mutex::new(BufferSet {
+                    input: None,
+                    output: None,
                 }),
                 quotient_output_pool: Arc::new(Mutex::new(QuotientOutputPool::default())),
                 digest_output_pool: Arc::new(Mutex::new(DigestOutputPool::default())),
@@ -3418,45 +3430,32 @@ impl MetalShared {
         })
     }
 
+    /// Acquires one of the bulk buffer sets, waiting while all
+    /// `MAX_BUFFER_SETS` are in flight. The serial-critical spine trees never
+    /// come here — they run on the dedicated `spine_lane` — so all sleepers
+    /// are interchangeable bulk jobs.
     fn acquire_set(&self) -> Result<BufferSet, String> {
-        self.acquire_set_priority(false)
-    }
-
-    /// `spine` acquisitions (the 2^17 serial-critical trees) take a freed set
-    /// ahead of any queued non-spine waiter; see `BufferPool::spine_waiters`.
-    fn acquire_set_priority(&self, spine: bool) -> Result<BufferSet, String> {
         let mut pool = self.pool.lock().map_err(|_| "buffer pool poisoned")?;
         loop {
-            if spine || pool.spine_waiters == 0 {
-                if let Some(set) = pool.free.pop() {
-                    return Ok(set);
-                }
-                if pool.created < MAX_BUFFER_SETS {
-                    pool.created += 1;
-                    return Ok(BufferSet {
-                        input: None,
-                        output: None,
-                    });
-                }
+            if let Some(set) = pool.free.pop() {
+                return Ok(set);
+            }
+            if pool.created < MAX_BUFFER_SETS {
+                pool.created += 1;
+                return Ok(BufferSet {
+                    input: None,
+                    output: None,
+                });
             }
             pool.waiters += 1;
-            if spine {
-                pool.spine_waiters += 1;
-            }
             match self.available.wait(pool) {
                 Ok(mut next) => {
                     next.waiters -= 1;
-                    if spine {
-                        next.spine_waiters -= 1;
-                    }
                     pool = next;
                 }
                 Err(poisoned) => {
                     let mut next = poisoned.into_inner();
                     next.waiters -= 1;
-                    if spine {
-                        next.spine_waiters -= 1;
-                    }
                     return Err("buffer pool poisoned".to_string());
                 }
             }
@@ -3469,23 +3468,12 @@ impl MetalShared {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pool.free.push(set);
-        // With a spine waiter queued, whichever non-spine waiter the OS would
-        // hand a `notify_one` to would just re-block, so the wake must reach
-        // the spine thread. Otherwise, a released singleton set can satisfy
-        // only one waiter and broadcasting just creates mutex contention.
-        // slow-host band; this comment changes no executable behavior.
-        if pool.waiters == 0 {
-            return;
-        }
-        if pool.spine_waiters == 0 {
-            // All sleepers are interchangeable non-spine jobs. One released
-            // set can satisfy exactly one of them, so waking the rest only
-            // makes them contend for the mutex and go back to sleep. Keep the
-            // broadcast solely for the priority case below, where the OS may
-            // otherwise wake a non-spine waiter ahead of the chain spine.
+        // A released singleton set can satisfy exactly one waiter, and every
+        // sleeper is an interchangeable bulk job (spine trees run on their own
+        // lane and never wait here), so waking more than one would only make
+        // the rest contend for the mutex and go back to sleep.
+        if pool.waiters > 0 {
             self.available.notify_one();
-        } else {
-            self.available.notify_all();
         }
     }
 
@@ -4215,10 +4203,41 @@ impl MetalShared {
 
         let job = GpuJobGuard::begin();
         // Spine trees (the 2^17 serial-critical shapes, same predicate as
-        // gpu_worthwhile) jump queued chunk-tree waiters for the single set —
-        // but only while the chain is actually the laggard (see SPINE_BACKLOG).
+        // gpu_worthwhile) run on the dedicated spine lane — their own command
+        // queue and their own retained buffer set — while the chain is
+        // actually the pipeline's laggard (see SPINE_BACKLOG). The lane
+        // removes both waits the old wait-queue priority could not: the
+        // in-flight bulk build holding the single set through its whole
+        // stage/hash/readback, and queue-FIFO behind already-committed bulk
+        // command buffers (fold commit phases measured 200-320 ms under
+        // pipeline load vs 10-50 ms alone — that gap was wait, on the
+        // strictly serial chain spine). Bulk builds stay serialized by
+        // MAX_BUFFER_SETS == 1 and total GPU work is unchanged; the lane
+        // only lets one small serial-path build start immediately instead of
+        // idling the chain behind bulk work that has window-depth slack.
         let spine = leaf_count == 1 << 17 && leaf_width > 4 && spine_urgent();
-        let mut set = self.acquire_set_priority(spine)?;
+        if spine {
+            let mut lane = self
+                .spine_lane
+                .lock()
+                .map_err(|_| "spine lane poisoned")?;
+            let result = self.build_with_set(
+                &mut lane,
+                source,
+                leaf_width,
+                leaf_count,
+                cap_height,
+                input_len,
+                input_bytes,
+                output_len,
+                output_bytes,
+                &self.spine_queue,
+            );
+            drop(lane);
+            drop(job);
+            return Ok(result?.finish());
+        }
+        let mut set = self.acquire_set()?;
         let result = self.build_with_set(
             &mut set,
             source,
@@ -4229,6 +4248,7 @@ impl MetalShared {
             input_bytes,
             output_len,
             output_bytes,
+            &self.queue,
         );
         self.release_set(set);
         drop(job);
@@ -4247,6 +4267,7 @@ impl MetalShared {
         input_bytes: usize,
         output_len: usize,
         output_bytes: usize,
+        queue: &CommandQueueRef,
     ) -> Result<TreeReadback<'_, F>, String> {
         let cap_count = 1usize << cap_height;
 
@@ -4326,7 +4347,7 @@ impl MetalShared {
                 LeafSource::Rows(_) => &self.leaf_pipeline,
                 LeafSource::Columns(_) | LeafSource::Shared(_) => &self.leaf_colmajor_pipeline,
             };
-            let command_buffer = self.queue.new_command_buffer();
+            let command_buffer = queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(leaf_pipeline);
             encoder.set_buffer(0, Some(input_buffer), 0);
@@ -7494,6 +7515,53 @@ kernel void goldilocks_mul_bench_native(
         assert_eq!(gpu.0.nodes.len(), node_count);
         let cpu = cpu_tree(&leaves, cap_height);
         assert_tree_eq(&gpu, &cpu, WIDTH, cap_height);
+    }
+
+    /// The dedicated spine lane (own queue, own retained buffer set) must
+    /// produce bit-identical trees to the CPU, including when its retained
+    /// output buffer is reused by a second build.
+    #[test]
+    fn spine_lane_merkle_matches_cpu() {
+        const WIDTH: usize = 8;
+        let leaf_count = 1usize << 17;
+        let cap_height = 4;
+
+        struct BacklogReset;
+        impl Drop for BacklogReset {
+            fn drop(&mut self) {
+                spine_backlog_add(-1);
+            }
+        }
+        spine_backlog_add(1);
+        let _reset = BacklogReset;
+        assert!(spine_urgent());
+
+        let mut rng = StdRng::seed_from_u64(0x5350_494e_454c_4e45);
+        let context = CONTEXT
+            .as_ref()
+            .unwrap_or_else(|error| panic!("{error}"));
+        for round in 0..2 {
+            let leaves: Vec<Vec<GoldilocksField>> = (0..leaf_count)
+                .map(|_| {
+                    (0..WIDTH)
+                        .map(|_| GoldilocksField(rng.next_u64() % GoldilocksField::ORDER))
+                        .collect()
+                })
+                .collect();
+            let flat: Vec<GoldilocksField> =
+                leaves.iter().flat_map(|leaf| leaf.iter().copied()).collect();
+            let gpu = context
+                .build(LeafSource::Rows(&flat), WIDTH, leaf_count, cap_height)
+                .unwrap();
+            let cpu = cpu_tree(&leaves, cap_height);
+            assert_tree_eq(&gpu, &cpu, WIDTH, cap_height);
+            assert_all_paths_match_cpu(&gpu, &cpu, leaf_count, cap_height);
+            let lane = context.spine_lane.lock().unwrap();
+            assert!(
+                lane.output.is_some(),
+                "round {round}: spine build must run on the lane's retained set"
+            );
+        }
     }
 
     fn cpu_tree(
