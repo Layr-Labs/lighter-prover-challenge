@@ -1639,7 +1639,7 @@ fn combine_low_range_quotient<F: RichField>(
     constants: &crate::hash::poseidon2::metal::MetalColumns<F>,
     filter_cache: Option<&LowRangeSelectorFilterCache<F>>,
 ) -> (Vec<F>, bool) {
-    const ROWS_PER_CHUNK: usize = 512;
+    const ROWS_PER_CHUNK: usize = 1024;
     const MAX_GROUP: usize = 16;
 
     let plans = low_range_selector_group_plans(gates);
