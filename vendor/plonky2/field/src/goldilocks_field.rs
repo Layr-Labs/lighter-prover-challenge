@@ -233,6 +233,30 @@ impl Field for GoldilocksField {
             reduce128((self.0 as u128) + (x.0 as u128) * (y.0 as u128))
         }
     }
+
+    #[inline]
+    fn multiply_accumulate_pair(
+        acc0: Self,
+        x0: Self,
+        y0: Self,
+        acc1: Self,
+        x1: Self,
+        y1: Self,
+    ) -> (Self, Self) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let (z0, z1) =
+                mul_acc_reduce_pair(acc0.0, x0.0, y0.0, acc1.0, x1.0, y1.0);
+            (Self(z0), Self(z1))
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            (
+                acc0.multiply_accumulate(x0, y0),
+                acc1.multiply_accumulate(x1, y1),
+            )
+        }
+    }
 }
 
 impl PrimeField for GoldilocksField {
@@ -503,6 +527,13 @@ fn mul_acc_reduce(acc: u64, a: u64, b: u64) -> u64 {
 
     result
 }
+
+/// The nine-instruction Goldilocks multiply-reduce kernel, re-exported so
+/// consumers outside this crate (the Poseidon2 S-box in `plonky2`) can reach the
+/// same kernel the packed field and `multiply_accumulate` already use, instead of
+/// keeping a second, slower copy of the same reduction.
+#[cfg(target_arch = "aarch64")]
+pub use crate::arch::aarch64::neon_goldilocks_field::{mul_acc_reduce_pair, mul_reduce_pair};
 
 /// Reduces to a 64-bit value. The result might not be in canonical form; it could be in between the
 /// field order and `2^64`.
