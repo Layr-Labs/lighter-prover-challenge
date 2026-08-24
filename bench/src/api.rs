@@ -1,4 +1,4 @@
-// Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
+// Redraw marker exp-pow-r2 1787598243641 (inert)
 // reuse in the comparison/u16 arithmetic gate generators (per-call allocation
 // elimination previously described in this account's fable-ps notes).
 // Marker bumped only for a fresh submission hash; no behavior change vs the prior fable-ps draws.
@@ -14,7 +14,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _}
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::fri::oracle::PolynomialBatch;
-use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::circuit_data::{CircuitData, GeneratorWatchIndex};
 use plonky2::plonk::proof::ProofWithPublicInputs;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
@@ -171,6 +171,7 @@ impl Circuits {
     /// Value-exact: no quantity is computed differently, only storage that no
     /// subsequent read can reach is returned early.
     pub fn release_finished_circuit_extensions(&mut self) {
+        Self::release_generator_machinery(&mut self.pre_data);
         self.pre_data.prover_only.constants_sigmas_commitment = PolynomialBatch::default();
         self.pre_data.prover_only.constants_sigmas_quotient_cache = None;
         for lock in [
@@ -187,7 +188,21 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_generator_machinery(data);
         }
+    }
+
+
+    /// Releases a circuit's generator worklist and watch index. These are read
+    /// only while generating that circuit's witnesses; once the last witness of
+    /// the family exists they are pure resident weight (the light tx circuit's
+    /// CSR alone is ~10 MB). Idempotent and guarded by the same proof as the
+    /// extension release: the caller only invokes this after the family's last
+    /// proof, and nothing after that point can generate its witnesses again.
+    fn release_generator_machinery(data: &mut CircuitData<F, C, D>) {
+        data.prover_only.generators = Vec::new();
+        data.prover_only.generator_indices_by_watches = GeneratorWatchIndex::empty();
+        data.prover_only.generator_watch_counts = Vec::new();
     }
 
     /// Releases the heavy transaction and chain circuits' preprocessed
@@ -223,6 +238,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_generator_machinery(&mut data);
         }
     }
 
@@ -247,6 +263,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_generator_machinery(&mut data);
         }
     }
 
