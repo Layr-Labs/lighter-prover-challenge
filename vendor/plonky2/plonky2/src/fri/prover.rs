@@ -261,17 +261,31 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
                     folded_len,
                 )
             };
-            folded_ext2
-                .par_chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
-                .enumerate()
-                .for_each(|(batch, output)| {
-                    let start = batch * FRI_FOLD_ARITY16_BATCH_WIDTH * 16;
-                    ext2_fri_fold_arity16_batch(
-                        &terms_ext2[start..start + output.len() * 16],
-                        powers_ext2,
-                        output,
-                    );
-                });
+            if folded_len == 1 << 10 {
+                folded_ext2
+                    .chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
+                    .enumerate()
+                    .for_each(|(batch, output)| {
+                        let start = batch * FRI_FOLD_ARITY16_BATCH_WIDTH * 16;
+                        ext2_fri_fold_arity16_batch(
+                            &terms_ext2[start..start + output.len() * 16],
+                            powers_ext2,
+                            output,
+                        );
+                    });
+            } else {
+                folded_ext2
+                    .par_chunks_mut(FRI_FOLD_ARITY16_BATCH_WIDTH)
+                    .enumerate()
+                    .for_each(|(batch, output)| {
+                        let start = batch * FRI_FOLD_ARITY16_BATCH_WIDTH * 16;
+                        ext2_fri_fold_arity16_batch(
+                            &terms_ext2[start..start + output.len() * 16],
+                            powers_ext2,
+                            output,
+                        );
+                    });
+            }
             return folded;
         }
     }
@@ -765,7 +779,7 @@ mod tests {
             F::from_canonical_u64(0x1234_5678_9abc_def0),
             F::from_canonical_u64(0x0fed_cba9_8765_4321),
         ]);
-        for rows in [1, 2, 3, 7, 8, 9, 16, 19] {
+        for rows in [1, 2, 3, 7, 8, 9, 16, 19, 1024, 1025] {
             let terms = (0..rows * 16)
                 .map(|i| {
                     let x = (i as u64)
@@ -792,7 +806,7 @@ mod tests {
             GoldilocksField(u64::MAX),
             GoldilocksField(F::ORDER),
         ]);
-        for rows in [1, 3, 7, 8, 9, 17] {
+        for rows in [1, 3, 7, 8, 9, 17, 1024, 1025] {
             let terms = (0..rows * 16)
                 .map(|i| FE::from_basefield_array([
                     GoldilocksField(raw[i % raw.len()]),
