@@ -1519,6 +1519,95 @@ fn fft_zero_padded_first_layer<P, M>(
     );
 }
 
+/// Fuse the zero-padded expansion (layer `r`) with layer `r+1` in one
+/// in-register pass. Identical butterflies and twiddles as the two separate
+/// production passes, one fewer store/load of the cache block. Requires
+/// `nonzero_len % 4 == 0` and `packed_repeat >= 1`.
+#[inline(always)]
+fn fused_expand_two_layers_block_with<P, M>(
+    packed_values: &mut [P],
+    source_start: usize,
+    nonzero_len: usize,
+    destination: usize,
+    packed_repeat: usize,
+    omega_r: &[P],
+    omega_r1: &[P],
+) where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
+    debug_assert!(nonzero_len >= 4 && nonzero_len % 4 == 0);
+    let pr = packed_repeat;
+    for quad in (0..nonzero_len / 4).rev() {
+        let source = source_start + quad * 4;
+        let s0 = packed_values[source / P::WIDTH].as_slice()[source % P::WIDTH];
+        let s1 = packed_values[(source + 1) / P::WIDTH].as_slice()[(source + 1) % P::WIDTH];
+        let s2 = packed_values[(source + 2) / P::WIDTH].as_slice()[(source + 2) % P::WIDTH];
+        let s3 = packed_values[(source + 3) / P::WIDTH].as_slice()[(source + 3) % P::WIDTH];
+        let u0 = P::from(s0);
+        let v0 = P::from(s1);
+        let u1 = P::from(s2);
+        let v1 = P::from(s3);
+        let dest = destination + quad * 4 * pr;
+        for j in 0..pr {
+            let t = M::mul(omega_r[j], v0);
+            let a0 = u0 + t;
+            let a1 = u0 - t;
+            let t = M::mul(omega_r[j], v1);
+            let c0 = u1 + t;
+            let c1 = u1 - t;
+            let t = M::mul(omega_r1[j], c0);
+            packed_values[dest + j] = a0 + t;
+            packed_values[dest + 2 * pr + j] = a0 - t;
+            let t = M::mul(omega_r1[pr + j], c1);
+            packed_values[dest + pr + j] = a1 + t;
+            packed_values[dest + 3 * pr + j] = a1 - t;
+        }
+    }
+}
+
+/// aarch64 rate-8 specialization of the fused expand+two-layers block:
+/// stage r=3 twiddles via the cheap 16th-root shift multiply, stage 4
+/// with the packed `root_table[4]` row. Field-identical to running the
+/// existing rate-8 first-layer kernel then layer 4.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn fused_rate_8_expand_two_layers_block(
+    packed_values: &mut [WideGoldilocksField],
+    source_start: usize,
+    nonzero_len: usize,
+    destination: usize,
+    omega4: &[WideGoldilocksField],
+) {
+    debug_assert!(nonzero_len >= 4 && nonzero_len % 4 == 0);
+    debug_assert!(omega4.len() >= 4);
+    for quad in (0..nonzero_len / 4).rev() {
+        let source = source_start + quad * 4;
+        let s0 = packed_values[source / 4].as_slice()[source % 4];
+        let s1 = packed_values[(source + 1) / 4].as_slice()[(source + 1) % 4];
+        let s2 = packed_values[(source + 2) / 4].as_slice()[(source + 2) % 4];
+        let s3 = packed_values[(source + 3) / 4].as_slice()[(source + 3) % 4];
+
+        let p0 = mul_16th_root_powers(s1);
+        let low0 = *WideGoldilocksField::from_slice(&p0[..4]);
+        let high0 = *WideGoldilocksField::from_slice(&p0[4..]);
+        let p1 = mul_16th_root_powers(s3);
+        let low1 = *WideGoldilocksField::from_slice(&p1[..4]);
+        let high1 = *WideGoldilocksField::from_slice(&p1[4..]);
+        let u0 = WideGoldilocksField::from(s0);
+        let u1 = WideGoldilocksField::from(s2);
+
+        let a = [u0 + low0, u0 + high0, u0 - low0, u0 - high0];
+        let c = [u1 + low1, u1 + high1, u1 - low1, u1 - high1];
+        let dest = destination + quad * 8;
+        for k in 0..4 {
+            let t = omega4[k] * c[k];
+            packed_values[dest + k] = a[k] + t;
+            packed_values[dest + 4 + k] = a[k] - t;
+        }
+    }
+}
+
 fn fft_zero_padded_cache_blocks<P, M>(
     values: &mut [P::Scalar],
     r: usize,
@@ -1536,51 +1625,107 @@ fn fft_zero_padded_cache_blocks<P, M>(
     let num_blocks = values.len() / block_len;
     let packed_values = P::pack_slice_mut(values);
     let omega_table = P::pack_slice(&root_table[r]);
+    let can_fuse = nonzero_per_block >= 4
+        && nonzero_per_block % 4 == 0
+        && packed_repeat >= 1
+        && r + 1 < lg_block_n;
+    // Caller already requires `r + 1 < lg_block_n <= lg_n = root_table.len()`,
+    // so row `r+1` exists on every cache-blocked expansion. Pack it once so
+    // both arms share a type; the unfused fallback ignores it.
+    let omega_r1 = P::pack_slice(&root_table[r + 1]);
 
     // Expand blocks from the end of the buffer so their output cannot clobber unread prefix
     // coefficients. Complete every block-local layer immediately while the block is still hot.
+    // When the block shape admits it, fuse expansion (layer r) with layer r+1 in one pass
+    // (lab A1 leftover; remaining in-block layers keep the production pair-fused scheduler).
     for block in (0..num_blocks).rev() {
         let source_start = block * nonzero_per_block;
         let destination = block * packed_block_len;
-        #[cfg(target_arch = "aarch64")]
-        if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
-        {
-            let wide_values = unsafe {
-                // SAFETY: The TypeId check proves this is the exact concrete packed type;
-                // only the generic spelling of the slice differs at this point.
-                core::slice::from_raw_parts_mut(
-                    packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
-                    packed_values.len(),
-                )
-            };
-            fft_zero_padded_rate_8_first_layer_block(
-                wide_values,
-                source_start,
-                nonzero_per_block,
-                destination,
-            );
+        let first_remaining = if can_fuse {
+            #[cfg(target_arch = "aarch64")]
+            let specialized = r == 3
+                && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>();
+            #[cfg(not(target_arch = "aarch64"))]
+            let specialized = false;
+            if specialized {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let wide_values = unsafe {
+                        // SAFETY: The TypeId check proves this is the exact concrete packed type;
+                        // only the generic spelling of the slice differs at this point.
+                        core::slice::from_raw_parts_mut(
+                            packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
+                            packed_values.len(),
+                        )
+                    };
+                    let wide_omega4 = unsafe {
+                        core::slice::from_raw_parts(
+                            omega_r1.as_ptr().cast::<WideGoldilocksField>(),
+                            omega_r1.len(),
+                        )
+                    };
+                    fused_rate_8_expand_two_layers_block(
+                        wide_values,
+                        source_start,
+                        nonzero_per_block,
+                        destination,
+                        wide_omega4,
+                    );
+                }
+            } else {
+                fused_expand_two_layers_block_with::<P, M>(
+                    packed_values,
+                    source_start,
+                    nonzero_per_block,
+                    destination,
+                    packed_repeat,
+                    &omega_table,
+                    &omega_r1,
+                );
+            }
+            r + 2
         } else {
+            #[cfg(target_arch = "aarch64")]
+            if r == 3 && core::any::TypeId::of::<P>() == core::any::TypeId::of::<WideGoldilocksField>()
+            {
+                let wide_values = unsafe {
+                    // SAFETY: The TypeId check proves this is the exact concrete packed type;
+                    // only the generic spelling of the slice differs at this point.
+                    core::slice::from_raw_parts_mut(
+                        packed_values.as_mut_ptr().cast::<WideGoldilocksField>(),
+                        packed_values.len(),
+                    )
+                };
+                fft_zero_padded_rate_8_first_layer_block(
+                    wide_values,
+                    source_start,
+                    nonzero_per_block,
+                    destination,
+                );
+            } else {
+                fft_zero_padded_first_layer_block_with::<P, M>(
+                    packed_values,
+                    source_start,
+                    nonzero_per_block,
+                    destination,
+                    packed_repeat,
+                    &omega_table,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             fft_zero_padded_first_layer_block_with::<P, M>(
                 packed_values,
                 source_start,
                 nonzero_per_block,
                 destination,
                 packed_repeat,
-                omega_table,
+                &omega_table,
             );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        fft_zero_padded_first_layer_block_with::<P, M>(
-            packed_values,
-            source_start,
-            nonzero_per_block,
-            destination,
-            packed_repeat,
-            omega_table,
-        );
+            r + 1
+        };
         fft_classic_simd_layers::<P, M>(
             &mut packed_values[destination..destination + packed_block_len],
-            r + 1,
+            first_remaining,
             lg_block_n,
             root_table,
         );
