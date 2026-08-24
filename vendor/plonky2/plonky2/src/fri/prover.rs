@@ -467,7 +467,7 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
     (trees, coeffs)
 }
 
-const POW_LANES: usize = 4;
+const POW_LANES: usize = 8; // exp-pow-r1: 8 lanes = two permute_quad calls; same per-lane math
 const POW_QUAD_DISABLE_ENV: &str = "LIGHTER_DISABLE_POW_QUAD";
 
 /// The four-lane path is the delivery default. Only the exact diagnostic value
@@ -504,10 +504,17 @@ const fn pow_quad_enabled() -> bool {
 #[inline]
 fn pow_candidate_quad(quad_index: u64, max_candidate: u64) -> ([u64; POW_LANES], usize) {
     debug_assert!(quad_index <= max_candidate / POW_LANES as u64);
+    debug_assert!(POW_LANES % 4 == 0);
     let start = quad_index * POW_LANES as u64;
     let remaining = max_candidate - start;
     if remaining >= (POW_LANES - 1) as u64 {
-        ([start, start + 1, start + 2, start + 3], POW_LANES)
+        let mut candidates = [start; POW_LANES];
+        let mut c = start;
+        for slot in candidates.iter_mut() {
+            *slot = c;
+            c += 1;
+        }
+        (candidates, POW_LANES)
     } else {
         let active_lanes = remaining as usize + 1;
         let mut candidates = [start; POW_LANES];
@@ -563,7 +570,11 @@ pub(crate) fn fri_proof_of_work<
                 for (duplex_state, candidate) in duplex_states.iter_mut().zip(candidates) {
                     duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
                 }
-                <C::Hasher as Hasher<F>>::Permutation::permute_quad(&mut duplex_states);
+                for quad in duplex_states.chunks_exact_mut(4) {
+                    <C::Hasher as Hasher<F>>::Permutation::permute_quad(
+                        quad.try_into().expect("chunk of 4"),
+                    );
+                }
 
                 (0..active_lanes).find_map(|lane| {
                     let pow_response = duplex_states[lane].squeeze().iter().last().unwrap();
