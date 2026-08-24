@@ -6,6 +6,7 @@ use alloc::{
     vec::Vec,
 };
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 use anyhow::Result;
@@ -29,6 +30,19 @@ use crate::plonk::vars::{
     EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
 };
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
+
+#[cfg(feature = "std")]
+fn coset_stack_workspace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var_os("LIGHTER_COSET_STACK").is_some_and(|value| value == "0")
+    })
+}
+
+#[cfg(not(feature = "std"))]
+fn coset_stack_workspace_enabled() -> bool {
+    true
+}
 
 /// One of the instantiations of `InterpolationGate`: allows constraints of variable
 /// degree, up to `1<<subgroup_bits`.
@@ -322,8 +336,52 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+
+        // The production recursion gates use 16 interpolation values and a
+        // 12 x 32 constraint batch. Both temporary regions are completely
+        // overwritten before their first read, so keep that hot shape on the
+        // stack without paying for heap allocation or zero initialization.
+        // Larger generic gates retain the previous initialized heap fallback.
+        const STACK_VALUES: usize = 16;
+        const STACK_SCRATCH: usize = 512;
+        let num_points = self.num_points();
+        let mut values_stack = [MaybeUninit::<F::Extension>::uninit(); STACK_VALUES];
+        let mut values_heap;
+        let use_stack = coset_stack_workspace_enabled()
+            && num_points <= STACK_VALUES
+            && num_constraints * n <= STACK_SCRATCH;
+        let values: &mut [F::Extension] = if use_stack {
+            // SAFETY: every value slot is assigned by the `values.iter_mut()`
+            // loop below before `partial_interpolate` reads the slice.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    values_stack.as_mut_ptr().cast::<F::Extension>(),
+                    num_points,
+                )
+            }
+        } else {
+            values_heap = vec![F::Extension::ZERO; num_points];
+            &mut values_heap
+        };
+
+        let scratch_len = num_constraints * n;
+        let mut scratch_stack = [MaybeUninit::<F>::uninit(); STACK_SCRATCH];
+        let mut scratch_heap;
+        let scratch: &mut [F] = if use_stack {
+            // SAFETY: for every point, the initial relation, each pair of
+            // intermediate relations, and the final relation assign exactly
+            // `num_constraints` rows. Thus every slot in this prefix is
+            // written before the row-wise multiply-add below reads it.
+            unsafe {
+                core::slice::from_raw_parts_mut(
+                    scratch_stack.as_mut_ptr().cast::<F>(),
+                    scratch_len,
+                )
+            }
+        } else {
+            scratch_heap = vec![F::ZERO; scratch_len];
+            &mut scratch_heap
+        };
 
         for (p, vars) in vars_base.iter().enumerate() {
             let shift = vars.local_wires[self.wire_shift()];
@@ -381,6 +439,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
             for (d, a) in arr.iter().enumerate() {
                 scratch[(row + d) * n + p] = *a;
             }
+            debug_assert_eq!(row + D, num_constraints);
         }
 
         for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
@@ -761,9 +820,11 @@ mod tests {
         const D: usize = 2;
         type F = GoldilocksField;
 
-        let n = 32;
-        for max_degree in [2, 3, 6, 16] {
-            let gate = <CosetInterpolationGate<F, D>>::with_max_degree(4, max_degree);
+        for (subgroup_bits, max_degree, n) in
+            [(4, 2, 32), (4, 3, 32), (4, 6, 32), (4, 16, 32), (5, 6, 64)]
+        {
+            let gate =
+                <CosetInterpolationGate<F, D>>::with_max_degree(subgroup_bits, max_degree);
             let num_wires = <CosetInterpolationGate<F, D> as Gate<F, D>>::num_wires(&gate);
             let num_constraints =
                 <CosetInterpolationGate<F, D> as Gate<F, D>>::num_constraints(&gate);
@@ -785,7 +846,10 @@ mod tests {
 
             let mut actual = initial;
             gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
-            assert_eq!(actual, expected, "max_degree {max_degree}");
+            assert_eq!(
+                actual, expected,
+                "subgroup_bits {subgroup_bits}, max_degree {max_degree}, n {n}"
+            );
         }
     }
 
