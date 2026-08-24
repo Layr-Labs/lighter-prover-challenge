@@ -216,6 +216,18 @@ impl BlockTxCircuit {
     where
         W: plonky2::iop::witness::Witness<F>,
     {
+        Self::generate_witness_into_path(block, target, pw, false)
+    }
+
+    pub fn generate_witness_into_path<W>(
+        block: &BlockTx<F>,
+        target: &BlockTxTarget,
+        pw: &mut W,
+        light: bool,
+    ) -> Result<()>
+    where
+        W: plonky2::iop::witness::Witness<F>,
+    {
         pw.set_target(target.created_at, F::from_canonical_i64(block.created_at))?;
         pw.set_hash_target(target.state_metadata_hash, block.state_metadata_hash)?;
 
@@ -251,7 +263,7 @@ impl BlockTxCircuit {
             .txs
             .iter()
             .zip_eq(block.txs.iter())
-            .try_for_each(|(t, tx)| pw.set_tx_target(t, tx))?;
+            .try_for_each(|(t, tx)| pw.set_tx_target_for_path(t, tx, light))?;
 
         Ok(())
     }
