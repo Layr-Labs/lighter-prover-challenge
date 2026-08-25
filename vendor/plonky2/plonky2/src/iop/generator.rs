@@ -43,7 +43,7 @@ const PARALLEL_WORKLIST_THRESHOLD: usize = 64;
 
 /// Generators per parallel-round task. Chunking amortizes per-task scheduling and buffer
 /// overhead across cheap generators while leaving enough tasks for load balancing.
-const PARALLEL_WORKLIST_CHUNK: usize = 64;
+const PARALLEL_WORKLIST_CHUNK: usize = 32;
 
 #[cfg(all(feature = "parallel", feature = "std"))]
 mod parallel_witness_context {
