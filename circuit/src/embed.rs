@@ -73,6 +73,7 @@ const EMBED_VERSION: u32 = 2;
 // Primitive encoding helpers
 // ---------------------------------------------------------------------------
 
+#[inline(always)]
 fn write_uvarint(out: &mut Vec<u8>, mut value: u64) {
     loop {
         let byte = (value & 0x7f) as u8;
@@ -85,6 +86,7 @@ fn write_uvarint(out: &mut Vec<u8>, mut value: u64) {
     }
 }
 
+#[inline(always)]
 fn read_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     let mut value = 0u64;
     let mut shift = 0u32;
