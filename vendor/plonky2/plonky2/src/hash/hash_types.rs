@@ -91,21 +91,21 @@ impl<F: RichField> GenericHashOut<F> for HashOut<F> {
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        self.elements
-            .into_iter()
-            .flat_map(|x| x.to_canonical_u64().to_le_bytes())
-            .collect()
+        let mut bytes = Vec::with_capacity(NUM_HASH_OUT_ELTS * 8);
+        for element in self.elements {
+            bytes.extend_from_slice(&element.to_canonical_u64().to_le_bytes());
+        }
+        bytes
     }
 
     fn from_bytes(bytes: &[u8]) -> Self {
         HashOut {
-            elements: bytes
-                .chunks(8)
-                .take(NUM_HASH_OUT_ELTS)
-                .map(|x| F::from_canonical_u64(u64::from_le_bytes(x.try_into().unwrap())))
-                .collect::<Vec<_>>()
-                .try_into()
-                .unwrap(),
+            elements: core::array::from_fn(|i| {
+                let start = i * 8;
+                F::from_canonical_u64(u64::from_le_bytes(
+                    bytes[start..start + 8].try_into().unwrap(),
+                ))
+            }),
         }
     }
 

@@ -13,10 +13,10 @@
 //! This is useful to allow even small devices to verify plonky2 proofs.
 
 #[cfg(not(feature = "std"))]
-use alloc::{collections::BTreeMap, sync::Arc, vec, vec::Vec};
+use alloc::{collections::BTreeMap, vec, vec::Vec};
 use core::ops::{Range, RangeFrom};
 #[cfg(feature = "std")]
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 use serde::Serialize;
@@ -394,13 +394,13 @@ pub struct GeneratorWatchIndex {
 
 /// Sets bit `representative` of a [`GeneratorWatchIndex::watched`] bitmap under construction.
 #[inline]
-pub fn mark_watched(watched: &mut [u64], representative: usize) {
+fn mark_watched(watched: &mut [u64], representative: usize) {
     watched[representative >> 6] |= 1u64 << (representative & 63);
 }
 
 /// Allocates a zeroed [`GeneratorWatchIndex::watched`] bitmap sized for `offsets_len` offsets,
 /// i.e. for the `offsets_len - 1` representatives those offsets describe.
-pub fn empty_watched(offsets_len: usize) -> Vec<u64> {
+fn empty_watched(offsets_len: usize) -> Vec<u64> {
     vec![0u64; offsets_len.saturating_sub(1).div_ceil(64)]
 }
 
@@ -594,42 +594,6 @@ impl GeneratorWatchIndex {
         }
     }
 
-    /// [`Self::from_parts`] for a loader that has already derived the presence bitmap and
-    /// entry count while decoding the offsets, using [`empty_watched`] and [`mark_watched`].
-    ///
-    /// The offsets arrive as a running sum of unsigned deltas, so they are monotonic by
-    /// construction and the sortedness assertion of the general constructor has nothing left
-    /// to catch; the invariants that are not structural -- first offset zero, last offset
-    /// covering the watcher list, bitmap sized for these offsets -- are still checked here.
-    /// `representative` is watched exactly when `offsets[r] != offsets[r + 1]`, i.e. exactly
-    /// when the delta read for `r + 1` was non-zero, which is the bit the decode loop already
-    /// has in hand.
-    pub fn from_parts_with_presence(
-        offsets: Vec<u32>,
-        watchers: Vec<u32>,
-        entries: usize,
-        watched: Vec<u64>,
-    ) -> Self {
-        assert!(!offsets.is_empty(), "watch index offsets must be non-empty");
-        assert_eq!(offsets[0], 0, "watch index offsets must start at zero");
-        assert_eq!(
-            *offsets.last().unwrap() as usize,
-            watchers.len(),
-            "watch index offsets must cover the watcher list"
-        );
-        assert_eq!(
-            watched.len(),
-            empty_watched(offsets.len()).len(),
-            "watch index presence bitmap is sized for different offsets"
-        );
-        Self {
-            offsets,
-            watchers,
-            entries,
-            watched,
-        }
-    }
-
     #[inline]
     pub fn get(&self, representative: &usize) -> Option<&[u32]> {
         let representative = *representative;
@@ -660,58 +624,6 @@ impl GeneratorWatchIndex {
                 let end = bounds[1] as usize;
                 (start != end).then(|| (representative, &self.watchers[start..end]))
             })
-    }
-}
-
-/// Runtime-only cache of immutable low-degree range-gate selector filters.
-///
-/// The filters are derived from the constants commitment and never participate
-/// in circuit identity, serialization, or equality. On non-Metal targets the
-/// wrapper is zero-sized.
-pub struct LowRangeSelectorFilterCache<F> {
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    inner: std::sync::OnceLock<Option<LowRangeSelectorFilterCacheEntry<F>>>,
-    _phantom: core::marker::PhantomData<F>,
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-pub(crate) struct LowRangeSelectorFilterCacheEntry<F> {
-    pub(crate) full_rows: usize,
-    pub(crate) gate_signature: Vec<(usize, usize, usize, usize, bool)>,
-    pub(crate) filters: Vec<Vec<F>>,
-}
-
-impl<F> Default for LowRangeSelectorFilterCache<F> {
-    fn default() -> Self {
-        Self {
-            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-            inner: std::sync::OnceLock::new(),
-            _phantom: core::marker::PhantomData,
-        }
-    }
-}
-
-// This is a derived runtime cache of immutable circuit data, so its fill state
-// must not change circuit equality (the same rule as `EvenColumns`).
-impl<F> PartialEq for LowRangeSelectorFilterCache<F> {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-impl<F> Eq for LowRangeSelectorFilterCache<F> {}
-impl<F> core::fmt::Debug for LowRangeSelectorFilterCache<F> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("LowRangeSelectorFilterCache")
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-impl<F> LowRangeSelectorFilterCache<F> {
-    pub(crate) fn get_or_init(
-        &self,
-        init: impl FnOnce() -> Option<LowRangeSelectorFilterCacheEntry<F>>,
-    ) -> Option<&LowRangeSelectorFilterCacheEntry<F>> {
-        self.inner.get_or_init(init).as_ref()
     }
 }
 
@@ -772,13 +684,7 @@ pub struct ProverOnlyCircuitData<
     /// the circuit digest.
     pub fixed_routed_wires: Vec<u8>,
     /// Pre-computed roots for faster FFT.
-    ///
-    /// Held by shared handle. The table is a deterministic function of (field,
-    /// domain size) and is immutable once built -- `field::fft` keeps one
-    /// process-wide copy per size and every reader here takes it as
-    /// `Option<&FftRootTable<F>>`. Owning it by value forced each circuit load
-    /// to deep-copy that cached `Vec<Vec<F>>`.
-    pub fft_root_table: Option<Arc<FftRootTable<F>>>,
+    pub fft_root_table: Option<FftRootTable<F>>,
     /// A digest of the "circuit" (i.e. the instance, minus public inputs), which can be used to
     /// seed Fiat-Shamir.
     pub circuit_digest: <<C as GenericConfig<D>>::Hasher as Hasher<F>>::Hash,
@@ -801,10 +707,6 @@ pub struct ProverOnlyCircuitData<
     pub constants_sigmas_quotient_step: usize,
     /// Quotient domain size used to extract [`Self::constants_sigmas_quotient_cache`].
     pub constants_sigmas_quotient_domain: usize,
-    /// Immutable low-degree range-gate selector filters, filled on first use
-    /// only when the process-wide cache budget admits the exact table.
-    /// Runtime-only: derived from the constants commitment and not serialized.
-    pub low_range_selector_filter_cache: LowRangeSelectorFilterCache<F>,
 }
 
 impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>

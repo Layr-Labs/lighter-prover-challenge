@@ -193,8 +193,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
         assert!(Self::limb_bits() * midpoint <= 30);
         let limb_base_u128 = 1u128 << Self::limb_bits();
         let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
-        // Batches are 32 points in this prover; keep the recomposition rows on
-        // the stack and fall back to the heap only for oversized batches.
         let mut combined_low_stack = [0u128; 64];
         let mut combined_high_stack = [0u128; 64];
         let mut combined_low_heap;

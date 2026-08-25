@@ -1,9 +1,8 @@
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
-// Redraw marker reducing-scratch-r1 1787499809993 (same-account archive-dedup convention; inert)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use circuit::block::Block;
 use circuit::block_constraints::{BlockCircuit, Circuit as _};
@@ -32,7 +31,9 @@ use plonky2::plonk::circuit_data::CircuitData;
 use plonky2::plonk::prover::prove_with_partition_witness;
 use plonky2::util::timing::TimingTree;
 
-use crate::api::{Circuits, PROVER_THREAD_STACK_BYTES, Proof};
+use crate::api::{
+    Circuits, HEAVY_TX_PER_PROOF, PROVER_THREAD_STACK_BYTES, PUBLIC_HEAVY_TX_COUNT, Proof,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TxPath {
@@ -53,75 +54,17 @@ fn profile_path_context(path: TxPath, stage: &str) -> &'static str {
     }
 }
 
-// Light-proof throughput is the run's terminal constraint (the chain drains
-// concurrently and finishes within a step of the last tx proof; the block
-// waits for both), so the window depth divides the longest phase directly.
-// Series draw marker: v11 surface (ramp depth 2), sample 5.
-// The depth-4 ceiling dated from tighter-memory hosts: measured peak RSS is
-// ~6.8 GB at depth 4 against 24 GB local / 48 GB ranked, and mid-run CPU
-// occupancy is ~8/14 cores with the GPU stream fractionally loaded, so the
-// machine has headroom for deeper overlap. LIGHTER_LIGHT_WINDOW overrides
-// for experiments.
-// Retuned 6 -> 4 for the *scored* configuration, which runs five concurrent
-// workers rather than the single worker a local run exercises. The depth-6
-// evidence above was gathered one worker at a time; with five workers sharing
-// 14 cores and 48 GiB against an 8.1-8.7 GiB per-worker peak, depth 6 puts
-// ~30 transaction proofs in flight machine-wide, into the allocator/fault
-// churn the ~9.5 GiB collapse note above describes.
-//
-// Measured with two concurrent workers (the smallest harness that reproduces
-// GPU sharing and memory contention at all), wall time until both finish.
-// On this base, three interleaved rounds: depth 6 = 44.77 s, depth 4 = 39.20 /
-// 39.76 / 42.62 s, mean 40.53 s (-9.5%), depth 4 winning every round. On the
-// previous base a fuller sweep gave depth 6 = 55.34 s, 5 = 53.63, 4 = 47.02
-// (-15.1%), 3 = 46.22 (-16.5%), 2 = 50.16 (-9.4%) — depth 2 being worse than 3
-// makes this an interior optimum rather than "less parallelism is better".
-// Depths 3 and 2 were re-swept on this base too, but the host had drifted by
-// then and the three rounds disagreed on the ordering, so depth 4 stands on the
-// evidence above rather than on a noisier re-measurement.
-//
-// Ranked corroboration: the first two draws of this change both landed in the
-// slow runner pool at 26.99 and 27.22 — above the entire historical slow-pool
-// range (n=39, mean 25.36, sd 0.77, max ~26.1): 26.99 / 27.22 / 26.83, mean
-// 27.01, i.e. +2.1 sd, implying ~+6.5%, and tightly clustered (spread 0.39).
-// Ranked status as of the first draw of this build: contemporaneous same-window
-// comparison puts it at +0.6% (26.98 against 26.75 / 26.85 / 26.86 from other
-// solvers in the same minutes), i.e. neutral within noise. The 2-worker local
-// gain does not currently reproduce on the scored runner; recorded here so the
-// next reader weights the ranked number rather than the local one. Paired
-// same-window analysis over nine slow-pool draws now puts every build from this
-// session at +0.57% +- 0.50%. Separating the window builds from the earlier
-// reorder-only ones (which were genuinely -1.5%) gives window=4 alone
-// unresolved at slow-pool noise (sd ~1.6%/draw). First FAST-pool draw of this
-// leaner build (window + dead-stores, reorder dropped): 30.6542 and 30.7417,
-// mean 30.698 against same-window fast peers ~30.30 = +1.3% on both, and the
-// second lands 0.158 under the 30.8996 bar.
-// Retuned 4 -> 6 on corrected execution-model evidence. The 6 -> 4 retune
-// above was premised on five concurrent workers, but the harness runs the
-// fixtures strictly sequentially (benchmark-tools/harness/src/main.rs
-// run_private_sequence: a plain for-loop that awaits each worker's exit before
-// spawning the next, single shared deadline), so exactly one worker owns the
-// ranked machine at a time — bin/prove.rs already records this and is right.
-// A sequential host is the quiet-host regime, where the ledger above records
-// depth 6 beating 4 by ~4.6%. Local corroboration on this base (8 interleaved
-// ABBA pairs, direct worker, public fixture, busy host): depth 6 mean 9.283 s
-// vs depth 4 mean 9.331 s (-0.5%), 6 winning 5/8 pairs, but depth 4 holds the
-// single fastest run (9.09 s vs 9.13 s), so 6 wins the mean and loses the min
-// — below local noise either way. The public fixture is also the all-empty
-// synthetic witness, where the light lane does far less per-chunk work than a
-// 500-active-tx ranked fixture, so a window-depth effect is structurally
-// understated locally. Per the file's own guidance the ranked draw, not the
-// local number, settles it.
+// Light-proof throughput is the run's terminal constraint, but excessive
+// overlap increases simultaneous proof allocations and can lose more to
+// allocator/fault churn than it gains from concurrency. Ranked multiworker
+// evidence favors four in-flight light proofs. LIGHTER_LIGHT_WINDOW remains
+// available for explicit experiments.
 const LIGHT_TX_PROOF_WINDOW: usize = 6;
 
 /// Window depth, overridable via `LIGHTER_LIGHT_WINDOW` (1..=12) for
-/// experiments; read once. Depth is deliberately NOT scaled up on
-/// bigger-memory hosts: the depth-8 regression reproduces at ~9.5 GiB peak
-/// RSS on a 24 GiB machine — the collapse is allocator/fault churn from more
-/// concurrent proof allocations, not memory capacity, and a 48 GiB host runs
-/// the same allocator. Measured: depth 6 beats 4 by ~4.6% on a quiet
-/// machine; under heavy external load the ordering inverts, so depth tuning
-/// beyond 6 needs quiet-host evidence first.
+/// experiments; read once. Depth is deliberately not scaled with host memory:
+/// the limiting cost is concurrent allocation and cache pressure rather than
+/// only aggregate capacity.
 fn light_tx_proof_window() -> usize {
     static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WINDOW.get_or_init(|| {
@@ -133,7 +76,7 @@ fn light_tx_proof_window() -> usize {
     })
 }
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 2;
 
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
@@ -248,63 +191,6 @@ enum ChainState<'scope> {
     InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
 }
 
-/// The recorded phase-1 seed layout of a path's chain circuit, shared by the
-/// chain-step threads.
-///
-/// `BlockTxChainCircuit::witness_inputs_early_into` writes a target sequence
-/// fixed by the circuit shape -- the self verifier data, then the transaction
-/// proof, then the recursion step, then the dummy cyclic proof, each walked
-/// structurally with `zip_eq` over the target trees -- and every step of a path
-/// feeds proofs of the same two shapes. So the first step to finish recording
-/// leaves a layout every later step can replay positionally, deleting the
-/// per-write `representative_map` gather (a scattered read into a table far
-/// larger than cache) and the per-write watcher-CSR traversal for the tens of
-/// thousands of targets a recursive proof occupies.
-///
-/// Steps overlap by design (a step's phase 1 runs while its predecessor
-/// proves), so the cell is written once by whichever step gets there first;
-/// losers drop their own recording. It fails closed exactly like the
-/// transaction path: a replay whose target sequence differs in order, length or
-/// circuit instance is rejected by the layout's own checksum before any watcher
-/// decrement or generator runs, and retires the layout so later steps take the
-/// generic path once instead of paying a failed replay plus a re-seed forever.
-struct ChainSeedLayout<'a> {
-    layout: OnceLock<PartitionSeedLayout<'a, F, C, D>>,
-    retired: AtomicBool,
-}
-
-impl<'a> ChainSeedLayout<'a> {
-    fn new() -> Self {
-        Self {
-            layout: OnceLock::new(),
-            retired: AtomicBool::new(false),
-        }
-    }
-
-    /// The layout to replay, or `None` when none has been recorded yet or one
-    /// was retired.
-    fn get(&self) -> Option<&PartitionSeedLayout<'a, F, C, D>> {
-        if self.retired.load(Ordering::Relaxed) {
-            return None;
-        }
-        self.layout.get()
-    }
-
-    fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::Relaxed)
-    }
-
-    fn retire(&self) {
-        self.retired.store(true, Ordering::Relaxed);
-    }
-
-    /// Publishes a recording. A racing step may have already published one; the
-    /// two are interchangeable, so the loser's is simply dropped.
-    fn record(&self, layout: PartitionSeedLayout<'a, F, C, D>) {
-        let _ = self.layout.set(layout);
-    }
-}
-
 impl ChainState<'_> {
     fn wait(self) -> Proof {
         #[cfg(feature = "diagnostic_profile")]
@@ -318,6 +204,77 @@ impl ChainState<'_> {
     }
 }
 
+/// Seed the proof-independent half of a recursive chain step, recording the
+/// fixed target/representative topology once per heavy/light path and replaying
+/// it for later steps.
+///
+/// The late cyclic-proof feed intentionally stays on `feed_seeded`: unlike a
+/// fresh partition, it must account for generators that expired during the
+/// early phase, so the start-layout's aggregate watcher decrements cannot be
+/// reused there.
+#[allow(clippy::too_many_arguments)]
+fn start_early_chain_witness<'a>(
+    chain_target: &BlockTxChainTarget,
+    chain_data: &'a CircuitData<F, C, D>,
+    chain_step: u64,
+    dummy_proof: &Proof,
+    tx_proof: &Proof,
+    early_chain_layout: &std::sync::OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+    early_chain_layout_disabled: &AtomicBool,
+) -> anyhow::Result<PendingPartitionWitness<'a, F, C, D>> {
+    let seed = |seeder: &mut plonky2::iop::generator::PartitionSeeder<'a, '_, F>| {
+        BlockTxChainCircuit::witness_inputs_early_into(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            seeder,
+        )
+    };
+
+    // A typed applicability failure retires replay for this path. The writer is
+    // pure (it only copies the supplied proof/scalar values), so retrying it on
+    // a fresh witness is safe; every other writer/worklist error propagates and
+    // is never rerun. Atomic state avoids putting a lock around generator work:
+    // racing first steps may both record, but both recordings are ordinary,
+    // fully checked starts and only one immutable layout is published.
+    if !early_chain_layout_disabled.load(Ordering::Acquire) {
+        if let Some(layout) = early_chain_layout.get() {
+            match PendingPartitionWitness::start_seeded_with_layout(
+                &chain_data.prover_only,
+                &chain_data.common,
+                layout,
+                seed,
+            ) {
+                Err(error) if is_seed_layout_mismatch(&error) => {
+                    early_chain_layout_disabled.store(true, Ordering::Release);
+                    PendingPartitionWitness::start_seeded(
+                        &chain_data.prover_only,
+                        &chain_data.common,
+                        seed,
+                    )
+                }
+                result => result,
+            }
+        } else {
+            PendingPartitionWitness::start_seeded_recording(
+                &chain_data.prover_only,
+                &chain_data.common,
+                seed,
+            )
+            .map(|(pending, layout)| {
+                // Losing an initialization race is harmless: this pending
+                // witness was produced by the checked recording path itself.
+                let _ = early_chain_layout.set(layout);
+                pending
+            })
+        }
+    } else {
+        PendingPartitionWitness::start_seeded(&chain_data.prover_only, &chain_data.common, seed)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn chain_step_proof<'a>(
     path: TxPath,
@@ -328,7 +285,8 @@ fn chain_step_proof<'a>(
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
-    seed_layout: &ChainSeedLayout<'a>,
+    early_chain_layout: &std::sync::OnceLock<PartitionSeedLayout<'a, F, C, D>>,
+    early_chain_layout_disabled: &AtomicBool,
 ) -> Proof {
     mark_spine_thread_latency_critical();
     #[cfg(feature = "diagnostic_profile")]
@@ -344,83 +302,15 @@ fn chain_step_proof<'a>(
         // that proof may still be in flight. Inputs are written directly into
         // the partition's representative slots — no PartialWitness map, no
         // per-path template clone, no replay pass.
-        // The writer's target sequence is fixed for this circuit, so the first
-        // step of the path records it and every later step replays it
-        // positionally (see `ChainSeedLayout`).
-        let mut pending = if let Some(layout) = seed_layout.get() {
-            let replay = PendingPartitionWitness::start_seeded_with_layout(
-                &chain_data.prover_only,
-                &chain_data.common,
-                layout,
-                |seeder| {
-                    BlockTxChainCircuit::witness_inputs_early_into(
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        dummy_proof,
-                        tx_proof,
-                        seeder,
-                    )
-                },
-            );
-            // Only a typed layout-applicability mismatch may retry on the
-            // generic path; a writer or worklist failure keeps its own type and
-            // propagates without rerunning the writer.
-            match replay {
-                Err(error) if is_seed_layout_mismatch(&error) => {
-                    seed_layout.retire();
-                    PendingPartitionWitness::start_seeded(
-                        &chain_data.prover_only,
-                        &chain_data.common,
-                        |seeder| {
-                            BlockTxChainCircuit::witness_inputs_early_into(
-                                chain_target,
-                                chain_data,
-                                chain_step,
-                                dummy_proof,
-                                tx_proof,
-                                seeder,
-                            )
-                        },
-                    )
-                }
-                result => result,
-            }
-        } else if seed_layout.is_retired() {
-            PendingPartitionWitness::start_seeded(
-                &chain_data.prover_only,
-                &chain_data.common,
-                |seeder| {
-                    BlockTxChainCircuit::witness_inputs_early_into(
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        dummy_proof,
-                        tx_proof,
-                        seeder,
-                    )
-                },
-            )
-        } else {
-            PendingPartitionWitness::start_seeded_recording(
-                &chain_data.prover_only,
-                &chain_data.common,
-                |seeder| {
-                    BlockTxChainCircuit::witness_inputs_early_into(
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        dummy_proof,
-                        tx_proof,
-                        seeder,
-                    )
-                },
-            )
-            .map(|(pending, layout)| {
-                seed_layout.record(layout);
-                pending
-            })
-        }?;
+        let mut pending = start_early_chain_witness(
+            chain_target,
+            chain_data,
+            chain_step,
+            dummy_proof,
+            tx_proof,
+            early_chain_layout,
+            early_chain_layout_disabled,
+        )?;
 
         // Phase 2: wait for the previous chain proof, feed it directly, and prove.
         let previous_proof = previous.map(ChainState::wait);
@@ -657,9 +547,6 @@ fn prove_path(
     // Recorded on this path's first chunk and replayed for the rest; failing
     // closed and retiring itself if the writer's target sequence ever changes.
     let mut tx_seed_layout = None;
-    // Same discipline for the chain circuit's phase-1 writer, shared across the
-    // chain-step threads this path spawns.
-    let chain_seed_layout = ChainSeedLayout::new();
     let mut chunks = chunks.into_iter();
     let (mut current_chunk_index, first_txs) =
         chunks.next().expect("transaction path must not be empty");
@@ -676,14 +563,25 @@ fn prove_path(
     );
     jump = next_jump;
 
-
+    // Each `prove_path` owns one topology instance, so heavy and light never
+    // share layouts even though their chain threads run concurrently. These
+    // owners sit outside the thread scope so every scoped borrow outlives its
+    // worker by construction.
+    let early_chain_layout_storage = std::sync::OnceLock::new();
+    let early_chain_layout_disabled_storage = AtomicBool::new(false);
     let chain_proof = std::thread::scope(|scope| {
         let base = &base_proof;
-        // Captured by the `move` step closures below as a shared reference.
-        let chain_seed = &chain_seed_layout;
+        // Copyable shared references can be captured by every scoped step.
+        let early_chain_layout = &early_chain_layout_storage;
+        let early_chain_layout_disabled = &early_chain_layout_disabled_storage;
         let mut chain: Option<ChainState<'_>> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
-        let mut in_flight = std::collections::VecDeque::new();
+        let path_proof_window = if path == TxPath::Light {
+            light_tx_proof_window()
+        } else {
+            1
+        };
+        let mut in_flight = std::collections::VecDeque::with_capacity(path_proof_window);
         let mut current_step = 0u64;
 
         loop {
@@ -697,7 +595,6 @@ fn prove_path(
                 // spine_backlog_add). Decremented inside chain_step_proof.
                 plonky2::hash::poseidon2::spine_backlog_add(1);
                 let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
                     .stack_size(PROVER_THREAD_STACK_BYTES)
                     .spawn_scoped(scope, move || {
                         chain_step_proof(
@@ -709,7 +606,8 @@ fn prove_path(
                             base,
                             dummy_proof,
                             &tx_proof,
-                            chain_seed,
+                            early_chain_layout,
+                            early_chain_layout_disabled,
                         )
                     })
                     .expect("chain step pipeline thread must start");
@@ -718,7 +616,6 @@ fn prove_path(
 
             let witness = current_witness;
             let proof_handle = std::thread::Builder::new()
-                .name(format!("{path:?}-tx-proof-{current_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
                     // These threads hold the single GPU buffer set across
@@ -753,7 +650,7 @@ fn prove_path(
             );
             let max_in_flight =
                 if path == TxPath::Light && current_step >= LIGHT_TX_PROOF_OVERLAP_START_STEP {
-                    light_tx_proof_window()
+                    path_proof_window
                 } else if path == TxPath::Light {
                     // Ramp: while the heavy path's three chunks run, the old
                     // depth-1 throttle left the GPU 38% idle and the buffer
@@ -792,7 +689,6 @@ fn prove_path(
             plonky2::hash::poseidon2::spine_backlog_add(1);
             let previous = chain.take();
             let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
                     chain_step_proof(
@@ -804,7 +700,8 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
-                        chain_seed,
+                        early_chain_layout,
+                        early_chain_layout_disabled,
                     )
                 })
                 .expect("chain step pipeline thread must start");
@@ -852,7 +749,6 @@ fn prove_path(
             let previous = chain.take();
             plonky2::hash::poseidon2::spine_backlog_add(1);
             let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-drain-{chain_step}"))
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
                     chain_step_proof(
@@ -864,7 +760,8 @@ fn prove_path(
                         base,
                         dummy_proof,
                         &tx_proof,
-                        chain_seed,
+                        early_chain_layout,
+                        early_chain_layout_disabled,
                     )
                 })
                 .expect("chain drain thread must start");
@@ -889,7 +786,6 @@ fn prove_path(
         // run's most serial window). Detached: only populates a stash the
         // block's allocation consults; a size miss falls through unchanged.
         std::thread::Builder::new()
-            .name("block-store-prewarm".to_owned())
             .spawn(|| {
                 // Page-walking ~2 GiB at default QoS competes with the light
                 // pipeline for P-cores; utility class prefers the E-cores,
@@ -901,13 +797,6 @@ fn prove_path(
                 const BLOCK_WIRES_STORE_BYTES: u64 =
                     (circuit::types::config::CIRCUIT_CONFIG.num_wires as u64) * (1 << 21) * 8;
                 plonky2::hash::poseidon2::prewarm_large_column_store(BLOCK_WIRES_STORE_BYTES);
-                // Same slack, same problem, different allocation: every streamed
-                // build before the final block is 2^19-leaf, so the streamed
-                // sponge's buffer pair is grown for the first time by the block
-                // itself (192 MiB state + ~128 MiB output) inside the exclusive
-                // serial tail. Pre-fault it here instead. Ordered after the
-                // wires store because that one is the larger fault set and the
-                // block reaches it first.
                 plonky2::hash::poseidon2::prewarm_streamed_buffers(1 << 21);
             })
             .ok();
@@ -998,9 +887,11 @@ pub(crate) fn prove_block_after_pre(
     let state_metadata_hash = pre_output.new_state_metadata.hash();
 
     let mut tx_chunks = std::mem::take(&mut block.tx_chunks);
-    let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> = Vec::new();
+    let heavy_chunk_capacity = PUBLIC_HEAVY_TX_COUNT.div_ceil(HEAVY_TX_PER_PROOF);
+    let mut heavy_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
+        Vec::with_capacity(heavy_chunk_capacity);
     let mut light_chunks: Vec<(usize, Vec<Arc<Tx<F>>>)> =
-        Vec::with_capacity(tx_chunks.len());
+        Vec::with_capacity(tx_chunks.len().saturating_sub(heavy_chunk_capacity));
     for (chunk_index, txs) in tx_chunks.drain(..).enumerate() {
         if chunk_is_light(&txs) {
             light_chunks.push((chunk_index, txs));
@@ -1042,7 +933,6 @@ pub(crate) fn prove_block_after_pre(
             // witness a 'static borrow across the thread boundary — free, the
             // worker exits via `process::exit`.
             let heavy_handle_outer = std::thread::Builder::new()
-                .name("heavy-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, || {
                     prove_path(
@@ -1059,8 +949,8 @@ pub(crate) fn prove_block_after_pre(
                 })
                 .expect("heavy transaction chain thread must start");
             let block_ref = &block;
+            let pre_proof_ref = &pre_proof;
             let block_circuit_handle = std::thread::Builder::new()
-                .name("block-circuit-build".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
                 .spawn_scoped(scope, move || {
                     #[cfg(feature = "diagnostic_profile")]
@@ -1091,22 +981,12 @@ pub(crate) fn prove_block_after_pre(
                             BlockCircuit::seed_witness_early_into(
                                 &block_target,
                                 block_ref,
-                                &pre_proof,
+                                pre_proof_ref,
                                 seeder,
                             )
                         },
                     )
                     .expect("final block early witness phase failed");
-                    // The pre-execution proof is now fully consumed: its wire
-                    // values live in `pending`'s partition slots and its public
-                    // inputs were read into `pre_output` before this scope. It
-                    // is captured by value here (rather than borrowed from the
-                    // caller's frame) purely so it can be released at its last
-                    // use instead of at the end of `prove_block_after_pre`,
-                    // which is after the whole light pipeline and the final
-                    // block proof. Same deallocation, same thread, no value
-                    // changes -- only its position moves earlier, off the peak.
-                    drop(pre_proof);
                     #[cfg(feature = "diagnostic_profile")]
                     let _heavy_wait =
                         plonky2::util::profile::span("wait", "heavy_path_join_for_final");
@@ -1116,7 +996,6 @@ pub(crate) fn prove_block_after_pre(
                     // The heavy path's thread has exited, so its shared guards
                     // on the heavy transaction and chain circuits are gone, and
                     // this lane dropped its own guard when `build_block_circuit`
-
                     // returned above. Nothing reads those two circuits again:
                     // the light pipeline uses the light pair, and the final
                     // block proof uses only `block_data`, the three finished
@@ -1136,11 +1015,10 @@ pub(crate) fn prove_block_after_pre(
                     (block_target, block_data, pending, heavy_chain_proof)
                 })
                 .expect("block circuit build thread must start");
-            let light_chunks = std::mem::take(&mut light_chunks);
+            let light_pre_output = &pre_output;
             let light_handle = std::thread::Builder::new()
-                .name("light-tx-chain".into())
                 .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, || {
+                .spawn_scoped(scope, move || {
                     mark_spine_thread_latency_critical();
                     prove_path(
                         TxPath::Light,
@@ -1149,7 +1027,7 @@ pub(crate) fn prove_block_after_pre(
                         block.block_number,
                         block.created_at,
                         block.old_account_delta_tree_root,
-                        &pre_output,
+                        light_pre_output,
                         state_metadata_hash,
                         active_paths,
                     )
@@ -1502,6 +1380,242 @@ mod tests {
         }
     }
 
+    /// Production-topology oracle for the recursive-chain early writer. This
+    /// deliberately proves one transaction chunk per path so the recursive
+    /// verifier generators see a real proof, then differentially compares a
+    /// recorded start, a second replayed start, the generic start path, and the
+    /// exact production helper. Run explicitly because producing both real tx
+    /// proofs is substantially heavier than a unit test.
+    #[test]
+    #[ignore = "proves heavy and light transaction chunks for a chain-layout differential"]
+    fn production_chain_early_seed_layout_heavy_light_differential() {
+        // Embedded circuit loading and witness rounds use the global pool; give
+        // its workers the same circuit-safe stack as production.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .build_global();
+        std::thread::Builder::new()
+            .stack_size(PROVER_THREAD_STACK_BYTES)
+            .spawn(production_chain_early_seed_layout_heavy_light_differential_impl)
+            .expect("chain seed-layout component thread must start")
+            .join()
+            .expect("chain seed-layout component thread must finish");
+    }
+
+    fn production_chain_early_seed_layout_heavy_light_differential_impl() {
+        let block = Block::<F>::from_json_with_empty_txs(
+            include_bytes!("../bench_test.json"),
+            HEAVY_TX_PER_PROOF,
+            LIGHT_TX_PER_PROOF,
+            PUBLIC_HEAVY_TX_COUNT,
+            PUBLIC_LIGHT_TX_COUNT,
+        )
+        .expect("public fixture must parse");
+        let mut state_metadata = block.state_metadata.clone();
+        if block.calculate_funding {
+            state_metadata.last_funding_round_timestamp = block.created_at;
+        }
+        if block.calculate_oracle_prices {
+            state_metadata.last_oracle_price_timestamp = block.created_at;
+        }
+        if block.calculate_premium {
+            state_metadata.last_premium_timestamp = block.created_at;
+        }
+        let state_metadata_hash = state_metadata.hash();
+        let circuits = Circuits::load();
+
+        for path in [TxPath::Heavy, TxPath::Light] {
+            let tx_data_guard = match path {
+                TxPath::Heavy => circuits.heavy_tx_data.read().unwrap(),
+                TxPath::Light => circuits.light_tx_data.read().unwrap(),
+            };
+            let chain_data_guard = match path {
+                TxPath::Heavy => circuits.heavy_chain_data.read().unwrap(),
+                TxPath::Light => circuits.light_chain_data.read().unwrap(),
+            };
+            let (tx_target, chain_target, dummy_proof) = match path {
+                TxPath::Heavy => (
+                    &circuits.heavy_tx_target,
+                    &circuits.heavy_chain_target,
+                    &circuits.dummy_heavy_proof,
+                ),
+                TxPath::Light => (
+                    &circuits.light_tx_target,
+                    &circuits.light_chain_target,
+                    &circuits.dummy_light_proof,
+                ),
+            };
+            let txs = block
+                .tx_chunks
+                .iter()
+                .find(|txs| chunk_is_light(txs) == (path == TxPath::Light))
+                .expect("fixture must contain each transaction path")
+                .clone();
+            let old_state_root = txs[0].old_state_root;
+            let old_validium_root = txs[0].old_validium_root;
+            let old_account_delta_tree_root = txs[0].old_account_delta_tree_root;
+            let initial_jump = JumpState::initial(old_state_root, old_account_delta_tree_root);
+            let mut tx_layout = None;
+            let (tx_witness, _) = generate_tx_witness(
+                path,
+                0,
+                txs,
+                &tx_data_guard,
+                tx_target,
+                block.created_at,
+                state_metadata_hash,
+                initial_jump,
+                &mut tx_layout,
+            );
+            let tx_proof = prove_tx_witness(path, 0, &tx_data_guard, tx_witness);
+            let base_proof = cyclic_base_witness(
+                dummy_proof,
+                block.block_number,
+                block.created_at,
+                old_state_root,
+                old_validium_root,
+                old_account_delta_tree_root,
+            );
+
+            macro_rules! finish {
+                ($pending:expr $(,)?) => {{
+                    let mut pending = $pending;
+                    pending
+                        .feed_seeded(|feeder| {
+                            BlockTxChainCircuit::witness_inputs_cyclic_into(
+                                chain_target,
+                                &base_proof,
+                                feeder,
+                            )
+                        })
+                        .expect("cyclic input feed must succeed");
+                    pending.finish().expect("chain witness must finish")
+                }};
+            }
+            let seed = |step, seeder: &mut plonky2::iop::generator::PartitionSeeder<'_, '_, F>| {
+                BlockTxChainCircuit::witness_inputs_early_into(
+                    chain_target,
+                    &chain_data_guard,
+                    step,
+                    dummy_proof,
+                    &tx_proof,
+                    seeder,
+                )
+            };
+
+            let (recorded_pending, layout) = PendingPartitionWitness::start_seeded_recording(
+                &chain_data_guard.prover_only,
+                &chain_data_guard.common,
+                |seeder| seed(0, seeder),
+            )
+            .expect("first chain step must record");
+            let recorded = finish!(recorded_pending);
+            let first_plain = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("first generic chain start must succeed"),
+            );
+            let first_plain_repeat = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("repeated generic chain start must succeed"),
+            );
+            assert_seeded_witness_matches_plain(
+                &recorded,
+                &first_plain,
+                &first_plain_repeat,
+                &chain_data_guard,
+            );
+
+            let replayed = finish!(
+                PendingPartitionWitness::start_seeded_with_layout(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    &layout,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("second chain start must replay"),
+            );
+            let second_plain = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("second generic chain start must succeed"),
+            );
+            let second_plain_repeat = finish!(
+                PendingPartitionWitness::start_seeded(
+                    &chain_data_guard.prover_only,
+                    &chain_data_guard.common,
+                    |seeder| seed(0, seeder),
+                )
+                .expect("repeated second generic chain start must succeed"),
+            );
+            assert_seeded_witness_matches_plain(
+                &replayed,
+                &second_plain,
+                &second_plain_repeat,
+                &chain_data_guard,
+            );
+
+            // Exercise the published-once production route for both its record
+            // and replay branches. The cyclic phase remains the ordinary feed.
+            let production_layout = std::sync::OnceLock::new();
+            let production_disabled = AtomicBool::new(false);
+            let production_first = finish!(
+                start_early_chain_witness(
+                    chain_target,
+                    &chain_data_guard,
+                    0,
+                    dummy_proof,
+                    &tx_proof,
+                    &production_layout,
+                    &production_disabled,
+                )
+                .expect("production first chain start must succeed"),
+            );
+            assert!(production_layout.get().is_some());
+            assert_seeded_witness_matches_plain(
+                &production_first,
+                &first_plain,
+                &first_plain_repeat,
+                &chain_data_guard,
+            );
+            let production_second = finish!(
+                start_early_chain_witness(
+                    chain_target,
+                    &chain_data_guard,
+                    0,
+                    dummy_proof,
+                    &tx_proof,
+                    &production_layout,
+                    &production_disabled,
+                )
+                .expect("production second chain start must succeed"),
+            );
+            assert!(!production_disabled.load(Ordering::Acquire));
+            assert_seeded_witness_matches_plain(
+                &production_second,
+                &second_plain,
+                &second_plain_repeat,
+                &chain_data_guard,
+            );
+
+            println!(
+                "CHAIN_EARLY_SEED_LAYOUT_CENSUS path={path:?} target_writes={} changed_generators={}",
+                layout.target_write_count(),
+                layout.changed_generator_count(),
+            );
+        }
+    }
+
     #[cfg(feature = "diagnostic_profile")]
     #[test]
     fn profile_path_context_names_are_stable() {
@@ -1720,7 +1834,8 @@ mod tests {
             old_delta_root,
         );
 
-        let harness_seed_layout = ChainSeedLayout::new();
+        let early_chain_layout = std::sync::OnceLock::new();
+        let early_chain_layout_disabled = AtomicBool::new(false);
         let mut previous: Option<Proof> = None;
         for chain_step in 0..CHAIN_STEPS {
             let cyclic_proof = previous.as_ref().unwrap_or(&base_proof);
@@ -1801,7 +1916,8 @@ mod tests {
                 &base_proof,
                 &circuits.dummy_proof,
                 &tx_proof,
-                &harness_seed_layout,
+                &early_chain_layout,
+                &early_chain_layout_disabled,
             );
             let direct_elapsed = direct_start.elapsed();
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);

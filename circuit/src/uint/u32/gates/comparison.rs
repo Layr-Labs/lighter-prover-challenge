@@ -232,8 +232,6 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
         let chunk_size = 1usize << chunk_bits;
         let three = F::from_canonical_usize(3);
         let mut chunks_iter = combined_gate_constraints.chunks_exact_mut(n);
-        // Batches are 32 points in this prover; keep the scratch rows on the
-        // stack and fall back to the heap only for oversized batches.
         let mut scratch_stack = [F::ZERO; 64];
         let mut msd_stack = [F::ZERO; 64];
         let mut scratch_heap;
@@ -247,9 +245,8 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
         };
 
         // combined chunks - input, for both inputs, accumulated per point by
-        // Horner over the chunk columns from most to least significant. The
-        // chunk-wire index is computed inline rather than collected, in the
-        // same most-to-least-significant order as before.
+        // Horner over the chunk columns from most to least significant. Compute
+        // wire indices inline instead of allocating two temporary vectors.
         for second_input in [false, true] {
             let input_wire = if second_input {
                 self.wire_second_input()

@@ -18,7 +18,7 @@ use crate::fft::{
 };
 use crate::types::Field;
 
-/// A polynomial in point-value form.
+///       A polynomial in point-value form.
 ///
 /// The points are implicitly `g^i`, where `g` generates the subgroup whose size equals the number
 /// of points.
@@ -91,9 +91,6 @@ impl<F: Field> PolynomialValues<F> {
         ifft_with_options_and_prescaled_postscale(self, None, None, prescaled_inverse_shift_powers)
     }
 
-    /// [`Self::coset_ifft_with_prescaled_powers`] with the transform's outer
-    /// stages spread across the worker pool. Byte-identical output; only use
-    /// where the call is not already inside a wider parallel phase.
     pub fn coset_ifft_with_prescaled_powers_parallel(
         self,
         prescaled_inverse_shift_powers: &[F],
@@ -583,6 +580,8 @@ mod tests {
 
     #[test]
     fn test_coset_ifft_with_prescaled_powers_matches_postscale() {
+        use crate::types::PrimeField64;
+
         type F = GoldilocksField;
 
         for k in [1usize, 2, 3, 5, 8, 11] {
@@ -607,19 +606,19 @@ mod tests {
             let expected = evals.clone().coset_ifft_with_powers(&inverse_powers);
             let actual = evals.coset_ifft_with_prescaled_powers(&prescaled);
 
-            // This helper is used where raw-word exactness is required, so
-            // compare the stored Goldilocks representatives, not merely their
-            // canonical field values.
+            // Field-value equality is the contract; the raw representatives
+            // agree here as well, and any divergence would be a `reduce128`
+            // wrap that both forms are already exposed to.
             assert_eq!(
                 actual
                     .coeffs
                     .iter()
-                    .map(|value| value.0)
+                    .map(|value| value.to_canonical_u64())
                     .collect::<Vec<_>>(),
                 expected
                     .coeffs
                     .iter()
-                    .map(|value| value.0)
+                    .map(|value| value.to_canonical_u64())
                     .collect::<Vec<_>>()
             );
         }
