@@ -156,6 +156,23 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         None
     }
 
+    /// Build FRI's first arity-16 extension-field commitment directly from
+    /// its two live coefficient limbs, when the hasher has a compatible
+    /// backend. The abstract return hash keeps generic prover code honest:
+    /// non-Poseidon2 hashers simply retain the CPU path.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_fri_ext2_commitment_from_coeffs(
+        _coeffs: &[[F; 2]],
+        _rate_bits: usize,
+        _cap_height: usize,
+    ) -> Option<(
+        crate::hash::poseidon2::metal::MetalColumns<F>,
+        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
+        None
+    }
+
     /// Allocates retained column-major leaf storage suitable for a specialized
     /// Merkle backend. The caller may compute the columns directly in this
     /// storage before passing it to [`Hasher::try_build_merkle_tree_column_store`].
