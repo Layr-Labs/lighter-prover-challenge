@@ -1007,14 +1007,27 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
         columns: &crate::hash::merkle_tree::ColumnStore<F>,
         cap_height: usize,
         fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
+        want_even_companion: bool,
     ) -> Option<(
         crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
         Vec<Self::Hash>,
+        Option<crate::hash::merkle_tree::ColumnStore<F>>,
     )> {
         match columns {
             crate::hash::merkle_tree::ColumnStore::Owned(_) => None,
             crate::hash::merkle_tree::ColumnStore::Shared(columns) => {
-                super::metal::build_merkle_tree_shared_streamed(columns, cap_height, fill_group)
+                let (digests, cap, even_companion) =
+                    super::metal::build_merkle_tree_shared_streamed(
+                        columns,
+                        cap_height,
+                        fill_group,
+                        want_even_companion,
+                    )?;
+                Some((
+                    digests,
+                    cap,
+                    even_companion.map(crate::hash::merkle_tree::ColumnStore::Shared),
+                ))
             }
         }
     }

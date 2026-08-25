@@ -343,41 +343,14 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // whenever the backend declines (the group fill below is the
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
-                // Compact even-row companion (Metal only, on request): the
-                // fill below writes row `2k` of every column into row `k` of
-                // the companion right after that column's FFT, while the
-                // column is still cache-resident.
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
-                    crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
-                        polynomials.len(),
-                        lde_len / 2,
-                    )
-                } else {
-                    None
-                };
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs: Option<Vec<usize>> = even_companion.as_mut().and_then(|companion| {
-                    companion
-                        .columns_mut()
-                        .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
-                });
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let even_ptrs = &even_ptrs;
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                let half_len = lde_len / 2;
-                let copy_even = |_column: usize, _destination: &[F]| {
-                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                    if let Some(ptrs) = even_ptrs {
-                        // SAFETY: each column index is written by exactly one
-                        // closure invocation (columns are disjoint), the
-                        // companion outlives the fill, and `F` is plain data.
-                        unsafe {
-                            copy_even_fast(ptrs[_column] as *mut F, _destination, half_len);
-                        }
-                    }
-                };
-                let copy_even = &copy_even;
+                // On the streamed Metal path, the absorb shader already loads
+                // every raw leaf word. Ask it to retain the even rows from
+                // those registers instead of making the CPU reread the full
+                // LDE after every column FFT. The backend returns the companion
+                // only after every absorb command, including the final short
+                // group and parent ladder, has completed successfully.
+                let stream_even_companion =
+                    want_even_companion && lde_len >= 2 && rate_bits >= 1;
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
@@ -407,36 +380,91 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                         Some(rate_bits),
                                         fft_root_table,
                                     );
-                                    copy_even(group * 8 + k, destination);
                                 },
                             );
                         },
+                        stream_even_companion,
                     )
                 };
-                if let Some((level_digests, cap)) = streamed {
-                    let merkle_tree = timed!(
-                        timing,
-                        "build Merkle tree",
-                        MerkleTree::from_prebuilt_columns(columns, level_digests, cap)
-                    );
-                    return Self {
-                        polynomials,
-                        merkle_tree,
-                        degree_log: log2_strict(degree),
-                        rate_bits,
-                        blinding,
-                        even_columns: {
-                            #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-                            {
-                                EvenColumns::from_ready(even_companion)
-                            }
-                            #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
-                            {
-                                EvenColumns::default()
-                            }
-                        }
+                if let Some((level_digests, cap, streamed_even_store)) = streamed {
+                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                    let streamed_even_companion = streamed_even_store.and_then(|store| match store {
+                        crate::hash::merkle_tree::ColumnStore::Shared(columns) => Some(columns),
+                        crate::hash::merkle_tree::ColumnStore::Owned(_) => None,
+                    });
+                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                    let streamed_companion_ready =
+                        !stream_even_companion || streamed_even_companion.is_some();
+                    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+                    let streamed_companion_ready = {
+                        let _ = streamed_even_store;
+                        true
                     };
+                    if streamed_companion_ready {
+                        let merkle_tree = timed!(
+                            timing,
+                            "build Merkle tree",
+                            MerkleTree::from_prebuilt_columns(columns, level_digests, cap)
+                        );
+                        return Self {
+                            polynomials,
+                            merkle_tree,
+                            degree_log: log2_strict(degree),
+                            rate_bits,
+                            blinding,
+                            even_columns: {
+                                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                                {
+                                    EvenColumns::from_ready(streamed_even_companion)
+                                }
+                                #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+                                {
+                                    EvenColumns::default()
+                                }
+                            },
+                        };
+                    }
+                    log::warn!(concat!(
+                        "streamed Merkle backend omitted a requested even companion; ",
+                        "refilling through the classic CPU path"
+                    ));
                 }
+
+                // Classic/fallback path: streamed admission or execution may
+                // fail after filling some LDE groups. Allocate the companion
+                // here and refill every column with the original CPU extractor;
+                // no partially written GPU companion is ever exposed.
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let mut even_companion = if stream_even_companion {
+                    crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
+                        polynomials.len(),
+                        lde_len / 2,
+                    )
+                } else {
+                    None
+                };
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let even_ptrs: Option<Vec<usize>> = even_companion.as_mut().and_then(|companion| {
+                    companion
+                        .columns_mut()
+                        .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
+                });
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let even_ptrs = &even_ptrs;
+                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                let half_len = lde_len / 2;
+                let copy_even = |_column: usize, _destination: &[F]| {
+                    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                    if let Some(ptrs) = even_ptrs {
+                        // SAFETY: each column index is written by exactly one
+                        // closure invocation (columns are disjoint), the
+                        // companion outlives the fill, and `F` is plain data.
+                        unsafe {
+                            copy_even_fast(ptrs[_column] as *mut F, _destination, half_len);
+                        }
+                    }
+                };
+                let copy_even = &copy_even;
                 let initialized = timed!(
                     timing,
                     "FFT + blinding",

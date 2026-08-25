@@ -1847,6 +1847,8 @@ kernel void poseidon2_absorb_pass(
     constant uint& chunk_size [[buffer(7)]],
     constant uint& first_pass [[buffer(8)]],
     constant uint& final_pass [[buffer(9)]],
+    device ulong* even_companion [[buffer(10)]],
+    constant uint& write_even_companion [[buffer(11)]],
     uint gid [[thread_position_in_grid]]) {
     if (gid >= leaf_count) {
         return;
@@ -1858,7 +1860,14 @@ kernel void poseidon2_absorb_pass(
         }
     }
     for (uint i = 0; i < chunk_size; ++i) {
-        st[i] = gl_canonicalize(leaves[(ulong)(col_start + i) * leaf_count + gid]);
+        ulong raw_leaf = leaves[(ulong)(col_start + i) * leaf_count + gid];
+        if (write_even_companion != 0u && (gid & 1u) == 0u) {
+            // Preserve the raw representative; only the sponge copy is
+            // canonicalized.
+            ulong half_count = (ulong)leaf_count >> 1;
+            even_companion[(ulong)(col_start + i) * half_count + (gid >> 1)] = raw_leaf;
+        }
+        st[i] = gl_canonicalize(raw_leaf);
     }
     poseidon2(st, parameters);
     if (final_pass != 0u) {

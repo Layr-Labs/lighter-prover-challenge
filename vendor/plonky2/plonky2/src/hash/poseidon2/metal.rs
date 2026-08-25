@@ -110,7 +110,7 @@ const SHADER_METALLIB: &[u8] = include_bytes!("poseidon2.metallib");
 
 /// SHA-256 of the `poseidon2.metal` bytes [`SHADER_METALLIB`] was built from.
 const SHADER_SOURCE_SHA256: &str =
-    "da95a20af129407628dd79e321a4ae2b3598c061f9580e6da8f32b2e34e1195d";
+    "86bb37e2cb363d843a88a9a555767d38fe2344be53cc8dfbbbe96035633accec";
 
 /// Prebuilt `MTLBinaryArchive` holding the AIR->ISA lowering of every kernel in
 /// [`SHADER_METALLIB`], recorded on this Apple M4 Pro. The metallib above
@@ -2513,8 +2513,10 @@ static STREAMED_BUFFERS: Mutex<Option<(Buffer, Buffer)>> = Mutex::new(None);
 /// zero-padded FFT as `fill_lde_column_store`, and each absorb pass performs
 /// exactly the corresponding loop iteration of `poseidon2_hash_leaves_colmajor`
 /// (chunked canonicalized absorption, permute, final bit-reversed digest
-/// write), so both the retained columns and the digests are bit-identical to
-/// the classic path. Any unavailability (pipeline missing, buffers, command
+/// write). When requested, the shader also stores each raw even leaf before
+/// canonicalization, so the companion is byte-identical to `columns[col][2k]`.
+/// The retained columns and digests remain bit-identical to the classic path.
+/// Any unavailability (pipeline missing, buffers, command
 /// failure) returns `None` and the caller falls back to that classic path;
 /// the fill is idempotent, so a partial fill followed by the fallback''s full
 /// fill is harmless.
@@ -2522,7 +2524,12 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     columns: &MetalColumns<F>,
     cap_height: usize,
     fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
-) -> Option<(LevelOrderDigests<HashOut<F>>, Vec<HashOut<F>>)> {
+    want_even_companion: bool,
+) -> Option<(
+    LevelOrderDigests<HashOut<F>>,
+    Vec<HashOut<F>>,
+    Option<MetalColumns<F>>,
+)> {
     let leaf_width = columns.cols;
     let leaf_count = columns.rows;
     // Exclusive phases stream the 2^20+ trees as before. Outside them, the
@@ -2563,6 +2570,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
     let output_len = total_node_count.checked_mul(4)?;
     let output_bytes = output_len.checked_mul(size_of::<u64>())?;
     let state_bytes = leaf_count.checked_mul(12)?.checked_mul(size_of::<u64>())?;
+    // Keep this buffer private until every absorb command has completed.
+    // Failure drops/recycles it only after all submitted commands are joined,
+    // so neither the caller nor a pool user can observe partial contents.
+    let even_companion = if want_even_companion {
+        Some(context.allocate_columns::<F>(leaf_count / 2, leaf_width).ok()?)
+    } else {
+        None
+    };
 
     let job = GpuJobGuard::begin();
     let mut buffers = STREAMED_BUFFERS.lock().ok()?;
@@ -2630,6 +2645,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
             set_u32(encoder, 7, chunk as u32);
             set_u32(encoder, 8, (group == 0) as u32);
             set_u32(encoder, 9, (group == groups - 1) as u32);
+            // Bind every declared Metal buffer. Without a requested
+            // companion, the leaf store is an inert placeholder and buffer 11
+            // disables writes.
+            let even_buffer = even_companion
+                .as_ref()
+                .map_or(&columns.buffer, |companion| &companion.buffer);
+            encoder.set_buffer(10, Some(even_buffer), 0);
+            set_u32(encoder, 11, want_even_companion as u32);
             dispatch(encoder, pipeline, leaf_count);
             // Parent levels over the completed leaf digests. Only the final
             // absorb group squeezes the sponge into `output_buffer`, so the
@@ -2685,10 +2708,14 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         absorb_commands.push(command_buffer);
     }
 
-    let all_ok = absorb_commands.iter().all(|command_buffer| {
+    // Do not short-circuit after an early failure: later command buffers may
+    // still use the private companion. Join the final command before returning
+    // the completed buffer or recycling it on failure.
+    let mut all_ok = true;
+    for command_buffer in &absorb_commands {
         command_buffer.wait_until_completed();
-        command_buffer.status() == MTLCommandBufferStatus::Completed
-    });
+        all_ok &= command_buffer.status() == MTLCommandBufferStatus::Completed;
+    }
     drop(job);
     if !all_ok {
         log::warn!("streamed Metal sponge build failed; falling back to the classic path");
@@ -2717,12 +2744,9 @@ pub(crate) fn build_merkle_tree_shared_streamed<F: RichField>(
         Arc::clone(&context.digest_output_pool),
         total_node_count,
     );
-    Some(tree_from_metal_digests(
-        nodes,
-        &level_offsets,
-        leaf_count,
-        cap_height,
-    ))
+    let (level_digests, cap) =
+        tree_from_metal_digests(nodes, &level_offsets, leaf_count, cap_height);
+    Some((level_digests, cap, even_companion))
 }
 
 pub(crate) fn build_merkle_tree_shared<F: RichField>(
@@ -4667,7 +4691,10 @@ mod tests {
             ("ifft_finalize", &[0, 1, 2, 3]),
             ("poseidon2_hash_leaves_colmajor", &[0, 1, 2, 3, 4, 5]),
             ("poseidon2_hash_parents", &[0, 1, 2, 3]),
-            ("poseidon2_absorb_pass", &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+            (
+                "poseidon2_absorb_pass",
+                &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            ),
         ];
         let observed: Vec<(&str, &[u32])> = kernels
             .iter()
@@ -7360,7 +7387,7 @@ kernel void goldilocks_mul_bench_native(
         let context = shared_context().expect("Metal context");
         let rows = 1usize << 20;
         // 17 columns is three absorb groups with a *partial* final group, so
-        // the group that now carries the parent ladder is the short one.
+        // both the digest ladder and companion must handle a short last pass.
         let cols = 17;
         let cap_height = 4;
         let columns = context
@@ -7369,23 +7396,48 @@ kernel void goldilocks_mul_bench_native(
         set_exclusive_gpu_phase(true);
         let _reset = ExclusiveReset;
         assert!(is_exclusive_gpu_phase());
-        assert!(absorb_pass_pipeline().is_some(), "absorb pipeline");
+        assert!(ABSORB_PASS_PIPELINE.get().is_some(), "absorb pipeline");
         let streamed = build_merkle_tree_shared_streamed(
             &columns,
             cap_height,
             &|group, destinations| {
                 for (index, destination) in destinations.iter_mut().enumerate() {
-                    destination.fill(F::from_canonical_usize(group * 8 + index + 1));
+                    let column = group * 8 + index;
+                    destination.fill(F::from_canonical_usize(column + 1));
+                    // Non-canonical sentinels distinguish raw leaf copying from
+                    // copying the canonicalized sponge input. They include the
+                    // first and last companion cells.
+                    destination[0] = GoldilocksField(F::ORDER);
+                    destination[2] = GoldilocksField(F::ORDER + 1 + column as u64);
+                    destination[rows - 2] = GoldilocksField(u64::MAX - column as u64);
                 }
             },
+            true,
         )
         .expect("streamed tree");
-        assert!(streamed.0.nodes.is_shared());
+        let (streamed_digests, streamed_cap, companion) = streamed;
+        assert!(streamed_digests.nodes.is_shared());
+        let companion = companion.expect("requested streamed even companion");
+        assert_eq!(companion.cols(), cols);
+        assert_eq!(companion.rows(), rows / 2);
+        // Exact cell differential, not merely field congruence. This covers
+        // every column of the partial final group and all raw sentinels.
+        for column in 0..cols {
+            let full = columns.col(column);
+            let even = companion.col(column);
+            for row in 0..rows / 2 {
+                assert_eq!(
+                    even[row].to_noncanonical_u64(),
+                    full[2 * row].to_noncanonical_u64(),
+                    "raw companion mismatch at column={column} row={row}",
+                );
+            }
+        }
 
         let classic = context
             .build(LeafSource::Shared(&columns), cols, rows, cap_height)
             .expect("classic tree");
-        assert_eq!(streamed, classic);
+        assert_eq!((streamed_digests, streamed_cap), classic);
     }
 
     #[test]

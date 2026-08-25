@@ -190,17 +190,22 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
     /// the caller computes the leaf columns on demand, eight at a time, via
     /// `fill_group(group, slices)` (covering columns `[8 * group, 8 * group +
     /// slices.len())`), and a capable backend overlaps each group's sponge
-    /// absorption with the next group's fill. Returns `None` when no backend
-    /// is available or the shape does not qualify; the caller then fills the
-    /// storage itself and uses the classic build (the fill is idempotent).
+    /// absorption with the next group's fill. When `want_even_companion` is
+    /// true, a capable backend may also return the raw even leaf rows in a
+    /// compact column store; that store is ready only when this method returns
+    /// `Some`. Returns `None` when no backend is available or the shape does
+    /// not qualify; the caller then fills the storage itself and uses the
+    /// classic build (the fill is idempotent).
     #[allow(clippy::type_complexity)]
     fn try_build_merkle_tree_column_store_streamed(
         _columns: &crate::hash::merkle_tree::ColumnStore<F>,
         _cap_height: usize,
         _fill_group: &(dyn Fn(usize, &mut [&mut [F]]) + Sync),
+        _want_even_companion: bool,
     ) -> Option<(
         crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
         Vec<Self::Hash>,
+        Option<crate::hash::merkle_tree::ColumnStore<F>>,
     )> {
         None
     }
