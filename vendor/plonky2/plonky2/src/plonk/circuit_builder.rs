@@ -15,7 +15,7 @@ use web_time::Instant;
 
 use crate::field::cosets::get_unique_coset_shifts;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::fft::fft_root_table;
+use crate::field::fft::{cached_fft_root_table, fft_root_table};
 use crate::field::polynomial::PolynomialValues;
 use crate::field::types::Field;
 use crate::fri::oracle::PolynomialBatch;
@@ -1282,7 +1282,16 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
 
         // Precompute FFT roots.
         let max_fft_points = 1 << (degree_bits + max(rate_bits, log2_ceil(quotient_degree_factor)));
-        let fft_root_table = fft_root_table(max_fft_points);
+        // Take the table from the process-wide cache rather than building a
+        // private copy. The embedded circuits already load through
+        // `cached_fft_root_table`, so their sizes are populated; the block
+        // circuit's 2^21 is not, and the final block proof's FRI expansion
+        // asks the cache for exactly that size later, on the serial tail.
+        // Building it here instead fills the slot the tail would otherwise
+        // have to fill itself, deleting one 2^21 power chain (~2.1M elements,
+        // 16.8 MB) from the critical path. `cached_fft_root_table` is
+        // value-identical to `fft_root_table` by construction.
+        let fft_root_table = cached_fft_root_table::<F>(max_fft_points);
 
         // `prover_only.sigmas` is the transpose of the sigma *values*, and the
         // commitment below consumes those same values. Transposing first reads the
@@ -1478,7 +1487,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
             fixed_routed_wires,
-            fft_root_table: Some(Arc::new(fft_root_table)),
+            fft_root_table: Some(fft_root_table),
             circuit_digest,
             lookup_rows: self.lookup_rows.clone(),
             lut_to_lookups: self.lut_to_lookups.clone(),
