@@ -1390,18 +1390,17 @@ fn wires_even_companion_wanted<F: RichField + Extendable<D>, const D: usize>(
 }
 
 /// Process-wide retained payload limit for immutable low-range selector filters.
-/// The budget is deliberately well below one recurring proof's live working set
-/// and is shared by every circuit loaded in the worker. Oversized and late
-/// caches stay on the unchanged chunk-local path.
+/// Sized to hold both recurring tables at once (64 MiB light + 76 MiB heavy)
+/// with a little slack. The one-off final-block table still misses the
+/// per-table cap and stays on the chunk-local path.
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-const MAX_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 96 * 1024 * 1024;
+const MAX_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 160 * 1024 * 1024;
 
-/// Reject a single table above the recurring light transaction shape. On the
-/// ranked circuits this admits the 64 MiB / 49-proof light table but rejects
-/// the 76 MiB / 3-proof heavy table and the one-off final block even if they
-/// happen to reach the quotient lane first.
+/// Admit the recurring light (64 MiB) and heavy (76 MiB) tables; still reject
+/// the one-off final block. 3 heavy proofs share one 76 MiB table instead of
+/// rebuilding it on the chunk-local path.
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-const MAX_SINGLE_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 68 * 1024 * 1024;
+const MAX_SINGLE_LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: usize = 80 * 1024 * 1024;
 
 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
 static LOW_RANGE_SELECTOR_FILTER_CACHE_BYTES: core::sync::atomic::AtomicUsize =
