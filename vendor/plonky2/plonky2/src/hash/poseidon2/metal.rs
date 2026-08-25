@@ -584,6 +584,12 @@ fn recycle_completed_quotient_output(
     let Some(buffer) = output.take() else {
         return;
     };
+    // Final-block 32 MiB outputs are rejected by the 8 MiB pool cap. Return
+    // them to the pretouch stash so a later proof does not re-fault pages.
+    if buffer.length() > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
+        recycle_prewarmed_quotient_output(buffer);
+        return;
+    }
     // Allocation/recycling is an opportunistic micro-optimization. On lock
     // contention or poisoning, drop normally instead of delaying a proof.
     if let Ok(mut pool) = pool.try_lock() {
@@ -831,11 +837,47 @@ static PREWARMED_STREAMED_DIGESTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
 /// quotient.
 const PREWARMED_STREAMED_DIGEST_COUNT: usize = 3;
 
+/// Pre-faulted gate-quotient *kernel* outputs for the final block.
+///
+/// Each of the six concurrent fb quotient jobs (poseidon ×2, range/U32 ×2,
+/// permutation ×2) writes `quotient_rows * 2` Goldilocks words. At 2^21 LDE
+/// rows that is 32 MiB, which is above [`MAX_CACHED_QUOTIENT_OUTPUT_BYTES`]
+/// (8 MiB), so [`QuotientOutputPool`] never retains them. Without this stash
+/// the exclusive serial tail allocates six fresh `StorageModeShared` buffers
+/// and the GPU first-touches them at submit time. Station-hold traces on
+/// `0b452d25` measured 5–7 s submit→scheduled on those six buffers against
+/// 0.4 s of kernel time; first-touch page-in is one remaining cause.
+static PREWARMED_QUOTIENT_OUTPUTS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
+
+/// Six concurrent final-block quotient command buffers.
+const PREWARMED_QUOTIENT_OUTPUT_COUNT: usize = 6;
+
 /// Takes a pre-faulted digest replacement of at least `bytes`, if one is stashed.
 fn take_prewarmed_streamed_digest(bytes: u64) -> Option<Buffer> {
     let mut stash = PREWARMED_STREAMED_DIGESTS.lock().ok()?;
     let index = stash.iter().position(|buffer| buffer.length() >= bytes)?;
     Some(stash.swap_remove(index))
+}
+
+/// Takes a pre-faulted fb-sized quotient output, if one is stashed.
+fn take_prewarmed_quotient_output(bytes: u64) -> Option<Buffer> {
+    let mut stash = PREWARMED_QUOTIENT_OUTPUTS.lock().ok()?;
+    let index = stash.iter().position(|buffer| buffer.length() >= bytes)?;
+    Some(stash.swap_remove(index))
+}
+
+/// Returns an oversized completed quotient output to the pretouch stash.
+/// Recurring (≤8 MiB) buffers stay in [`QuotientOutputPool`]; this path is
+/// only for the final-block 32 MiB outputs the pool is designed to reject.
+fn recycle_prewarmed_quotient_output(buffer: Buffer) {
+    if buffer.length() <= MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
+        return;
+    }
+    if let Ok(mut stash) = PREWARMED_QUOTIENT_OUTPUTS.try_lock() {
+        if stash.len() < PREWARMED_QUOTIENT_OUTPUT_COUNT {
+            stash.push(buffer);
+        }
+    }
 }
 
 /// Allocates `bytes` and touches one byte per page so the faults are paid here.
@@ -905,6 +947,37 @@ pub fn prewarm_streamed_buffers(leaf_count: usize) {
         };
         match PREWARMED_STREAMED_DIGESTS.lock() {
             Ok(mut stash) => stash.push(buffer),
+            Err(_) => return,
+        }
+    }
+
+    // Six concurrent fb quotient kernel outputs at `leaf_count * 2` u64
+    // words (2^21 → 32 MiB). The 8 MiB quotient pool rejects them, so
+    // without this they are six first-touch allocations in the exclusive
+    // tail. Same page-walk as the digest stash; published one at a time so
+    // a block that arrives mid-walk takes whatever is ready.
+    let Some(quotient_bytes) = leaf_count
+        .checked_mul(2)
+        .and_then(|v| v.checked_mul(size_of::<u64>()))
+    else {
+        return;
+    };
+    let quotient_bytes = quotient_bytes as u64;
+    let already = PREWARMED_QUOTIENT_OUTPUTS
+        .lock()
+        .ok()
+        .map(|stash| stash.len())
+        .unwrap_or(PREWARMED_QUOTIENT_OUTPUT_COUNT);
+    for _ in already..PREWARMED_QUOTIENT_OUTPUT_COUNT {
+        let Some(buffer) = allocate_page_walked(&context.device, quotient_bytes) else {
+            return;
+        };
+        match PREWARMED_QUOTIENT_OUTPUTS.lock() {
+            Ok(mut stash) => {
+                if stash.len() < PREWARMED_QUOTIENT_OUTPUT_COUNT {
+                    stash.push(buffer);
+                }
+            }
             Err(_) => return,
         }
     }
@@ -3093,6 +3166,8 @@ impl MetalShared {
                     return buffer;
                 }
             }
+        } else if let Some(buffer) = take_prewarmed_quotient_output(bytes) {
+            return buffer;
         }
         autoreleasepool(|| {
             self.device
@@ -4905,6 +4980,31 @@ mod tests {
 
         pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
         assert!(pool.free.is_empty(), "oversized output must not be cached");
+    }
+
+    #[test]
+    fn oversized_quotient_outputs_round_trip_the_pretouch_stash() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        if let Ok(mut stash) = PREWARMED_QUOTIENT_OUTPUTS.lock() {
+            stash.clear();
+        }
+        let bytes = MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1;
+        let Some(buffer) = allocate_page_walked(&device, bytes) else {
+            return;
+        };
+        recycle_prewarmed_quotient_output(buffer);
+        let taken = take_prewarmed_quotient_output(bytes).expect("stash hit");
+        assert!(taken.length() >= bytes);
+        assert!(
+            take_prewarmed_quotient_output(bytes).is_none(),
+            "stash must be empty after the take"
+        );
+        // Recurring-size buffers must not enter the pretouch stash.
+        let small = allocate_page_walked(&device, 64).expect("small alloc");
+        recycle_prewarmed_quotient_output(small);
+        assert!(take_prewarmed_quotient_output(64).is_none());
     }
 
     #[test]
