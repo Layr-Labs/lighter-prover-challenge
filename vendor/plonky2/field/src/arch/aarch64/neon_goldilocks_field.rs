@@ -231,7 +231,14 @@ unsafe impl PackedField for NeonGoldilocksField {
 /// lanes share the condition flags; only the flag-free instructions are
 /// interleaved across lanes.
 #[inline(always)]
-fn mul_acc_reduce_pair(acc0: u64, a0: u64, b0: u64, acc1: u64, a1: u64, b1: u64) -> (u64, u64) {
+pub fn mul_acc_reduce_pair(
+    acc0: u64,
+    a0: u64,
+    b0: u64,
+    acc1: u64,
+    a1: u64,
+    b1: u64,
+) -> (u64, u64) {
     let mut result0 = a0;
     let mut result1 = a1;
     let scratch0 = b0;
@@ -356,7 +363,7 @@ impl Sum for NeonGoldilocksField {
 /// Seven registers per pair (down from fifteen), which lets the surrounding butterfly
 /// keep its loads, twiddles and accumulators in flight.
 #[inline(always)]
-fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
+pub fn mul_reduce_pair(a0: u64, b0: u64, a1: u64, b1: u64) -> (u64, u64) {
     let mut result0 = a0;
     let mut result1 = a1;
     let scratch0 = b0;
