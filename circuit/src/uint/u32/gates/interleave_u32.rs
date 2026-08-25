@@ -210,9 +210,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32InterleaveG
         let base = F::from_canonical_usize(Self::B);
         let base_sq = F::from_canonical_usize(Self::B * Self::B);
 
-        let mut scratch_stack = [F::ZERO; 3 * 64];
+        let mut scratch_stack = [F::ZERO; 3 * 32];
         let mut scratch_heap;
-        let scratch: &mut [F] = if n <= 64 {
+        let scratch: &mut [F] = if n <= 32 {
             &mut scratch_stack[..3 * n]
         } else {
             scratch_heap = vec![F::ZERO; 3 * n];
