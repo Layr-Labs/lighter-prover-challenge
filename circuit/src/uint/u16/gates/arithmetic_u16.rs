@@ -222,9 +222,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
 
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
             // in the same descending order as `eval_unfiltered`, accumulating
-            // the low/high recompositions along the way.
-            combined_low.fill(0);
-            combined_high.fill(0);
+            // the low/high recompositions along the way. Each half starts at
+            // its most-significant limb, so seed that row directly instead of
+            // clearing the scratch and performing a redundant zero*base pass.
             for j in (0..Self::num_limbs()).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 let out = chunks.next().unwrap();
@@ -239,9 +239,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
                 } else {
                     &mut combined_high
                 };
-                for p in 0..n {
-                    combined[p] =
-                        combined[p] * limb_base_u128 + limb[p].to_noncanonical_u64() as u128;
+                let most_significant_in_half =
+                    j + 1 == Self::num_limbs() || (j < midpoint && j + 1 == midpoint);
+                if most_significant_in_half {
+                    for p in 0..n {
+                        combined[p] = limb[p].to_noncanonical_u64() as u128;
+                    }
+                } else {
+                    for p in 0..n {
+                        combined[p] =
+                            combined[p] * limb_base_u128 + limb[p].to_noncanonical_u64() as u128;
+                    }
                 }
             }
             let out = chunks.next().unwrap();
