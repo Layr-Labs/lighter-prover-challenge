@@ -340,9 +340,9 @@ impl<F: Field> Witness<F> for PartialWitness<F> {
 /// The value of a target is defined to be the value of its root in the forest.
 #[derive(Clone, Debug)]
 pub struct PartitionWitness<'a, F: Field> {
-    /// Value of each representative slot. Unset slots hold `F::ZERO`; whether a slot has actually
-    /// been set is tracked by the 1-bit-per-slot `set_bitmap`. Storing the values densely (8 bytes
-    /// per slot instead of 16 for `Option<F>`) halves memory traffic during witness generation.
+    /// Value storage for each representative slot. Unset slots are intentionally uninitialized;
+    /// whether a slot can be read is tracked by the 1-bit-per-slot `set_bitmap`. Storing the values
+    /// densely (8 bytes per slot instead of 16 for `Option<F>`) halves witness-generation traffic.
     pub values: Vec<F>,
     /// Bitmap with one bit per slot of `values`; bit `i` of word `i / 64` is set iff slot `i` has
     /// been assigned a value.
@@ -354,6 +354,30 @@ pub struct PartitionWitness<'a, F: Field> {
     pub num_wires: usize,
     pub degree: usize,
 }
+
+/// Hint that a valid raw address will be read soon without creating a Rust
+/// reference or loading the pointed-to value. In particular, callers may pass
+/// the address of an unset (and therefore uninitialized) representative slot.
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[inline(always)]
+unsafe fn prefetch_read_l1(address: *const u8) {
+    unsafe {
+        core::arch::asm!(
+            "prfm pldl1keep, [{address}]",
+            address = in(reg) address,
+            // PRFM may observe memory but cannot write it; it does not touch
+            // the stack or condition flags.
+            options(readonly, nostack, preserves_flags),
+        );
+    }
+}
+
+/// Exact portable fallback. The lookahead block at the call site is cfg-elided
+/// too, so non-AArch64-macOS builds retain no address arithmetic or map loads.
+#[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn prefetch_read_l1(_address: *const u8) {}
 
 impl<'a, F: Field> PartitionWitness<'a, F> {
     pub fn new(num_wires: usize, degree: usize, representative_map: &'a [u32]) -> Self {
@@ -456,19 +480,42 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
     pub fn full_witness(self) -> MatrixWitness<F> {
         // Single fused pass, parallel over row chunks. Cell (column j, row i)
-        // is `values[representative_map[i * num_wires + j]]` (unset slots hold
-        // `F::ZERO` in the dense `values` vector), with `Target::index`'s
-        // `row * num_wires + column` inlined as a running cursor. Each
-        // parallel task owns one row range of every column — disjoint
-        // `MaybeUninit` segments carved off the pre-sized column buffers up
-        // front — reads `representative_map` sequentially within its range,
-        // and initializes every cell exactly once before the final `set_len`.
+        // is `values[representative_map[i * num_wires + j]]`; unset slots yield
+        // `F::ZERO` without reading their uninitialized backing storage. Each
+        // task owns one row range of every column through disjoint `MaybeUninit`
+        // segments. The inner 16x32 tiles keep destination lines/pages bounded
+        // while their representative-map reads stay within a small row window.
+        // On AArch64 macOS, raw-address hints overlap the random representative
+        // gather with the preceding 16 visited cells. Every output cell is
+        // initialized exactly once before the final `set_len`.
+        const TILE_ROWS: usize = 16;
+        const TILE_COLUMNS: usize = 32;
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        const PREFETCH_DISTANCE: usize = 16;
+
         let num_wires = self.num_wires;
         let degree = self.degree;
         let mut wire_values: Vec<Vec<F>> = (0..num_wires)
             .map(|_| Vec::with_capacity(degree))
             .collect();
-        let num_chunks = 16.min(degree.max(1));
+        // Three row tasks per Rayon worker provide scheduling slack on heterogeneous cores. The env
+        // switch is a diagnostic-only exact rollback to the promoted fixed-16
+        // task policy.
+        #[cfg(all(feature = "parallel", feature = "std"))]
+        let chunk_budget = if std::env::var_os("PLONKY2_FULL_WITNESS_FIXED_16_CHUNKS").is_some() {
+            16
+        } else {
+            plonky2_maybe_rayon::rayon::current_num_threads()
+                .saturating_mul(3)
+                .max(1)
+        };
+        #[cfg(not(all(feature = "parallel", feature = "std")))]
+        let chunk_budget = 16;
+        let num_chunks = if degree == 0 {
+            1
+        } else {
+            degree.min(chunk_budget)
+        };
         let chunk_rows = degree.div_ceil(num_chunks);
         {
             let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
@@ -490,20 +537,91 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
                 .enumerate()
                 .for_each(|(chunk, columns)| {
                     let rows = columns.first().map_or(0, |column| column.len());
-                    let mut wire_index = chunk * chunk_rows * num_wires;
-                    for i in 0..rows {
-                        for column in columns.iter_mut() {
-                            let rep = self.representative_map[wire_index] as usize;
-                            // Bitmap-guarded: unset slots are uninitialized
-                            // storage and must read as F::ZERO (identical to
-                            // the dense-zero representation this replaces).
-                            let value = if self.is_set_by_rep_index(rep) {
-                                self.values[rep]
-                            } else {
-                                F::ZERO
-                            };
-                            column[i].write(value);
-                            wire_index += 1;
+                    for row_start in (0..rows).step_by(TILE_ROWS) {
+                        let row_end = (row_start + TILE_ROWS).min(rows);
+                        for (column_chunk, tile_columns) in
+                            columns.chunks_mut(TILE_COLUMNS).enumerate()
+                        {
+                            let column_start = column_chunk * TILE_COLUMNS;
+                            let tile_width = tile_columns.len();
+                            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                            let tile_cells = (row_end - row_start) * tile_width;
+                            let mut wire_index =
+                                (chunk * chunk_rows + row_start) * num_wires + column_start;
+
+                            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                            let (mut future_wire_index, mut future_column) =
+                                if PREFETCH_DISTANCE < tile_cells {
+                                    (
+                                        (chunk * chunk_rows
+                                            + row_start
+                                            + PREFETCH_DISTANCE / tile_width)
+                                            * num_wires
+                                            + column_start
+                                            + PREFETCH_DISTANCE % tile_width,
+                                        PREFETCH_DISTANCE % tile_width,
+                                    )
+                                } else {
+                                    (0, 0)
+                                };
+                            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                            let mut visited = 0usize;
+                            for row in row_start..row_end {
+                                for column in tile_columns.iter_mut() {
+                                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                                    if visited + PREFETCH_DISTANCE < tile_cells {
+                                        let future_rep =
+                                            self.representative_map[future_wire_index] as usize;
+                                        let future_bitmap_word = future_rep >> 6;
+                                        assert!(
+                                            future_rep < self.values.len()
+                                                && future_bitmap_word < self.set_bitmap.len(),
+                                            "representative index exceeds witness storage"
+                                        );
+                                        // SAFETY: the range check above establishes that both `add`
+                                        // operations stay within their allocations. It also enforces
+                                        // the prover-data representative-range invariant for manually
+                                        // constructed or malformed inputs before entering inline asm.
+                                        // `future_wire_index` names a later visited cell in this tile.
+                                        // Only raw addresses are passed to PRFM: no `&F` is formed and
+                                        // no Rust value is read from a possibly-uninitialized slot.
+                                        unsafe {
+                                            prefetch_read_l1(
+                                                self.set_bitmap
+                                                    .as_ptr()
+                                                    .add(future_bitmap_word)
+                                                    .cast(),
+                                            );
+                                            prefetch_read_l1(
+                                                self.values.as_ptr().add(future_rep).cast(),
+                                            );
+                                        }
+                                        future_wire_index += 1;
+                                        future_column += 1;
+                                        if future_column == tile_width {
+                                            future_column = 0;
+                                            future_wire_index += num_wires - tile_width;
+                                        }
+                                    }
+
+                                    let rep = self.representative_map[wire_index] as usize;
+                                    // Bitmap-guarded: unset slots are uninitialized
+                                    // storage and must read as F::ZERO (identical to
+                                    // the dense-zero representation this replaces).
+                                    let value = if self.is_set_by_rep_index(rep) {
+                                        self.values[rep]
+                                    } else {
+                                        F::ZERO
+                                    };
+                                    column[row].write(value);
+                                    wire_index += 1;
+                                    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+                                    {
+                                        visited += 1;
+                                    }
+                                }
+                                wire_index += num_wires - tile_width;
+                            }
                         }
                     }
                 });
@@ -518,6 +636,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
         MatrixWitness { wire_values }
     }
+
     #[allow(dead_code)]
     fn full_witness_serial_reference(self) -> MatrixWitness<F> {
         let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
@@ -540,6 +659,138 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         }
 
         MatrixWitness { wire_values }
+    }
+}
+
+#[cfg(test)]
+mod full_witness_tiling_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    fn assert_matches_serial(
+        num_wires: usize,
+        degree: usize,
+        all_unset: bool,
+        virtual_tail: usize,
+    ) {
+        let wire_len = num_wires * degree;
+        let value_len = wire_len + virtual_tail;
+        let representative_map: Vec<u32> = if value_len == 0 {
+            Vec::new()
+        } else {
+            (0..value_len)
+                .map(|i| {
+                    // Route a deterministic subset of wire cells to virtual
+                    // representatives after the wire prefix. The remaining map
+                    // stays nontrivial across the complete representative range.
+                    let rep = if i < wire_len && virtual_tail != 0 && i % 7 == 0 {
+                        wire_len + (i * 17 + 3) % virtual_tail
+                    } else {
+                        (i * 17 + 3) % value_len
+                    };
+                    rep as u32
+                })
+                .collect()
+        };
+        // Nonzero sentinels in unset slots ensure the bitmap guard, rather
+        // than their backing storage, supplies zero. Some set slots hold an
+        // explicit zero as well. Extra slots model virtual-target roots that
+        // wire representatives can validly reference.
+        let values: Vec<GoldilocksField> = (0..value_len)
+            .map(|i| {
+                if i % 11 == 0 {
+                    GoldilocksField::ZERO
+                } else {
+                    GoldilocksField::from_canonical_usize(i + 1)
+                }
+            })
+            .collect();
+        let mut set_bitmap = vec![0u64; value_len.div_ceil(64)];
+        if !all_unset {
+            for i in (0..value_len).filter(|i| i % 3 != 0) {
+                set_bitmap[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        if virtual_tail != 0 && wire_len != 0 {
+            assert!(representative_map[..wire_len]
+                .iter()
+                .any(|&rep| rep as usize >= wire_len));
+            assert!(representative_map[..wire_len].iter().any(|&rep| {
+                let rep = rep as usize;
+                rep >= wire_len
+                    && (set_bitmap[rep >> 6] >> (rep & 63)) & 1 == 0
+                    && values[rep] != GoldilocksField::ZERO
+            }));
+        }
+        let witness = PartitionWitness {
+            values,
+            set_bitmap,
+            representative_map: &representative_map,
+            num_wires,
+            degree,
+        };
+
+        let expected = witness.clone().full_witness_serial_reference();
+        let actual = witness.full_witness();
+        assert_eq!(actual.wire_values, expected.wire_values);
+    }
+
+    #[test]
+    fn full_witness_tiling_matches_serial_reference() {
+        // Zero rows/wires, all-unset storage, both sides of the tile widths,
+        // representatives rooted in the virtual-target tail, row tiles larger
+        // than one iteration, and empty trailing Rayon chunks.
+        let cases = [
+            (0, 0, false, 0),
+            (0, 17, true, 0),
+            (4, 0, false, 0),
+            (3, 1, true, 7),
+            (31, 15, false, 17),
+            (32, 16, false, 17),
+            (33, 17, false, 17),
+            (136, 257, false, 31),
+            (136, 1025, false, 31),
+        ];
+        #[cfg(all(feature = "parallel", feature = "std"))]
+        for threads in [1, 14] {
+            plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    for &(num_wires, degree, all_unset, virtual_tail) in &cases {
+                        assert_matches_serial(num_wires, degree, all_unset, virtual_tail);
+                    }
+                });
+        }
+        #[cfg(not(all(feature = "parallel", feature = "std")))]
+        for (num_wires, degree, all_unset, virtual_tail) in cases {
+            assert_matches_serial(num_wires, degree, all_unset, virtual_tail);
+        }
+    }
+
+    #[test]
+    fn full_witness_tiling_handles_unset_nonzero_virtual_tail_reps() {
+        // Production wire width, both tile tails, and representatives in the
+        // virtual-target suffix, including unset slots with nonzero backing
+        // sentinels. The comparison covers the complete Vec<Vec<F>> output.
+        assert_matches_serial(136, 257, false, 131);
+    }
+
+    #[test]
+    fn full_witness_tiling_zeroes_uninitialized_unset_slots() {
+        let num_wires = 7;
+        let degree = 17;
+        let representative_map: Vec<u32> = (0..num_wires * degree).map(|i| i as u32).collect();
+        let matrix =
+            PartitionWitness::<GoldilocksField>::new(num_wires, degree, &representative_map)
+                .full_witness();
+
+        assert!(matrix
+            .wire_values
+            .iter()
+            .flatten()
+            .all(|&value| value == GoldilocksField::ZERO));
     }
 }
 
