@@ -409,18 +409,35 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
         let num_ops = self.gate.num_ops;
-        let diffs: Vec<F> = (0..num_ops)
-            .map(|i| witness.get_target(Target::wire(self.row, self.gate.wire_ith_temporary(i, 0))))
-            .collect();
+        // The production recursion configuration packs 22 equality operations
+        // per row. Keep both Montgomery work rows on the stack, retaining the
+        // old two-allocation behavior only for unusually wide configurations.
+        let mut diffs_stack = [F::ZERO; 32];
+        let mut prefixes_stack = [F::ZERO; 32];
+        let mut diffs_heap;
+        let mut prefixes_heap;
+        let (diffs, prefixes): (&mut [F], &mut [F]) = if num_ops <= 32 {
+            (
+                &mut diffs_stack[..num_ops],
+                &mut prefixes_stack[..num_ops],
+            )
+        } else {
+            diffs_heap = vec![F::ZERO; num_ops];
+            prefixes_heap = vec![F::ZERO; num_ops];
+            (&mut diffs_heap, &mut prefixes_heap)
+        };
+        for (i, diff) in diffs.iter_mut().enumerate() {
+            *diff = witness
+                .get_target(Target::wire(self.row, self.gate.wire_ith_temporary(i, 0)));
+        }
 
         // Montgomery's trick over the row's nonzero diffs. Forward pass: prefix products
         // of the nonzero diffs (zero diffs keep the running product unchanged and their
         // `invdiff` stays zero, as in the per-slot formula).
-        let mut prefixes: Vec<F> = Vec::with_capacity(num_ops);
         let mut acc = F::ONE;
         let mut any_nonzero = false;
-        for &diff in &diffs {
-            prefixes.push(acc);
+        for (i, &diff) in diffs.iter().enumerate() {
+            prefixes[i] = acc;
             if diff != F::ZERO {
                 acc *= diff;
                 any_nonzero = true;
@@ -443,7 +460,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             }
         }
 
-        for (i, inv_value) in prefixes.into_iter().enumerate() {
+        for (i, &inv_value) in prefixes.iter().enumerate() {
             let invdiff = Target::wire(self.row, self.gate.wire_ith_temporary(i, 1));
             out_buffer.set_target(invdiff, inv_value)?;
         }
