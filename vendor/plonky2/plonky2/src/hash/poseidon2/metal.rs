@@ -355,7 +355,7 @@ const MAX_BUFFER_SETS: usize = 1;
 /// Concurrent detached digest readbacks (see `BufferPool::detached_readbacks`).
 /// Detachment only moves the post-completion digest copy off the buffer set;
 /// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
-const MAX_DETACHED_READBACKS: usize = 2;
+const MAX_DETACHED_READBACKS: usize = 4;
 /// Parallel staging copy granularity in u64 elements (4 MiB chunks).
 const STAGING_CHUNK: usize = 1 << 19;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
@@ -1089,9 +1089,9 @@ struct BufferPool {
     /// Number of readbacks currently running detached from the set. Each
     /// detachment lets the completing build release the set before its
     /// ~tens-of-MB digest copy; while all slots are taken, a completing
-    /// build copies inline holding the set, delaying the next build. Two
-    /// slots cover the common case of two builds completing back-to-back
-    /// under the deeper proof window.
+    /// build copies inline holding the set, delaying the next build. Four
+    /// slots cover a burst of wires/Zs/quotient (+split) completions
+    /// without adding GPU concurrency (MAX_BUFFER_SETS stays 1).
     detached_readbacks: usize,
 }
 

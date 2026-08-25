@@ -1,7 +1,5 @@
-// Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
-// reuse in the comparison/u16 arithmetic gate generators (per-call allocation
-// elimination previously described in this account's fable-ps notes).
-// Marker bumped only for a fresh submission hash; no behavior change vs the prior fable-ps draws.
+// detached-readbacks-4-r1 1787625900001 (inert)
+// Isolated leftover: MAX_DETACHED_READBACKS 2->4 (GPU still 1-set serialized).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
