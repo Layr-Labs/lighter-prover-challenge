@@ -170,7 +170,7 @@ impl<F: Field> ReducingFactor<F> {
         // the serial merge of those vectors. Each slot receives powers in
         // ascending polynomial order; this is field-equal to the previous
         // regrouped sum, while proof serialization canonicalizes every limb.
-        const SLOT_BLOCK: usize = 2048;
+        const SLOT_BLOCK: usize = 1024;
         let mut acc = vec![F::ZERO; max_len];
         acc.par_chunks_mut(SLOT_BLOCK)
             .enumerate()
@@ -382,7 +382,7 @@ where
     // batches partition the coefficient slots so each worker visits all
     // polynomials for one cache-sized output range.
     const PARALLEL_CHUNK: usize = 16;
-    const SLOT_BLOCK: usize = 2048;
+    const SLOT_BLOCK: usize = 1024;
     if slices.len() <= PARALLEL_CHUNK {
         let out = unsafe {
             core::slice::from_raw_parts_mut(
