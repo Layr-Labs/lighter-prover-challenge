@@ -367,7 +367,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 /// required a pointer-chasing tree walk for every newly populated representative.
 #[derive(Eq, PartialEq, Debug)]
 pub struct GeneratorWatchIndex {
-    offsets: Vec<u32>,
+    /// Logical length of the former dense CSR offset table. Keeping the length
+    /// preserves the serialized representation without retaining one `u32`
+    /// for every representative at runtime.
+    offsets_len: usize,
+    /// Cumulative watcher end for each set bit in `watched`, in ascending
+    /// representative order. The matching start is the previous end (or zero).
+    ends: Vec<u32>,
     /// Generator indices, `u32` rather than `usize`: the circuit builder already
     /// refuses a generator count that does not fit a `u32` (see the guards in
     /// [`Self::from_map`] and [`Self::from_sorted_generator_representatives`]),
@@ -390,6 +396,10 @@ pub struct GeneratorWatchIndex {
     /// them; `get` returns exactly what it returned before, so no witness value, no queue
     /// push and no proof byte can move.
     watched: Vec<u64>,
+    /// Number of watched representatives in all bitmap words before this one.
+    /// This turns a set representative into its `ends` index with one compact
+    /// sequential-table load and one popcount.
+    rank_before_word: Vec<u32>,
 }
 
 /// Sets bit `representative` of a [`GeneratorWatchIndex::watched`] bitmap under construction.
@@ -409,10 +419,12 @@ impl GeneratorWatchIndex {
         let entries = map.values().filter(|watchers| !watchers.is_empty()).count();
         let Some((&max_representative, _)) = map.last_key_value() else {
             return Self {
-                offsets: vec![0],
+                offsets_len: 1,
+                ends: Vec::new(),
                 watchers: Vec::new(),
                 entries: 0,
                 watched: Vec::new(),
+                rank_before_word: Vec::new(),
             };
         };
 
@@ -447,12 +459,7 @@ impl GeneratorWatchIndex {
         offsets[max_representative + 1] = watchers.len() as u32;
         debug_assert!(entries_iter.next().is_none());
 
-        Self {
-            offsets,
-            watchers,
-            entries,
-            watched,
-        }
+        Self::from_parts_with_presence(offsets, watchers, entries, watched)
     }
 
     /// Builds the CSR directly from consecutive, per-generator groups of sorted, distinct
@@ -481,10 +488,12 @@ impl GeneratorWatchIndex {
 
         let Some(&max_representative) = representatives.iter().max() else {
             return Self {
-                offsets: vec![0],
+                offsets_len: 1,
+                ends: Vec::new(),
                 watchers: Vec::new(),
                 entries: 0,
                 watched: Vec::new(),
+                rank_before_word: Vec::new(),
             };
         };
         let max_representative = max_representative as usize;
@@ -543,28 +552,23 @@ impl GeneratorWatchIndex {
             }
         }
 
-        Self {
-            offsets,
-            watchers,
-            entries,
-            watched,
-        }
+        Self::from_parts_with_presence(offsets, watchers, entries, watched)
     }
 
-    /// The raw CSR offset table (`representative -> [start, end)` into
-    /// [`Self::watchers`]). Exposed for compact serialization of the index.
-    pub fn offsets(&self) -> &[u32] {
-        &self.offsets
+    /// Logical length of the dense CSR offset sequence used by the stable
+    /// embedded format. Runtime storage remains sparse.
+    pub const fn offsets_len(&self) -> usize {
+        self.offsets_len
     }
 
-    /// The flat, concatenated watcher lists indexed by [`Self::offsets`].
+    /// The flat, concatenated watcher lists indexed by the sparse cumulative ends.
     pub fn watchers(&self) -> &[u32] {
         &self.watchers
     }
 
-    /// Rebuilds the index from its raw CSR parts (as exposed by
-    /// [`Self::offsets`] and [`Self::watchers`]); the `entries` count is a pure
-    /// function of the offsets and is re-derived. The offsets must be
+    /// Rebuilds the index from raw dense CSR offsets plus [`Self::watchers`];
+    /// the `entries` count is a pure function of the offsets and is re-derived.
+    /// The offsets must be
     /// monotonically nondecreasing, start at 0 and end at `watchers.len()`,
     /// exactly as [`Self::from_map`] produces them.
     pub fn from_parts(offsets: Vec<u32>, watchers: Vec<u32>) -> Self {
@@ -586,12 +590,7 @@ impl GeneratorWatchIndex {
                 mark_watched(&mut watched, representative);
             }
         }
-        Self {
-            offsets,
-            watchers,
-            entries,
-            watched,
-        }
+        Self::from_parts_with_presence(offsets, watchers, entries, watched)
     }
 
     /// [`Self::from_parts`] for a loader that has already derived the presence bitmap and
@@ -622,11 +621,72 @@ impl GeneratorWatchIndex {
             empty_watched(offsets.len()).len(),
             "watch index presence bitmap is sized for different offsets"
         );
+        let mut ends = Vec::with_capacity(entries);
+        for bounds in offsets.windows(2) {
+            if bounds[0] != bounds[1] {
+                ends.push(bounds[1]);
+            }
+        }
+        Self::from_sparse_parts(offsets.len(), ends, watchers, watched)
+    }
+
+    /// Builds the runtime-sparse index directly from the stable offset-delta
+    /// stream. `ends` contains one cumulative watcher end per set presence bit.
+    pub fn from_sparse_parts(
+        offsets_len: usize,
+        ends: Vec<u32>,
+        watchers: Vec<u32>,
+        watched: Vec<u64>,
+    ) -> Self {
+        assert!(offsets_len != 0, "watch index offsets must be non-empty");
+        assert_eq!(
+            watched.len(),
+            empty_watched(offsets_len).len(),
+            "watch index presence bitmap is sized for different offsets"
+        );
+        let representative_count = offsets_len - 1;
+        if let Some(&last_word) = watched.last() {
+            let live_bits = representative_count & 63;
+            if live_bits != 0 {
+                assert_eq!(
+                    last_word >> live_bits,
+                    0,
+                    "watch index presence bitmap exceeds the offset range"
+                );
+            }
+        }
+        assert_eq!(
+            ends.len(),
+            watched.iter().map(|word| word.count_ones() as usize).sum(),
+            "watch index sparse ends must match presence bits"
+        );
+        assert_eq!(
+            ends.last().copied().unwrap_or(0) as usize,
+            watchers.len(),
+            "watch index sparse ends must cover the watcher list"
+        );
+        assert!(
+            ends.windows(2).all(|pair| pair[0] < pair[1]),
+            "watch index sparse ends must be strictly increasing"
+        );
+
+        let mut rank_before_word = Vec::with_capacity(watched.len());
+        let mut rank = 0u32;
+        for &word in &watched {
+            rank_before_word.push(rank);
+            rank = rank
+                .checked_add(word.count_ones())
+                .expect("watch index entry count exceeds u32");
+        }
+        assert_eq!(rank as usize, ends.len());
+
         Self {
-            offsets,
+            offsets_len,
+            ends,
             watchers,
-            entries,
+            entries: rank as usize,
             watched,
+            rank_before_word,
         }
     }
 
@@ -638,12 +698,19 @@ impl GeneratorWatchIndex {
         // only for representatives strictly below `offsets.len() - 1` whose watcher list is
         // non-empty, so reaching the indexing below implies both `offsets` reads are in
         // bounds and that the slice is non-empty -- exactly the old `Some` condition.
-        if (self.watched.get(representative >> 6)? >> (representative & 63)) & 1 == 0 {
+        let word_index = representative >> 6;
+        let bit_index = representative & 63;
+        let word = *self.watched.get(word_index)?;
+        if (word >> bit_index) & 1 == 0 {
             return None;
         }
-        let start = self.offsets[representative] as usize;
-        let end = self.offsets[representative + 1] as usize;
-        debug_assert!(start != end);
+        let below = (1u64 << bit_index).wrapping_sub(1);
+        let sparse_index = self.rank_before_word[word_index] as usize
+            + (word & below).count_ones() as usize;
+        let start = sparse_index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous] as usize);
+        let end = self.ends[sparse_index] as usize;
         Some(&self.watchers[start..end])
     }
 
@@ -652,14 +719,42 @@ impl GeneratorWatchIndex {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (usize, &[u32])> {
-        self.offsets
-            .windows(2)
+        let representatives = self
+            .watched
+            .iter()
             .enumerate()
-            .filter_map(|(representative, bounds)| {
-                let start = bounds[0] as usize;
-                let end = bounds[1] as usize;
-                (start != end).then(|| (representative, &self.watchers[start..end]))
+            .flat_map(|(word_index, &word)| {
+                (0..64).filter_map(move |bit_index| {
+                    ((word >> bit_index) & 1 != 0).then_some(word_index * 64 + bit_index)
+                })
+            });
+        let mut start = 0usize;
+        representatives
+            .zip(self.ends.iter().copied())
+            .map(move |(representative, end)| {
+                let end = end as usize;
+                let watchers = &self.watchers[start..end];
+                start = end;
+                (representative, watchers)
             })
+    }
+
+    #[cfg(test)]
+    fn dense_offsets(&self) -> Vec<u32> {
+        let mut offsets = vec![0u32; self.offsets_len];
+        let mut entries = self.iter().peekable();
+        let mut running = 0u32;
+        for representative in 0..self.offsets_len.saturating_sub(1) {
+            if entries
+                .peek()
+                .is_some_and(|(watched_representative, _)| *watched_representative == representative)
+            {
+                running += u32::try_from(entries.next().unwrap().1.len()).unwrap();
+            }
+            offsets[representative + 1] = running;
+        }
+        assert!(entries.next().is_none());
+        offsets
     }
 }
 
@@ -1221,7 +1316,7 @@ mod generator_watch_index_tests {
 
             // Seam 3: `from_parts`, i.e. the embedded-blob loader.
             let from_parts = GeneratorWatchIndex::from_parts(
-                from_map.offsets().to_vec(),
+                from_map.dense_offsets(),
                 from_map.watchers().to_vec(),
             );
 
@@ -1273,5 +1368,35 @@ mod generator_watch_index_tests {
             "sabotage control did not trip: the differential cannot detect a truncated watcher"
         );
         assert_eq!(actual, vec![65_536u64, 3]);
+    }
+
+    #[test]
+    fn sparse_rank_crosses_bitmap_word_boundaries() {
+        let representatives = [0usize, 1, 62, 63, 64, 65, 126, 127, 128, 191, 192];
+        let map = representatives
+            .into_iter()
+            .enumerate()
+            .map(|(generator, representative)| (representative, vec![generator, generator + 1000]))
+            .collect::<BTreeMap<_, _>>();
+        let index = GeneratorWatchIndex::from_map(map.clone());
+
+        for representative in 0..=200 {
+            let expected = map
+                .get(&representative)
+                .map(|watchers| watchers.iter().map(|&watcher| watcher as u32).collect::<Vec<_>>());
+            assert_eq!(
+                index.get(&representative).map(<[u32]>::to_vec),
+                expected,
+                "rank diverges at bitmap boundary representative {representative}"
+            );
+        }
+        assert_eq!(
+            index.iter().map(|(representative, _)| representative).collect::<Vec<_>>(),
+            representatives
+        );
+
+        let dense = index.dense_offsets();
+        let rebuilt = GeneratorWatchIndex::from_parts(dense, index.watchers().to_vec());
+        assert_eq!(rebuilt, index);
     }
 }

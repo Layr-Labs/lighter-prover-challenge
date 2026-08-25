@@ -102,6 +102,30 @@ fn read_uvarint(bytes: &[u8], pos: &mut usize) -> Result<u64> {
     }
 }
 
+/// Emits the stable dense-CSR delta stream from the runtime-sparse watch index.
+/// The bytes are identical to iterating the former dense offsets vector: the
+/// first delta is zero and offset `r + 1` advances by watcher-list length `r`.
+fn write_watch_offset_deltas(out: &mut Vec<u8>, index: &GeneratorWatchIndex) -> Result<()> {
+    let offsets_len = index.offsets_len();
+    write_uvarint(out, offsets_len as u64);
+    let mut entries = index.iter().peekable();
+    for offset_index in 0..offsets_len {
+        let representative = offset_index.saturating_sub(1);
+        let delta = if offset_index != 0
+            && entries
+                .peek()
+                .is_some_and(|(watched_representative, _)| *watched_representative == representative)
+        {
+            entries.next().unwrap().1.len() as u64
+        } else {
+            0
+        };
+        write_uvarint(out, delta);
+    }
+    ensure!(entries.next().is_none(), "watch index entry exceeds offset range");
+    Ok(())
+}
+
 const fn zigzag(value: i64) -> u64 {
     ((value << 1) ^ (value >> 63)) as u64
 }
@@ -246,16 +270,9 @@ pub fn serialize_embedded<T: Serialize>(target: &T, data: &CircuitData<F, C, D>)
     write_compressed_section(&mut out, &buf);
 
     // watch index CSR: offsets as varint deltas (mostly zero), watchers as u32
-    let offsets = prover.generator_indices_by_watches.offsets();
     let watchers = prover.generator_indices_by_watches.watchers();
     let mut buf = Vec::new();
-    write_uvarint(&mut buf, offsets.len() as u64);
-    let mut previous = 0u32;
-    for &offset in offsets {
-        ensure!(offset >= previous, "watch index offsets must be sorted");
-        write_uvarint(&mut buf, u64::from(offset - previous));
-        previous = offset;
-    }
+    write_watch_offset_deltas(&mut buf, &prover.generator_indices_by_watches)?;
     write_compressed_section(&mut out, &buf);
 
     let mut buf = Vec::with_capacity(4 * watchers.len() + 8);
@@ -450,7 +467,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     let section = read_compressed_section(bytes, &mut pos)?;
     let mut vpos = 0usize;
     let offsets_len = read_uvarint(&section, &mut vpos)? as usize;
-    let mut offsets = Vec::with_capacity(offsets_len);
+    ensure!(offsets_len != 0, "watch index offsets must be non-empty");
     // A representative is watched exactly when its offset differs from the next one, i.e.
     // exactly when the delta decoded for the following index is non-zero -- a bit this loop
     // already holds. Deriving the presence bitmap and the entry count here rather than in
@@ -459,15 +476,19 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // cache-resident, so it is a genuine DRAM re-read.
     let mut watched = empty_watched(offsets_len);
     let mut watch_entries = 0usize;
+    let mut ends = Vec::new();
     let mut running = 0u64;
     for index in 0..offsets_len {
         let delta = read_uvarint(&section, &mut vpos)?;
+        ensure!(index != 0 || delta == 0, "watch index offsets must start at zero");
+        running = running
+            .checked_add(delta)
+            .context("watch index offset sum overflow")?;
         if index > 0 && delta != 0 {
             mark_watched(&mut watched, index - 1);
             watch_entries += 1;
+            ends.push(u32::try_from(running).context("watch index offset exceeds u32")?);
         }
-        running += delta;
-        offsets.push(u32::try_from(running).context("watch index offset exceeds u32")?);
     }
     let section = read_compressed_section(bytes, &mut pos)?;
     let mut vpos = 0usize;
@@ -490,8 +511,16 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         generator_watch_counts[watcher as usize] += 1;
         watchers.push(watcher);
     }
+    ensure!(
+        running as usize == watchers.len(),
+        "watch index offsets must cover the watcher list"
+    );
+    ensure!(
+        ends.len() == watch_entries,
+        "watch index entry count mismatch"
+    );
     let generator_indices_by_watches =
-        GeneratorWatchIndex::from_parts_with_presence(offsets, watchers, watch_entries, watched);
+        GeneratorWatchIndex::from_sparse_parts(offsets_len, ends, watchers, watched);
 
     // constant polynomial values
     let section = read_compressed_section(bytes, &mut pos)?;
@@ -726,6 +755,8 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -798,5 +829,30 @@ mod tests {
         let decoded = read_compressed_section(&framed, &mut pos).unwrap();
         assert_eq!(decoded, input);
         assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn sparse_watch_offsets_preserve_dense_serialized_bytes() {
+        let map = BTreeMap::from([
+            (0usize, vec![2usize]),
+            (1, vec![3, 8]),
+            (63, vec![5]),
+            (64, vec![1, 7, 9]),
+            (130, vec![4]),
+        ]);
+        let index = GeneratorWatchIndex::from_map(map.clone());
+        let mut actual = Vec::new();
+        write_watch_offset_deltas(&mut actual, &index).unwrap();
+
+        let mut expected = Vec::new();
+        write_uvarint(&mut expected, 132);
+        write_uvarint(&mut expected, 0);
+        for representative in 0..=130 {
+            write_uvarint(
+                &mut expected,
+                map.get(&representative).map_or(0, |watchers| watchers.len()) as u64,
+            );
+        }
+        assert_eq!(actual, expected);
     }
 }
