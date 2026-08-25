@@ -1228,6 +1228,7 @@ fn start_gpu_poseidon_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
+    batch: Option<&mut crate::hash::poseidon2::metal::FbQuotientBatch>,
 ) -> Option<(
     usize,
     crate::hash::poseidon2::metal::PoseidonGateQuotientJob<F>,
@@ -1260,18 +1261,33 @@ fn start_gpu_poseidon_gate_quotient<
     // z_1 contributes one term per challenge and the partial-product path
     // contributes `num_partial_products + 1`; all precede gate constraints.
     let alpha_offset = common_data.config.num_challenges * (common_data.num_partial_products + 2);
-    let job = crate::hash::poseidon2::metal::start_poseidon2_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        selector_index,
-        gate_index,
-        group,
-        common_data.selectors_info.num_selectors() > 1,
-        alphas,
-        alpha_offset,
-    )?;
+    let job = match batch {
+        Some(batch) => crate::hash::poseidon2::metal::start_poseidon2_gate_quotient_in_batch(
+            batch,
+            wires,
+            constants,
+            quotient_rows,
+            step,
+            selector_index,
+            gate_index,
+            group,
+            common_data.selectors_info.num_selectors() > 1,
+            alphas,
+            alpha_offset,
+        ),
+        None => crate::hash::poseidon2::metal::start_poseidon2_gate_quotient(
+            wires,
+            constants,
+            quotient_rows,
+            step,
+            selector_index,
+            gate_index,
+            group,
+            common_data.selectors_info.num_selectors() > 1,
+            alphas,
+            alpha_offset,
+        ),
+    }?;
     let started = GPU_POSEIDON_QUOTIENT_STARTED.fetch_add(1, Ordering::Relaxed) + 1;
     log::info!(
         "Metal Poseidon2 gate quotient active: started={started}, gate={gate_index}, \
@@ -1884,7 +1900,7 @@ pub fn range_quotient_microbench<
     let even = wires_commitment.even_columns.get();
     let constants = prover_data.constants_sigmas_commitment.merkle_tree.shared_columns().expect("metal constants");
     // Build specs exactly as start_gpu_range_check_gate_quotient does, by calling it (split may be on).
-    let Some((_gates, jobs)) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas) else {
+    let Some((_gates, jobs)) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas, None) else {
         eprintln!("[qmb] range job declined"); return;
     };
     drop(jobs);
@@ -1897,7 +1913,7 @@ pub fn range_quotient_microbench<
         // Whole job = production path with split disabled: emulate by calling metal directly
         // through start_gpu_range_check_gate_quotient with LIGHTER_QSPLIT=0 semantics is not
         // possible per-call; so we rely on the caller running this harness twice (QSPLIT=0/1).
-        let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, q, st, &alphas)?;
+        let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, q, st, &alphas, None)?;
         match &jobs {
             RangeQuotientJobs::Whole(job) => { job.finish().ok()?; }
             RangeQuotientJobs::Split { low, high, .. } => { low.finish().ok()?; if let Some(h) = high { h.finish().ok()?; } }
@@ -1907,14 +1923,14 @@ pub fn range_quotient_microbench<
     time(&format!("production range job (split={}) full rows", range_quotient_split_enabled()), &|| run_whole(quotient_rows, step));
     // Split pieces individually + CPU extension.
     if let Some((_g, RangeQuotientJobs::Split { low, low_gates, low_rows, high })) =
-        start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)
+        start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas, None
     {
         let _ = (wires, even);
         low.finish().ok();
         if let Some(h) = &high { h.finish().ok(); }
         time("  low job only (re-dispatched)", &|| {
             let t = std::time::Instant::now();
-            let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas)?;
+            let (_g, jobs) = start_gpu_range_check_gate_quotient(common_data, prover_data, &wires_commitment, quotient_rows, step, &alphas, None)?;
             if let RangeQuotientJobs::Split { low, .. } = &jobs { low.finish().ok()?; }
             Some(t.elapsed().as_secs_f64() * 1e3)
         });
@@ -1970,6 +1986,7 @@ fn start_gpu_range_check_gate_quotient<
     quotient_rows: usize,
     step: usize,
     alphas: &[F],
+    mut batch: Option<&mut crate::hash::poseidon2::metal::FbQuotientBatch>,
 ) -> Option<(Vec<usize>, RangeQuotientJobs<F>)> {
     use core::sync::atomic::Ordering;
     use crate::gates::equality_base::EqualityGate;
@@ -2460,28 +2477,54 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
         if !low_groups.is_empty() {
-            if let Some(low) = crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
-                even_wires,
-                even_constants.unwrap_or(constants),
-                quotient_rows / 2,
-                1,
-                &low_groups,
-                alphas,
-                alpha_offset,
-            ) {
+            let low = match batch.as_deref_mut() {
+                Some(batch) => crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi_in_batch(
+                    batch,
+                    even_wires,
+                    even_constants.unwrap_or(constants),
+                    quotient_rows / 2,
+                    1,
+                    &low_groups,
+                    alphas,
+                    alpha_offset,
+                ),
+                None => crate::hash::poseidon2::metal::start_range_check_gate_quotient_multi(
+                    even_wires,
+                    even_constants.unwrap_or(constants),
+                    quotient_rows / 2,
+                    1,
+                    &low_groups,
+                    alphas,
+                    alpha_offset,
+                ),
+            };
+            if let Some(low) = low {
                 let high = if high_specs.is_empty() && high_u32_specs.is_empty() {
                     None
                 } else {
-                    crate::hash::poseidon2::metal::start_range_check_gate_quotient(
-                        wires,
-                        constants,
-                        quotient_rows,
-                        step,
-                        &high_specs,
-                        &high_u32_specs,
-                        alphas,
-                        alpha_offset,
-                    )
+                    match batch.as_deref_mut() {
+                        Some(batch) => crate::hash::poseidon2::metal::start_range_check_gate_quotient_in_batch(
+                            batch,
+                            wires,
+                            constants,
+                            quotient_rows,
+                            step,
+                            &high_specs,
+                            &high_u32_specs,
+                            alphas,
+                            alpha_offset,
+                        ),
+                        None => crate::hash::poseidon2::metal::start_range_check_gate_quotient(
+                            wires,
+                            constants,
+                            quotient_rows,
+                            step,
+                            &high_specs,
+                            &high_u32_specs,
+                            alphas,
+                            alpha_offset,
+                        ),
+                    }
                 };
                 if high.is_some() || (high_specs.is_empty() && high_u32_specs.is_empty()) {
                     split_job = Some(RangeQuotientJobs::Split {
@@ -2494,18 +2537,39 @@ fn start_gpu_range_check_gate_quotient<
             }
         }
     }
+    // Preserve the parent's laziness: the whole-domain dispatch is encoded
+    // only when the half-domain split did not already produce a job,
+    // otherwise every split-path proof would carry a redundant dispatch.
+    let whole_job = if split_job.is_none() {
+        match batch.as_deref_mut() {
+        Some(batch) => crate::hash::poseidon2::metal::start_range_check_gate_quotient_in_batch(
+            batch,
+            wires,
+            constants,
+            quotient_rows,
+            step,
+            &specs,
+            &u32_specs,
+            alphas,
+            alpha_offset,
+        ),
+        None => crate::hash::poseidon2::metal::start_range_check_gate_quotient(
+            wires,
+            constants,
+            quotient_rows,
+            step,
+            &specs,
+            &u32_specs,
+            alphas,
+            alpha_offset,
+        ),
+        }
+    } else {
+        None
+    };
     let job = if let Some(job) = split_job {
         job
-    } else if let Some(job) = crate::hash::poseidon2::metal::start_range_check_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &specs,
-        &u32_specs,
-        alphas,
-        alpha_offset,
-    ) {
+    } else if let Some(job) = whole_job {
         RangeQuotientJobs::Whole(job)
     } else {
         if gpu_poseidon_quotient_diagnostics_enabled() {
@@ -2553,6 +2617,7 @@ fn start_gpu_permutation_quotient<
     gammas: &[F],
     beta_k_is: &[F],
     alphas: &[F],
+    batch: Option<&mut crate::hash::poseidon2::metal::FbQuotientBatch>,
 ) -> Option<crate::hash::poseidon2::metal::PermutationQuotientJob<F>> {
     if common_data.num_lookup_polys != 0 || common_data.config.num_challenges != 2 {
         return None;
@@ -2565,23 +2630,43 @@ fn start_gpu_permutation_quotient<
     let zs_partial_products = zs_partial_products_commitment
         .merkle_tree
         .shared_columns()?;
-    let job = crate::hash::poseidon2::metal::start_permutation_quotient(
-        wires,
-        constants_sigmas,
-        zs_partial_products,
-        shifted_points,
-        quotient_rows,
-        step,
-        next_step,
-        common_data.sigmas_range().start,
-        common_data.config.num_routed_wires,
-        common_data.num_partial_products,
-        common_data.quotient_degree_factor,
-        betas,
-        gammas,
-        beta_k_is,
-        alphas,
-    )?;
+    let job = match batch {
+        Some(batch) => crate::hash::poseidon2::metal::start_permutation_quotient_in_batch(
+            batch,
+            wires,
+            constants_sigmas,
+            zs_partial_products,
+            shifted_points,
+            quotient_rows,
+            step,
+            next_step,
+            common_data.sigmas_range().start,
+            common_data.config.num_routed_wires,
+            common_data.num_partial_products,
+            common_data.quotient_degree_factor,
+            betas,
+            gammas,
+            beta_k_is,
+            alphas,
+        ),
+        None => crate::hash::poseidon2::metal::start_permutation_quotient(
+            wires,
+            constants_sigmas,
+            zs_partial_products,
+            shifted_points,
+            quotient_rows,
+            step,
+            next_step,
+            common_data.sigmas_range().start,
+            common_data.config.num_routed_wires,
+            common_data.num_partial_products,
+            common_data.quotient_degree_factor,
+            betas,
+            gammas,
+            beta_k_is,
+            alphas,
+        ),
+    }?;
     if gpu_poseidon_quotient_diagnostics_enabled() {
         eprintln!(
             "[gpu-permutation-quotient] active rows={quotient_rows} step={step} \
@@ -2664,51 +2749,78 @@ fn compute_quotient_polys<
     );
     let lde_mask = lde_size - 1;
 
+    // The three GPU quotient launches below start back-to-back from this one
+    // point with all inputs resident, yet each historically opened and
+    // committed its own command buffer. On the final block (degree_bits 18)
+    // the fb-tail profile (`exp-fb-quotient-station-hold`) attributes 5.1-7.1
+    // s of the tail to submit->scheduled delivery of those separately
+    // committed buffers while their combined kernel time is only ~0.4 s, so
+    // the fb variants encode into one shared command buffer with a single
+    // commit (`FbQuotientBatch`). Dispatch arguments, shader order, output
+    // buffers and every job's finish() wait are unchanged; each job simply
+    // waits on the one shared buffer. Kill-switch: LIGHTER_FB_ONEBUF=0.
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_poseidon = allow_gpu_poseidon
-        .then(|| {
-            start_gpu_poseidon_gate_quotient(
-                common_data,
-                prover_data,
-                wires_commitment,
-                lde_size,
-                step,
-                alphas,
-            )
-        })
+    let mut fb_quotient_batch = (allow_gpu_poseidon
+        && common_data.degree_bits() == 18
+        && crate::hash::poseidon2::metal::fb_quotient_onebuf_enabled())
+        .then(crate::hash::poseidon2::metal::start_fb_quotient_batch)
         .flatten();
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_range = allow_gpu_poseidon
-        .then(|| {
-            start_gpu_range_check_gate_quotient(
-                common_data,
-                prover_data,
-                wires_commitment,
-                lde_size,
-                step,
-                alphas,
-            )
-        })
-        .flatten();
+    let gpu_poseidon = if allow_gpu_poseidon {
+        start_gpu_poseidon_gate_quotient(
+            common_data,
+            prover_data,
+            wires_commitment,
+            lde_size,
+            step,
+            alphas,
+            fb_quotient_batch.as_mut(),
+        )
+    } else {
+        None
+    };
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
-    let gpu_permutation = (allow_gpu_poseidon && col_major_perm)
-        .then(|| {
-            start_gpu_permutation_quotient(
-                common_data,
-                prover_data,
-                wires_commitment,
-                zs_partial_products_and_lookup_commitment,
-                &shifted_points,
-                lde_size,
-                step,
-                next_step,
-                betas,
-                gammas,
-                beta_k_is,
-                alphas,
-            )
-        })
-        .flatten();
+    let gpu_range = if allow_gpu_poseidon {
+        start_gpu_range_check_gate_quotient(
+            common_data,
+            prover_data,
+            wires_commitment,
+            lde_size,
+            step,
+            alphas,
+            fb_quotient_batch.as_mut(),
+        )
+    } else {
+        None
+    };
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_permutation = if allow_gpu_poseidon && col_major_perm {
+        start_gpu_permutation_quotient(
+            common_data,
+            prover_data,
+            wires_commitment,
+            zs_partial_products_and_lookup_commitment,
+            &shifted_points,
+            lde_size,
+            step,
+            next_step,
+            betas,
+            gammas,
+            beta_k_is,
+            alphas,
+            fb_quotient_batch.as_mut(),
+        )
+    } else {
+        None
+    };
+    // One commit for everything encoded into the shared final-block buffer.
+    // `FbQuotientBatch::drop` re-commits defensively, so an early `?` exit
+    // between the launches cannot leave a job waiting on an uncommitted
+    // buffer.
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    if let Some(batch) = fb_quotient_batch.as_mut() {
+        batch.commit();
+    }
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let permutation_products_offloaded = gpu_permutation.is_some();
     #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
