@@ -457,18 +457,37 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
     pub fn full_witness(self) -> MatrixWitness<F> {
         // Single fused pass, parallel over row chunks. Cell (column j, row i)
         // is `values[representative_map[i * num_wires + j]]` (unset slots hold
-        // `F::ZERO` in the dense `values` vector), with `Target::index`'s
-        // `row * num_wires + column` inlined as a running cursor. Each
-        // parallel task owns one row range of every column — disjoint
-        // `MaybeUninit` segments carved off the pre-sized column buffers up
-        // front — reads `representative_map` sequentially within its range,
-        // and initializes every cell exactly once before the final `set_len`.
+        // `F::ZERO` in the dense `values` vector). Each task owns one row
+        // range of every column through disjoint `MaybeUninit` segments. The
+        // inner 16x32 tiles keep destination lines/pages bounded while their
+        // representative-map reads stay within a small row window. Every cell
+        // is initialized exactly once before the final `set_len`.
+        const TILE_ROWS: usize = 16;
+        const TILE_COLUMNS: usize = 32;
+
         let num_wires = self.num_wires;
         let degree = self.degree;
         let mut wire_values: Vec<Vec<F>> = (0..num_wires)
             .map(|_| Vec::with_capacity(degree))
             .collect();
-        let num_chunks = 16.min(degree.max(1));
+        // Three row tasks per Rayon worker provide scheduling slack on heterogeneous cores. The env
+        // switch is a diagnostic-only exact rollback to the promoted fixed-16
+        // task policy.
+        #[cfg(all(feature = "parallel", feature = "std"))]
+        let chunk_budget = if std::env::var_os("PLONKY2_FULL_WITNESS_FIXED_16_CHUNKS").is_some() {
+            16
+        } else {
+            plonky2_maybe_rayon::rayon::current_num_threads()
+                .saturating_mul(3)
+                .max(1)
+        };
+        #[cfg(not(all(feature = "parallel", feature = "std")))]
+        let chunk_budget = 16;
+        let num_chunks = if degree == 0 {
+            1
+        } else {
+            degree.min(chunk_budget)
+        };
         let chunk_rows = degree.div_ceil(num_chunks);
         {
             let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
@@ -490,20 +509,31 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
                 .enumerate()
                 .for_each(|(chunk, columns)| {
                     let rows = columns.first().map_or(0, |column| column.len());
-                    let mut wire_index = chunk * chunk_rows * num_wires;
-                    for i in 0..rows {
-                        for column in columns.iter_mut() {
-                            let rep = self.representative_map[wire_index] as usize;
-                            // Bitmap-guarded: unset slots are uninitialized
-                            // storage and must read as F::ZERO (identical to
-                            // the dense-zero representation this replaces).
-                            let value = if self.is_set_by_rep_index(rep) {
-                                self.values[rep]
-                            } else {
-                                F::ZERO
-                            };
-                            column[i].write(value);
-                            wire_index += 1;
+                    for row_start in (0..rows).step_by(TILE_ROWS) {
+                        let row_end = (row_start + TILE_ROWS).min(rows);
+                        for (column_chunk, tile_columns) in
+                            columns.chunks_mut(TILE_COLUMNS).enumerate()
+                        {
+                            let column_start = column_chunk * TILE_COLUMNS;
+                            let tile_width = tile_columns.len();
+                            let mut wire_index =
+                                (chunk * chunk_rows + row_start) * num_wires + column_start;
+                            for row in row_start..row_end {
+                                for column in tile_columns.iter_mut() {
+                                    let rep = self.representative_map[wire_index] as usize;
+                                    // Bitmap-guarded: unset slots are uninitialized
+                                    // storage and must read as F::ZERO (identical to
+                                    // the dense-zero representation this replaces).
+                                    let value = if self.is_set_by_rep_index(rep) {
+                                        self.values[rep]
+                                    } else {
+                                        F::ZERO
+                                    };
+                                    column[row].write(value);
+                                    wire_index += 1;
+                                }
+                                wire_index += num_wires - tile_width;
+                            }
                         }
                     }
                 });
@@ -518,6 +548,7 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
 
         MatrixWitness { wire_values }
     }
+
     #[allow(dead_code)]
     fn full_witness_serial_reference(self) -> MatrixWitness<F> {
         let mut wire_values: Vec<Vec<F>> = (0..self.num_wires)
@@ -540,6 +571,109 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         }
 
         MatrixWitness { wire_values }
+    }
+}
+
+#[cfg(test)]
+mod full_witness_tiling_tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    fn assert_matches_serial(
+        num_wires: usize,
+        degree: usize,
+        all_unset: bool,
+        virtual_tail: usize,
+    ) {
+        let wire_len = num_wires * degree;
+        let value_len = wire_len + virtual_tail;
+        let representative_map: Vec<u32> = if wire_len == 0 {
+            Vec::new()
+        } else {
+            (0..wire_len)
+                .map(|i| ((i * 17 + 3) % value_len) as u32)
+                .collect()
+        };
+        // Nonzero sentinels in unset slots ensure the bitmap guard, rather
+        // than their backing storage, supplies zero. Some set slots hold an
+        // explicit zero as well. Extra slots model virtual-target roots that
+        // wire representatives can validly reference.
+        let values: Vec<GoldilocksField> = (0..value_len)
+            .map(|i| {
+                if i % 11 == 0 {
+                    GoldilocksField::ZERO
+                } else {
+                    GoldilocksField::from_canonical_usize(i + 1)
+                }
+            })
+            .collect();
+        let mut set_bitmap = vec![0u64; value_len.div_ceil(64)];
+        if !all_unset {
+            for i in (0..value_len).filter(|i| i % 3 != 0) {
+                set_bitmap[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        let witness = PartitionWitness {
+            values,
+            set_bitmap,
+            representative_map: &representative_map,
+            num_wires,
+            degree,
+        };
+
+        let expected = witness.clone().full_witness_serial_reference();
+        let actual = witness.full_witness();
+        assert_eq!(actual.wire_values, expected.wire_values);
+    }
+
+    #[test]
+    fn full_witness_tiling_matches_serial_reference() {
+        // Zero rows/wires, all-unset storage, both sides of the tile widths,
+        // representatives rooted in the virtual-target tail, row tiles larger
+        // than one iteration, and empty trailing Rayon chunks.
+        let cases = [
+            (0, 0, false, 0),
+            (0, 17, true, 0),
+            (4, 0, false, 0),
+            (3, 1, true, 7),
+            (31, 15, false, 17),
+            (32, 16, false, 17),
+            (33, 17, false, 17),
+            (136, 257, false, 31),
+            (136, 1025, false, 31),
+        ];
+        #[cfg(all(feature = "parallel", feature = "std"))]
+        for threads in [1, 14] {
+            plonky2_maybe_rayon::rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    for &(num_wires, degree, all_unset, virtual_tail) in &cases {
+                        assert_matches_serial(num_wires, degree, all_unset, virtual_tail);
+                    }
+                });
+        }
+        #[cfg(not(all(feature = "parallel", feature = "std")))]
+        for (num_wires, degree, all_unset, virtual_tail) in cases {
+            assert_matches_serial(num_wires, degree, all_unset, virtual_tail);
+        }
+    }
+
+    #[test]
+    fn full_witness_tiling_zeroes_uninitialized_unset_slots() {
+        let num_wires = 7;
+        let degree = 17;
+        let representative_map: Vec<u32> = (0..num_wires * degree).map(|i| i as u32).collect();
+        let matrix =
+            PartitionWitness::<GoldilocksField>::new(num_wires, degree, &representative_map)
+                .full_witness();
+
+        assert!(matrix
+            .wire_values
+            .iter()
+            .flatten()
+            .all(|&value| value == GoldilocksField::ZERO));
     }
 }
 
