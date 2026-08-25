@@ -1,7 +1,5 @@
-// Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
-// reuse in the comparison/u16 arithmetic gate generators (per-call allocation
-// elimination previously described in this account's fable-ps notes).
-// Marker bumped only for a fresh submission hash; no behavior change vs the prior fable-ps draws.
+// base4-spread-stage-15-r1 1787667800001 (inert)
+// Isolated leftover: BASE4_SPREAD_STAGE 11->15 (interleave fused reduce).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

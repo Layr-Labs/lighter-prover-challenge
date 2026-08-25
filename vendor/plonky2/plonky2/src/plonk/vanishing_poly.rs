@@ -238,8 +238,8 @@ const INTERLEAVE_PAIR_STACK_BATCH: usize = 32;
 /// How many base-4 spread bits may share one delayed reduction. A stage seeded
 /// by a sub-`2^64` representative and running `k` steps holds at most
 /// `(2^64 - 1)(4·4^k - 1)/3`, which stays under `2^96` exactly while
-/// `k <= 15`; `11` splits the 32-bit chain into 11/11/10 with wide margin.
-const BASE4_SPREAD_STAGE: usize = 11;
+/// `k <= 15`; `15` is the largest k under the 2^96 bit-identical bound (15/15/2).
+const BASE4_SPREAD_STAGE: usize = 15;
 const _: () = assert!(BASE4_SPREAD_STAGE <= 15 && BASE4_SPREAD_STAGE > 0);
 
 /// Proof-local recognition of the exact CPU-owned pair used by the ranked
