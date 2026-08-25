@@ -8,14 +8,12 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 #[cfg(feature = "diagnostic_profile")]
 use block::ConcreteBlock;
 #[cfg(feature = "diagnostic_profile")]
-use metal::CommandBufferRef;
-#[cfg(feature = "diagnostic_profile")]
 use objc::runtime::Sel;
 #[cfg(feature = "diagnostic_profile")]
 use objc::Message;
 use metal::{
-    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandQueue, CompileOptions,
-    ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
+    BinaryArchive, BinaryArchiveDescriptor, Buffer, CommandBuffer, CommandBufferRef, CommandQueue,
+    CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, MTLCommandBufferStatus,
     MTLPipelineOption, MTLResourceOptions, MTLSize, NSUInteger, URL,
 };
 use objc::rc::autoreleasepool;
@@ -505,6 +503,19 @@ impl Drop for ForceRangeQuotientFinishFailureGuard {
             fault.borrow_mut().take();
         });
     }
+}
+
+#[cfg(test)]
+fn capture_range_failure_observer() -> Option<Arc<RangeQuotientFailureObserver>> {
+    FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
+        let observer = fault.borrow().clone();
+        if let Some(observer) = &observer {
+            observer
+                .captured
+                .store(true, core::sync::atomic::Ordering::Relaxed);
+        }
+        observer
+    })
 }
 impl<F: RichField> PoseidonGateQuotientJob<F> {
     pub(crate) fn finish(&self) -> Result<&[F], String> {
@@ -1841,11 +1852,163 @@ pub(crate) fn build_merkle_tree_columns<F: RichField>(
     }
 }
 
+/// Whether the final-block quotient dispatches share one command buffer.
+///
+/// The fb tail measurement (`exp-fb-quotient-station-hold`) attributes
+/// 5.1-7.1 s of the tail to submit->scheduled delivery of separately
+/// committed quotient command buffers whose combined kernel time is only
+/// ~0.4 s. This switch is the kill-switch for the one-command-buffer
+/// submission path; it defaults to enabled because the ranked host is the
+/// only place the effect can be measured.
+pub(crate) fn fb_quotient_onebuf_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        match std::env::var("LIGHTER_FB_ONEBUF").as_deref() {
+            Ok("0") | Ok("off") | Ok("false") => false,
+            _ => true,
+        }
+    });
+    *ENABLED
+}
+
+/// A single command buffer shared by every simultaneously-started final-block
+/// quotient dispatch.
+///
+/// The poseidon gate, range/U32 (whole or split) and permutation quotient
+/// jobs are started back-to-back from one point in `compute_quotient_polys`
+/// with all of their inputs already resident, yet historically each opened
+/// and committed its own command buffer. The fb-tail profile shows that
+/// delivery latency, not kernel execution, dominates that stretch, so this
+/// batch lets those dispatches share one command buffer and one commit while
+/// each job keeps its own output buffer, completion wait and pool
+/// recycling. Dispatch arguments, shader order within the buffer, output
+/// values and the finish() contract of every job type are unchanged; only
+/// the number of command-buffer commits changes.
+pub(crate) struct FbQuotientBatch {
+    context: &'static MetalShared,
+    command_buffer: CommandBuffer,
+    encoded: bool,
+    committed: bool,
+}
+
+/// Opens the shared final-block quotient command buffer. Returns `None` when
+/// the Metal context is unavailable, exactly like every other GPU start.
+pub(crate) fn start_fb_quotient_batch() -> Option<FbQuotientBatch> {
+    let context = shared_context()?;
+    let command_buffer =
+        autoreleasepool(|| -> CommandBuffer { context.queue.new_command_buffer().to_owned() });
+    Some(FbQuotientBatch {
+        context,
+        command_buffer,
+        encoded: false,
+        committed: false,
+    })
+}
+
+impl FbQuotientBatch {
+    #[inline]
+    fn command_buffer(&self) -> &CommandBufferRef {
+        &self.command_buffer
+    }
+
+    #[inline]
+    fn command_buffer_owned(&self) -> CommandBuffer {
+        self.command_buffer.clone()
+    }
+
+    #[inline]
+    fn note_encoded(&mut self) {
+        self.encoded = true;
+    }
+
+    /// Commits the shared command buffer once, after every dispatch that will
+    /// participate has been encoded. Idempotent; safe to call when nothing
+    /// was encoded.
+    pub(crate) fn commit(&mut self) {
+        if self.encoded && !self.committed {
+            autoreleasepool(|| {
+                self.command_buffer.commit();
+            });
+            self.committed = true;
+        }
+    }
+}
+
+impl Drop for FbQuotientBatch {
+    fn drop(&mut self) {
+        // Safety net: a job holding a clone of this command buffer must never
+        // observe a buffer that was never committed, because finish() would
+        // wait forever. Commit anything encoded even on an early-error path;
+        // committing costs no wait.
+        self.commit();
+    }
+}
+
 /// Starts a whole-domain Poseidon2Gate evaluation over retained natural-order
 /// LDE columns. `alpha_offset` is the number of non-gate vanishing terms that
 /// precede the gate constraints in the global alpha reduction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    selector_column: usize,
+    gate_index: usize,
+    group: core::ops::Range<usize>,
+    include_unused_selector: bool,
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<PoseidonGateQuotientJob<F>> {
+    start_poseidon2_gate_quotient_inner(
+        None,
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        selector_column,
+        gate_index,
+        group,
+        include_unused_selector,
+        alphas,
+        alpha_offset,
+    )
+}
+
+/// Batch twin of [`start_poseidon2_gate_quotient`]: encodes the same dispatch
+/// onto the shared final-block quotient command buffer instead of a dedicated
+/// one. The job's completion wait covers every dispatch in that buffer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_poseidon2_gate_quotient_in_batch<F: RichField>(
+    batch: &mut FbQuotientBatch,
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    selector_column: usize,
+    gate_index: usize,
+    group: core::ops::Range<usize>,
+    include_unused_selector: bool,
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<PoseidonGateQuotientJob<F>> {
+    start_poseidon2_gate_quotient_inner(
+        Some(batch),
+        wires,
+        constants,
+        quotient_rows,
+        step,
+        selector_column,
+        gate_index,
+        group,
+        include_unused_selector,
+        alphas,
+        alpha_offset,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_poseidon2_gate_quotient_inner<F: RichField>(
+    batch: Option<&mut FbQuotientBatch>,
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
     quotient_rows: usize,
@@ -1891,18 +2054,50 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
         }
     }
 
-    let context = shared_context()?;
-    match context.start_poseidon2_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        selector_column,
-        gate_index,
-        group,
-        include_unused_selector,
-        &alpha_powers,
-    ) {
+    let result = match batch {
+        Some(batch) => {
+            let context = batch.context;
+            let job_guard = GpuJobGuard::begin();
+            let encoded = context.encode_poseidon2_gate_quotient(
+                batch.command_buffer(),
+                wires,
+                constants,
+                quotient_rows,
+                step,
+                selector_column,
+                gate_index,
+                group,
+                include_unused_selector,
+                &alpha_powers,
+            );
+            match encoded {
+                Ok((output, len)) => {
+                    batch.note_encoded();
+                    Ok(PoseidonGateQuotientJob {
+                        command_buffer: batch.command_buffer_owned(),
+                        output: Some(output),
+                        output_pool: Arc::clone(&context.quotient_output_pool),
+                        len,
+                        _job: job_guard,
+                        _phantom: PhantomData,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        None => shared_context()?.start_poseidon2_gate_quotient(
+            wires,
+            constants,
+            quotient_rows,
+            step,
+            selector_column,
+            gate_index,
+            group,
+            include_unused_selector,
+            &alpha_powers,
+        ),
+    };
+    match result {
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!("Metal Poseidon2 gate quotient unavailable; using CPU path: {error}");
@@ -1916,6 +2111,86 @@ pub(crate) fn start_poseidon2_gate_quotient<F: RichField>(
 /// the CPU; this job emits their successors at global alpha powers 2 onward.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_permutation_quotient<F: RichField>(
+    wires: &MetalColumns<F>,
+    constants_sigmas: &MetalColumns<F>,
+    zs_partial_products: &MetalColumns<F>,
+    shifted_points: &[F],
+    quotient_rows: usize,
+    step: usize,
+    next_step: usize,
+    sigma_start: usize,
+    num_routed_wires: usize,
+    num_partial_products: usize,
+    chunk_size: usize,
+    betas: &[F],
+    gammas: &[F],
+    beta_k_is: &[F],
+    alphas: &[F],
+) -> Option<PermutationQuotientJob<F>> {
+    start_permutation_quotient_inner(
+        None,
+    wires,
+    constants_sigmas,
+    zs_partial_products,
+    shifted_points,
+    quotient_rows,
+    step,
+    next_step,
+    sigma_start,
+    num_routed_wires,
+    num_partial_products,
+    chunk_size,
+    betas,
+    gammas,
+    beta_k_is,
+    alphas,
+    )
+}
+
+/// Batch twin of [`start_permutation_quotient`]; see
+/// [`start_poseidon2_gate_quotient_in_batch`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_permutation_quotient_in_batch<F: RichField>(
+    batch: &mut FbQuotientBatch,
+    wires: &MetalColumns<F>,
+    constants_sigmas: &MetalColumns<F>,
+    zs_partial_products: &MetalColumns<F>,
+    shifted_points: &[F],
+    quotient_rows: usize,
+    step: usize,
+    next_step: usize,
+    sigma_start: usize,
+    num_routed_wires: usize,
+    num_partial_products: usize,
+    chunk_size: usize,
+    betas: &[F],
+    gammas: &[F],
+    beta_k_is: &[F],
+    alphas: &[F],
+) -> Option<PermutationQuotientJob<F>> {
+    start_permutation_quotient_inner(
+        Some(batch),
+    wires,
+    constants_sigmas,
+    zs_partial_products,
+    shifted_points,
+    quotient_rows,
+    step,
+    next_step,
+    sigma_start,
+    num_routed_wires,
+    num_partial_products,
+    chunk_size,
+    betas,
+    gammas,
+    beta_k_is,
+    alphas,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_permutation_quotient_inner<F: RichField>(
+    batch: Option<&mut FbQuotientBatch>,
     wires: &MetalColumns<F>,
     constants_sigmas: &MetalColumns<F>,
     zs_partial_products: &MetalColumns<F>,
@@ -1987,23 +2262,60 @@ pub(crate) fn start_permutation_quotient<F: RichField>(
     challenges.extend(gammas.iter().map(|x| x.to_canonical_u64()));
     challenges.extend(beta_k_is.iter().map(|x| x.to_canonical_u64()));
 
-    let context = shared_context()?;
-    match context.start_permutation_quotient(
-        wires,
-        constants_sigmas,
-        zs_partial_products,
-        shifted_points,
-        quotient_rows,
-        step,
-        next_step,
-        sigma_start,
-        num_routed_wires,
-        num_partial_products,
-        chunk_size,
-        &alpha_powers,
-        alpha_stride,
-        &challenges,
-    ) {
+    let result = match batch {
+        Some(batch) => {
+            let context = batch.context;
+            let job_guard = GpuJobGuard::begin();
+            let encoded = context.encode_permutation_quotient(
+                batch.command_buffer(),
+                wires,
+                constants_sigmas,
+                zs_partial_products,
+                shifted_points,
+                quotient_rows,
+                step,
+                next_step,
+                sigma_start,
+                num_routed_wires,
+                num_partial_products,
+                chunk_size,
+                &alpha_powers,
+                alpha_stride,
+                &challenges,
+            );
+            match encoded {
+                Ok((output, len)) => {
+                    batch.note_encoded();
+                    Ok(PermutationQuotientJob {
+                        command_buffer: batch.command_buffer_owned(),
+                        output: Some(output),
+                        output_pool: Arc::clone(&context.quotient_output_pool),
+                        len,
+                        _job: job_guard,
+                        _phantom: PhantomData,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        None => shared_context()?.start_permutation_quotient(
+            wires,
+            constants_sigmas,
+            zs_partial_products,
+            shifted_points,
+            quotient_rows,
+            step,
+            next_step,
+            sigma_start,
+            num_routed_wires,
+            num_partial_products,
+            chunk_size,
+            &alpha_powers,
+            alpha_stride,
+            &challenges,
+        ),
+    };
+    match result {
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!("Metal permutation quotient unavailable; using CPU path: {error}");
@@ -2056,24 +2368,110 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
     alphas: &[F],
     alpha_offset: usize,
 ) -> Option<RangeCheckGateQuotientJob<F>> {
+    start_range_check_gate_quotient_inner(
+        None,
+    wires,
+    constants,
+    quotient_rows,
+    step,
+    specs,
+    u32_specs,
+    alphas,
+    alpha_offset,
+    )
+}
+
+/// Batch twin of [`start_range_check_gate_quotient`]; see
+/// [`start_poseidon2_gate_quotient_in_batch`].
+pub(crate) fn start_range_check_gate_quotient_in_batch<F: RichField>(
+    batch: &mut FbQuotientBatch,
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    specs: &[RangeCheckQuotientSpec],
+    u32_specs: &[U32QuotientSpec],
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<RangeCheckGateQuotientJob<F>> {
+    start_range_check_gate_quotient_inner(
+        Some(batch),
+    wires,
+    constants,
+    quotient_rows,
+    step,
+    specs,
+    u32_specs,
+    alphas,
+    alpha_offset,
+    )
+}
+
+fn start_range_check_gate_quotient_inner<F: RichField>(
+    batch: Option<&mut FbQuotientBatch>,
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    specs: &[RangeCheckQuotientSpec],
+    u32_specs: &[U32QuotientSpec],
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<RangeCheckGateQuotientJob<F>> {
     if !range_quotient_shape_ok(wires, constants, quotient_rows, step, alphas) {
         return None;
     }
     let args = build_range_quotient_dispatch_args(
         wires, constants, specs, u32_specs, alphas, alpha_offset,
     )?;
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &args.metadata,
-        specs.len(),
-        u32_specs.len(),
-        &args.alpha_powers,
-        args.alpha_stride,
-    ) {
+    let result = match batch {
+        Some(batch) => {
+            let context = batch.context;
+            let job_guard = GpuJobGuard::begin();
+            let encoded = context.encode_range_check_gate_quotient(
+                batch.command_buffer(),
+                wires,
+                constants,
+                quotient_rows,
+                step,
+                &args.metadata,
+                specs.len(),
+                u32_specs.len(),
+                &args.alpha_powers,
+                args.alpha_stride,
+            );
+            match encoded {
+                Ok((output, len)) => {
+                    batch.note_encoded();
+                    #[cfg(test)]
+                    let failure_observer = capture_range_failure_observer();
+                    Ok(RangeCheckGateQuotientJob {
+                        command_buffer: batch.command_buffer_owned(),
+                        output: Some(output),
+                        output_pool: Arc::clone(&context.quotient_output_pool),
+                        len,
+                        #[cfg(test)]
+                        failure_observer,
+                        _job: job_guard,
+                        _phantom: PhantomData,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        None => shared_context()?.start_range_check_gate_quotient(
+            wires,
+            constants,
+            quotient_rows,
+            step,
+            &args.metadata,
+            specs.len(),
+            u32_specs.len(),
+            &args.alpha_powers,
+            args.alpha_stride,
+        ),
+    };
+    match result {
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!("Metal RangeCheck gate quotient unavailable; using CPU path: {error}");
@@ -2089,6 +2487,52 @@ pub(crate) fn start_range_check_gate_quotient<F: RichField>(
 /// `(quotient_rows, step)` sub-domain, so a group's slice is exactly what the
 /// single-dispatch job would have produced for those specs alone.
 pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    groups: &[(Vec<RangeCheckQuotientSpec>, Vec<U32QuotientSpec>)],
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<RangeCheckGateQuotientJob<F>> {
+    start_range_check_gate_quotient_multi_inner(
+        None,
+    wires,
+    constants,
+    quotient_rows,
+    step,
+    groups,
+    alphas,
+    alpha_offset,
+    )
+}
+
+/// Batch twin of [`start_range_check_gate_quotient_multi`]; see
+/// [`start_poseidon2_gate_quotient_in_batch`].
+pub(crate) fn start_range_check_gate_quotient_multi_in_batch<F: RichField>(
+    batch: &mut FbQuotientBatch,
+    wires: &MetalColumns<F>,
+    constants: &MetalColumns<F>,
+    quotient_rows: usize,
+    step: usize,
+    groups: &[(Vec<RangeCheckQuotientSpec>, Vec<U32QuotientSpec>)],
+    alphas: &[F],
+    alpha_offset: usize,
+) -> Option<RangeCheckGateQuotientJob<F>> {
+    start_range_check_gate_quotient_multi_inner(
+        Some(batch),
+    wires,
+    constants,
+    quotient_rows,
+    step,
+    groups,
+    alphas,
+    alpha_offset,
+    )
+}
+
+fn start_range_check_gate_quotient_multi_inner<F: RichField>(
+    batch: Option<&mut FbQuotientBatch>,
     wires: &MetalColumns<F>,
     constants: &MetalColumns<F>,
     quotient_rows: usize,
@@ -2124,14 +2568,46 @@ pub(crate) fn start_range_check_gate_quotient_multi<F: RichField>(
         )?;
         dispatches.push((args, specs.len(), u32_specs.len()));
     }
-    let context = shared_context()?;
-    match context.start_range_check_gate_quotient_multi(
-        wires,
-        constants,
-        quotient_rows,
-        step,
-        &dispatches,
-    ) {
+    let result = match batch {
+        Some(batch) => {
+            let context = batch.context;
+            let job_guard = GpuJobGuard::begin();
+            let encoded = context.encode_range_check_gate_quotient_multi(
+                batch.command_buffer(),
+                wires,
+                constants,
+                quotient_rows,
+                step,
+                &dispatches,
+            );
+            match encoded {
+                Ok((output, len)) => {
+                    batch.note_encoded();
+                    #[cfg(test)]
+                    let failure_observer = None;
+                    Ok(RangeCheckGateQuotientJob {
+                        command_buffer: batch.command_buffer_owned(),
+                        output: Some(output),
+                        output_pool: Arc::clone(&context.quotient_output_pool),
+                        len,
+                        #[cfg(test)]
+                        failure_observer,
+                        _job: job_guard,
+                        _phantom: PhantomData,
+                    })
+                }
+                Err(error) => Err(error),
+            }
+        }
+        None => shared_context()?.start_range_check_gate_quotient_multi(
+            wires,
+            constants,
+            quotient_rows,
+            step,
+            &dispatches,
+        ),
+    };
+    match result {
         Ok(job) => Some(job),
         Err(error) => {
             log::warn!(
@@ -3113,6 +3589,53 @@ impl MetalShared {
         include_unused_selector: bool,
         alpha_powers: &[u64],
     ) -> Result<PoseidonGateQuotientJob<F>, String> {
+        let job_guard = GpuJobGuard::begin();
+        let (command_buffer, output, len) =
+            autoreleasepool(|| -> Result<(CommandBuffer, Buffer, usize), String> {
+                let command_buffer = self.queue.new_command_buffer();
+                let (output, len) = self.encode_poseidon2_gate_quotient(
+                    command_buffer,
+                    wires,
+                    constants,
+                    quotient_rows,
+                    step,
+                    selector_column,
+                    gate_index,
+                    group,
+                    include_unused_selector,
+                    alpha_powers,
+                )?;
+                command_buffer.commit();
+                Ok((command_buffer.to_owned(), output, len))
+            })?;
+        Ok(PoseidonGateQuotientJob {
+            command_buffer,
+            output: Some(output),
+            output_pool: Arc::clone(&self.quotient_output_pool),
+            len,
+            _job: job_guard,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Encodes one whole-domain Poseidon2Gate quotient dispatch onto
+    /// `command_buffer` without committing it, so a caller may share the
+    /// command buffer with other final-block quotient dispatches. Bindings,
+    /// dispatch and diagnostics are exactly those of the standalone job.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_poseidon2_gate_quotient<F: RichField>(
+        &self,
+        command_buffer: &CommandBufferRef,
+        wires: &MetalColumns<F>,
+        constants: &MetalColumns<F>,
+        quotient_rows: usize,
+        step: usize,
+        selector_column: usize,
+        gate_index: usize,
+        group: core::ops::Range<usize>,
+        include_unused_selector: bool,
+        alpha_powers: &[u64],
+    ) -> Result<(Buffer, usize), String> {
         let pipeline = poseidon_gate_quotient_pipeline()
             .ok_or("Poseidon2 gate quotient pipeline unavailable")?;
         let len = quotient_rows
@@ -3122,9 +3645,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("Poseidon2 gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+        autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -3152,20 +3673,10 @@ impl MetalShared {
                 "poseidon_quotient",
                 (quotient_rows * (group.end - group.start)) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
         });
-        Ok(PoseidonGateQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
+        Ok((output, len))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn start_range_check_gate_quotient<F: RichField>(
         &self,
         wires: &MetalColumns<F>,
@@ -3178,6 +3689,56 @@ impl MetalShared {
         alpha_powers: &[u64],
         alpha_stride: usize,
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
+        let job_guard = GpuJobGuard::begin();
+        let (command_buffer, output, len) =
+            autoreleasepool(|| -> Result<(CommandBuffer, Buffer, usize), String> {
+                let command_buffer = self.queue.new_command_buffer();
+                let (output, len) = self.encode_range_check_gate_quotient(
+                    command_buffer,
+                    wires,
+                    constants,
+                    quotient_rows,
+                    step,
+                    metadata,
+                    range_count,
+                    u32_count,
+                    alpha_powers,
+                    alpha_stride,
+                )?;
+                command_buffer.commit();
+                Ok((command_buffer.to_owned(), output, len))
+            })?;
+        #[cfg(test)]
+        let failure_observer = capture_range_failure_observer();
+        Ok(RangeCheckGateQuotientJob {
+            command_buffer,
+            output: Some(output),
+            output_pool: Arc::clone(&self.quotient_output_pool),
+            len,
+            #[cfg(test)]
+            failure_observer,
+            _job: job_guard,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Encodes one whole-domain RangeCheck/U32 quotient dispatch onto
+    /// `command_buffer` without committing it; see
+    /// [`Self::encode_poseidon2_gate_quotient`].
+    #[allow(clippy::too_many_arguments)]
+    fn encode_range_check_gate_quotient<F: RichField>(
+        &self,
+        command_buffer: &CommandBufferRef,
+        wires: &MetalColumns<F>,
+        constants: &MetalColumns<F>,
+        quotient_rows: usize,
+        step: usize,
+        metadata: &[u32],
+        range_count: usize,
+        u32_count: usize,
+        alpha_powers: &[u64],
+        alpha_stride: usize,
+    ) -> Result<(Buffer, usize), String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         if metadata.len() != (range_count + u32_count) * 10
@@ -3192,9 +3753,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+        autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -3224,29 +3783,8 @@ impl MetalShared {
                 "range_u32_quotient",
                 (quotient_rows * (range_count + u32_count)) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
         });
-        #[cfg(test)]
-        let failure_observer = FORCE_RANGE_QUOTIENT_FINISH_FAILURE.with(|fault| {
-            let observer = fault.borrow().clone();
-            if let Some(observer) = &observer {
-                observer
-                    .captured
-                    .store(true, core::sync::atomic::Ordering::Relaxed);
-            }
-            observer
-        });
-        Ok(RangeCheckGateQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            #[cfg(test)]
-            failure_observer,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
+        Ok((output, len))
     }
 
     /// Multi-dispatch twin of `start_range_check_gate_quotient`: `dispatches[k]`
@@ -3262,6 +3800,46 @@ impl MetalShared {
         step: usize,
         dispatches: &[(RangeQuotientDispatchArgs, usize, usize)],
     ) -> Result<RangeCheckGateQuotientJob<F>, String> {
+        let job_guard = GpuJobGuard::begin();
+        let (command_buffer, output, len) =
+            autoreleasepool(|| -> Result<(CommandBuffer, Buffer, usize), String> {
+                let command_buffer = self.queue.new_command_buffer();
+                let (output, len) = self.encode_range_check_gate_quotient_multi(
+                    command_buffer,
+                    wires,
+                    constants,
+                    quotient_rows,
+                    step,
+                    dispatches,
+                )?;
+                command_buffer.commit();
+                Ok((command_buffer.to_owned(), output, len))
+            })?;
+        #[cfg(test)]
+        let failure_observer = None;
+        Ok(RangeCheckGateQuotientJob {
+            command_buffer,
+            output: Some(output),
+            output_pool: Arc::clone(&self.quotient_output_pool),
+            len,
+            #[cfg(test)]
+            failure_observer,
+            _job: job_guard,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Encodes one dispatch per entry of `dispatches` onto `command_buffer`
+    /// without committing it; see [`Self::encode_poseidon2_gate_quotient`].
+    fn encode_range_check_gate_quotient_multi<F: RichField>(
+        &self,
+        command_buffer: &CommandBufferRef,
+        wires: &MetalColumns<F>,
+        constants: &MetalColumns<F>,
+        quotient_rows: usize,
+        step: usize,
+        dispatches: &[(RangeQuotientDispatchArgs, usize, usize)],
+    ) -> Result<(Buffer, usize), String> {
         let pipeline = range_check_gate_quotient_pipeline()
             .ok_or("RangeCheck gate quotient pipeline unavailable")?;
         for (args, range_count, u32_count) in dispatches {
@@ -3282,9 +3860,7 @@ impl MetalShared {
             .ok_or("RangeCheck gate quotient output size overflow")?;
         let slice_bytes = slice_len * size_of::<u64>();
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+        autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -3316,24 +3892,10 @@ impl MetalShared {
                 "range_u32_quotient_split",
                 (quotient_rows * dispatches.len()) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
         });
-        #[cfg(test)]
-        let failure_observer = None;
-        Ok(RangeCheckGateQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            #[cfg(test)]
-            failure_observer,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
+        Ok((output, len))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn start_permutation_quotient<F: RichField>(
         &self,
         wires: &MetalColumns<F>,
@@ -3351,6 +3913,62 @@ impl MetalShared {
         alpha_stride: usize,
         challenges: &[u64],
     ) -> Result<PermutationQuotientJob<F>, String> {
+        let job_guard = GpuJobGuard::begin();
+        let (command_buffer, output, len) =
+            autoreleasepool(|| -> Result<(CommandBuffer, Buffer, usize), String> {
+                let command_buffer = self.queue.new_command_buffer();
+                let (output, len) = self.encode_permutation_quotient(
+                    command_buffer,
+                    wires,
+                    constants_sigmas,
+                    zs_partial_products,
+                    shifted_points,
+                    quotient_rows,
+                    step,
+                    next_step,
+                    sigma_start,
+                    num_routed_wires,
+                    num_partial_products,
+                    chunk_size,
+                    alpha_powers,
+                    alpha_stride,
+                    challenges,
+                )?;
+                command_buffer.commit();
+                Ok((command_buffer.to_owned(), output, len))
+            })?;
+        Ok(PermutationQuotientJob {
+            command_buffer,
+            output: Some(output),
+            output_pool: Arc::clone(&self.quotient_output_pool),
+            len,
+            _job: job_guard,
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Encodes the no-lookup permutation partial-product dispatch onto
+    /// `command_buffer` without committing it; see
+    /// [`Self::encode_poseidon2_gate_quotient`].
+    #[allow(clippy::too_many_arguments)]
+    fn encode_permutation_quotient<F: RichField>(
+        &self,
+        command_buffer: &CommandBufferRef,
+        wires: &MetalColumns<F>,
+        constants_sigmas: &MetalColumns<F>,
+        zs_partial_products: &MetalColumns<F>,
+        shifted_points: &[F],
+        quotient_rows: usize,
+        step: usize,
+        next_step: usize,
+        sigma_start: usize,
+        num_routed_wires: usize,
+        num_partial_products: usize,
+        chunk_size: usize,
+        alpha_powers: &[u64],
+        alpha_stride: usize,
+        challenges: &[u64],
+    ) -> Result<(Buffer, usize), String> {
         let pipeline = permutation_quotient_pipeline()
             .ok_or("permutation quotient pipeline unavailable")?;
         let num_chunks = num_partial_products + 1;
@@ -3368,9 +3986,7 @@ impl MetalShared {
             .checked_mul(size_of::<u64>())
             .ok_or("permutation quotient output size overflow")?;
         let output = self.acquire_quotient_output(bytes as u64);
-        let job_guard = GpuJobGuard::begin();
-        let command_buffer = autoreleasepool(|| -> CommandBuffer {
-            let command_buffer = self.queue.new_command_buffer();
+        autoreleasepool(|| {
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(pipeline);
             encoder.set_buffer(0, Some(&wires.buffer), 0);
@@ -3405,17 +4021,8 @@ impl MetalShared {
                 "permutation_quotient",
                 (quotient_rows * num_routed_wires * 2) as u64,
             );
-            command_buffer.commit();
-            command_buffer.to_owned()
         });
-        Ok(PermutationQuotientJob {
-            command_buffer,
-            output: Some(output),
-            output_pool: Arc::clone(&self.quotient_output_pool),
-            len,
-            _job: job_guard,
-            _phantom: PhantomData,
-        })
+        Ok((output, len))
     }
 
     fn acquire_set(&self) -> Result<BufferSet, String> {
