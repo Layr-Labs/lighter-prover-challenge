@@ -171,8 +171,19 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16AddManyGate
         let base16 = F::from_canonical_u64(1 << 16u64);
         let mut res = vec![F::ZERO; n * <Self as Gate<F, D>>::num_constraints(self)];
         let mut chunks = res.chunks_exact_mut(n);
-        let mut combined_result = vec![F::ZERO; n];
-        let mut combined_carry = vec![F::ZERO; n];
+        // Batches are 32 points in this prover; keep the recomposition rows on
+        // the stack and fall back to the heap only for oversized batches.
+        let mut combined_result_stack = [F::ZERO; 64];
+        let mut combined_carry_stack = [F::ZERO; 64];
+        let mut combined_result_heap;
+        let mut combined_carry_heap;
+        let (mut combined_result, mut combined_carry): (&mut [F], &mut [F]) = if n <= 64 {
+            (&mut combined_result_stack[..n], &mut combined_carry_stack[..n])
+        } else {
+            combined_result_heap = vec![F::ZERO; n];
+            combined_carry_heap = vec![F::ZERO; n];
+            (&mut combined_result_heap, &mut combined_carry_heap)
+        };
 
         for i in 0..self.num_ops {
             let output_result = &wires[self.wire_ith_output_result(i) * n..][..n];
