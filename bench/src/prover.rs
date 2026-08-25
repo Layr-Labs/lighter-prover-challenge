@@ -3,6 +3,7 @@
 // Redraw marker reducing-scratch-r1 1787499809993 (same-account archive-dedup convention; inert)
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, OnceLock};
 
 use circuit::block::Block;
@@ -243,9 +244,17 @@ fn mark_thread_utility() {
 #[cfg(not(target_os = "macos"))]
 fn mark_thread_utility() {}
 
-enum ChainState<'scope> {
+enum ChainState {
+    #[cfg(test)]
     Ready(Proof),
-    InFlight(std::thread::ScopedJoinHandle<'scope, Proof>),
+    Queued(mpsc::Receiver<std::thread::Result<Proof>>),
+}
+
+struct ChainJob {
+    chain_step: u64,
+    previous: Option<ChainState>,
+    tx_proof: Proof,
+    output: mpsc::SyncSender<std::thread::Result<Proof>>,
 }
 
 /// The recorded phase-1 seed layout of a path's chain circuit, shared by the
@@ -305,15 +314,20 @@ impl<'a> ChainSeedLayout<'a> {
     }
 }
 
-impl ChainState<'_> {
+impl ChainState {
     fn wait(self) -> Proof {
         #[cfg(feature = "diagnostic_profile")]
         let _wait = plonky2::util::profile::span("wait", "chain_predecessor_join");
         match self {
+            #[cfg(test)]
             ChainState::Ready(proof) => proof,
-            ChainState::InFlight(handle) => handle
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            ChainState::Queued(receiver) => match receiver
+                .recv()
+                .expect("persistent chain worker must return its proof")
+            {
+                Ok(proof) => proof,
+                Err(panic) => std::panic::resume_unwind(panic),
+            },
         }
     }
 }
@@ -324,7 +338,7 @@ fn chain_step_proof<'a>(
     chain_target: &BlockTxChainTarget,
     chain_data: &'a CircuitData<F, C, D>,
     chain_step: u64,
-    previous: Option<ChainState<'_>>,
+    previous: Option<ChainState>,
     base_proof: &Proof,
     dummy_proof: &Proof,
     tx_proof: &Proof,
@@ -681,10 +695,73 @@ fn prove_path(
         let base = &base_proof;
         // Captured by the `move` step closures below as a shared reference.
         let chain_seed = &chain_seed_layout;
-        let mut chain: Option<ChainState<'_>> = None;
+        let mut chain: Option<ChainState> = None;
         let mut pending_tx: Option<(u64, Proof)> = None;
         let mut in_flight = std::collections::VecDeque::new();
         let mut current_step = 0u64;
+
+        // A chain has only two useful execution states at once: step i proves
+        // while step i+1 runs the predecessor-independent witness phase, then
+        // waits for i. Alternating steps between two persistent workers keeps
+        // that overlap and exact dependency order without allocating a fresh
+        // 64 MiB-stack OS thread and pending dense witness for every step.
+        // Each worker owns one parity for the whole path, so at most two chain
+        // pending witnesses are live and their allocations retain owner
+        // locality. The command queues hold only completed transaction proofs.
+        let worker_capacity = chunks.len().div_ceil(2) + 1;
+        let (worker0_tx, worker0_rx) =
+            mpsc::sync_channel::<Option<ChainJob>>(worker_capacity);
+        let (worker1_tx, worker1_rx) =
+            mpsc::sync_channel::<Option<ChainJob>>(worker_capacity);
+        let worker_senders = [worker0_tx, worker1_tx];
+        let mut worker_handles = Vec::with_capacity(2);
+        for (worker_index, receiver) in [worker0_rx, worker1_rx].into_iter().enumerate() {
+            let handle = std::thread::Builder::new()
+                .name(format!("{path:?}-chain-worker-{worker_index}"))
+                .stack_size(PROVER_THREAD_STACK_BYTES)
+                .spawn_scoped(scope, move || {
+                    while let Ok(Some(job)) = receiver.recv() {
+                        // A per-step thread used `join` to carry the original
+                        // panic payload through every dependent step. Catching
+                        // here and sending `thread::Result` preserves that
+                        // behavior while allowing the persistent worker to
+                        // relay the same payload through later queued steps.
+                        let result = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(|| {
+                                chain_step_proof(
+                                    path,
+                                    chain_target,
+                                    chain_data,
+                                    job.chain_step,
+                                    job.previous,
+                                    base,
+                                    dummy_proof,
+                                    &job.tx_proof,
+                                    chain_seed,
+                                )
+                            }),
+                        );
+                        if job.output.send(result).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("persistent chain pipeline thread must start");
+            worker_handles.push(handle);
+        }
+        let enqueue_chain =
+            |chain_step: u64, previous: Option<ChainState>, tx_proof: Proof| {
+                let (output, proof) = mpsc::sync_channel(1);
+                worker_senders[chain_step as usize & 1]
+                    .send(Some(ChainJob {
+                        chain_step,
+                        previous,
+                        tx_proof,
+                        output,
+                    }))
+                    .expect("persistent chain worker must stay open");
+                ChainState::Queued(proof)
+            };
 
         loop {
             if let Some((chain_step, tx_proof)) = pending_tx.take() {
@@ -696,24 +773,7 @@ fn prove_path(
                 // the laggard and its GPU trees take priority (see
                 // spine_backlog_add). Decremented inside chain_step_proof.
                 plonky2::hash::poseidon2::spine_backlog_add(1);
-                let handle = std::thread::Builder::new()
-                    .name(format!("{path:?}-chain-step-{chain_step}"))
-                    .stack_size(PROVER_THREAD_STACK_BYTES)
-                    .spawn_scoped(scope, move || {
-                        chain_step_proof(
-                            path,
-                            chain_target,
-                            chain_data,
-                            chain_step,
-                            previous,
-                            base,
-                            dummy_proof,
-                            &tx_proof,
-                            chain_seed,
-                        )
-                    })
-                    .expect("chain step pipeline thread must start");
-                chain = Some(ChainState::InFlight(handle));
+                chain = Some(enqueue_chain(chain_step, previous, tx_proof));
             }
 
             let witness = current_witness;
@@ -791,24 +851,7 @@ fn prove_path(
             // backlog in `chain_step_proof`, exactly like both spawn loops.
             plonky2::hash::poseidon2::spine_backlog_add(1);
             let previous = chain.take();
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-step-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous,
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                        chain_seed,
-                    )
-                })
-                .expect("chain step pipeline thread must start");
-            chain = Some(ChainState::InFlight(handle));
+            chain = Some(enqueue_chain(chain_step, previous, tx_proof));
         }
         // Past this point the pipeline spawns no new chunk work: the drain
         // below is the strictly sequential chain tail, so its mid-size
@@ -851,28 +894,21 @@ fn prove_path(
             // above is unchanged.
             let previous = chain.take();
             plonky2::hash::poseidon2::spine_backlog_add(1);
-            let handle = std::thread::Builder::new()
-                .name(format!("{path:?}-chain-drain-{chain_step}"))
-                .stack_size(PROVER_THREAD_STACK_BYTES)
-                .spawn_scoped(scope, move || {
-                    chain_step_proof(
-                        path,
-                        chain_target,
-                        chain_data,
-                        chain_step,
-                        previous,
-                        base,
-                        dummy_proof,
-                        &tx_proof,
-                        chain_seed,
-                    )
-                })
-                .expect("chain drain thread must start");
-            chain = Some(ChainState::InFlight(handle));
+            chain = Some(enqueue_chain(chain_step, previous, tx_proof));
         }
         let chain_proof = chain
             .map(ChainState::wait)
             .expect("transaction path must produce a chain proof");
+        for sender in &worker_senders {
+            sender
+                .send(None)
+                .expect("persistent chain worker must accept shutdown");
+        }
+        for handle in worker_handles {
+            handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        }
         if exclusive_drain {
             plonky2::hash::poseidon2::set_exclusive_gpu_phase(false);
         }
@@ -1616,6 +1652,24 @@ mod tests {
         assert_eq!(final_chain_inputs(&light, &heavy), (&light, &heavy));
     }
 
+    #[test]
+    fn queued_chain_state_resumes_the_original_panic_payload() {
+        let (output, receiver) =
+            mpsc::sync_channel::<std::thread::Result<Proof>>(1);
+        let payload: Box<dyn std::any::Any + Send> =
+            Box::new(String::from("chain-panic-payload"));
+        output.send(Err(payload)).unwrap();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ChainState::Queued(receiver).wait()
+        }))
+        .expect_err("queued chain failure must resume unwinding");
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("chain-panic-payload"),
+        );
+    }
+
     /// Manual timing harness for the two-phase chain-step witness split. Run with:
     /// `RAYON_NUM_THREADS=8 cargo test --release -p bench --bin prove -- --ignored chain_step`
     #[test]
@@ -1736,13 +1790,18 @@ mod tests {
             )
             .expect("single-shot witness inputs failed");
             let single_shot = generate_partial_witness::<F, C, D>(
-                inputs,
+                inputs.clone(),
                 &circuits.chain_data.prover_only,
                 &circuits.chain_data.common,
             )
             .expect("single-shot witness generation failed");
             let single_shot_elapsed = single_shot_start.elapsed();
-            drop(single_shot);
+            let single_shot_repeat = generate_partial_witness::<F, C, D>(
+                inputs,
+                &circuits.chain_data.prover_only,
+                &circuits.chain_data.common,
+            )
+            .expect("repeated single-shot witness generation failed");
 
             let phase1_start = Instant::now();
             let early_inputs = BlockTxChainCircuit::witness_inputs_early(
@@ -1775,6 +1834,12 @@ mod tests {
                 .finish()
                 .expect("chain step witness must be complete");
             let phase2_elapsed = phase2_start.elapsed();
+            assert_seeded_witness_matches_plain(
+                &witness,
+                &single_shot,
+                &single_shot_repeat,
+                &circuits.chain_data,
+            );
 
             let prove_start = Instant::now();
             let mut timing = TimingTree::new("chain-step-prove", log::Level::Debug);
@@ -1804,7 +1869,15 @@ mod tests {
                 &harness_seed_layout,
             );
             let direct_elapsed = direct_start.elapsed();
+            // RandomValueGenerator slots deliberately make proof bytes differ
+            // across independent proves. The raw witness differential above
+            // compares every deterministic slot, and both proofs must expose
+            // identical public inputs and verify.
             assert_eq!(proof.public_inputs, direct_proof.public_inputs);
+            circuits
+                .chain_data
+                .verify(proof)
+                .expect("map two-phase proof must verify");
 
             println!(
                 "chain step {chain_step}: single-shot witness {single_shot_elapsed:?}, \
