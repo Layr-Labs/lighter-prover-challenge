@@ -140,7 +140,7 @@ pub fn final_poly_coeff_len(mut degree_bits: usize, reduction_arity_bits: &Vec<u
 /// `0..n`, so every slot is written exactly once and the source is only read —
 /// the result is index-for-index identical to the serial fill.
 fn bitrev_flatten<F: RichField + Extendable<D>, const D: usize>(values: &[F::Extension]) -> Vec<F> {
-    const FLATTEN_BLOCK: usize = 1 << 10;
+    const FLATTEN_BLOCK: usize = 1 << 9;
 
     let n = values.len();
     let log_n = log2_strict(n);
@@ -196,7 +196,7 @@ fn flatten_bitrev_order<F: RichField + Extendable<D>, const D: usize>(
         };
     }
 
-    const FLATTEN_BLOCK: usize = 1 << 10;
+    const FLATTEN_BLOCK: usize = 1 << 9;
 
     let n = values.len();
     let mut flat: Vec<F> = Vec::with_capacity(n * D);
@@ -668,7 +668,7 @@ mod tests {
         type F = GoldilocksField;
         type FE = <F as Extendable<D>>::Extension;
 
-        // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 10` grain: below it
+        // Sizes on both sides of the `FLATTEN_BLOCK = 1 << 9` grain: below it
         // (a single partial chunk), exactly on it, and several blocks past it.
         for log_n in [0usize, 1, 5, 10, 11, 13] {
             let n = 1usize << log_n;
