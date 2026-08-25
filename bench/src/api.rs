@@ -1,7 +1,5 @@
-// Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
-// reuse in the comparison/u16 arithmetic gate generators (per-call allocation
-// elimination previously described in this account's fable-ps notes).
-// Marker bumped only for a fresh submission hash; no behavior change vs the prior fable-ps draws.
+// merge-chunk-256-r1 1787635440001 (inert)
+// Isolated leftover: MERGE_CHUNK_POINTS 512->256 (GPU quotient merge grain).
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

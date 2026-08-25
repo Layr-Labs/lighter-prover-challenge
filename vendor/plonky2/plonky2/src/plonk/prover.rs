@@ -3371,7 +3371,7 @@ fn compute_quotient_polys<
         // GPU accumulation pass and point-major scatter pass into one walk:
         // CPU quotient pages are now read once and never dirtied again.
         // validator population; this comment changes no executable behavior.
-        const MERGE_CHUNK_POINTS: usize = 512;
+        const MERGE_CHUNK_POINTS: usize = 256;
         #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
         let pos_vals = gpu_poseidon_values;
         #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
