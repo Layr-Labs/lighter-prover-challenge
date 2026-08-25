@@ -1,6 +1,6 @@
 use core::ptr::swap;
 
-const LB_BLOCK_SIZE: usize = 3;
+const LB_BLOCK_SIZE: usize = 4;
 
 /// Transpose square matrix in-place
 /// The matrix is of size `1 << lb_size` by `1 << lb_size`. It occupies
