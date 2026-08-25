@@ -14,7 +14,7 @@ use circuit::block_tx_constraints::{BlockTxCircuit, BlockTxTarget, Circuit as _}
 use circuit::types::config::{C, CIRCUIT_CONFIG, D, F};
 use circuit::types::constants::{TX_HEAVY, TX_LIGHT};
 use plonky2::fri::oracle::PolynomialBatch;
-use plonky2::plonk::circuit_data::CircuitData;
+use plonky2::plonk::circuit_data::{CircuitData, GeneratorWatchIndex};
 use plonky2::plonk::proof::ProofWithPublicInputs;
 
 pub type Proof = ProofWithPublicInputs<F, C, D>;
@@ -187,7 +187,18 @@ impl Circuits {
             // as the commitment above, so wherever that is dead this is too.
             // Clearing it is idempotent for a path that already released its own.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_generator_machinery(data);
         }
+        Self::release_generator_machinery(&mut self.pre_data);
+    }
+
+    /// Releases generator worklists and their CSR watch tables once a circuit
+    /// family has produced its final witness. The existing exclusive guards at
+    /// each caller prove that no witness generator can still read this state.
+    fn release_generator_machinery(data: &mut CircuitData<F, C, D>) {
+        data.prover_only.generators = Vec::new();
+        data.prover_only.generator_indices_by_watches = GeneratorWatchIndex::empty();
+        data.prover_only.generator_watch_counts = Vec::new();
     }
 
     /// Releases the heavy transaction and chain circuits' preprocessed
@@ -223,6 +234,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_generator_machinery(&mut data);
         }
     }
 
@@ -247,6 +259,7 @@ impl Circuits {
             // reader remains, and the quotient-domain cache is read only by the
             // proofs that read the commitment.
             data.prover_only.constants_sigmas_quotient_cache = None;
+            Self::release_generator_machinery(&mut data);
         }
     }
 

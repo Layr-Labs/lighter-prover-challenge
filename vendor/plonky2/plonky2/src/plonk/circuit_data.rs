@@ -405,6 +405,19 @@ pub fn empty_watched(offsets_len: usize) -> Vec<u64> {
 }
 
 impl GeneratorWatchIndex {
+    /// An empty index: no representatives, no watchers. Used by callers that
+    /// retire a circuit's generator machinery after its last witness — the
+    /// empty form is never read again, it only makes the drop cheap and the
+    /// struct whole.
+    pub fn empty() -> Self {
+        Self {
+            offsets: Vec::new(),
+            watchers: Vec::new(),
+            entries: 0,
+            watched: Vec::new(),
+        }
+    }
+
     pub fn from_map(map: BTreeMap<usize, Vec<usize>>) -> Self {
         let entries = map.values().filter(|watchers| !watchers.is_empty()).count();
         let Some((&max_representative, _)) = map.last_key_value() else {

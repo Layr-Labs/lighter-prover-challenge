@@ -4322,17 +4322,24 @@ mod l_0_table_cache {
     static CACHE: OnceLock<Mutex<HashMap<(TypeId, usize, usize), Arc<dyn Any + Send + Sync>>>> =
         OnceLock::new();
 
-    /// Builds the table with, per entry, exactly the operations of the uncached
-    /// `eval_l_0(i, g * w^i)` path: `x = g * w^i` from the same `two_adic_subgroup` points the
-    /// prover feeds it, then `(n * (x - ONE)).inverse()` — the same inverse of the same
-    /// product, so every entry is bit-identical to the value it replaces. Entries are
-    /// independent, so the parallel map changes nothing.
+    /// Builds the same nonzero denominators as the uncached
+    /// `eval_l_0(i, g * w^i)` path, then batch-inverts independent bounded chunks.
+    /// The 4,096-entry bound caps per-worker scratch while replacing almost all
+    /// individual inversions with multiplications. The raw-word differential tests
+    /// below verify that every entry remains bit-identical to the legacy table.
     fn build<F: Field>(degree_bits: usize, quotient_degree_bits: usize) -> Vec<F> {
         let n = F::from_canonical_usize(1 << degree_bits);
-        F::two_adic_subgroup(degree_bits + quotient_degree_bits)
+        let mut table = F::two_adic_subgroup(degree_bits + quotient_degree_bits)
             .into_par_iter()
-            .map(|x| (n * (F::coset_shift() * x - F::ONE)).inverse())
-            .collect()
+            .map(|x| n * (F::coset_shift() * x - F::ONE))
+            .collect::<Vec<_>>();
+        table
+            .par_chunks_mut(4096)
+            .for_each_init(Vec::<F>::new, |scratch, chunk| {
+                F::batch_multiplicative_inverse_into(chunk, scratch);
+                chunk.copy_from_slice(scratch);
+            });
+        table
     }
 
     pub(super) fn l_0_denominator_inverses<F: Field>(
