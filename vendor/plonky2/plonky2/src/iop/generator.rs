@@ -519,13 +519,14 @@ fn fold_target_checksum(checksum: u64, target_index: usize) -> u64 {
         ^ (target_index as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
-/// Exact target order and aggregate watcher effects of a fixed witness-input
+/// Exact target order and post-seed scheduler state of a fixed witness-input
 /// writer, replayable across later inputs of the same shape.
 ///
 /// Values are deliberately absent: replay still receives and writes every value
 /// the caller supplies. The layout removes only the repeated target-to-
 /// representative lookup and the repeated traversal of the immutable watcher
-/// CSR for the same circuit/input shape.
+/// CSR, watch-count conversion, and first-worklist scan for the same
+/// circuit/input shape.
 pub struct PartitionSeedLayout<
     'a,
     F: RichField + Extendable<D>,
@@ -537,7 +538,15 @@ pub struct PartitionSeedLayout<
     /// Fold of the recorded target sequence; a replay whose targets differ in
     /// value or order cannot reproduce it.
     target_checksum: u64,
-    seeded_watch_decrements: Vec<(u32, u32)>,
+    /// Readiness immediately after the checked seed and before any generator
+    /// runs. Later replays clone this dense image instead of rebuilding it from
+    /// `generator_watch_counts` and applying sparse watcher decrements.
+    seeded_unresolved: Vec<u32>,
+    /// First worklist derived from `seeded_unresolved`. It is fixed by the
+    /// circuit instance and target sequence, just like the representative
+    /// layout, so replay can copy it instead of rescanning every generator.
+    initial_pending: Vec<usize>,
+    changed_generator_count: usize,
     /// Lifetime brand for the exact immutable prover topology used while
     /// recording. Holding the whole owner borrowed prevents drop, mutation and
     /// allocator-address reuse (ABA), while pointer equality binds the
@@ -555,7 +564,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize> D
             .field("target_write_count", &self.representatives.len())
             .field(
                 "changed_generator_count",
-                &self.seeded_watch_decrements.len(),
+                &self.changed_generator_count,
             )
             .finish_non_exhaustive()
     }
@@ -570,11 +579,10 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         self.representatives.len()
     }
 
-    /// Number of generators whose seeded watch count changes. Replay traverses
-    /// exactly this sparse list instead of every watcher list reached by every
-    /// input target.
+    /// Number of generators whose seeded watch count changes. Exposed for
+    /// census output only; replay copies the recorded dense readiness image.
     pub fn changed_generator_count(&self) -> usize {
-        self.seeded_watch_decrements.len()
+        self.changed_generator_count
     }
 }
 
@@ -871,31 +879,25 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 checksum: &mut target_checksum,
             },
         })?;
-        // The aggregate effect of the seed on every watch counter. A replay
-        // applies exactly this sparse list instead of walking a watcher slice
-        // per newly populated representative.
-        let seeded_watch_decrements = prover_data
+        let changed_generator_count = prover_data
             .generator_watch_counts
             .iter()
             .zip(&readiness.unresolved)
-            .enumerate()
-            .filter_map(|(generator, (&total, &unresolved))| {
+            .filter(|&(&total, &unresolved)| {
                 let total = u32::try_from(total)
                     .expect("generator watch count exceeds the CSR u32 edge index");
-                let decrement = total - unresolved;
-                (decrement != 0).then(|| {
-                    Ok((
-                        u32::try_from(generator)
-                            .map_err(|_| anyhow!("generator index exceeds u32"))?,
-                        decrement,
-                    ))
-                })
+                total != unresolved
             })
-            .collect::<Result<Vec<_>>>()?;
+            .count();
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
         let initial_pending = readiness.initial_worklist(prover_data.generators_defer_until_ready);
+        // These two vectors are immutable functions of the circuit instance
+        // and the checked target sequence. Preserve them before the worklist
+        // mutates readiness and consumes its first queue.
+        let seeded_unresolved = readiness.unresolved.clone();
+        let recorded_initial_pending = initial_pending.clone();
         run_generator_worklist(
             &mut witness,
             prover_data,
@@ -917,7 +919,9 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             PartitionSeedLayout {
                 representatives,
                 target_checksum,
-                seeded_watch_decrements,
+                seeded_unresolved,
+                initial_pending: recorded_initial_pending,
+                changed_generator_count,
                 prover_data,
                 common_data,
             },
@@ -947,10 +951,13 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
             common_data.degree(),
             &prover_data.representative_map,
         );
-        let mut readiness = TargetReadiness::new(
-            &prover_data.generator_watch_counts,
-            &prover_data.generator_indices_by_watches,
-        );
+        // Replay-mode writes deliberately do not touch readiness. Start with
+        // an empty shell, validate the target sequence, then clone the exact
+        // post-seed image recorded for this circuit instance.
+        let mut readiness = TargetReadiness {
+            unresolved: Vec::new(),
+            watchers: &prover_data.generator_indices_by_watches,
+        };
         let (cursor, checksum) = {
             let mut seeder = PartitionSeeder {
                 witness: &mut witness,
@@ -976,27 +983,23 @@ impl<'a, F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usiz
                 cursor,
             )));
         }
-        // Checked before any watcher decrement is applied and before any
-        // generator runs, so a drifted target sequence can never reach the
-        // worklist.
+        // Checked before scheduler state is installed and before any generator
+        // runs, so a drifted target sequence can never reach the worklist.
         if checksum != layout.target_checksum {
             return Err(seed_layout_mismatch(
                 "seed layout target sequence checksum mismatch",
             ));
         }
-        for &(generator, decrement) in &layout.seeded_watch_decrements {
-            let count = &mut readiness.unresolved[generator as usize];
-            if *count < decrement {
-                return Err(seed_layout_mismatch(
-                    "seed layout watcher decrement underflow",
-                ));
-            }
-            *count -= decrement;
-        }
+        let initial_pending = {
+            #[cfg(feature = "diagnostic_profile")]
+            let _readiness_restore =
+                crate::util::profile::span("witness", "seed_readiness_restore");
+            readiness.unresolved.clone_from(&layout.seeded_unresolved);
+            layout.initial_pending.clone()
+        };
 
         let mut generator_is_expired = vec![false; generators.len()];
         let mut remaining_generators = generators.len();
-        let initial_pending = readiness.initial_worklist(prover_data.generators_defer_until_ready);
         run_generator_worklist(
             &mut witness,
             prover_data,
@@ -2012,27 +2015,7 @@ mod tests {
         .expect("a drifted target sequence must be rejected");
         assert!(is_seed_layout_mismatch(&error), "{error:?}");
 
-        // Sabotage 4: a corrupted aggregate watch decrement must be caught
-        // rather than silently changing the generator schedule.
-        let mut wrong_decrements = PendingPartitionWitness::start_seeded_recording(
-            prover_data,
-            common_data,
-            write(&all_inputs),
-        )?
-        .1;
-        assert!(!wrong_decrements.seeded_watch_decrements.is_empty());
-        wrong_decrements.seeded_watch_decrements[0].1 = u32::MAX;
-        let error = PendingPartitionWitness::start_seeded_with_layout(
-            prover_data,
-            common_data,
-            &wrong_decrements,
-            write(&all_inputs),
-        )
-        .err()
-        .expect("an impossible watcher decrement must be rejected");
-        assert!(is_seed_layout_mismatch(&error), "{error:?}");
-
-        // Sabotage 5: a layout from a different circuit instance.
+        // Sabotage 4: a layout from a different circuit instance.
         let (other, other_early, other_late) = two_inner_proof_fixture()?;
         let other_all = merged_inputs(&other_early, &other_late)?;
         let other_layout = PendingPartitionWitness::start_seeded_recording(

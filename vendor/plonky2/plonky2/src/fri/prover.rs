@@ -20,6 +20,7 @@ use crate::fri::{FriConfig, FriParams};
 use crate::hash::hash_types::{RichField, NUM_HASH_OUT_ELTS};
 use crate::hash::hashing::PlonkyPermutation;
 use crate::hash::merkle_tree::MerkleTree;
+use crate::hash::poseidon2::hash::Poseidon2Permutation;
 use crate::iop::challenger::Challenger;
 use crate::plonk::config::{GenericConfig, Hasher};
 use crate::plonk::plonk_common::reduce_with_powers;
@@ -82,8 +83,9 @@ pub(crate) fn fri_proof_with_initial_order<
         "fold codewords in the commitment phase",
         fri_committed_trees::<F, C, D>(
             lde_polynomial_coeffs,
-            lde_polynomial_values,
+            Some(lde_polynomial_values),
             initial_values_bitrev,
+            None,
             challenger,
             fri_params,
             final_poly_coeff_len,
@@ -108,6 +110,56 @@ pub(crate) fn fri_proof_with_initial_order<
         // clone allocated and copied a fresh `MerkleCap` per commit round only to free
         // the original moments later.
         commit_phase_merkle_caps: trees.into_iter().map(|t| t.cap).collect(),
+        query_round_proofs,
+        final_poly: final_coeffs,
+        pow_witness,
+    }
+}
+
+/// Internal entry point when a backend has already built the first FRI tree
+/// directly from coefficients. The remaining folds, transcript, PoW, queries,
+/// and proof format are unchanged.
+pub(crate) fn fri_proof_with_prebuilt_first_tree<
+    F: RichField + Extendable<D>,
+    C: GenericConfig<D, F = F>,
+    const D: usize,
+>(
+    initial_merkle_trees: &[&MerkleTree<F, C::Hasher>],
+    lde_polynomial_coeffs: PolynomialCoeffs<F::Extension>,
+    first_tree: MerkleTree<F, C::Hasher>,
+    challenger: &mut Challenger<F, C::Hasher>,
+    fri_params: &FriParams,
+    final_poly_coeff_len: Option<usize>,
+    max_num_query_steps: Option<usize>,
+    timing: &mut TimingTree,
+) -> FriProof<F, C::Hasher, D> {
+    let n = lde_polynomial_coeffs.len();
+    let first_arity = 1usize << fri_params.reduction_arity_bits[0];
+    assert_eq!(first_tree.num_leaves * first_arity, n);
+
+    let (trees, final_coeffs) = timed!(
+        timing,
+        "fold codewords in the commitment phase",
+        fri_committed_trees::<F, C, D>(
+            lde_polynomial_coeffs,
+            None,
+            true,
+            Some(first_tree),
+            challenger,
+            fri_params,
+            final_poly_coeff_len,
+            max_num_query_steps,
+        )
+    );
+    let pow_witness = timed!(
+        timing,
+        "find proof-of-work witness",
+        fri_proof_of_work::<F, C, D>(challenger, &fri_params.config)
+    );
+    let query_round_proofs =
+        fri_prover_query_rounds::<F, C, D>(initial_merkle_trees, &trees, challenger, n, fri_params);
+    FriProof {
+        commit_phase_merkle_caps: trees.into_iter().map(|tree| tree.cap).collect(),
         query_round_proofs,
         final_poly: final_coeffs,
         pow_witness,
@@ -287,15 +339,15 @@ fn fri_fold_arity16_chunks<F: RichField + Extendable<D>, const D: usize>(
 
 fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>(
     mut coeffs: PolynomialCoeffs<F::Extension>,
-    values: PolynomialValues<F::Extension>,
+    mut values: Option<PolynomialValues<F::Extension>>,
     mut values_are_bitrev: bool,
+    mut first_tree: Option<MerkleTree<F, C::Hasher>>,
     challenger: &mut Challenger<F, C::Hasher>,
     fri_params: &FriParams,
     final_poly_coeff_len: Option<usize>,
     max_num_query_steps: Option<usize>,
 ) -> FriCommitedTrees<F, C, D> {
     let mut trees = Vec::with_capacity(fri_params.reduction_arity_bits.len());
-    let mut values = Some(values);
 
     let mut shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
     let num_rounds = fri_params.reduction_arity_bits.len();
@@ -304,38 +356,44 @@ fn fri_committed_trees<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>,
         #[cfg(feature = "diagnostic_profile")]
         let round_name = |names: [&'static str; 3]| names.get(round).copied().unwrap_or(names[2]);
 
-        // Fused bit-reversal + flatten: one gather pass writes the flat leaf
-        // buffer directly (leaf `i` is the `arity`-chunk of the bit-reversed
-        // codeword starting at `i * arity`), instead of a random-access
-        // in-place permutation followed by a separate flattening pass with a
-        // heap allocation per element.
-        let flat_values = {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = crate::util::profile::span(
-                "fri_commit",
-                round_name(["direct_flatten_r0", "direct_flatten_r1", "direct_flatten_r2"]),
-            );
-            let round_values = values
-                .take()
-                .expect("every FRI commit round has one codeword")
-                .values;
-            if values_are_bitrev {
-                flatten_bitrev_order::<F, D>(round_values)
-            } else {
-                bitrev_flatten::<F, D>(&round_values)
+        let tree = match first_tree.take() {
+            Some(tree) if round == 0 => tree,
+            Some(_) => unreachable!("a prebuilt FRI tree is valid only for round zero"),
+            None => {
+                // Fused bit-reversal + flatten: one gather pass writes the
+                // flat leaf buffer directly (leaf `i` is the `arity`-chunk of
+                // the bit-reversed codeword starting at `i * arity`).
+                let flat_values = {
+                    #[cfg(feature = "diagnostic_profile")]
+                    let _span = crate::util::profile::span(
+                        "fri_commit",
+                        round_name([
+                            "direct_flatten_r0",
+                            "direct_flatten_r1",
+                            "direct_flatten_r2",
+                        ]),
+                    );
+                    let round_values = values
+                        .take()
+                        .expect("every non-prebuilt FRI round has one codeword")
+                        .values;
+                    if values_are_bitrev {
+                        flatten_bitrev_order::<F, D>(round_values)
+                    } else {
+                        bitrev_flatten::<F, D>(&round_values)
+                    }
+                };
+                #[cfg(feature = "diagnostic_profile")]
+                let _span = crate::util::profile::span(
+                    "fri_commit",
+                    round_name(["merkle_tree_r0", "merkle_tree_r1", "merkle_tree_r2"]),
+                );
+                MerkleTree::<F, C::Hasher>::new_flat(
+                    flat_values,
+                    arity * D,
+                    fri_params.config.cap_height,
+                )
             }
-        };
-        let tree = {
-            #[cfg(feature = "diagnostic_profile")]
-            let _span = crate::util::profile::span(
-                "fri_commit",
-                round_name(["merkle_tree_r0", "merkle_tree_r1", "merkle_tree_r2"]),
-            );
-            MerkleTree::<F, C::Hasher>::new_flat(
-                flat_values,
-                arity * D,
-                fri_params.config.cap_height,
-            )
         };
 
         challenger.observe_cap(&tree.cap);
@@ -554,7 +612,28 @@ pub(crate) fn fri_proof_of_work<
     duplex_intermediate_state.set_from_slice(&challenger.input_buffer, 0);
 
     let max_candidate = F::NEG_ONE.to_canonical_u64();
-    let pow_witness = if pow_quad_enabled() {
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    let gpu_witness = if TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && core::any::type_name::<<C::Hasher as Hasher<F>>::Permutation>()
+            == core::any::type_name::<Poseidon2Permutation<GoldilocksField>>()
+        && <C::Hasher as Hasher<F>>::Permutation::WIDTH == 12
+        && <C::Hasher as Hasher<F>>::Permutation::RATE == 8
+    {
+        let state = duplex_intermediate_state.as_ref();
+        let raw_state = core::array::from_fn(|i| state[i].to_noncanonical_u64());
+        crate::hash::poseidon2::metal::try_fri_pow_search(
+            &raw_state,
+            witness_input_pos,
+            min_leading_zeros,
+            max_candidate,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+    let gpu_witness = None;
+
+    let pow_witness = gpu_witness.or_else(|| if pow_quad_enabled() {
         (0..=max_candidate / POW_LANES as u64)
             .into_par_iter()
             .map(|quad_index| {
@@ -582,7 +661,7 @@ pub(crate) fn fri_proof_of_work<
             let leading_zeros = pow_response.to_canonical_u64().leading_zeros();
             leading_zeros >= min_leading_zeros
         })
-    }
+    })
     .map(F::from_canonical_u64)
     .expect("Proof of work failed. This is highly unlikely!");
 
@@ -632,8 +711,14 @@ fn fri_prover_query_round<
         .collect::<Vec<_>>();
     for (i, tree) in trees.iter().enumerate() {
         let arity_bits = fri_params.reduction_arity_bits[i];
-        let evals = unflatten(tree.get(x_index >> arity_bits));
-        let merkle_proof = tree.prove(x_index >> arity_bits);
+        let leaf_index = x_index >> arity_bits;
+        let evals = match &tree.leaves {
+            crate::hash::merkle_tree::MerkleLeaves::FriExt2Columns { .. } => {
+                unflatten(&tree.leaf_vec(leaf_index))
+            }
+            _ => unflatten(tree.get(leaf_index)),
+        };
+        let merkle_proof = tree.prove(leaf_index);
 
         query_steps.push(FriQueryStep {
             evals,
@@ -659,6 +744,90 @@ mod tests {
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::fri::reduction_strategies::FriReductionStrategy;
     use crate::plonk::config::Poseidon2GoldilocksConfig;
+
+    /// Fold one bit-reversed arity-16 evaluation leaf without recovering
+    /// coefficient form. Consecutive entries are evaluations at `x` and
+    /// `-x`; after each pair fold, squaring the points preserves the same
+    /// bit-reversed pairing for the next level.
+    fn eval_space_fold_arity16<F: RichField + Extendable<2>>(
+        leaf: [F::Extension; 16],
+        first_point: F,
+        root_16: F,
+        beta: F::Extension,
+    ) -> F::Extension {
+        let mut values = leaf.to_vec();
+        let mut points = (0..16)
+            .map(|j| first_point * root_16.exp_u64(reverse_bits(j, 4) as u64))
+            .collect::<Vec<_>>();
+        let inv_two = (F::ONE + F::ONE).inverse();
+        let mut alpha = beta;
+
+        while values.len() > 1 {
+            let mut next_values = Vec::with_capacity(values.len() / 2);
+            let mut next_points = Vec::with_capacity(points.len() / 2);
+            for i in 0..values.len() / 2 {
+                let a = values[2 * i];
+                let b = values[2 * i + 1];
+                let x = points[2 * i];
+                assert_eq!(points[2 * i + 1], -x);
+                let even = <F::Extension as FieldExtension<2>>::scalar_mul(&(a + b), inv_two);
+                let odd_scale = inv_two * x.inverse();
+                let odd = <F::Extension as FieldExtension<2>>::scalar_mul(&(a - b), odd_scale);
+                next_values.push(even + alpha * odd);
+                next_points.push(x * x);
+            }
+            values = next_values;
+            points = next_points;
+            alpha *= alpha;
+        }
+        values[0]
+    }
+
+    #[test]
+    fn evaluation_space_arity16_fold_matches_coefficient_fold() {
+        type F = GoldilocksField;
+        type FE = <F as Extendable<2>>::Extension;
+
+        for log_n in [8usize, 10, 13] {
+            let n = 1usize << log_n;
+            let shift = F::MULTIPLICATIVE_GROUP_GENERATOR;
+            let root = F::primitive_root_of_unity(log_n);
+            let root_16 = root.exp_u64((n / 16) as u64);
+            let beta = FE::rand();
+            let mut coeffs = (0..n / 8).map(|_| FE::rand()).collect::<Vec<_>>();
+            coeffs.resize(n, FE::ZERO);
+
+            let natural_values =
+                PolynomialCoeffs::new(coeffs.clone()).coset_fft(shift.into()).values;
+            let bitrev_values = (0..n)
+                .map(|i| natural_values[reverse_bits(i, log_n)])
+                .collect::<Vec<_>>();
+
+            let mut expected_coeffs = coeffs
+                .chunks_exact(16)
+                .map(|chunk| reduce_with_powers(chunk, beta))
+                .collect::<Vec<_>>();
+            expected_coeffs.resize(n / 16, FE::ZERO);
+            let expected_values = PolynomialCoeffs::new(expected_coeffs)
+                .coset_fft(shift.exp_u64(16).into())
+                .values;
+
+            for leaf_index in 0..n / 16 {
+                let leaf: [FE; 16] = bitrev_values[leaf_index * 16..][..16]
+                    .try_into()
+                    .unwrap();
+                let natural_index = reverse_bits(leaf_index, log_n - 4);
+                let first_point = shift * root.exp_u64(natural_index as u64);
+                let actual =
+                    eval_space_fold_arity16::<F>(leaf, first_point, root_16, beta);
+                assert_eq!(
+                    actual,
+                    expected_values[natural_index],
+                    "evaluation fold mismatch at log_n={log_n}, leaf={leaf_index}",
+                );
+            }
+        }
+    }
 
     /// `bitrev_flatten` must be raw-`u64`-identical to the serial
     /// gather-and-extend loop it replaced, for every leaf and every limb.
