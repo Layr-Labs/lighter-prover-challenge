@@ -1,3 +1,5 @@
+// Redraw marker i34-9-composite basingamarket-ctrl 1787696002267 (inert)
+// Redraw marker 718
 // Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
 // reuse in the comparison/u16 arithmetic gate generators (per-call allocation
 // elimination previously described in this account's fable-ps notes).
