@@ -468,7 +468,16 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         let mut wire_values: Vec<Vec<F>> = (0..num_wires)
             .map(|_| Vec::with_capacity(degree))
             .collect();
-        let num_chunks = 16.min(degree.max(1));
+        let threads = {
+            use plonky2_maybe_rayon::*;
+            rayon::current_num_threads().max(1) as usize
+        };
+        let by_rows = degree.max(1).div_ceil(1024);
+        let num_chunks = by_rows
+            .max(threads.saturating_mul(2))
+            .min(64)
+            .min(degree.max(1))
+            .max(1);
         let chunk_rows = degree.div_ceil(num_chunks);
         {
             let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
