@@ -133,7 +133,7 @@ fn light_tx_proof_window() -> usize {
     })
 }
 // Keep the initial light proofs serial while the fixed three-chunk heavy path is active.
-const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 3;
+const LIGHT_TX_PROOF_OVERLAP_START_STEP: u64 = 2;
 
 fn chunk_is_light(txs: &[Arc<Tx<F>>]) -> bool {
     txs.first()
