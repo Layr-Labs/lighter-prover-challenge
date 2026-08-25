@@ -235,6 +235,63 @@ where
 {
     debug_assert_eq!(l.len() % D, 0);
     l.chunks_exact(D)
-        .map(|c| F::Extension::from_basefield_array(c.to_vec().try_into().unwrap()))
+        .map(|chunk| {
+            let mut limbs = [F::ZERO; D];
+            limbs.copy_from_slice(chunk);
+            F::Extension::from_basefield_array(limbs)
+        })
         .collect()
+}
+
+#[cfg(test)]
+mod unflatten_tests {
+    use super::*;
+    use crate::goldilocks_field::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    fn legacy_unflatten<const D: usize>(input: &[F]) -> Vec<<F as Extendable<D>>::Extension>
+    where
+        F: Extendable<D>,
+    {
+        input
+            .chunks_exact(D)
+            .map(|chunk| {
+                <F as Extendable<D>>::Extension::from_basefield_array(
+                    chunk.to_vec().try_into().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_matches_legacy<const D: usize>(input: &[F])
+    where
+        F: Extendable<D>,
+    {
+        let expected = legacy_unflatten::<D>(input);
+        let actual = unflatten::<F, D>(input);
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert_eq!(
+                actual.to_basefield_array().map(|limb| limb.0),
+                expected.to_basefield_array().map(|limb| limb.0)
+            );
+        }
+    }
+
+    #[test]
+    fn stack_unflatten_matches_legacy_for_empty_and_noncanonical_ext2() {
+        assert_matches_legacy::<2>(&[]);
+        let input = (0..8)
+            .map(|i| GoldilocksField(u64::MAX.wrapping_sub(i)))
+            .collect::<Vec<_>>();
+        assert_matches_legacy::<2>(&input);
+    }
+
+    #[test]
+    fn stack_unflatten_matches_legacy_for_generic_degrees() {
+        assert_matches_legacy::<1>(&[F::ONE, F::TWO]);
+        assert_matches_legacy::<4>(&[F::ONE; 8]);
+        assert_matches_legacy::<5>(&[F::TWO; 10]);
+    }
 }
