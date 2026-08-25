@@ -752,8 +752,9 @@ pub struct ProverOnlyCircuitData<
     pub constants_sigmas_commitment: PolynomialBatch<F, C, D>,
     /// The transpose of the list of sigma polynomials.
     pub sigmas: Vec<Vec<F>>,
-    /// Subgroup of order `degree`.
-    pub subgroup: Vec<F>,
+    /// Subgroup of order `degree`, shared by circuits with the same degree.
+    /// Runtime ownership only; serialization still writes the same field-element sequence.
+    pub subgroup: Arc<Vec<F>>,
     /// Targets to be made public.
     pub public_inputs: Vec<Target>,
     /// A map from each `Target`'s index to the index of its representative in the disjoint-set

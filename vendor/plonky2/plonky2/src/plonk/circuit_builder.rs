@@ -1474,7 +1474,7 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             generators_defer_until_ready,
             constants_sigmas_commitment,
             sigmas,
-            subgroup,
+            subgroup: Arc::new(subgroup),
             public_inputs: self.public_inputs,
             representative_map: forest.parents,
             fixed_routed_wires,

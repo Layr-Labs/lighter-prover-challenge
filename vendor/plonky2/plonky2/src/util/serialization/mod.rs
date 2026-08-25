@@ -915,7 +915,7 @@ pub trait Read {
         }
 
         let subgroup_len = self.read_usize()?;
-        let subgroup = self.read_field_vec(subgroup_len)?;
+        let subgroup = Arc::new(self.read_field_vec(subgroup_len)?);
 
         let public_inputs = self.read_target_vec()?;
 

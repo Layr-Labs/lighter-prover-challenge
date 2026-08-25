@@ -595,7 +595,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // chains per load. The cached values are value-identical to a fresh
     // computation (the cache stores exactly what `two_adic_subgroup` /
     // `fft_root_table` produce), so this is startup-only deduplication.
-    let subgroup = cached_two_adic_subgroup::<F>(degree_bits).as_ref().clone();
+    let subgroup = cached_two_adic_subgroup::<F>(degree_bits);
 
     // Same table size expression as `try_build_with_options`.
     let max_fft_points =
@@ -606,7 +606,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // is the same `WirePartition::get_sigma_polys` path as the builder, only
     // the frozen partition itself no longer gets re-derived at runtime.
     let wire_partition = WirePartition::from_sigma_indices(sigma_indices);
-    let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, &subgroup);
+    let sigma_vecs = wire_partition.get_sigma_polys(degree_bits, &common.k_is, subgroup.as_slice());
 
     // `prover_only.sigmas` is the transpose of the sigma *values*, and the
     // commitment below consumes those same values. Transposing first reads the
@@ -798,5 +798,17 @@ mod tests {
         let decoded = read_compressed_section(&framed, &mut pos).unwrap();
         assert_eq!(decoded, input);
         assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn subgroup_cache_shares_same_degree_but_separates_degrees() {
+        let first = cached_two_adic_subgroup::<F>(14);
+        let same_degree = cached_two_adic_subgroup::<F>(14);
+        let different_degree = cached_two_adic_subgroup::<F>(15);
+
+        assert!(std::sync::Arc::ptr_eq(&first, &same_degree));
+        assert!(!std::sync::Arc::ptr_eq(&first, &different_degree));
+        assert_eq!(first.as_slice(), F::two_adic_subgroup(14));
+        assert_eq!(different_degree.as_slice(), F::two_adic_subgroup(15));
     }
 }

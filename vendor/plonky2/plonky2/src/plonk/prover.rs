@@ -4581,6 +4581,8 @@ mod l_0_table_tests {
 /// comparisons here are on the raw `to_noncanonical_u64` limbs instead.
 #[cfg(all(test, feature = "std"))]
 mod permutation_pairing_tests {
+    use std::sync::Arc;
+
     use crate::field::polynomial::PolynomialValues;
     use crate::field::types::{Field, Field64, PrimeField64};
     use crate::iop::witness::MatrixWitness;
@@ -4787,7 +4789,7 @@ mod permutation_pairing_tests {
                 "no noncanonical inputs for {n_points} points"
             );
 
-            data.prover_only.subgroup = subgroup.clone();
+            data.prover_only.subgroup = Arc::new(subgroup.clone());
             data.prover_only.sigmas = sigmas.clone();
 
             // Reference: the general per-challenge loop, two complete passes.
@@ -4943,7 +4945,8 @@ mod permutation_pairing_tests {
 
         // Same field value as subgroup[0] = 1, deliberately different raw Goldilocks limb.
         assert_eq!(data.prover_only.subgroup[0], F::ONE);
-        data.prover_only.subgroup[0] = F::from_noncanonical_u64(F::ORDER + 1);
+        Arc::make_mut(&mut data.prover_only.subgroup)[0] =
+            F::from_noncanonical_u64(F::ORDER + 1);
         assert_eq!(data.prover_only.subgroup[0], F::ONE);
         assert_eq!(data.prover_only.subgroup[0].to_noncanonical_u64(), F::ORDER + 1);
 
