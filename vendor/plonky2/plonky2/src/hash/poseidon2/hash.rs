@@ -896,6 +896,23 @@ impl<F: RichField + Poseidon2> Hasher<F> for Poseidon2Hash {
     type Hash = HashOut<F>;
     type Permutation = Poseidon2Permutation<F>;
 
+    #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+    fn try_build_fri_ext2_commitment_from_coeffs(
+        coeffs: &[[F; 2]],
+        rate_bits: usize,
+        cap_height: usize,
+    ) -> Option<(
+        crate::hash::poseidon2::metal::MetalColumns<F>,
+        crate::hash::merkle_tree::LevelOrderDigests<Self::Hash>,
+        Vec<Self::Hash>,
+    )> {
+        crate::hash::poseidon2::metal::build_fri_ext2_commitment_from_coeffs(
+            coeffs,
+            rate_bits,
+            cap_height,
+        )
+    }
+
     fn hash_no_pad(input: &[F]) -> Self::Hash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
     }
