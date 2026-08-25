@@ -362,7 +362,7 @@ const STAGING_CHUNK: usize = 1 << 19;
 /// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
 /// peak unified-memory pressure.
 const MAX_CACHED_QUOTIENT_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
+const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 4;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
@@ -1113,9 +1113,10 @@ impl QuotientOutputPool {
         Some(self.free.swap_remove(index))
     }
 
-    /// Retains at most the two largest recurring-size buffers. A larger buffer
+    /// Retains at most the four largest recurring-size buffers. A larger buffer
     /// can service every smaller quotient shape, while final-proof outputs are
-    /// rejected by the size cap before they reach the cache.
+    /// rejected by the size cap before they reach the cache. Two slots was
+    /// tight against poseidon/range/permutation/split-half jobs of one proof.
     fn recycle(&mut self, buffer: Buffer) {
         let length = buffer.length();
         if length > MAX_CACHED_QUOTIENT_OUTPUT_BYTES {
@@ -4892,15 +4893,19 @@ mod tests {
         pool.recycle(buffer(2 * mib));
         pool.recycle(buffer(8 * mib));
         pool.recycle(buffer(4 * mib));
+        pool.recycle(buffer(6 * mib));
+        pool.recycle(buffer(1 * mib));
         assert_eq!(pool.free.len(), MAX_CACHED_QUOTIENT_OUTPUTS);
         let mut lengths = pool.free.iter().map(|buffer| buffer.length()).collect::<Vec<_>>();
         lengths.sort_unstable();
-        assert_eq!(lengths, vec![4 * mib, 8 * mib]);
+        assert_eq!(lengths, vec![2 * mib, 4 * mib, 6 * mib, 8 * mib]);
 
         let four = pool.take_best_fit(3 * mib).expect("4 MiB best fit");
         assert_eq!(four.length(), 4 * mib);
-        let eight = pool.take_best_fit(1).expect("remaining 8 MiB buffer");
-        assert_eq!(eight.length(), 8 * mib);
+        let two = pool.take_best_fit(1).expect("2 MiB remaining");
+        assert_eq!(two.length(), 2 * mib);
+        assert!(pool.take_best_fit(1).is_some());
+        assert!(pool.take_best_fit(1).is_some());
         assert!(pool.take_best_fit(1).is_none());
 
         pool.recycle(buffer(MAX_CACHED_QUOTIENT_OUTPUT_BYTES + 1));
