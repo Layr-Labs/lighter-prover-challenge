@@ -162,22 +162,36 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for MulExtensionGa
             let m0_start = Self::wires_ith_multiplicand_0(i).start;
             let m1_start = Self::wires_ith_multiplicand_1(i).start;
             let output_start = Self::wires_ith_output(i).start;
-            for p in 0..n {
-                let multiplicand_0 = ext(m0_start, p);
-                let multiplicand_1 = ext(m1_start, p);
-                let output = ext(output_start, p);
-                let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p]);
-                let arr = (output - computed_output).to_basefield_array();
-                for (d, a) in arr.iter().enumerate() {
-                    scratch[d * n + p] = *a;
+            if D == 2 {
+                let (out0, rest) = combined_gate_constraints[(i * 2) * n..].split_at_mut(n);
+                let out1 = &mut rest[..n];
+                for p in 0..n {
+                    let multiplicand_0 = ext(m0_start, p);
+                    let multiplicand_1 = ext(m1_start, p);
+                    let output = ext(output_start, p);
+                    let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p]);
+                    let arr = (output - computed_output).to_basefield_array();
+                    out0[p] = out0[p] + arr[0] * filters[p];
+                    out1[p] = out1[p] + arr[1] * filters[p];
                 }
-            }
-            for d in 0..D {
-                batch_multiply_add_inplace(
-                    &mut combined_gate_constraints[(i * D + d) * n..][..n],
-                    &scratch[d * n..][..n],
-                    filters,
-                );
+            } else {
+                for p in 0..n {
+                    let multiplicand_0 = ext(m0_start, p);
+                    let multiplicand_1 = ext(m1_start, p);
+                    let output = ext(output_start, p);
+                    let computed_output = (multiplicand_0 * multiplicand_1).scalar_mul(const_0[p]);
+                    let arr = (output - computed_output).to_basefield_array();
+                    for (d, a) in arr.iter().enumerate() {
+                        scratch[d * n + p] = *a;
+                    }
+                }
+                for d in 0..D {
+                    batch_multiply_add_inplace(
+                        &mut combined_gate_constraints[(i * D + d) * n..][..n],
+                        &scratch[d * n..][..n],
+                        filters,
+                    );
+                }
             }
         }
     }

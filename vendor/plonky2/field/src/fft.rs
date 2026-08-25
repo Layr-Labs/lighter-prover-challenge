@@ -307,19 +307,17 @@ pub(crate) fn ifft_with_options_and_postscale<F: Field>(
         Some(scales) => {
             assert_eq!(scales.len(), n);
             // Fuse the caller's coefficient scaling into the same writes as
-            // IFFT reversal and normalization, preserving multiplication order.
-            buffer[0] *= n_inv;
-            buffer[n / 2] *= n_inv;
-            buffer[0] *= scales[0];
+            // IFFT reversal and normalization, pre-factoring n_inv into the scales.
+            buffer[0] *= n_inv * scales[0];
             if n > 1 {
-                buffer[n / 2] *= scales[n / 2];
+                buffer[n / 2] *= n_inv * scales[n / 2];
             }
             for i in 1..(n / 2) {
                 let j = n - i;
-                let mut coeffs_i = buffer[j] * n_inv;
-                let mut coeffs_j = buffer[i] * n_inv;
-                coeffs_i *= scales[i];
-                coeffs_j *= scales[j];
+                let scale_i = scales[i] * n_inv;
+                let scale_j = scales[j] * n_inv;
+                let coeffs_i = buffer[j] * scale_i;
+                let coeffs_j = buffer[i] * scale_j;
                 buffer[i] = coeffs_i;
                 buffer[j] = coeffs_j;
             }

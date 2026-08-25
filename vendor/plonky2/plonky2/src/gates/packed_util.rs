@@ -109,12 +109,13 @@ pub trait PackedEvaluableBase<F: RichField + Extendable<D>, const D: usize>: Gat
             // packed values"; `from_slice` also asserts len == WIDTH.
             let filter = *<F as Packable>::Packing::from_slice(&filters[offset..offset + width]);
             for j in 0..num_constraints {
-                let combined = &mut combined_gate_constraints[j * n + offset..][..width];
-                let acc = *<F as Packable>::Packing::from_slice(combined);
+                let combined_slot = <F as Packable>::Packing::from_slice_mut(
+                    &mut combined_gate_constraints[j * n + offset..][..width],
+                );
                 let row = *<F as Packable>::Packing::from_slice(
                     &scratch[j * width..(j + 1) * width],
                 );
-                combined.copy_from_slice(acc.multiply_accumulate(row, filter).as_slice());
+                *combined_slot = combined_slot.multiply_accumulate(row, filter);
             }
         }
         for (i, vars_leftovers) in vars_leftovers_iter.enumerate() {
