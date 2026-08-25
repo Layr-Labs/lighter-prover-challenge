@@ -222,9 +222,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32Subtraction
         let base32 = F::from_canonical_u64(1 << 32u64);
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
-        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_stack = [F::ZERO; 32];
         let mut scratch_heap;
-        let scratch: &mut [F] = if n <= 64 {
+        let scratch: &mut [F] = if n <= 32 {
             &mut scratch_stack[..n]
         } else {
             scratch_heap = vec![F::ZERO; n];
