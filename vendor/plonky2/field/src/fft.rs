@@ -1047,9 +1047,20 @@ fn fft_classic_simd_single_layer_neon_ext(
     let half = 1usize << lg_half_m;
     let m = half << 1;
     debug_assert!(omega_row.len() >= half);
-    let base_subfield = omega_row[..half]
-        .iter()
-        .all(|w| w.0[1].0 == 0);
+    // Decide the base-subfield case from one element instead of scanning the
+    // whole row. `fft_root_table` builds every row as `base.powers()`, so
+    // `omega_row[j] == base^j`; the base subfield (zero imaginary limb) is
+    // closed under multiplication, so every power lies in it exactly when
+    // `base = omega_row[1]` does. `powers().take(half_m.max(2))` guarantees the
+    // row always has at least two entries, so index 1 is always in bounds.
+    //
+    // The `half < 2` arm keeps the old value rather than the shortcut: with a
+    // single element the scan sees only `omega_row[0] == 1`, which is in the
+    // subfield, and the loop below uses exactly that element. Value-identical
+    // in both arms; this deletes an O(half) pass over the twiddle row per
+    // layer, which sums to roughly one extra read of the whole table per
+    // transform.
+    let base_subfield = half < 2 || omega_row[1].0[1].0 == 0;
     unsafe {
         let eps = vdupq_n_u64(EPSILON);
         let mut k = 0;
