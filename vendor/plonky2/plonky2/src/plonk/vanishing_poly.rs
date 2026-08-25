@@ -184,6 +184,10 @@ pub(crate) struct VanishingScratch<F> {
     pub constraint_terms_batch: Vec<F>,
     /// Reused selector-filter buffer across batches (survivor-list package).
     pub gate_filters: Vec<F>,
+    /// Opaque field workspace retained for gate evaluators across quotient
+    /// batches. The coset interpolation gate uses it for its row-major
+    /// constraint matrix.
+    pub gate_constraint_scratch: Vec<F>,
     /// Gate-major selector filters produced once per selector group with
     /// shared prefix/suffix products. Only gates selected by
     /// `shared_gate_filter_plan` have initialized rows.
@@ -837,6 +841,7 @@ pub(crate) fn eval_vanishing_poly_base_batch<F: RichField + Extendable<D>, const
         &mut scratch.constraint_terms_batch,
         cpu_gate_indices,
         &mut scratch.gate_filters,
+        &mut scratch.gate_constraint_scratch,
         &mut scratch.shared_gate_filters,
         &mut scratch.selector_filter_suffix,
         &mut scratch.interleave_summed_filter,
@@ -1721,6 +1726,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         .filter(|i| !excluded_gate_indices.contains(i))
         .collect::<Vec<_>>();
     let mut filters = Vec::with_capacity(vars_batch.len());
+    let mut gate_constraint_scratch = Vec::new();
     let mut shared_gate_filters = Vec::new();
     let mut selector_filter_suffix = Vec::new();
     let mut interleave_summed_filter = Vec::new();
@@ -1731,6 +1737,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_excluding_many<
         constraints_batch,
         &cpu_gate_indices,
         &mut filters,
+        &mut gate_constraint_scratch,
         &mut shared_gate_filters,
         &mut selector_filter_suffix,
         &mut interleave_summed_filter,
@@ -1749,6 +1756,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
     constraints_batch: &mut Vec<F>,
     cpu_gate_indices: &[usize],
     filters: &mut Vec<F>,
+    gate_constraint_scratch: &mut Vec<F>,
     shared_gate_filters: &mut Vec<F>,
     selector_filter_suffix: &mut Vec<F>,
     interleave_summed_filter: &mut Vec<F>,
@@ -1872,17 +1880,17 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
             let filter = &shared_gate_filters[i * batch_size..(i + 1) * batch_size];
             let mut unfiltered_vars = vars_batch;
             unfiltered_vars.remove_prefix(
-                common_data.selectors_info.num_selectors()
-                    + common_data.num_lookup_selectors,
+                common_data.selectors_info.num_selectors() + common_data.num_lookup_selectors,
             );
-            gate.0.eval_unfiltered_base_batch_accumulate(
+            gate.0.eval_unfiltered_base_batch_accumulate_with_scratch(
                 unfiltered_vars,
                 filter,
                 constraints_batch,
+                gate_constraint_scratch,
             );
         } else {
             let selector_index = common_data.selectors_info.selector_indices[i];
-            gate.0.eval_filtered_base_batch(
+            gate.0.eval_filtered_base_batch_with_scratch(
                 vars_batch,
                 i,
                 selector_index,
@@ -1891,6 +1899,7 @@ pub(crate) fn evaluate_gate_constraints_base_batch_into_cpu_gates<
                 common_data.num_lookup_selectors,
                 filters,
                 constraints_batch,
+                gate_constraint_scratch,
             );
         }
     }

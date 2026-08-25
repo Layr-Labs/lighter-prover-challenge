@@ -174,6 +174,59 @@ impl<F: RichField + Extendable<D>, const D: usize> CosetInterpolationGate<F, D> 
         let start = self.start_intermediates() + D * 2 * self.num_intermediates();
         start..start + D
     }
+
+    /// Load one extension value from a wire-major batch without building a
+    /// point view or a temporary range.
+    #[inline]
+    fn get_batch_ext(
+        local_wires: &[F],
+        stride: usize,
+        point: usize,
+        start: usize,
+    ) -> F::Extension {
+        F::Extension::from_basefield_array(core::array::from_fn(|d| {
+            local_wires[(start + d) * stride + point]
+        }))
+    }
+
+    /// The interpolation recurrence for one batch point, reading each value
+    /// directly from its wire column. The field expression and iteration order
+    /// match `partial_interpolate`.
+    #[inline]
+    fn partial_interpolate_base_batch_point(
+        &self,
+        local_wires: &[F],
+        stride: usize,
+        point: usize,
+        domain: &[F],
+        weights: &[F],
+        value_indices: Range<usize>,
+        x: F::Extension,
+        initial_eval: F::Extension,
+        initial_partial_prod: F::Extension,
+    ) -> (F::Extension, F::Extension) {
+        debug_assert_ne!(value_indices.len(), 0);
+        debug_assert!(value_indices.end <= self.num_points());
+        debug_assert!(value_indices.end <= domain.len());
+        debug_assert!(value_indices.end <= weights.len());
+
+        value_indices.fold(
+            (initial_eval, initial_partial_prod),
+            |(eval, terms_partial_prod), i| {
+                let value = Self::get_batch_ext(
+                    local_wires,
+                    stride,
+                    point,
+                    self.start_values() + i * D,
+                );
+                let val = value.scalar_mul(weights[i]);
+                let term = x - domain[i].into();
+                let next_eval = eval * term + val * terms_partial_prod;
+                let next_terms_partial_prod = terms_partial_prod * term;
+                (next_eval, next_terms_partial_prod)
+            },
+        )
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpolationGate<F, D> {
@@ -312,6 +365,25 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         filters: &[F],
         combined_gate_constraints: &mut [F],
     ) {
+        let mut scratch = Vec::new();
+        self.eval_unfiltered_base_batch_accumulate_with_scratch(
+            vars_base,
+            filters,
+            combined_gate_constraints,
+            &mut scratch,
+        );
+    }
+
+    /// Retained-workspace form used by the quotient loop. Only the first
+    /// `num_constraints() * batch_size` elements belong to this invocation;
+    /// all are overwritten before the row-wise multiply-add reads them.
+    fn eval_unfiltered_base_batch_accumulate_with_scratch(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        scratch: &mut Vec<F>,
+    ) {
         let n = vars_base.len();
         assert_eq!(filters.len(), n);
         let num_constraints = <Self as Gate<F, D>>::num_constraints(self);
@@ -322,37 +394,56 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
         // otherwise run once per 32-point batch call.
         let domain = crate::field::fft::cached_two_adic_subgroup::<F>(self.subgroup_bits);
         let weights = &self.barycentric_weights;
-        let mut values = vec![F::Extension::ZERO; self.num_points()];
-        let mut scratch = vec![F::ZERO; num_constraints * n];
+        let required = num_constraints * n;
+        if scratch.len() < required {
+            scratch.resize(required, F::ZERO);
+        }
+        let scratch = &mut scratch[..required];
 
-        for (p, vars) in vars_base.iter().enumerate() {
-            let shift = vars.local_wires[self.wire_shift()];
-            let evaluation_point = vars.get_local_ext(self.wires_evaluation_point());
-            let shifted_evaluation_point =
-                vars.get_local_ext(self.wires_shifted_evaluation_point());
+        let local_wires = vars_base.local_wires;
+        for p in 0..n {
+            let shift = local_wires[p];
+            let evaluation_point =
+                Self::get_batch_ext(local_wires, n, p, self.start_evaluation_point());
+            let shifted_evaluation_point = Self::get_batch_ext(
+                local_wires,
+                n,
+                p,
+                self.wires_shifted_evaluation_point().start,
+            );
             let arr = (evaluation_point - shifted_evaluation_point.scalar_mul(shift))
                 .to_basefield_array();
             for (d, a) in arr.iter().enumerate() {
                 scratch[d * n + p] = *a;
             }
 
-            for (i, value) in values.iter_mut().enumerate() {
-                *value = vars.get_local_ext(self.wires_value(i));
-            }
-
-            let (mut computed_eval, mut computed_prod) = partial_interpolate(
-                &domain[..self.degree()],
-                &values[..self.degree()],
-                &weights[..self.degree()],
-                shifted_evaluation_point,
-                F::Extension::ZERO,
-                F::Extension::ONE,
-            );
+            let (mut computed_eval, mut computed_prod) =
+                self.partial_interpolate_base_batch_point(
+                    local_wires,
+                    n,
+                    p,
+                    &domain,
+                    weights,
+                    0..self.degree(),
+                    shifted_evaluation_point,
+                    F::Extension::ZERO,
+                    F::Extension::ONE,
+                );
 
             let mut row = D;
             for i in 0..self.num_intermediates() {
-                let intermediate_eval = vars.get_local_ext(self.wires_intermediate_eval(i));
-                let intermediate_prod = vars.get_local_ext(self.wires_intermediate_prod(i));
+                let intermediate_eval = Self::get_batch_ext(
+                    local_wires,
+                    n,
+                    p,
+                    self.wires_intermediate_eval(i).start,
+                );
+                let intermediate_prod = Self::get_batch_ext(
+                    local_wires,
+                    n,
+                    p,
+                    self.wires_intermediate_prod(i).start,
+                );
                 let arr = (intermediate_eval - computed_eval).to_basefield_array();
                 for (d, a) in arr.iter().enumerate() {
                     scratch[(row + d) * n + p] = *a;
@@ -366,21 +457,26 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for CosetInterpola
 
                 let start_index = 1 + (self.degree() - 1) * (i + 1);
                 let end_index = (start_index + self.degree() - 1).min(self.num_points());
-                (computed_eval, computed_prod) = partial_interpolate(
-                    &domain[start_index..end_index],
-                    &values[start_index..end_index],
-                    &weights[start_index..end_index],
+                (computed_eval, computed_prod) = self.partial_interpolate_base_batch_point(
+                    local_wires,
+                    n,
+                    p,
+                    &domain,
+                    weights,
+                    start_index..end_index,
                     shifted_evaluation_point,
                     intermediate_eval,
                     intermediate_prod,
                 );
             }
 
-            let evaluation_value = vars.get_local_ext(self.wires_evaluation_value());
+            let evaluation_value =
+                Self::get_batch_ext(local_wires, n, p, self.start_evaluation_value());
             let arr = (evaluation_value - computed_eval).to_basefield_array();
             for (d, a) in arr.iter().enumerate() {
                 scratch[(row + d) * n + p] = *a;
             }
+            debug_assert_eq!(row + D, num_constraints);
         }
 
         for (j, row_slice) in scratch.chunks_exact(n).enumerate() {
@@ -746,7 +842,7 @@ mod tests {
 
     use super::*;
     use crate::field::goldilocks_field::GoldilocksField;
-    use crate::field::types::Sample;
+    use crate::field::types::{Field64, PrimeField64, Sample};
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
@@ -758,34 +854,84 @@ mod tests {
     /// cannot reach.
     #[test]
     fn test_accumulate_matches_default_across_batch() {
+        use crate::field::batch_util::batch_multiply_add_inplace;
+
         const D: usize = 2;
         type F = GoldilocksField;
 
-        let n = 32;
-        for max_degree in [2, 3, 6, 16] {
-            let gate = <CosetInterpolationGate<F, D>>::with_max_degree(4, max_degree);
+        // Cover the production 32-point batch, both neighboring ragged sizes,
+        // every supported interpolation split, and a smaller subgroup.
+        for (subgroup_bits, max_degree) in [(4, 2), (4, 3), (4, 6), (4, 16), (3, 6)] {
+            let gate = <CosetInterpolationGate<F, D>>::with_max_degree(subgroup_bits, max_degree);
             let num_wires = <CosetInterpolationGate<F, D> as Gate<F, D>>::num_wires(&gate);
             let num_constraints =
                 <CosetInterpolationGate<F, D> as Gate<F, D>>::num_constraints(&gate);
-
-            let wires_batch: Vec<F> = (0..num_wires * n).map(|_| F::rand()).collect();
-            let filters: Vec<F> = (0..n).map(|_| F::rand()).collect();
-            let initial: Vec<F> = (0..num_constraints * n).map(|_| F::rand()).collect();
             let public_inputs_hash = HashOut::<F>::ZERO;
-            let vars_batch =
-                EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+            let mut scratch = Vec::new();
+            let mut retained_ptr = core::ptr::null();
+            let mut retained_capacity = 0;
 
-            let reference = gate.eval_unfiltered_base_batch(vars_batch);
-            let mut expected = initial.clone();
-            for (combined, row) in expected.chunks_exact_mut(n).zip(reference.chunks_exact(n)) {
-                for p in 0..n {
-                    combined[p] += row[p] * filters[p];
+            // Start at the largest batch so every later call must reuse the
+            // allocation; finish there again after two shorter prefixes.
+            for (round, n) in [33, 31, 32, 33].into_iter().enumerate() {
+                let raw = |i: usize| match i % 6 {
+                    0 => F::ZERO,
+                    1 => F::ONE,
+                    2 => GoldilocksField(F::ORDER),
+                    3 => GoldilocksField(F::ORDER + 1),
+                    4 => GoldilocksField(u64::MAX),
+                    _ => F::from_canonical_usize(i.wrapping_mul(0x9e37) + 17),
+                };
+                let wires_batch: Vec<F> = (0..num_wires * n).map(raw).collect();
+                let filters: Vec<F> = (0..n).map(|i| raw(i + 11)).collect();
+                let initial: Vec<F> = (0..num_constraints * n).map(|i| raw(i + 23)).collect();
+                let vars_batch =
+                    EvaluationVarsBaseBatch::new(n, &[], &wires_batch, &public_inputs_hash);
+
+                let reference = gate.eval_unfiltered_base_batch(vars_batch);
+                let mut expected = initial.clone();
+                for (combined, row) in expected.chunks_exact_mut(n).zip(reference.chunks_exact(n)) {
+                    batch_multiply_add_inplace(combined, row, &filters);
+                }
+
+                let required = num_constraints * n;
+                let poison = GoldilocksField(F::ORDER + 7);
+                if round != 0 {
+                    scratch.fill(poison);
+                }
+                let mut actual = initial;
+                gate.eval_unfiltered_base_batch_accumulate_with_scratch(
+                    vars_batch,
+                    &filters,
+                    &mut actual,
+                    &mut scratch,
+                );
+                assert!(
+                    scratch[..required]
+                        .iter()
+                        .zip(&reference)
+                        .all(|(a, b)| a.to_noncanonical_u64() == b.to_noncanonical_u64()),
+                    "raw constraint words differ: subgroup_bits {subgroup_bits}, max_degree {max_degree}, n {n}"
+                );
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| a.to_noncanonical_u64() == b.to_noncanonical_u64()),
+                    "subgroup_bits {subgroup_bits}, max_degree {max_degree}, n {n}"
+                );
+
+                if round == 0 {
+                    retained_ptr = scratch.as_ptr();
+                    retained_capacity = scratch.capacity();
+                } else {
+                    assert_eq!(scratch.as_ptr(), retained_ptr, "scratch moved");
+                    assert_eq!(scratch.capacity(), retained_capacity, "capacity changed");
+                    assert!(scratch[required..]
+                        .iter()
+                        .all(|x| x.to_noncanonical_u64() == poison.to_noncanonical_u64()));
                 }
             }
-
-            let mut actual = initial;
-            gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut actual);
-            assert_eq!(actual, expected, "max_degree {max_degree}");
         }
     }
 
@@ -831,14 +977,29 @@ mod tests {
         for _ in 0..iters {
             gate.eval_unfiltered_base_batch_accumulate(vars_batch, &filters, &mut combined);
         }
-        let new: Duration = start.elapsed();
+        let allocating: Duration = start.elapsed();
         assert_eq!(old_sink, combined[0], "paths diverged");
 
+        let mut combined = vec![F::ZERO; num_constraints * n];
+        let mut scratch = vec![F::ZERO; num_constraints * n];
+        let start = Instant::now();
+        for _ in 0..iters {
+            gate.eval_unfiltered_base_batch_accumulate_with_scratch(
+                vars_batch,
+                &filters,
+                &mut combined,
+                &mut scratch,
+            );
+        }
+        let retained: Duration = start.elapsed();
+        assert_eq!(old_sink, combined[0], "retained path diverged");
+
         println!(
-            "{:>10.3}us/iter -> {:>10.3}us/iter ({:.2}x)  CosetInterpolationGate(subgroup_bits=4, degree=6)",
+            "materialized {:>10.3}us, allocating fused {:>10.3}us, retained fused {:>10.3}us ({:.3}x retained/allocating)",
             old.as_secs_f64() * 1e6 / iters as f64,
-            new.as_secs_f64() * 1e6 / iters as f64,
-            old.as_secs_f64() / new.as_secs_f64(),
+            allocating.as_secs_f64() * 1e6 / iters as f64,
+            retained.as_secs_f64() * 1e6 / iters as f64,
+            allocating.as_secs_f64() / retained.as_secs_f64(),
         );
     }
 

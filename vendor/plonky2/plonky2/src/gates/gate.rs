@@ -204,6 +204,19 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         }
     }
 
+    /// Like [`Gate::eval_unfiltered_base_batch_accumulate`], but accepts opaque
+    /// caller-owned field scratch. The default keeps the existing behavior;
+    /// gates with retained-workspace implementations can override this method.
+    fn eval_unfiltered_base_batch_accumulate_with_scratch(
+        &self,
+        vars_base: EvaluationVarsBaseBatch<F>,
+        filters: &[F],
+        combined_gate_constraints: &mut [F],
+        _scratch: &mut Vec<F>,
+    ) {
+        self.eval_unfiltered_base_batch_accumulate(vars_base, filters, combined_gate_constraints);
+    }
+
     /// Defines the recursive constraints that enforce the statement represented by this custom gate.
     /// This is necessary to recursively verify proofs generated from a circuit containing such gates.
     ///
@@ -244,6 +257,32 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
     /// Constraint `j` for point `i` is at index `j * batch_size + i`.
     fn eval_filtered_base_batch(
         &self,
+        vars_batch: EvaluationVarsBaseBatch<F>,
+        row: usize,
+        selector_index: usize,
+        group_range: Range<usize>,
+        num_selectors: usize,
+        num_lookup_selectors: usize,
+        filters: &mut Vec<F>,
+        combined_gate_constraints: &mut [F],
+    ) {
+        let mut scratch = Vec::new();
+        self.eval_filtered_base_batch_with_scratch(
+            vars_batch,
+            row,
+            selector_index,
+            group_range,
+            num_selectors,
+            num_lookup_selectors,
+            filters,
+            combined_gate_constraints,
+            &mut scratch,
+        );
+    }
+
+    /// Retained-scratch form of [`Gate::eval_filtered_base_batch`].
+    fn eval_filtered_base_batch_with_scratch(
+        &self,
         mut vars_batch: EvaluationVarsBaseBatch<F>,
         row: usize,
         selector_index: usize,
@@ -252,6 +291,7 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
         num_lookup_selectors: usize,
         filters: &mut Vec<F>,
         combined_gate_constraints: &mut [F],
+        scratch: &mut Vec<F>,
     ) {
         let batch_size = vars_batch.len();
         debug_assert!(self.num_constraints() * batch_size <= combined_gate_constraints.len());
@@ -277,7 +317,12 @@ pub trait Gate<F: RichField + Extendable<D>, const D: usize>: 'static + Send + S
             }
         }
         vars_batch.remove_prefix(num_selectors + num_lookup_selectors);
-        self.eval_unfiltered_base_batch_accumulate(vars_batch, filters, combined_gate_constraints);
+        self.eval_unfiltered_base_batch_accumulate_with_scratch(
+            vars_batch,
+            filters,
+            combined_gate_constraints,
+            scratch,
+        );
     }
 
     /// Adds this gate's filtered constraints into the `combined_gate_constraints` buffer.
