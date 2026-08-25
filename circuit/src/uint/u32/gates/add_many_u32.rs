@@ -290,8 +290,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
 
             // Result/carry recompositions, folded high-to-low over each group
             // exactly as the interleaved accumulation in the batch path.
-            scratch.fill(F::ZERO);
-            for j in (0..Self::num_result_limbs()).rev() {
+            let most_significant_result = &wires
+                [self.wire_ith_output_jth_limb(i, Self::num_result_limbs() - 1) * n..]
+                [..n];
+            scratch.copy_from_slice(most_significant_result);
+            for j in (0..Self::num_result_limbs() - 1).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
                     scratch[p] = scratch[p] * base_limb + limb[p];
@@ -305,8 +308,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32AddManyGate
             batch_multiply_add_inplace(combined, &scratch, filters);
             constraint_index += 1;
 
-            scratch.fill(F::ZERO);
-            for j in (Self::num_result_limbs()..Self::num_limbs()).rev() {
+            let most_significant_carry = &wires
+                [self.wire_ith_output_jth_limb(i, Self::num_limbs() - 1) * n..]
+                [..n];
+            scratch.copy_from_slice(most_significant_carry);
+            for j in (Self::num_result_limbs()..Self::num_limbs() - 1).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
                     scratch[p] = scratch[p] * base_limb + limb[p];
