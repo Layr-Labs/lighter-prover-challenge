@@ -518,8 +518,19 @@ mod tests {
         let base16 = F::from_canonical_u64(1 << 16u64);
         let midpoint = U16ArithmeticGate::<F, D>::num_limbs() / 2;
         let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
-        let mut combined_low = vec![F::ZERO; n];
-        let mut combined_high = vec![F::ZERO; n];
+        // Batches are 32 points in this prover; keep the recomposition rows on
+        // the stack and fall back to the heap only for oversized batches.
+        let mut combined_low_stack = [F::ZERO; 64];
+        let mut combined_high_stack = [F::ZERO; 64];
+        let mut combined_low_heap;
+        let mut combined_high_heap;
+        let (mut combined_low, mut combined_high): (&mut [F], &mut [F]) = if n <= 64 {
+            (&mut combined_low_stack[..n], &mut combined_high_stack[..n])
+        } else {
+            combined_low_heap = vec![F::ZERO; n];
+            combined_high_heap = vec![F::ZERO; n];
+            (&mut combined_low_heap, &mut combined_high_heap)
+        };
 
         for i in 0..gate.num_ops {
             let multiplicand_0 = &wires[gate.wire_ith_multiplicand_0(i) * n..][..n];
