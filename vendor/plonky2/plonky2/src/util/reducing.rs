@@ -7,7 +7,9 @@ use plonky2_maybe_rayon::*;
 
 use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
-use crate::field::goldilocks_extensions::ext2_base_scalar_dot_slots;
+use crate::field::goldilocks_extensions::{
+    ext2_base_scalar_dot_slots_buffered,
+};
 use crate::field::goldilocks_field::GoldilocksField;
 use crate::field::packed::PackedField;
 use crate::field::polynomial::PolynomialCoeffs;
@@ -390,20 +392,32 @@ where
                 out.len(),
             )
         };
-        ext2_base_scalar_dot_slots(out, start, &slices, powers);
+        let mut full = Vec::with_capacity(slices.len());
+        let mut partial = Vec::new();
+        ext2_base_scalar_dot_slots_buffered(out, start, &slices, powers, &mut full, &mut partial);
     } else {
         out.par_chunks_mut(SLOT_BLOCK)
             .enumerate()
-            .for_each(|(block, out)| {
-                let block_start = start + block * SLOT_BLOCK;
-                let out = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        out.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
-                        out.len(),
-                    )
-                };
-                ext2_base_scalar_dot_slots(out, block_start, &slices, powers);
-            });
+            .for_each_init(
+                || (Vec::with_capacity(slices.len()), Vec::new()),
+                |(full, partial), (block, out)| {
+                    let block_start = start + block * SLOT_BLOCK;
+                    let out = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            out.as_mut_ptr().cast::<QuadraticExtension<GoldilocksField>>(),
+                            out.len(),
+                        )
+                    };
+                    ext2_base_scalar_dot_slots_buffered(
+                        out,
+                        block_start,
+                        &slices,
+                        powers,
+                        full,
+                        partial,
+                    );
+                },
+            );
     }
     true
 }
