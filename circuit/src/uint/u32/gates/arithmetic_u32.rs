@@ -328,8 +328,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
 
             // Low/high recompositions, folded high-to-low over each group
             // exactly as the interleaved accumulation in the batch path.
-            scratch.fill(F::ZERO);
-            for j in (0..midpoint).rev() {
+            let most_significant_low = &wires
+                [self.wire_ith_output_jth_limb(i, midpoint - 1) * n..]
+                [..n];
+            scratch.copy_from_slice(most_significant_low);
+            for j in (0..midpoint - 1).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
                     scratch[p] = scratch[p] * limb_base + limb[p];
@@ -343,8 +346,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U32ArithmeticG
             batch_multiply_add_inplace(combined, &scratch, filters);
             constraint_index += 1;
 
-            scratch.fill(F::ZERO);
-            for j in (midpoint..Self::num_limbs()).rev() {
+            let most_significant_high = &wires
+                [self.wire_ith_output_jth_limb(i, Self::num_limbs() - 1) * n..]
+                [..n];
+            scratch.copy_from_slice(most_significant_high);
+            for j in (midpoint..Self::num_limbs() - 1).rev() {
                 let limb = &wires[self.wire_ith_output_jth_limb(i, j) * n..][..n];
                 for p in 0..n {
                     scratch[p] = scratch[p] * limb_base + limb[p];
