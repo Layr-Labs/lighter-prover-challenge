@@ -7,7 +7,6 @@ use alloc::{
     string::{String, ToString},
     vec::Vec,
 };
-
 use anyhow::Result;
 use core::any::Any;
 use plonky2::field::extension::quintic::QuinticExtension;
@@ -19,7 +18,10 @@ use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
-use plonky2::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
+use plonky2::iop::generator::{
+    CompiledGeneratorIo, CompiledGeneratorIoCache, GeneratedValues, SimpleGenerator,
+    WitnessGeneratorRef,
+};
 use plonky2::iop::target::Target;
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
@@ -246,6 +248,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticMultipl
                         row,
                         const_3: F::from_canonical_u64(3),
                         i,
+                        compiled_io: CompiledGeneratorIoCache::default(),
                     }
                     .adapter(),
                 )
@@ -356,6 +359,44 @@ pub struct QuinticMultiplicationBaseGenerator<F: RichField + Extendable<D>, cons
     row: usize,
     const_3: F,
     i: usize,
+    compiled_io: CompiledGeneratorIoCache<CompiledGeneratorIo<10, 5>>,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> QuinticMultiplicationBaseGenerator<F, D> {
+    #[inline]
+    fn input_targets(&self) -> [Target; 10] {
+        core::array::from_fn(|index| {
+            let wire = if index < 5 {
+                self.gate.wire_ith_multiplicand_jth_limb_0(self.i, index)
+            } else {
+                self.gate
+                    .wire_ith_multiplicand_jth_limb_1(self.i, index - 5)
+            };
+            Target::wire(self.row, wire)
+        })
+    }
+
+    #[inline]
+    fn output_targets(&self) -> [Target; 5] {
+        core::array::from_fn(|j| {
+            Target::wire(self.row, self.gate.wire_ith_output_jth_limb(self.i, j))
+        })
+    }
+
+    fn run_once_generic(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let inputs = self.input_targets();
+        let a = core::array::from_fn(|j| witness.get_target(inputs[j]));
+        let b = core::array::from_fn(|j| witness.get_target(inputs[5 + j]));
+        let c = quintic_mul_limbs(&a, &b, self.const_3);
+        for (target, value) in self.output_targets().into_iter().zip(c) {
+            out_buffer.set_target(target, value)?;
+        }
+        Ok(())
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
@@ -366,21 +407,21 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
     }
 
     fn dependencies(&self) -> Vec<Target> {
-        [
-            self.gate.wire_ith_multiplicand_jth_limb_0(self.i, 0),
-            self.gate.wire_ith_multiplicand_jth_limb_0(self.i, 1),
-            self.gate.wire_ith_multiplicand_jth_limb_0(self.i, 2),
-            self.gate.wire_ith_multiplicand_jth_limb_0(self.i, 3),
-            self.gate.wire_ith_multiplicand_jth_limb_0(self.i, 4),
-            self.gate.wire_ith_multiplicand_jth_limb_1(self.i, 0),
-            self.gate.wire_ith_multiplicand_jth_limb_1(self.i, 1),
-            self.gate.wire_ith_multiplicand_jth_limb_1(self.i, 2),
-            self.gate.wire_ith_multiplicand_jth_limb_1(self.i, 3),
-            self.gate.wire_ith_multiplicand_jth_limb_1(self.i, 4),
-        ]
-        .iter()
-        .map(|&i| Target::wire(self.row, i))
-        .collect()
+        self.input_targets().to_vec()
+    }
+
+    fn compile_fixed_io(&mut self, representative_map: &[u32], num_wires: usize, degree: usize) {
+        self.compiled_io.set(CompiledGeneratorIo::new(
+            representative_map,
+            num_wires,
+            degree,
+            self.input_targets(),
+            self.output_targets(),
+        ));
+    }
+
+    fn clear_compiled_io(&mut self) {
+        self.compiled_io.clear();
     }
 
     fn run_once(
@@ -388,30 +429,58 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a: [F; 5] = core::array::from_fn(|j| {
-            witness.get_target(Target::wire(
-                self.row,
-                self.gate.wire_ith_multiplicand_jth_limb_0(self.i, j),
-            ))
-        });
-
-        let b: [F; 5] = core::array::from_fn(|j| {
-            witness.get_target(Target::wire(
-                self.row,
-                self.gate.wire_ith_multiplicand_jth_limb_1(self.i, j),
-            ))
-        });
-
-        let c = quintic_mul_limbs(&a, &b, self.const_3);
-
-        for j in 0..5 {
-            out_buffer.set_target(
-                Target::wire(self.row, self.gate.wire_ith_output_jth_limb(self.i, j)),
-                c[j],
-            )?;
+        let Some(io) = self.compiled_io.get() else {
+            return self.run_once_generic(witness, out_buffer);
+        };
+        if !io.matches(witness) {
+            return self.run_once_generic(witness, out_buffer);
         }
 
+        let inputs = io.input_representatives();
+        let a = core::array::from_fn(|j| witness.get_representative(inputs[j]));
+        let b = core::array::from_fn(|j| witness.get_representative(inputs[5 + j]));
+        let c = quintic_mul_limbs(&a, &b, self.const_3);
+        for ((target_index, representative), value) in (*io.output_target_indices())
+            .into_iter()
+            .zip(*io.output_representatives())
+            .zip(c)
+        {
+            out_buffer.set_compiled_target(target_index, representative, value)?;
+        }
         Ok(())
+    }
+
+    fn run_once_direct(
+        &self,
+        witness: &mut PartitionWitness<F>,
+        on_new_representative: &mut dyn FnMut(usize),
+    ) -> Option<Result<()>> {
+        let io = self.compiled_io.get()?;
+        if !io.matches(witness) {
+            return None;
+        }
+        Some((|| {
+            let inputs = io.input_representatives();
+            let a = core::array::from_fn(|j| witness.get_representative(inputs[j]));
+            let b = core::array::from_fn(|j| witness.get_representative(inputs[5 + j]));
+            let c = quintic_mul_limbs(&a, &b, self.const_3);
+            for ((target_index, representative), value) in (*io.output_target_indices())
+                .into_iter()
+                .zip(*io.output_representatives())
+                .zip(c)
+            {
+                if let Some(representative) = witness
+                    .set_rep_index_from_target_index_returning_new(
+                        representative as usize,
+                        target_index as usize,
+                        value,
+                    )?
+                {
+                    on_new_representative(representative);
+                }
+            }
+            Ok(())
+        })())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -431,6 +500,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             row,
             const_3,
             i,
+            compiled_io: CompiledGeneratorIoCache::default(),
         })
     }
 }
@@ -523,5 +593,113 @@ mod tests {
             let b = core::array::from_fn(|_| GoldilocksField(next()));
             check(a, b);
         }
+    }
+
+    #[test]
+    fn compiled_mul_io_preserves_raw_alias_and_conflict_behavior() {
+        use plonky2::field::types::Field;
+        use plonky2::iop::generator::generate_partial_witness;
+        use plonky2::iop::witness::{PartialWitness, Witness, WitnessWrite};
+        use plonky2::plonk::circuit_builder::CircuitBuilder;
+
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = GoldilocksField;
+
+        let config = CircuitConfig::standard_recursion_config();
+        let mut builder = CircuitBuilder::<F, D>::new(config.clone());
+        let gate = QuinticMultiplicationGate::new_from_config(&config);
+        let row = builder.add_gate(gate.clone(), vec![]);
+        let inputs: [plonky2::iop::target::Target; 10] = core::array::from_fn(|index| {
+            let wire = if index < 5 {
+                gate.wire_ith_multiplicand_jth_limb_0(0, index)
+            } else {
+                gate.wire_ith_multiplicand_jth_limb_1(0, index - 5)
+            };
+            plonky2::iop::target::Target::wire(row, wire)
+        });
+        let all_inputs = (0..gate.num_ops)
+            .flat_map(|operation| {
+                (0..10).map({
+                    let gate = gate.clone();
+                    move |index| {
+                        let wire = if index < 5 {
+                            gate.wire_ith_multiplicand_jth_limb_0(operation, index)
+                        } else {
+                            gate.wire_ith_multiplicand_jth_limb_1(operation, index - 5)
+                        };
+                        plonky2::iop::target::Target::wire(row, wire)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let output_0 = plonky2::iop::target::Target::wire(row, gate.wire_ith_output_jth_limb(0, 0));
+        let output_1 = plonky2::iop::target::Target::wire(row, gate.wire_ith_output_jth_limb(0, 1));
+        // Sabotage the circuit so two ordered generator outputs share a representative. Equal
+        // writes must populate it once; unequal writes must report the same contradiction.
+        builder.connect(output_0, output_1);
+        builder.register_public_input(output_0);
+        let mut data = builder.build::<C>();
+
+        let make_inputs = |conflict: bool| {
+            let mut witness = PartialWitness::new();
+            for &target in &all_inputs {
+                // a = b = 1 yields c[0] = 1 and c[1] = 0.
+                let value = if conflict && (target == inputs[0] || target == inputs[5]) {
+                    F::ONE
+                } else {
+                    F::ZERO
+                };
+                witness.set_target(target, value).unwrap();
+            }
+            witness
+        };
+
+        for generator in &mut data.prover_only.generators {
+            generator.0.clear_compiled_io();
+        }
+        let generic =
+            generate_partial_witness(make_inputs(false), &data.prover_only, &data.common).unwrap();
+        let generic_bitmap = generic.set_bitmap.clone();
+        let generic_values = (0..generic.values.len())
+            .filter(|&representative| generic.is_set_by_rep_index(representative))
+            .map(|representative| (representative, generic.values[representative]))
+            .collect::<Vec<_>>();
+        let generic_public_output = generic.get_target(output_0);
+        drop(generic);
+        for generator in &mut data.prover_only.generators {
+            generator.0.compile_fixed_io(
+                &data.prover_only.representative_map,
+                data.common.config.num_wires,
+                data.common.degree(),
+            );
+        }
+        let compiled =
+            generate_partial_witness(make_inputs(false), &data.prover_only, &data.common).unwrap();
+        assert_eq!(compiled.set_bitmap, generic_bitmap);
+        for (representative, generic_value) in generic_values {
+            assert_eq!(compiled.values[representative], generic_value);
+        }
+        assert_eq!(compiled.get_target(output_0), generic_public_output);
+        drop(compiled);
+
+        for generator in &mut data.prover_only.generators {
+            generator.0.clear_compiled_io();
+        }
+        let generic_error =
+            generate_partial_witness(make_inputs(true), &data.prover_only, &data.common)
+                .expect_err("generic aliased outputs must conflict");
+        for generator in &mut data.prover_only.generators {
+            generator.0.compile_fixed_io(
+                &data.prover_only.representative_map,
+                data.common.config.num_wires,
+                data.common.degree(),
+            );
+        }
+        let compiled_error =
+            generate_partial_witness(make_inputs(true), &data.prover_only, &data.common)
+                .expect_err("compiled aliased outputs must conflict");
+        assert_eq!(format!("{generic_error:#}"), format!("{compiled_error:#}"));
+        assert!(format!("{compiled_error:#}").contains("set twice with different values"));
     }
 }

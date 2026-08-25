@@ -11,7 +11,7 @@ use crate::field::extension::quadratic::QuadraticExtension;
 use crate::field::extension::{Extendable, FieldExtension};
 use crate::field::fft::{
     FftRootTable, cached_fft_root_table, fft_in_place_with_options,
-    fft_in_place_with_options_parallel,
+    fft_in_place_with_options_and_even, fft_in_place_with_options_parallel,
 };
 use crate::field::goldilocks_extensions::ext2_mul_add;
 use crate::field::goldilocks_field::GoldilocksField;
@@ -344,9 +344,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // same computation `fill_lde_column_store` performs, so a
                 // partial fill is simply refilled).
                 // Compact even-row companion (Metal only, on request): the
-                // fill below writes row `2k` of every column into row `k` of
-                // the companion right after that column's FFT, while the
-                // column is still cache-resident.
+                // production Goldilocks LDE schedule emits row `2k` directly
+                // from the final FFT butterfly registers. Unsupported shapes
+                // retain the exact post-FFT extraction fallback.
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                 let mut even_companion = if want_even_companion && lde_len >= 2 && rate_bits >= 1 {
                     crate::hash::poseidon2::metal::allocate_plain_columns::<F>(
@@ -362,22 +362,38 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         .columns_mut()
                         .map(|cols| cols.into_iter().map(|c| c.as_mut_ptr() as usize).collect())
                 });
-                #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
+                #[cfg(not(all(feature = "std", target_arch = "aarch64", target_os = "macos")))]
+                let even_ptrs: Option<Vec<usize>> = None;
                 let even_ptrs = &even_ptrs;
                 #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                 let half_len = lde_len / 2;
-                let copy_even = |_column: usize, _destination: &[F]| {
+                let transform = |_column: usize, _destination: &mut [F]| {
                     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
                     if let Some(ptrs) = even_ptrs {
-                        // SAFETY: each column index is written by exactly one
-                        // closure invocation (columns are disjoint), the
-                        // companion outlives the fill, and `F` is plain data.
-                        unsafe {
-                            copy_even_fast(ptrs[_column] as *mut F, _destination, half_len);
-                        }
+                        // SAFETY: each column owns one disjoint companion
+                        // slice, the companion outlives every parallel fill,
+                        // and the pointer was obtained from that exact slice.
+                        let even = unsafe {
+                            core::slice::from_raw_parts_mut(
+                                ptrs[_column] as *mut F,
+                                half_len,
+                            )
+                        };
+                        fft_in_place_with_options_and_even(
+                            _destination,
+                            Some(rate_bits),
+                            fft_root_table,
+                            even,
+                        );
+                        return;
                     }
+                    fft_in_place_with_options(
+                        _destination,
+                        Some(rate_bits),
+                        fft_root_table,
+                    );
                 };
-                let copy_even = &copy_even;
+                let transform = &transform;
                 let streamed = {
                     let coset_powers =
                         crate::plonk::prover::precomputed::coset_shift_powers::<F>(degree);
@@ -402,12 +418,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                                     if rate_bits == 0 || degree < 2 {
                                         destination[degree..].fill(F::ZERO);
                                     }
-                                    fft_in_place_with_options(
-                                        destination,
-                                        Some(rate_bits),
-                                        fft_root_table,
-                                    );
-                                    copy_even(group * 8 + k, destination);
+                                    transform(group * 8 + k, destination);
                                 },
                             );
                         },
@@ -445,7 +456,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                         &polynomials,
                         rate_bits,
                         fft_root_table,
-                        copy_even,
+                        even_ptrs.as_deref(),
                     )
                 );
                 if initialized {
@@ -563,7 +574,7 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         polynomials: &[PolynomialCoeffs<F>],
         rate_bits: usize,
         fft_root_table: Option<&FftRootTable<F>>,
-        copy_even: &(dyn Fn(usize, &[F]) + Sync),
+        even_ptrs: Option<&[usize]>,
     ) -> bool {
         let degree = polynomials[0].len();
         let lde_len = degree << rate_bits;
@@ -573,6 +584,9 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         };
         assert_eq!(destinations.len(), polynomials.len());
         assert!(destinations.iter().all(|column| column.len() == lde_len));
+        if let Some(ptrs) = even_ptrs {
+            assert_eq!(ptrs.len(), destinations.len());
+        }
 
         destinations
             .into_par_iter()
@@ -600,8 +614,28 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
                 // For a nontrivial zero-padded FFT, the expansion path writes
                 // every tail element before reading it. This is the same
                 // invariant used by `lde_values` to avoid a dead tail memset.
-                fft_in_place_with_options(destination, Some(rate_bits), fft_root_table);
-                copy_even(column, destination);
+                if let Some(ptrs) = even_ptrs {
+                    // SAFETY: each parallel column owns one disjoint slice and
+                    // the pointers were obtained from the live companion.
+                    let even = unsafe {
+                        core::slice::from_raw_parts_mut(
+                            ptrs[column] as *mut F,
+                            lde_len / 2,
+                        )
+                    };
+                    fft_in_place_with_options_and_even(
+                        destination,
+                        Some(rate_bits),
+                        fft_root_table,
+                        even,
+                    );
+                } else {
+                    fft_in_place_with_options(
+                        destination,
+                        Some(rate_bits),
+                        fft_root_table,
+                    );
+                }
             });
         true
     }
@@ -1669,7 +1703,7 @@ mod tests {
                         &polynomials,
                         rate_bits,
                         root_table,
-                        &|_, _| {},
+                        None,
                     ));
 
                     for (column, expected) in expected.iter().enumerate() {
@@ -1687,6 +1721,75 @@ mod tests {
                             "degree {degree}, rate_bits {rate_bits}, column {column}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// The production-shape retained LDE fill must emit an exact raw compact
+    /// companion for every column. Seventeen columns covers a ragged third
+    /// streamed absorb group; d14/d16/d18 cover all ranked FFT schedules.
+    #[test]
+    fn retained_lde_even_companion_matches_full_raw_words_across_ranked_degrees() {
+        use crate::field::fft::fft_root_table;
+        use crate::field::types::{Field64, PrimeField64};
+
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type C = Poseidon2GoldilocksConfig;
+
+        for (degree_bits, columns) in [(14usize, 17usize), (16, 17), (18, 3)] {
+            let degree = 1usize << degree_bits;
+            let rate_bits = 3usize;
+            let lde_len = degree << rate_bits;
+            let polynomials = (0..columns)
+                .map(|column| {
+                    PolynomialCoeffs::new(
+                        (0..degree)
+                            .map(|row| {
+                                let index = column * degree + row;
+                                let raw = match index & 31 {
+                                    0 => F::ORDER,
+                                    1 => F::ORDER + 1,
+                                    2 => u64::MAX,
+                                    _ => 0x9E37_79B9_7F4A_7C15u64
+                                        .wrapping_mul(index as u64 + 1)
+                                        .rotate_left((index & 63) as u32),
+                                };
+                                GoldilocksField(raw)
+                            })
+                            .collect(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let roots = fft_root_table::<F>(lde_len);
+            let mut retained = ColumnStore::Owned(
+                (0..columns)
+                    .map(|_| vec![GoldilocksField(u64::MAX); lde_len])
+                    .collect(),
+            );
+            let mut companion = (0..columns)
+                .map(|_| vec![GoldilocksField::ZERO; lde_len / 2])
+                .collect::<Vec<_>>();
+            let companion_ptrs = companion
+                .iter_mut()
+                .map(|column| column.as_mut_ptr() as usize)
+                .collect::<Vec<_>>();
+            assert!(PolynomialBatch::<F, C, D>::fill_lde_column_store(
+                &mut retained,
+                &polynomials,
+                rate_bits,
+                Some(&roots),
+                Some(&companion_ptrs),
+            ));
+            for column in 0..columns {
+                let full = retained.col(column);
+                for row in 0..lde_len / 2 {
+                    assert_eq!(
+                        companion[column][row].to_noncanonical_u64(),
+                        full[2 * row].to_noncanonical_u64(),
+                        "raw companion mismatch at d{degree_bits}, column={column}, row={row}",
+                    );
                 }
             }
         }

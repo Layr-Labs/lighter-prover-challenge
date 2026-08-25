@@ -16,7 +16,10 @@ use plonky2::gates::packed_util::PackedEvaluableBase;
 use plonky2::gates::util::StridedConstraintConsumer;
 use plonky2::hash::hash_types::RichField;
 use plonky2::iop::ext_target::ExtensionTarget;
-use plonky2::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
+use plonky2::iop::generator::{
+    CompiledGeneratorIo, CompiledGeneratorIoCache, GeneratedValues, SimpleGenerator,
+    WitnessGeneratorRef,
+};
 use plonky2::iop::target::Target;
 use plonky2::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use plonky2::plonk::circuit_builder::CircuitBuilder;
@@ -278,6 +281,7 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for QuinticSquarin
                         const_3: F::from_canonical_u64(3),
                         const_6: F::from_canonical_u64(6),
                         i,
+                        compiled_io: CompiledGeneratorIoCache::default(),
                     }
                     .adapter(),
                 )
@@ -447,6 +451,49 @@ pub struct QuinticSquaringBaseGenerator<F: RichField + Extendable<D>, const D: u
     const_3: F,
     const_6: F,
     i: usize,
+    compiled_io: CompiledGeneratorIoCache<CompiledGeneratorIo<5, 15>>,
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> QuinticSquaringBaseGenerator<F, D> {
+    #[inline]
+    fn input_targets(&self) -> [Target; 5] {
+        core::array::from_fn(|j| {
+            Target::wire(
+                self.row,
+                self.gate.wire_ith_multiplicand_jth_limb(self.i, j),
+            )
+        })
+    }
+
+    #[inline]
+    fn output_targets(&self) -> [Target; 15] {
+        core::array::from_fn(|index| {
+            let wire = if index < 5 {
+                self.gate.wire_ith_output_jth_limb(self.i, index)
+            } else {
+                self.gate.temporary_wire(self.i, index - 5)
+            };
+            Target::wire(self.row, wire)
+        })
+    }
+
+    fn run_once_generic(
+        &self,
+        witness: &PartitionWitness<F>,
+        out_buffer: &mut GeneratedValues<F>,
+    ) -> Result<()> {
+        let inputs = self.input_targets();
+        let a = core::array::from_fn(|j| witness.get_target(inputs[j]));
+        let (c, extra) = quintic_square_wires(&a, self.const_2, self.const_3, self.const_6);
+        let outputs = self.output_targets();
+        for j in 0..5 {
+            out_buffer.set_target(outputs[j], c[j])?;
+        }
+        for j in 0..10 {
+            out_buffer.set_target(outputs[5 + j], extra[j])?;
+        }
+        Ok(())
+    }
 }
 
 impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
@@ -457,16 +504,21 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
     }
 
     fn dependencies(&self) -> Vec<Target> {
-        [
-            self.gate.wire_ith_multiplicand_jth_limb(self.i, 0),
-            self.gate.wire_ith_multiplicand_jth_limb(self.i, 1),
-            self.gate.wire_ith_multiplicand_jth_limb(self.i, 2),
-            self.gate.wire_ith_multiplicand_jth_limb(self.i, 3),
-            self.gate.wire_ith_multiplicand_jth_limb(self.i, 4),
-        ]
-        .iter()
-        .map(|&i| Target::wire(self.row, i))
-        .collect()
+        self.input_targets().to_vec()
+    }
+
+    fn compile_fixed_io(&mut self, representative_map: &[u32], num_wires: usize, degree: usize) {
+        self.compiled_io.set(CompiledGeneratorIo::new(
+            representative_map,
+            num_wires,
+            degree,
+            self.input_targets(),
+            self.output_targets(),
+        ));
+    }
+
+    fn clear_compiled_io(&mut self) {
+        self.compiled_io.clear();
     }
 
     fn run_once(
@@ -474,32 +526,70 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()> {
-        let a: [F; 5] = core::array::from_fn(|j| {
-            witness.get_target(Target::wire(
-                self.row,
-                self.gate.wire_ith_multiplicand_jth_limb(self.i, j),
-            ))
-        });
-
-        let (c, extra) = quintic_square_wires(&a, self.const_2, self.const_3, self.const_6);
-
-        // Set outputs
-        for j in 0..5 {
-            out_buffer.set_target(
-                Target::wire(self.row, self.gate.wire_ith_output_jth_limb(self.i, j)),
-                c[j],
-            )?;
+        let Some(io) = self.compiled_io.get() else {
+            return self.run_once_generic(witness, out_buffer);
+        };
+        if !io.matches(witness) {
+            return self.run_once_generic(witness, out_buffer);
         }
 
-        // Set extra/intermediate wires
+        let inputs = io.input_representatives();
+        let a = core::array::from_fn(|j| witness.get_representative(inputs[j]));
+        let (c, extra) = quintic_square_wires(&a, self.const_2, self.const_3, self.const_6);
+        let target_indices = io.output_target_indices();
+        let representatives = io.output_representatives();
+        for j in 0..5 {
+            out_buffer.set_compiled_target(target_indices[j], representatives[j], c[j])?;
+        }
         for j in 0..10 {
-            out_buffer.set_target(
-                Target::wire(self.row, self.gate.temporary_wire(self.i, j)),
+            out_buffer.set_compiled_target(
+                target_indices[5 + j],
+                representatives[5 + j],
                 extra[j],
             )?;
         }
-
         Ok(())
+    }
+
+    fn run_once_direct(
+        &self,
+        witness: &mut PartitionWitness<F>,
+        on_new_representative: &mut dyn FnMut(usize),
+    ) -> Option<Result<()>> {
+        let io = self.compiled_io.get()?;
+        if !io.matches(witness) {
+            return None;
+        }
+        Some((|| {
+            let inputs = io.input_representatives();
+            let a = core::array::from_fn(|j| witness.get_representative(inputs[j]));
+            let (c, extra) = quintic_square_wires(&a, self.const_2, self.const_3, self.const_6);
+            let target_indices = io.output_target_indices();
+            let representatives = io.output_representatives();
+            for j in 0..5 {
+                if let Some(representative) = witness
+                    .set_rep_index_from_target_index_returning_new(
+                        representatives[j] as usize,
+                        target_indices[j] as usize,
+                        c[j],
+                    )?
+                {
+                    on_new_representative(representative);
+                }
+            }
+            for j in 0..10 {
+                if let Some(representative) = witness
+                    .set_rep_index_from_target_index_returning_new(
+                        representatives[5 + j] as usize,
+                        target_indices[5 + j] as usize,
+                        extra[j],
+                    )?
+                {
+                    on_new_representative(representative);
+                }
+            }
+            Ok(())
+        })())
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {
@@ -525,6 +615,7 @@ impl<F: RichField + Extendable<D>, const D: usize> SimpleGenerator<F, D>
             const_3,
             const_6,
             i,
+            compiled_io: CompiledGeneratorIoCache::default(),
         })
     }
 }

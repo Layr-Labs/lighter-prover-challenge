@@ -259,6 +259,7 @@ fn run_generator_worklist<
 
     let parallel_rounds = parallel_rounds_enabled();
     let mut buffer = GeneratedValues::empty();
+    let mut direct_representatives = Vec::with_capacity(15);
 
     // The two round queues are swapped rather than reallocated. Every round used
     // to start from a fresh `Vec::new()` and end by *moving* it over the old
@@ -297,7 +298,7 @@ fn run_generator_worklist<
             #[allow(clippy::type_complexity)]
             let round_outputs: Vec<(
                 Vec<(usize, bool, usize)>,
-                Vec<(Target, F, usize, Option<&[u32]>)>,
+                Vec<(usize, F, usize, Option<&[u32]>)>,
             )> = pending_generator_indices
                 .par_chunks(PARALLEL_WORKLIST_CHUNK)
                 .map(|chunk| {
@@ -320,19 +321,39 @@ fn run_generator_worklist<
                             &mut round_buffer,
                             ready,
                         );
-                        entries.push((generator_idx, finished, round_buffer.target_values.len()));
-                        for (t, v) in round_buffer.target_values.drain(..) {
-                            let rep_index = round_witness.representative_map
-                                [round_witness.target_index(t)]
-                                as usize;
-                            let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
-                                generator_indices_by_watches.get(&rep_index)
-                            } else {
-                                // The representative is populated in the snapshot, so the merge
-                                // cannot newly populate it and never needs watchers.
-                                None
-                            };
-                            annotated_values.push((t, v, rep_index, watchers));
+                        entries.push((
+                            generator_idx,
+                            finished,
+                            round_buffer.target_values.len() + round_buffer.compiled_values.len(),
+                        ));
+                        if !round_buffer.compiled_values.is_empty() {
+                            debug_assert!(round_buffer.target_values.is_empty());
+                            for (target_index, rep_index, v) in
+                                round_buffer.compiled_values.drain(..)
+                            {
+                                let target_index = target_index as usize;
+                                let rep_index = rep_index as usize;
+                                let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
+                                    generator_indices_by_watches.get(&rep_index)
+                                } else {
+                                    None
+                                };
+                                annotated_values.push((target_index, v, rep_index, watchers));
+                            }
+                        } else {
+                            for (t, v) in round_buffer.target_values.drain(..) {
+                                let target_index = round_witness.target_index(t);
+                                let rep_index =
+                                    round_witness.representative_map[target_index] as usize;
+                                let watchers = if !round_witness.is_set_by_rep_index(rep_index) {
+                                    generator_indices_by_watches.get(&rep_index)
+                                } else {
+                                    // The representative is populated in the snapshot, so the
+                                    // merge cannot newly populate it and never needs watchers.
+                                    None
+                                };
+                                annotated_values.push((target_index, v, rep_index, watchers));
+                            }
                         }
                     }
                     (entries, annotated_values)
@@ -349,14 +370,16 @@ fn run_generator_worklist<
                         *remaining_generators -= 1;
                     }
 
-                    for (t, v, rep_index, watchers) in annotated_values.by_ref().take(value_count) {
+                    for (target_index, v, rep_index, watchers) in
+                        annotated_values.by_ref().take(value_count)
+                    {
                         // Reuse the representative the run phase already gathered
                         // instead of gathering it again. `round_witness` above is an
                         // immutable reborrow of this very `witness`, and
                         // `representative_map` is an immutable `&[u32]` for the
                         // witness's whole lifetime, so the index is by construction
                         // the one `set_target_returning_rep` would have looked up.
-                        // `set_rep_index_returning_new` is documented as running the
+                        // The compact target-index setter runs the
                         // identical sequence on the identical slot from that point on,
                         // so the resulting witness is bit-for-bit unchanged. What goes
                         // away is a second scattered 4-byte read out of a table of
@@ -365,7 +388,11 @@ fn run_generator_worklist<
                         // twice, because the whole round's outputs are collected
                         // between the two lookups.
                         if witness
-                            .set_rep_index_returning_new(rep_index, t, v)?
+                            .set_rep_index_from_target_index_returning_new(
+                                rep_index,
+                                target_index,
+                                v,
+                            )?
                             .is_none()
                         {
                             continue;
@@ -398,6 +425,27 @@ fn run_generator_worklist<
                 continue;
             }
 
+            direct_representatives.clear();
+            if let Some(result) = generators[generator_idx]
+                .0
+                .run_direct_with_ready_hint(witness, ready, &mut |representative| {
+                    direct_representatives.push(representative)
+                })
+            {
+                result?;
+                generator_is_expired[generator_idx] = true;
+                *remaining_generators -= 1;
+                for representative in direct_representatives.drain(..) {
+                    readiness.populate_representative(
+                        representative,
+                        generator_is_expired,
+                        &mut next_pending_generator_indices,
+                        skip_unready,
+                    );
+                }
+                continue;
+            }
+
             let finished =
                 generators[generator_idx]
                     .0
@@ -414,14 +462,36 @@ fn run_generator_worklist<
             // touch disjoint state, so fusing the two passes deletes the per-run intermediate
             // rep Vec while preserving both the `set_target_returning_rep` call order and the
             // pending-queue push order exactly.
-            for (t, v) in buffer.target_values.drain(..) {
-                if let Some(representative) = witness.set_target_returning_rep(t, v)? {
-                    readiness.populate_representative(
-                        representative,
-                        generator_is_expired,
-                        &mut next_pending_generator_indices,
-                        skip_unready,
-                    );
+            if !buffer.compiled_values.is_empty() {
+                debug_assert!(buffer.target_values.is_empty());
+                for (target_index, representative, value) in buffer.compiled_values.drain(..) {
+                    let representative = representative as usize;
+                    if witness
+                        .set_rep_index_from_target_index_returning_new(
+                            representative,
+                            target_index as usize,
+                            value,
+                        )?
+                        .is_some()
+                    {
+                        readiness.populate_representative(
+                            representative,
+                            generator_is_expired,
+                            &mut next_pending_generator_indices,
+                            skip_unready,
+                        );
+                    }
+                }
+            } else {
+                for (t, v) in buffer.target_values.drain(..) {
+                    if let Some(representative) = witness.set_target_returning_rep(t, v)? {
+                        readiness.populate_representative(
+                            representative,
+                            generator_is_expired,
+                            &mut next_pending_generator_indices,
+                            skip_unready,
+                        );
+                    }
                 }
             }
         }
@@ -1115,6 +1185,19 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
         self.run(witness, out_buffer)
     }
 
+    /// Optional sequential fast path for fixed-I/O generators. It computes and merges outputs in
+    /// exact generator order, reporting each newly populated representative to the scheduler and
+    /// avoiding an intermediate output buffer. `None` retains the generic path.
+    #[doc(hidden)]
+    fn run_direct_with_ready_hint(
+        &self,
+        _witness: &mut PartitionWitness<F>,
+        _all_watches_populated: bool,
+        _on_new_representative: &mut dyn FnMut(usize),
+    ) -> Option<Result<()>> {
+        None
+    }
+
     /// Whether `run_with_ready_hint(_, _, false)` is guaranteed to be a pure no-op: it writes
     /// nothing to `out_buffer`, reads nothing from the witness, and returns `false`.
     ///
@@ -1132,6 +1215,16 @@ pub trait WitnessGenerator<F: RichField + Extendable<D>, const D: usize>:
     fn defers_until_ready(&self) -> bool {
         false
     }
+
+    /// Builds runtime-only fixed-I/O metadata after the representative map is known. The default
+    /// keeps the ordinary `Target` path; only explicitly specialized generators override it.
+    #[doc(hidden)]
+    fn compile_fixed_io(&mut self, _representative_map: &[u32], _num_wires: usize, _degree: usize) {
+    }
+
+    /// Clears optional compiled I/O and restores the exact generic fallback.
+    #[doc(hidden)]
+    fn clear_compiled_io(&mut self) {}
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()>;
 
@@ -1166,20 +1259,146 @@ impl<F: RichField + Extendable<D>, const D: usize> Debug for WitnessGeneratorRef
     }
 }
 
+/// Runtime-only cache used by specialized fixed-I/O generators. Cloning deliberately starts with
+/// an empty cache because the clone may be installed beside a different representative map.
+#[derive(Debug)]
+pub struct CompiledGeneratorIoCache<T> {
+    #[cfg(feature = "std")]
+    inner: Option<T>,
+    #[cfg(not(feature = "std"))]
+    marker: PhantomData<T>,
+}
+
+impl<T> Default for CompiledGeneratorIoCache<T> {
+    fn default() -> Self {
+        Self {
+            #[cfg(feature = "std")]
+            inner: None,
+            #[cfg(not(feature = "std"))]
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T> Clone for CompiledGeneratorIoCache<T> {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl<T> CompiledGeneratorIoCache<T> {
+    /// Installs build/load-time metadata. No-std builds retain the exact generic path.
+    #[inline]
+    pub fn set(&mut self, value: T) {
+        #[cfg(feature = "std")]
+        {
+            self.inner = Some(value);
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            let _ = value;
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> Option<&T> {
+        #[cfg(feature = "std")]
+        {
+            self.inner.as_ref()
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        #[cfg(feature = "std")]
+        {
+            self.inner = None;
+        }
+    }
+}
+
+/// A compact, circuit-instance-bound mapping from a fixed generator's input/output targets to
+/// witness representative slots. It is runtime-only and is intentionally not serialized.
+#[derive(Clone, Debug)]
+pub struct CompiledGeneratorIo<const INPUTS: usize, const OUTPUTS: usize> {
+    representative_map_address: usize,
+    representative_map_len: usize,
+    input_representatives: [u32; INPUTS],
+    output_target_indices: [u32; OUTPUTS],
+    output_representatives: [u32; OUTPUTS],
+}
+
+impl<const INPUTS: usize, const OUTPUTS: usize> CompiledGeneratorIo<INPUTS, OUTPUTS> {
+    pub fn new(
+        representative_map: &[u32],
+        num_wires: usize,
+        degree: usize,
+        inputs: [Target; INPUTS],
+        outputs: [Target; OUTPUTS],
+    ) -> Self {
+        let target_index = |target: Target| {
+            u32::try_from(target.index(num_wires, degree))
+                .expect("compiled generator target index exceeds u32")
+        };
+        let representative = |target: Target| representative_map[target.index(num_wires, degree)];
+        Self {
+            representative_map_address: representative_map.as_ptr() as usize,
+            representative_map_len: representative_map.len(),
+            input_representatives: inputs.map(representative),
+            output_target_indices: outputs.map(target_index),
+            output_representatives: outputs.map(representative),
+        }
+    }
+
+    /// Returns false if a cloned/corrupted cache is presented to another circuit instance. The
+    /// caller must then use ordinary `Target` I/O rather than trusting these representative slots.
+    #[inline]
+    pub fn matches<F: Field>(&self, witness: &PartitionWitness<F>) -> bool {
+        self.representative_map_address == witness.representative_map.as_ptr() as usize
+            && self.representative_map_len == witness.representative_map.len()
+    }
+
+    #[inline]
+    pub fn input_representatives(&self) -> &[u32; INPUTS] {
+        &self.input_representatives
+    }
+
+    #[inline]
+    pub fn output_target_indices(&self) -> &[u32; OUTPUTS] {
+        &self.output_target_indices
+    }
+
+    #[inline]
+    pub fn output_representatives(&self) -> &[u32; OUTPUTS] {
+        &self.output_representatives
+    }
+}
+
 /// Values generated by a generator invocation.
 #[derive(Debug)]
 pub struct GeneratedValues<F: Field> {
     pub target_values: Vec<(Target, F)>,
+    /// Empty for ordinary generators. Specialized fixed-I/O outputs carry only compact target and
+    /// representative indices plus the value; their tiny allocation is drained and reused.
+    compiled_values: Vec<(u32, u32, F)>,
 }
 
 impl<F: Field> From<Vec<(Target, F)>> for GeneratedValues<F> {
     fn from(target_values: Vec<(Target, F)>) -> Self {
-        Self { target_values }
+        Self {
+            target_values,
+            compiled_values: Vec::new(),
+        }
     }
 }
 
 impl<F: Field> WitnessWrite<F> for GeneratedValues<F> {
     fn set_target(&mut self, target: Target, value: F) -> Result<()> {
+        debug_assert!(self.compiled_values.is_empty());
         self.target_values.push((target, value));
 
         Ok(())
@@ -1187,6 +1406,26 @@ impl<F: Field> WitnessWrite<F> for GeneratedValues<F> {
 }
 
 impl<F: Field> GeneratedValues<F> {
+    /// Adds one output whose target index and representative were compiled from this exact circuit
+    /// instance. A generator invocation must use either this method for every output or
+    /// `set_target` for every output.
+    #[doc(hidden)]
+    pub fn set_compiled_target(
+        &mut self,
+        target_index: u32,
+        representative: u32,
+        value: F,
+    ) -> Result<()> {
+        if !self.target_values.is_empty() {
+            return Err(anyhow!(
+                "cannot mix generic and compiled generator outputs in one invocation"
+            ));
+        }
+        self.compiled_values
+            .push((target_index, representative, value));
+        Ok(())
+    }
+
     pub fn with_capacity(capacity: usize) -> Self {
         Vec::with_capacity(capacity).into()
     }
@@ -1230,6 +1469,25 @@ pub trait SimpleGenerator<F: RichField + Extendable<D>, const D: usize>:
         witness: &PartitionWitness<F>,
         out_buffer: &mut GeneratedValues<F>,
     ) -> Result<()>;
+
+    /// Optional sequential direct-merge path. A fixed-I/O implementation must emit newly populated
+    /// representatives in the same order as its ordinary `GeneratedValues` outputs.
+    #[doc(hidden)]
+    fn run_once_direct(
+        &self,
+        _witness: &mut PartitionWitness<F>,
+        _on_new_representative: &mut dyn FnMut(usize),
+    ) -> Option<Result<()>> {
+        None
+    }
+
+    /// Optional runtime-only fixed-I/O compilation after circuit representatives are finalized.
+    #[doc(hidden)]
+    fn compile_fixed_io(&mut self, _representative_map: &[u32], _num_wires: usize, _degree: usize) {
+    }
+
+    #[doc(hidden)]
+    fn clear_compiled_io(&mut self) {}
 
     fn adapter(self) -> SimpleGeneratorAdapter<F, Self, D>
     where
@@ -1286,10 +1544,30 @@ impl<F: RichField + Extendable<D>, SG: SimpleGenerator<F, D>, const D: usize> Wi
         all_watches_populated && self.inner.run_once(witness, out_buffer).is_ok()
     }
 
+    fn run_direct_with_ready_hint(
+        &self,
+        witness: &mut PartitionWitness<F>,
+        all_watches_populated: bool,
+        on_new_representative: &mut dyn FnMut(usize),
+    ) -> Option<Result<()>> {
+        all_watches_populated
+            .then(|| self.inner.run_once_direct(witness, on_new_representative))
+            .flatten()
+    }
+
     /// `&&` short-circuits, so a `false` hint returns `false` without reaching `run_once`:
     /// nothing is read and nothing is written. See [`WitnessGenerator::defers_until_ready`].
     fn defers_until_ready(&self) -> bool {
         true
+    }
+
+    fn compile_fixed_io(&mut self, representative_map: &[u32], num_wires: usize, degree: usize) {
+        self.inner
+            .compile_fixed_io(representative_map, num_wires, degree);
+    }
+
+    fn clear_compiled_io(&mut self) {
+        self.inner.clear_compiled_io();
     }
 
     fn serialize(&self, dst: &mut Vec<u8>, common_data: &CommonCircuitData<F, D>) -> IoResult<()> {

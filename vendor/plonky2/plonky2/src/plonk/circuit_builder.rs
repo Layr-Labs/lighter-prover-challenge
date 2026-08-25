@@ -1462,13 +1462,20 @@ impl<F: RichField + Extendable<D>, const D: usize> CircuitBuilder<F, D> {
             }
         };
 
-        let generators_defer_until_ready = self
-            .generators
+        let mut generators = self.generators;
+        for generator in &mut generators {
+            generator.0.compile_fixed_io(
+                &forest.parents,
+                common.config.num_wires,
+                common.degree(),
+            );
+        }
+        let generators_defer_until_ready = generators
             .iter()
             .all(|generator| generator.0.defers_until_ready());
 
         let prover_only = ProverOnlyCircuitData::<F, C, D> {
-            generators: self.generators,
+            generators,
             generator_indices_by_watches,
             generator_watch_counts,
             generators_defer_until_ready,

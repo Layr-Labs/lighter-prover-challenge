@@ -386,6 +386,30 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         (self.set_bitmap[rep_index >> 6] >> (rep_index & 63)) & 1 != 0
     }
 
+    /// Reconstructs a target only for parallel annotation or a contradiction diagnostic.
+    #[doc(hidden)]
+    #[inline]
+    pub fn target_from_index(&self, target_index: usize) -> Target {
+        let wire_targets = self.degree * self.num_wires;
+        if target_index < wire_targets {
+            Target::wire(target_index / self.num_wires, target_index % self.num_wires)
+        } else {
+            Target::VirtualTarget {
+                index: target_index - wire_targets,
+            }
+        }
+    }
+
+    /// Reads an already-populated representative slot. The scheduler's ready hint guarantees this
+    /// precondition for fixed-input simple generators.
+    #[doc(hidden)]
+    #[inline]
+    pub fn get_representative(&self, representative: u32) -> F {
+        let representative = representative as usize;
+        debug_assert!(self.is_set_by_rep_index(representative));
+        self.values[representative]
+    }
+
     #[inline]
     fn mark_set(&mut self, rep_index: usize) {
         self.set_bitmap[rep_index >> 6] |= 1u64 << (rep_index & 63);
@@ -442,6 +466,35 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
                 ));
             }
 
+            Ok(None)
+        } else {
+            self.values[rep_index] = value;
+            self.mark_set(rep_index);
+            Ok(Some(rep_index))
+        }
+    }
+
+    /// Compact-index form used by build/load-compiled fixed generator outputs. The original target
+    /// is reconstructed only on the cold contradiction path, preserving its exact diagnostic.
+    #[doc(hidden)]
+    #[inline]
+    pub fn set_rep_index_from_target_index_returning_new(
+        &mut self,
+        rep_index: usize,
+        target_index: usize,
+        value: F,
+    ) -> Result<Option<usize>> {
+        if self.is_set_by_rep_index(rep_index) {
+            let old_value = self.values[rep_index];
+            if value != old_value {
+                let target = self.target_from_index(target_index);
+                return Err(anyhow!(
+                    "Partition containing {:?} was set twice with different values: {} != {}",
+                    target,
+                    old_value,
+                    value
+                ));
+            }
             Ok(None)
         } else {
             self.values[rep_index] = value;

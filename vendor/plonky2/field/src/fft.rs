@@ -207,6 +207,37 @@ fn fft_dispatch<F: Field>(
 }
 
 #[inline]
+fn fft_dispatch_with_even<F: Field>(
+    input: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    even: &mut [F],
+) {
+    assert_eq!(even.len() * 2, input.len());
+    let direct = if let Some(table) = root_table {
+        fft_classic_with_even(input, zero_factor.unwrap_or(0), table, even)
+    } else {
+        #[cfg(feature = "std")]
+        let computed_root_table = root_table_cache::get::<F>(log2_strict(input.len()));
+        #[cfg(not(feature = "std"))]
+        let computed_root_table = fft_root_table::<F>(input.len());
+        fft_classic_with_even(
+            input,
+            zero_factor.unwrap_or(0),
+            &computed_root_table,
+            even,
+        )
+    };
+    if !direct {
+        // Shapes without a trailing standalone SIMD layer retain the classic
+        // transform schedule and exact post-FFT extraction semantics.
+        for (destination, source) in even.iter_mut().zip(input.iter().step_by(2)) {
+            *destination = *source;
+        }
+    }
+}
+
+#[inline]
 fn fft_dispatch_parallel<F: Field>(
     input: &mut [F],
     zero_factor: Option<usize>,
@@ -235,6 +266,22 @@ pub fn fft_in_place_with_options<F: Field>(
     root_table: Option<&FftRootTable<F>>,
 ) {
     fft_dispatch(buffer, zero_factor, root_table);
+}
+
+/// Computes an FFT in place and also retains its raw even-indexed outputs.
+///
+/// On production AArch64 Goldilocks LDE shapes, the compact values are emitted
+/// directly from the final butterfly registers as two contiguous streams. All
+/// other fields and schedules keep the classic FFT and copy the even values
+/// afterwards, so this entry is value-identical on every supported shape.
+#[inline]
+pub fn fft_in_place_with_options_and_even<F: Field>(
+    buffer: &mut [F],
+    zero_factor: Option<usize>,
+    root_table: Option<&FftRootTable<F>>,
+    even: &mut [F],
+) {
+    fft_dispatch_with_even(buffer, zero_factor, root_table, even);
 }
 
 /// Computes an FFT in place, distributing independent blocks of the large
@@ -481,6 +528,134 @@ fn fft_classic_simd_with<P, M>(
     // We've already done the first lg_packed_width (if they were required) iterations.
     let s = max(r, lg_packed_width);
     fft_classic_simd_layers::<P, M>(packed_values, s, lg_n, root_table);
+}
+
+/// FFT sibling that can intercept a trailing standalone layer and emit raw
+/// even rows from that layer's output registers.
+#[unroll_for_loops]
+fn fft_classic_simd_with_even<P, M>(
+    values: &mut [P::Scalar],
+    r: usize,
+    lg_n: usize,
+    root_table: &FftRootTable<P::Scalar>,
+    even: &mut [P::Scalar],
+) -> bool
+where
+    P: PackedField,
+    M: FftTwiddleMul<P>,
+{
+    let lg_packed_width = log2_strict(P::WIDTH);
+    {
+        let packed_values = P::pack_slice_mut(values);
+        let packed_n = packed_values.len();
+        debug_assert!(packed_n == 1 << (lg_n - lg_packed_width));
+        assert!(lg_packed_width <= 4);
+        for lg_half_m in 0..4 {
+            if (r..min(lg_n, lg_packed_width)).contains(&lg_half_m) {
+                let half_m = 1 << lg_half_m;
+                let mut omega = P::default();
+                for (j, omega_j) in omega.as_slice_mut().iter_mut().enumerate() {
+                    *omega_j = root_table[lg_half_m][j % half_m];
+                }
+                for k in (0..packed_n).step_by(2) {
+                    let (u, v) = packed_values[k].interleave(packed_values[k + 1], half_m);
+                    let t = M::mul(omega, v);
+                    (packed_values[k], packed_values[k + 1]) =
+                        (u + t).interleave(u - t, half_m);
+                }
+            }
+        }
+
+        let start = max(r, lg_packed_width);
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = &even;
+        #[cfg(target_arch = "aarch64")]
+        if lg_n >= 3
+            && start < lg_n
+            && core::any::TypeId::of::<P>()
+                == core::any::TypeId::of::<
+                    crate::arch::aarch64::wide_goldilocks_field::WideGoldilocksField,
+                >()
+        {
+            let remaining = lg_n - start;
+            let final_start = if remaining & 1 == 1 {
+                lg_n - 1
+            } else {
+                lg_n - 2
+            };
+            // Split off exactly the single or fused-pair tail the existing
+            // scheduler already chooses. No layer fusion is disabled.
+            fft_classic_simd_layers::<P, M>(
+                packed_values,
+                start,
+                final_start,
+                root_table,
+            );
+            // SAFETY: the exact `TypeId` match proves `P` is
+            // `WideGoldilocksField` and its scalar is `GoldilocksField`.
+            let scalars = unsafe {
+                core::slice::from_raw_parts_mut(
+                    packed_values
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    packed_values.len() * P::WIDTH,
+                )
+            };
+            let compact = unsafe {
+                core::slice::from_raw_parts_mut(
+                    even
+                        .as_mut_ptr()
+                        .cast::<crate::goldilocks_field::GoldilocksField>(),
+                    even.len(),
+                )
+            };
+            if remaining & 1 == 1 {
+                let row = &root_table[lg_n - 1];
+                let omega_row = unsafe {
+                    core::slice::from_raw_parts(
+                        row.as_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row.len(),
+                    )
+                };
+                fft_classic_simd_final_layer_neon_w4_emit_even(
+                    scalars,
+                    lg_n - 1,
+                    omega_row,
+                    compact,
+                );
+            } else {
+                let row1 = &root_table[lg_n - 2];
+                let row2 = &root_table[lg_n - 1];
+                let w1_row = unsafe {
+                    core::slice::from_raw_parts(
+                        row1
+                            .as_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row1.len(),
+                    )
+                };
+                let w2_row = unsafe {
+                    core::slice::from_raw_parts(
+                        row2
+                            .as_ptr()
+                            .cast::<crate::goldilocks_field::GoldilocksField>(),
+                        row2.len(),
+                    )
+                };
+                fft_classic_simd_final_two_layers_neon_w4_emit_even(
+                    scalars,
+                    lg_n - 2,
+                    w1_row,
+                    w2_row,
+                    compact,
+                );
+            }
+            return true;
+        }
+        fft_classic_simd_layers::<P, M>(packed_values, start, lg_n, root_table);
+    }
+    false
 }
 
 /// Parallel sibling of `fft_classic_simd_with`. The packed-width prefix is
@@ -826,6 +1001,109 @@ fn fft_classic_simd_two_layers_neon_w4(
     }
 }
 
+/// Final fused layer pair with compact-even emission. The butterfly and
+/// full-store operations are identical to `fft_classic_simd_two_layers_neon_w4`;
+/// each four-output quarter also writes its raw lanes 0 and 2 to one of four
+/// contiguous companion streams, without reloading the full store.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_final_two_layers_neon_w4_emit_even(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    w1_row: &[crate::goldilocks_field::GoldilocksField],
+    w2_row: &[crate::goldilocks_field::GoldilocksField],
+    even: &mut [crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let q = 1usize << lg_half_m;
+    debug_assert!(lg_half_m >= 2);
+    debug_assert_eq!(values.len(), 4 * q);
+    debug_assert_eq!(even.len(), 2 * q);
+    let w1_row = &w1_row[..q];
+    let (w2_lo, w2_hi) = w2_row[..2 * q].split_at(q);
+    let compact = even.as_mut_ptr().cast::<u64>();
+
+    let eps = unsafe { vdupq_n_u64(EPSILON) };
+    let (ab, cd) = values.split_at_mut(2 * q);
+    let (quarter_a, quarter_b) = ab.split_at_mut(q);
+    let (quarter_c, quarter_d) = cd.split_at_mut(q);
+    for (chunk, (((((a4, b4), c4), d4), (w14, w2a4)), w2b4)) in quarter_a
+        .chunks_exact_mut(4)
+        .zip(quarter_b.chunks_exact_mut(4))
+        .zip(quarter_c.chunks_exact_mut(4))
+        .zip(quarter_d.chunks_exact_mut(4))
+        .zip(w1_row.chunks_exact(4).zip(w2_lo.chunks_exact(4)))
+        .zip(w2_hi.chunks_exact(4))
+        .enumerate()
+    {
+        let t1x =
+            NeonGoldilocksField([w14[0], w14[1]]) * NeonGoldilocksField([b4[0], b4[1]]);
+        let t1y =
+            NeonGoldilocksField([w14[2], w14[3]]) * NeonGoldilocksField([b4[2], b4[3]]);
+        let t2x =
+            NeonGoldilocksField([w14[0], w14[1]]) * NeonGoldilocksField([d4[0], d4[1]]);
+        let t2y =
+            NeonGoldilocksField([w14[2], w14[3]]) * NeonGoldilocksField([d4[2], d4[3]]);
+        let cd0x = [c4[0] + t2x.0[0], c4[1] + t2x.0[1]];
+        let cd1x = [c4[0] - t2x.0[0], c4[1] - t2x.0[1]];
+        let cd0y = [c4[2] + t2y.0[0], c4[3] + t2y.0[1]];
+        let cd1y = [c4[2] - t2y.0[0], c4[3] - t2y.0[1]];
+        let t3x = NeonGoldilocksField([w2a4[0], w2a4[1]]) * NeonGoldilocksField(cd0x);
+        let t3y = NeonGoldilocksField([w2a4[2], w2a4[3]]) * NeonGoldilocksField(cd0y);
+        let t4x = NeonGoldilocksField([w2b4[0], w2b4[1]]) * NeonGoldilocksField(cd1x);
+        let t4y = NeonGoldilocksField([w2b4[2], w2b4[3]]) * NeonGoldilocksField(cd1y);
+        unsafe {
+            let avx = vld1q_u64(a4.as_ptr().cast::<u64>());
+            let avy = vld1q_u64(a4.as_ptr().add(2).cast::<u64>());
+            let t1vx = vcombine_u64(vcreate_u64(t1x.0[0].0), vcreate_u64(t1x.0[1].0));
+            let t1vy = vcombine_u64(vcreate_u64(t1y.0[0].0), vcreate_u64(t1y.0[1].0));
+            let ab0x = gl_add_neon(avx, t1vx, eps);
+            let ab1x = gl_sub_neon(avx, t1vx, eps);
+            let ab0y = gl_add_neon(avy, t1vy, eps);
+            let ab1y = gl_sub_neon(avy, t1vy, eps);
+            let t3vx = vcombine_u64(vcreate_u64(t3x.0[0].0), vcreate_u64(t3x.0[1].0));
+            let t3vy = vcombine_u64(vcreate_u64(t3y.0[0].0), vcreate_u64(t3y.0[1].0));
+            let t4vx = vcombine_u64(vcreate_u64(t4x.0[0].0), vcreate_u64(t4x.0[1].0));
+            let t4vy = vcombine_u64(vcreate_u64(t4y.0[0].0), vcreate_u64(t4y.0[1].0));
+            let output_a_x = gl_add_neon(ab0x, t3vx, eps);
+            let output_a_y = gl_add_neon(ab0y, t3vy, eps);
+            vst1q_u64(a4.as_mut_ptr().cast::<u64>(), output_a_x);
+            vst1q_u64(a4.as_mut_ptr().add(2).cast::<u64>(), output_a_y);
+            vst1q_u64(
+                compact.add(chunk * 2),
+                vuzp1q_u64(output_a_x, output_a_y),
+            );
+            let output_b_x = gl_add_neon(ab1x, t4vx, eps);
+            let output_b_y = gl_add_neon(ab1y, t4vy, eps);
+            vst1q_u64(b4.as_mut_ptr().cast::<u64>(), output_b_x);
+            vst1q_u64(b4.as_mut_ptr().add(2).cast::<u64>(), output_b_y);
+            vst1q_u64(
+                compact.add(q / 2 + chunk * 2),
+                vuzp1q_u64(output_b_x, output_b_y),
+            );
+            let output_c_x = gl_sub_neon(ab0x, t3vx, eps);
+            let output_c_y = gl_sub_neon(ab0y, t3vy, eps);
+            vst1q_u64(c4.as_mut_ptr().cast::<u64>(), output_c_x);
+            vst1q_u64(c4.as_mut_ptr().add(2).cast::<u64>(), output_c_y);
+            vst1q_u64(
+                compact.add(q + chunk * 2),
+                vuzp1q_u64(output_c_x, output_c_y),
+            );
+            let output_d_x = gl_sub_neon(ab1x, t4vx, eps);
+            let output_d_y = gl_sub_neon(ab1y, t4vy, eps);
+            vst1q_u64(d4.as_mut_ptr().cast::<u64>(), output_d_x);
+            vst1q_u64(d4.as_mut_ptr().add(2).cast::<u64>(), output_d_y);
+            vst1q_u64(
+                compact.add(3 * q / 2 + chunk * 2),
+                vuzp1q_u64(output_d_x, output_d_y),
+            );
+        }
+    }
+}
+
 /// Three consecutive layers in one memory sweep: blocks of `8q` split into
 /// octants `O0..O7` at stride `q`. Stage 1 pairs `(O0,O1)(O2,O3)(O4,O5)(O6,O7)`
 /// with `w1[j]`; stage 2 pairs `(n0,n2)(n1,n3)(n4,n6)(n5,n7)` with
@@ -1010,6 +1288,77 @@ fn fft_classic_simd_single_layer_neon_w4(
             }
             k += m;
         }
+    }
+}
+
+/// Final-layer kernel for the compact-even write seam. This is the production w4
+/// single-layer body with one difference: on the transform's final layer it
+/// also stores output lanes `0, 2` from each four-output register group into
+/// two contiguous halves of `even`. No output is reloaded from `values`.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+fn fft_classic_simd_final_layer_neon_w4_emit_even(
+    values: &mut [crate::goldilocks_field::GoldilocksField],
+    lg_half_m: usize,
+    omega_row: &[crate::goldilocks_field::GoldilocksField],
+    even: &mut [crate::goldilocks_field::GoldilocksField],
+) {
+    use core::arch::aarch64::*;
+    use crate::arch::aarch64::neon_goldilocks_field::NeonGoldilocksField;
+
+    const EPSILON: u64 = (1 << 32) - 1;
+    let half = 1usize << lg_half_m;
+    debug_assert_eq!(values.len(), half << 1);
+    debug_assert_eq!(even.len(), half);
+    debug_assert!(omega_row.len() >= half);
+    debug_assert!(lg_half_m >= 2);
+    let base = values.as_mut_ptr().cast::<u64>();
+    let compact = even.as_mut_ptr().cast::<u64>();
+    unsafe {
+        let eps = vdupq_n_u64(EPSILON);
+        let mut j = 0;
+        while j + 4 <= half {
+            let vx = NeonGoldilocksField([
+                *values.get_unchecked(half + j),
+                *values.get_unchecked(half + j + 1),
+            ]);
+            let vy = NeonGoldilocksField([
+                *values.get_unchecked(half + j + 2),
+                *values.get_unchecked(half + j + 3),
+            ]);
+            let wx = NeonGoldilocksField([
+                *omega_row.get_unchecked(j),
+                *omega_row.get_unchecked(j + 1),
+            ]);
+            let wy = NeonGoldilocksField([
+                *omega_row.get_unchecked(j + 2),
+                *omega_row.get_unchecked(j + 3),
+            ]);
+            let tx = wx * vx;
+            let ty = wy * vy;
+            let tvx = vcombine_u64(vcreate_u64(tx.0[0].0), vcreate_u64(tx.0[1].0));
+            let tvy = vcombine_u64(vcreate_u64(ty.0[0].0), vcreate_u64(ty.0[1].0));
+            let ux = vld1q_u64(base.add(j));
+            let uy = vld1q_u64(base.add(j + 2));
+            let sum_x = gl_add_neon(ux, tvx, eps);
+            let sum_y = gl_add_neon(uy, tvy, eps);
+            let diff_x = gl_sub_neon(ux, tvx, eps);
+            let diff_y = gl_sub_neon(uy, tvy, eps);
+            vst1q_u64(base.add(j), sum_x);
+            vst1q_u64(base.add(j + 2), sum_y);
+            vst1q_u64(base.add(half + j), diff_x);
+            vst1q_u64(base.add(half + j + 2), diff_y);
+            // Even rows from the low and high transform halves are each a
+            // contiguous companion stream. `vuzp1` selects lanes 0 and 2
+            // without reloading either full-store cache line.
+            vst1q_u64(compact.add(j >> 1), vuzp1q_u64(sum_x, sum_y));
+            vst1q_u64(
+                compact.add((half >> 1) + (j >> 1)),
+                vuzp1q_u64(diff_x, diff_y),
+            );
+            j += 4;
+        }
+        debug_assert_eq!(j, half);
     }
 }
 
@@ -1669,6 +2018,41 @@ where
 }
 
 #[inline(always)]
+fn fft_classic_with_even_twiddle<F, M>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+    even: &mut [F],
+) -> bool
+where
+    F: Field,
+    M: FftTwiddleMul<F> + FftTwiddleMul<<F as Packable>::Packing>,
+{
+    let n = values.len();
+    let lg_n = log2_strict(n);
+    let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
+    let first_layer = if r == 0 {
+        reverse_index_bits_in_place(values);
+        0
+    } else {
+        prepare_zero_padded_fft::<F, M>(values, r, lg_n, lg_packed_width, root_table)
+    };
+
+    if lg_n <= lg_packed_width {
+        fft_classic_simd_with::<F, M>(values, first_layer, lg_n, root_table);
+        false
+    } else {
+        fft_classic_simd_with_even::<<F as Packable>::Packing, M>(
+            values,
+            first_layer,
+            lg_n,
+            root_table,
+            even,
+        )
+    }
+}
+
+#[inline(always)]
 fn fft_classic_with_parallel<F, M>(values: &mut [F], r: usize, root_table: &FftRootTable<F>)
 where
     F: Field,
@@ -1713,6 +2097,28 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         fft_classic_with::<F, GeneralTwiddle>(values, r, root_table);
     } else {
         fft_classic_with::<F, BaseSubfieldTwiddle>(values, r, root_table);
+    }
+}
+
+fn fft_classic_with_even<F: Field>(
+    values: &mut [F],
+    r: usize,
+    root_table: &FftRootTable<F>,
+    even: &mut [F],
+) -> bool {
+    let lg_n = log2_strict(values.len());
+    if root_table.len() != lg_n {
+        panic!(
+            "Expected root table of length {}, but it was {}.",
+            lg_n,
+            root_table.len()
+        );
+    }
+
+    if lg_n == F::TWO_ADICITY {
+        fft_classic_with_even_twiddle::<F, GeneralTwiddle>(values, r, root_table, even)
+    } else {
+        fft_classic_with_even_twiddle::<F, BaseSubfieldTwiddle>(values, r, root_table, even)
     }
 }
 
@@ -2783,7 +3189,8 @@ mod tests {
     use crate::extension::quadratic::QuadraticExtension;
     use crate::fft::{
         FftRootTable, fft, fft_classic, fft_classic_parallel, fft_in_place_with_options,
-        fft_in_place_with_options_parallel, fft_root_table, fft_with_options, ifft,
+        fft_in_place_with_options_and_even, fft_in_place_with_options_parallel, fft_root_table,
+        fft_with_options, ifft,
     };
     use crate::goldilocks_field::GoldilocksField;
 
@@ -3454,6 +3861,202 @@ mod tests {
                 a.iter().map(|x| x.0).collect::<Vec<_>>(),
                 b.iter().map(|x| x.0).collect::<Vec<_>>(),
                 "three-layer mismatch at lg_half_m={lg_half_m}"
+            );
+        }
+    }
+
+    #[test]
+    fn fft_even_output_matches_full_raw_words_across_lde_degrees() {
+        use crate::types::{Field, Field64};
+
+        // Ranked d14/d16/d18 commitments all use rate_bits=3. Include an
+        // alternate single-layer-tail schedule as well.
+        for (degree_bits, rate_bits) in [(14usize, 3usize), (16, 3), (18, 3), (13, 2)] {
+            let degree = 1usize << degree_bits;
+            let len = degree << rate_bits;
+            let roots = fft_root_table::<GoldilocksField>(len);
+            let mut input = vec![GoldilocksField::ZERO; len];
+            for (i, value) in input[..degree].iter_mut().enumerate() {
+                let raw = match i & 31 {
+                    0 => GoldilocksField::ORDER,
+                    1 => GoldilocksField::ORDER + 1,
+                    2 => u64::MAX,
+                    _ => 0x9E37_79B9_7F4A_7C15u64
+                        .wrapping_mul(i as u64 + 1)
+                        .rotate_left((i & 63) as u32),
+                };
+                *value = GoldilocksField(raw);
+            }
+            let mut expected = input.clone();
+            fft_in_place_with_options(&mut expected, Some(rate_bits), Some(&roots));
+            let mut actual = input;
+            let mut even = vec![GoldilocksField::ZERO; len / 2];
+            fft_in_place_with_options_and_even(
+                &mut actual,
+                Some(rate_bits),
+                Some(&roots),
+                &mut even,
+            );
+            assert_eq!(
+                actual.iter().map(|x| x.0).collect::<Vec<_>>(),
+                expected.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "full raw mismatch at degree 2^{degree_bits}",
+            );
+            for (row, value) in even.iter().enumerate() {
+                assert_eq!(
+                    value.0,
+                    expected[2 * row].0,
+                    "even raw mismatch at degree 2^{degree_bits}, row {row}",
+                );
+            }
+        }
+    }
+
+    /// Production-topology screen for emitting the compact even rows from the
+    /// final FFT registers versus the current final layer plus a full strided
+    /// reread. Run with:
+    /// `cargo test -p plonky2_field --release -- --ignored --nocapture final_fft_even_emit_bench_mt`
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "aarch64")]
+    fn final_fft_even_emit_bench_mt() {
+        use super::{
+            fft_classic_simd_final_two_layers_neon_w4_emit_even,
+            fft_classic_simd_two_layers_neon_w4,
+        };
+        use core::arch::aarch64::*;
+        use std::sync::{Arc, Barrier};
+        use std::time::Instant;
+
+        const THREADS: usize = 14;
+
+        unsafe fn copy_even(dst: &mut [GoldilocksField], src: &[GoldilocksField]) {
+            debug_assert_eq!(dst.len() * 2, src.len());
+            let mut s = src.as_ptr().cast::<u64>();
+            let mut d = dst.as_mut_ptr().cast::<u64>();
+            for _ in 0..dst.len() / 4 {
+                let x = vld2q_u64(s);
+                vst1q_u64(d, x.0);
+                let y = vld2q_u64(s.add(4));
+                vst1q_u64(d.add(2), y.0);
+                s = s.add(8);
+                d = d.add(4);
+            }
+        }
+
+        let initial = |len: usize, salt: u64| {
+            (0..len)
+                .map(|i| {
+                    let x = 0x9E37_79B9_7F4A_7C15u64
+                        .wrapping_mul(i as u64 + 1)
+                        .rotate_left((i & 63) as u32)
+                        ^ salt;
+                    GoldilocksField(if i & 31 == 0 { u64::MAX - i as u64 } else { x })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let run_arm = |lg_n: usize, reps: usize, fused: bool| -> f64 {
+            let len = 1usize << lg_n;
+            let roots = Arc::new(fft_root_table::<GoldilocksField>(len));
+            let gate = Arc::new(Barrier::new(THREADS));
+            let mut handles = Vec::with_capacity(THREADS);
+            for thread in 0..THREADS {
+                let roots = Arc::clone(&roots);
+                let gate = Arc::clone(&gate);
+                let mut data = initial(len, thread as u64 * 0xD1B5_4A32_D192_ED03);
+                let mut even = vec![GoldilocksField::ZERO; len / 2];
+                handles.push(std::thread::spawn(move || {
+                    gate.wait();
+                    let start = Instant::now();
+                    for _ in 0..reps {
+                        if fused {
+                            fft_classic_simd_final_two_layers_neon_w4_emit_even(
+                                &mut data,
+                                lg_n - 2,
+                                &roots[lg_n - 2],
+                                &roots[lg_n - 1],
+                                &mut even,
+                            );
+                        } else {
+                            fft_classic_simd_two_layers_neon_w4(
+                                &mut data,
+                                lg_n - 2,
+                                &roots[lg_n - 2],
+                                &roots[lg_n - 1],
+                            );
+                            unsafe { copy_even(&mut even, &data) };
+                        }
+                    }
+                    // Keep both stores observable.
+                    std::hint::black_box((&data, &even));
+                    start.elapsed().as_secs_f64()
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .fold(0.0, f64::max)
+        };
+
+        for (lg_n, reps) in [(17usize, 64usize), (19, 16), (21, 4)] {
+            let len = 1usize << lg_n;
+            let roots = fft_root_table::<GoldilocksField>(len);
+            let mut baseline = initial(len, 0xA409_3822_299F_31D0);
+            let mut fused = baseline.clone();
+            let mut expected_even = vec![GoldilocksField::ZERO; len / 2];
+            let mut emitted_even = vec![GoldilocksField::ZERO; len / 2];
+            fft_classic_simd_two_layers_neon_w4(
+                &mut baseline,
+                lg_n - 2,
+                &roots[lg_n - 2],
+                &roots[lg_n - 1],
+            );
+            unsafe { copy_even(&mut expected_even, &baseline) };
+            fft_classic_simd_final_two_layers_neon_w4_emit_even(
+                &mut fused,
+                lg_n - 2,
+                &roots[lg_n - 2],
+                &roots[lg_n - 1],
+                &mut emitted_even,
+            );
+            assert_eq!(
+                fused.iter().map(|x| x.0).collect::<Vec<_>>(),
+                baseline.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "full raw words at 2^{lg_n}",
+            );
+            assert_eq!(
+                emitted_even.iter().map(|x| x.0).collect::<Vec<_>>(),
+                expected_even.iter().map(|x| x.0).collect::<Vec<_>>(),
+                "companion raw words at 2^{lg_n}",
+            );
+
+            // Warm both arms, then alternate order. Median rather than minimum
+            // retains the production memory-contention cost.
+            run_arm(lg_n, (reps / 8).max(1), false);
+            run_arm(lg_n, (reps / 8).max(1), true);
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            for round in 0..5 {
+                if round & 1 == 0 {
+                    old.push(run_arm(lg_n, reps, false));
+                    new.push(run_arm(lg_n, reps, true));
+                } else {
+                    new.push(run_arm(lg_n, reps, true));
+                    old.push(run_arm(lg_n, reps, false));
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            new.sort_by(f64::total_cmp);
+            let old_median = old[old.len() / 2];
+            let new_median = new[new.len() / 2];
+            println!(
+                "final-even 14t 2^{lg_n}: old {:?} median {:.6}s | emit {:?} median {:.6}s | {:+.2}%",
+                old,
+                old_median,
+                new,
+                new_median,
+                100.0 * (new_median - old_median) / old_median,
             );
         }
     }

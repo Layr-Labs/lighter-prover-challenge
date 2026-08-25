@@ -927,6 +927,13 @@ pub trait Read {
             subgroup.len(),
         )
         .ok_or(IoError)?;
+        for generator in &mut generators {
+            generator.0.compile_fixed_io(
+                &representative_map,
+                common_data.config.num_wires,
+                common_data.degree(),
+            );
+        }
 
         let is_some = self.read_bool()?;
         let fft_root_table = match is_some {
