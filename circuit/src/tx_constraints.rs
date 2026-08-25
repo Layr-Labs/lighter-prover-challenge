@@ -3340,76 +3340,147 @@ impl TxTarget {
 
 pub trait TxTargetWitness<F: PrimeField64 + Extendable<5> + RichField> {
     fn set_tx_target(&mut self, a: &TxTarget, b: &Tx<F>) -> Result<()>;
+    fn set_tx_target_for_path(&mut self, a: &TxTarget, b: &Tx<F>, light: bool) -> Result<()>;
 }
 
 impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + RichField>
     TxTargetWitness<F> for T
 {
     fn set_tx_target(&mut self, a: &TxTarget, b: &Tx<F>) -> Result<()> {
+        self.set_tx_target_for_path(a, b, false)
+    }
+
+    fn set_tx_target_for_path(&mut self, a: &TxTarget, b: &Tx<F>, light: bool) -> Result<()> {
+        // The light circuit allocates the generic transaction target, but does
+        // not constrain these 33 transaction-family inputs. Keep the eleven
+        // inputs that feed generators in the fixed circuit; omit only the
+        // individually and jointly generator-complete set below.
+        const LIGHT_UNUSED_INPUTS: u64 = 3_298_260_058_062;
+        let omit_mask = if light { LIGHT_UNUSED_INPUTS } else { 0 };
+        macro_rules! set_unless_omitted {
+            ($bit:expr, $setter:expr) => {
+                if omit_mask & (1u64 << $bit) == 0 {
+                    $setter?;
+                }
+            };
+        }
         self.set_target(a.tx_type, F::from_canonical_u8(b.tx_type))?;
         self.set_target(a.tx_index, F::from_canonical_u64(b.tx_index))?;
 
         /***********************/
         /*   L1 Transactions   */
         /***********************/
-        self.set_l1_deposit_tx_target(&a.l1_deposit_tx_target.inner, &b.l1_deposit_tx)?;
-        self.set_l1_create_market_tx_target(
-            &a.l1_create_market_tx_target.inner,
-            &b.l1_create_market_tx,
-        )?;
-        self.set_l1_update_market_tx_target(
-            &a.l1_update_market_tx_target.inner,
-            &b.l1_update_market_tx,
-        )?;
-        self.set_l1_cancel_all_orders_tx_target(
-            &a.l1_cancel_all_orders_tx_target.inner,
-            &b.l1_cancel_all_orders_tx,
-        )?;
-        self.set_l1_withdraw_tx_target(&a.l1_withdraw_tx_target.inner, &b.l1_withdraw_tx)?;
-        self.set_l1_create_order_tx_target(
-            &a.l1_create_order_tx_target.inner,
-            &b.l1_create_order_tx,
-        )?;
-        self.set_l1_change_pub_key_tx_target(
-            &a.l1_change_pub_key_tx_target.inner,
-            &b.l1_change_pub_key_tx,
-        )?;
-        self.set_l1_burn_shares_tx_target(&a.l1_burn_shares_tx_target.inner, &b.l1_burn_shares_tx)?;
-        self.set_l1_register_asset_tx_target(
-            &a.l1_register_asset_tx_target.inner,
-            &b.l1_register_asset_tx,
-        )?;
-        self.set_l1_update_asset_tx_target(
-            &a.l1_update_asset_tx_target.inner,
-            &b.l1_update_asset_tx,
-        )?;
-
-        self.set_l1_set_system_config_tx_target(
-            &a.l1_set_system_config_tx_target.inner,
-            &b.l1_set_system_config_tx,
-        )?;
+        set_unless_omitted!(
+            0,
+            self.set_l1_deposit_tx_target(&a.l1_deposit_tx_target.inner, &b.l1_deposit_tx)
+        );
+        set_unless_omitted!(
+            1,
+            self.set_l1_create_market_tx_target(
+                &a.l1_create_market_tx_target.inner,
+                &b.l1_create_market_tx,
+            )
+        );
+        set_unless_omitted!(
+            2,
+            self.set_l1_update_market_tx_target(
+                &a.l1_update_market_tx_target.inner,
+                &b.l1_update_market_tx,
+            )
+        );
+        set_unless_omitted!(
+            3,
+            self.set_l1_cancel_all_orders_tx_target(
+                &a.l1_cancel_all_orders_tx_target.inner,
+                &b.l1_cancel_all_orders_tx,
+            )
+        );
+        set_unless_omitted!(
+            4,
+            self.set_l1_withdraw_tx_target(&a.l1_withdraw_tx_target.inner, &b.l1_withdraw_tx)
+        );
+        set_unless_omitted!(
+            5,
+            self.set_l1_create_order_tx_target(
+                &a.l1_create_order_tx_target.inner,
+                &b.l1_create_order_tx,
+            )
+        );
+        set_unless_omitted!(
+            6,
+            self.set_l1_change_pub_key_tx_target(
+                &a.l1_change_pub_key_tx_target.inner,
+                &b.l1_change_pub_key_tx,
+            )
+        );
+        set_unless_omitted!(
+            7,
+            self.set_l1_burn_shares_tx_target(
+                &a.l1_burn_shares_tx_target.inner,
+                &b.l1_burn_shares_tx,
+            )
+        );
+        set_unless_omitted!(
+            8,
+            self.set_l1_register_asset_tx_target(
+                &a.l1_register_asset_tx_target.inner,
+                &b.l1_register_asset_tx,
+            )
+        );
+        set_unless_omitted!(
+            9,
+            self.set_l1_update_asset_tx_target(
+                &a.l1_update_asset_tx_target.inner,
+                &b.l1_update_asset_tx,
+            )
+        );
+        set_unless_omitted!(
+            10,
+            self.set_l1_set_system_config_tx_target(
+                &a.l1_set_system_config_tx_target.inner,
+                &b.l1_set_system_config_tx,
+            )
+        );
 
         /***********************/
         /*   L2 Transactions   */
         /***********************/
-        self.set_l2_change_pk_tx_target(
-            &a.l2_change_pub_key_tx_target.inner,
-            &b.l2_change_pub_key_tx,
-        )?;
-        self.set_l2_create_sub_account_tx_target(
-            &a.l2_create_sub_account_tx_target.inner,
-            &b.l2_create_sub_account_tx,
-        )?;
-        self.set_l2_create_public_pool_tx_target(
-            &a.l2_create_public_pool_tx_target.inner,
-            &b.l2_create_public_pool_tx,
-        )?;
-        self.set_l2_update_public_pool_tx_target(
-            &a.l2_update_public_pool_tx_target.inner,
-            &b.l2_update_public_pool_tx,
-        )?;
-        self.set_l2_transfer_tx_target(&a.l2_transfer_tx_target.inner, &b.l2_transfer_tx)?;
-        self.set_l2_withdraw_tx_target(&a.l2_withdraw_tx_target, &b.l2_withdraw_tx)?;
+        set_unless_omitted!(
+            11,
+            self.set_l2_change_pk_tx_target(
+                &a.l2_change_pub_key_tx_target.inner,
+                &b.l2_change_pub_key_tx,
+            )
+        );
+        set_unless_omitted!(
+            12,
+            self.set_l2_create_sub_account_tx_target(
+                &a.l2_create_sub_account_tx_target.inner,
+                &b.l2_create_sub_account_tx,
+            )
+        );
+        set_unless_omitted!(
+            13,
+            self.set_l2_create_public_pool_tx_target(
+                &a.l2_create_public_pool_tx_target.inner,
+                &b.l2_create_public_pool_tx,
+            )
+        );
+        set_unless_omitted!(
+            14,
+            self.set_l2_update_public_pool_tx_target(
+                &a.l2_update_public_pool_tx_target.inner,
+                &b.l2_update_public_pool_tx,
+            )
+        );
+        set_unless_omitted!(
+            15,
+            self.set_l2_transfer_tx_target(&a.l2_transfer_tx_target.inner, &b.l2_transfer_tx)
+        );
+        set_unless_omitted!(
+            16,
+            self.set_l2_withdraw_tx_target(&a.l2_withdraw_tx_target, &b.l2_withdraw_tx)
+        );
         self.set_l2_create_order_tx_target(
             &a.l2_create_order_tx_target.inner,
             &b.l2_create_order_tx,
@@ -3418,68 +3489,122 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             &a.l2_cancel_order_tx_target.inner,
             &b.l2_cancel_order_tx,
         )?;
-        self.set_l2_cancel_all_orders_tx_target(
-            &a.l2_cancel_all_orders_tx_target.inner,
-            &b.l2_cancel_all_orders_tx,
-        )?;
+        set_unless_omitted!(
+            17,
+            self.set_l2_cancel_all_orders_tx_target(
+                &a.l2_cancel_all_orders_tx_target.inner,
+                &b.l2_cancel_all_orders_tx,
+            )
+        );
         self.set_l2_modify_order_tx_target(
             &a.l2_modify_order_tx_target.inner,
             &b.l2_modify_order_tx,
         )?;
-        self.set_l2_mint_shares_tx_target(&a.l2_mint_shares_tx_target.inner, &b.l2_mint_shares_tx)?;
-        self.set_l2_burn_shares_tx_target(&a.l2_burn_shares_tx_target.inner, &b.l2_burn_shares_tx)?;
-        self.set_l2_update_leverage_tx_target(
-            &a.l2_update_leverage_tx_target.inner,
-            &b.l2_update_leverage_tx,
-        )?;
-        self.set_l2_create_grouped_orders_tx_target(
-            &a.l2_create_grouped_orders_tx_target.inner,
-            &b.l2_create_grouped_orders_tx,
-        )?;
-        self.set_l2_update_margin_tx_target(
-            &a.l2_update_margin_tx_target.inner,
-            &b.l2_update_margin_tx,
-        )?;
-        self.set_l2_create_staking_pool_tx_target(
-            &a.l2_create_staking_pool_tx_target.inner,
-            &b.l2_create_staking_pool_tx,
-        )?;
-        self.set_l2_stake_assets_tx_target(
-            &a.l2_stake_assets_tx_target.inner,
-            &b.l2_stake_assets_tx,
-        )?;
-        self.set_l2_unstake_assets_tx_target(
-            &a.l2_unstake_assets_tx_target.inner,
-            &b.l2_unstake_assets_tx,
-        )?;
-        self.set_l2_force_burn_shares_tx_target(
-            &a.l2_force_burn_shares_tx_target.inner,
-            &b.l2_force_burn_shares_tx,
-        )?;
-        self.set_l2_update_account_config_tx_target(
-            &a.l2_update_account_config_tx_target.inner,
-            &b.l2_update_account_config_tx,
-        )?;
-        self.set_l2_strategy_transfer_tx_target(
-            &a.l2_strategy_transfer_tx_target.inner,
-            &b.l2_strategy_transfer_tx,
-        )?;
-        self.set_l2_update_market_config_tx_target(
-            &a.l2_update_market_config_tx_target.inner,
-            &b.l2_update_market_config_tx,
-        )?;
-        self.set_l2_approve_integrator_tx_target(
-            &a.l2_approve_integrator_tx_target.inner,
-            &b.l2_approve_integrator_tx,
-        )?;
-        self.set_l2_update_account_asset_config_tx_target(
-            &a.l2_update_account_asset_config_tx_target.inner,
-            &b.l2_update_account_asset_config_tx,
-        )?;
-        self.set_l2_update_asset_config_tx_target(
-            &a.l2_update_asset_config_tx_target.inner,
-            &b.l2_update_asset_config_tx,
-        )?;
+        set_unless_omitted!(
+            18,
+            self.set_l2_mint_shares_tx_target(
+                &a.l2_mint_shares_tx_target.inner,
+                &b.l2_mint_shares_tx,
+            )
+        );
+        set_unless_omitted!(
+            19,
+            self.set_l2_burn_shares_tx_target(
+                &a.l2_burn_shares_tx_target.inner,
+                &b.l2_burn_shares_tx,
+            )
+        );
+        set_unless_omitted!(
+            20,
+            self.set_l2_update_leverage_tx_target(
+                &a.l2_update_leverage_tx_target.inner,
+                &b.l2_update_leverage_tx,
+            )
+        );
+        set_unless_omitted!(
+            21,
+            self.set_l2_create_grouped_orders_tx_target(
+                &a.l2_create_grouped_orders_tx_target.inner,
+                &b.l2_create_grouped_orders_tx,
+            )
+        );
+        set_unless_omitted!(
+            22,
+            self.set_l2_update_margin_tx_target(
+                &a.l2_update_margin_tx_target.inner,
+                &b.l2_update_margin_tx,
+            )
+        );
+        set_unless_omitted!(
+            23,
+            self.set_l2_create_staking_pool_tx_target(
+                &a.l2_create_staking_pool_tx_target.inner,
+                &b.l2_create_staking_pool_tx,
+            )
+        );
+        set_unless_omitted!(
+            24,
+            self.set_l2_stake_assets_tx_target(
+                &a.l2_stake_assets_tx_target.inner,
+                &b.l2_stake_assets_tx,
+            )
+        );
+        set_unless_omitted!(
+            25,
+            self.set_l2_unstake_assets_tx_target(
+                &a.l2_unstake_assets_tx_target.inner,
+                &b.l2_unstake_assets_tx,
+            )
+        );
+        set_unless_omitted!(
+            26,
+            self.set_l2_force_burn_shares_tx_target(
+                &a.l2_force_burn_shares_tx_target.inner,
+                &b.l2_force_burn_shares_tx,
+            )
+        );
+        set_unless_omitted!(
+            27,
+            self.set_l2_update_account_config_tx_target(
+                &a.l2_update_account_config_tx_target.inner,
+                &b.l2_update_account_config_tx,
+            )
+        );
+        set_unless_omitted!(
+            28,
+            self.set_l2_strategy_transfer_tx_target(
+                &a.l2_strategy_transfer_tx_target.inner,
+                &b.l2_strategy_transfer_tx,
+            )
+        );
+        set_unless_omitted!(
+            29,
+            self.set_l2_update_market_config_tx_target(
+                &a.l2_update_market_config_tx_target.inner,
+                &b.l2_update_market_config_tx,
+            )
+        );
+        set_unless_omitted!(
+            30,
+            self.set_l2_approve_integrator_tx_target(
+                &a.l2_approve_integrator_tx_target.inner,
+                &b.l2_approve_integrator_tx,
+            )
+        );
+        set_unless_omitted!(
+            31,
+            self.set_l2_update_account_asset_config_tx_target(
+                &a.l2_update_account_asset_config_tx_target.inner,
+                &b.l2_update_account_asset_config_tx,
+            )
+        );
+        set_unless_omitted!(
+            32,
+            self.set_l2_update_asset_config_tx_target(
+                &a.l2_update_asset_config_tx_target.inner,
+                &b.l2_update_asset_config_tx,
+            )
+        );
 
         /*************************/
         /* Internal Transactions */
@@ -3488,42 +3613,69 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
             &a.internal_claim_order_tx_target.inner,
             &b.internal_claim_order_tx,
         )?;
-        self.set_internal_cancel_order_tx_target(
-            &a.internal_cancel_order_tx_target.inner,
-            &b.internal_cancel_order_tx,
-        )?;
-        self.set_internal_deleverage_tx_target(
-            &a.internal_deleverage_tx_target.inner,
-            &b.internal_deleverage_tx,
-        )?;
-        self.set_internal_exit_position_tx_target(
-            &a.internal_exit_position_tx_target.inner,
-            &b.internal_exit_position_tx,
-        )?;
-        self.set_internal_cancel_all_orders_tx_target(
-            &a.internal_cancel_all_orders_tx_target.inner,
-            &b.internal_cancel_all_orders_tx,
-        )?;
-        self.set_internal_liquidate_position_tx_target(
-            &a.internal_liquidate_position_tx_target.inner,
-            &b.internal_liquidate_position_tx,
-        )?;
-        self.set_internal_create_order_tx_target(
-            &a.internal_create_order_tx_target.inner,
-            &b.internal_create_order_tx,
-        )?;
-        self.set_internal_pending_unlock_tx_target(
-            &a.internal_pending_unlock_tx_target.inner,
-            &b.internal_pending_unlock_tx,
-        )?;
-        self.set_internal_transfer_tx_target(
-            &a.internal_transfer_tx_target.inner,
-            &b.internal_transfer_tx,
-        )?;
-        self.set_internal_liquidate_spot_tx_target(
-            &a.internal_liquidate_spot_tx_target.inner,
-            &b.internal_liquidate_spot_tx,
-        )?;
+        set_unless_omitted!(
+            33,
+            self.set_internal_cancel_order_tx_target(
+                &a.internal_cancel_order_tx_target.inner,
+                &b.internal_cancel_order_tx,
+            )
+        );
+        set_unless_omitted!(
+            34,
+            self.set_internal_deleverage_tx_target(
+                &a.internal_deleverage_tx_target.inner,
+                &b.internal_deleverage_tx,
+            )
+        );
+        set_unless_omitted!(
+            35,
+            self.set_internal_exit_position_tx_target(
+                &a.internal_exit_position_tx_target.inner,
+                &b.internal_exit_position_tx,
+            )
+        );
+        set_unless_omitted!(
+            36,
+            self.set_internal_cancel_all_orders_tx_target(
+                &a.internal_cancel_all_orders_tx_target.inner,
+                &b.internal_cancel_all_orders_tx,
+            )
+        );
+        set_unless_omitted!(
+            37,
+            self.set_internal_liquidate_position_tx_target(
+                &a.internal_liquidate_position_tx_target.inner,
+                &b.internal_liquidate_position_tx,
+            )
+        );
+        set_unless_omitted!(
+            38,
+            self.set_internal_create_order_tx_target(
+                &a.internal_create_order_tx_target.inner,
+                &b.internal_create_order_tx,
+            )
+        );
+        set_unless_omitted!(
+            39,
+            self.set_internal_pending_unlock_tx_target(
+                &a.internal_pending_unlock_tx_target.inner,
+                &b.internal_pending_unlock_tx,
+            )
+        );
+        set_unless_omitted!(
+            40,
+            self.set_internal_transfer_tx_target(
+                &a.internal_transfer_tx_target.inner,
+                &b.internal_transfer_tx,
+            )
+        );
+        set_unless_omitted!(
+            41,
+            self.set_internal_liquidate_spot_tx_target(
+                &a.internal_liquidate_spot_tx_target.inner,
+                &b.internal_liquidate_spot_tx,
+            )
+        );
 
         /***********************/
         /*  Transactions Data  */
@@ -3534,24 +3686,28 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         self.set_signed_target(a.taker_fee, b.taker_fee)?;
         self.set_signed_target(a.maker_fee, b.maker_fee)?;
 
-        if let Some(ref l1_signature) = b.l1_signature {
-            self.set_ecdsa_signature_target(&a.l1_signature, l1_signature)?;
-        } else {
-            self.set_ecdsa_signature_target(
-                &a.l1_signature,
-                &ECDSASignature {
-                    r: Secp256K1Scalar::ZERO,
-                    s: Secp256K1Scalar::ZERO,
-                },
-            )?;
-        }
-        if let Some(ref l1_pub_key) = b.l1_pub_key {
-            if !l1_pub_key.0.is_valid() {
-                anyhow::bail!("Invalid L1 public key. {:?}", l1_pub_key);
+        if omit_mask & (1u64 << 42) == 0 {
+            if let Some(ref l1_signature) = b.l1_signature {
+                self.set_ecdsa_signature_target(&a.l1_signature, l1_signature)?;
+            } else {
+                self.set_ecdsa_signature_target(
+                    &a.l1_signature,
+                    &ECDSASignature {
+                        r: Secp256K1Scalar::ZERO,
+                        s: Secp256K1Scalar::ZERO,
+                    },
+                )?;
             }
-            self.set_ecdsa_public_key_target(&a.l1_pub_key, l1_pub_key)?;
-        } else {
-            self.set_ecdsa_public_key_target(&a.l1_pub_key, &ECDSAPublicKey(AffinePoint::ZERO))?;
+        }
+        if omit_mask & (1u64 << 43) == 0 {
+            if let Some(ref l1_pub_key) = b.l1_pub_key {
+                if !l1_pub_key.0.is_valid() {
+                    anyhow::bail!("Invalid L1 public key. {:?}", l1_pub_key);
+                }
+                self.set_ecdsa_public_key_target(&a.l1_pub_key, l1_pub_key)?;
+            } else {
+                self.set_ecdsa_public_key_target(&a.l1_pub_key, &ECDSAPublicKey(AffinePoint::ZERO))?;
+            }
         }
 
         /***********************/
@@ -3590,7 +3746,11 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
         /*****************************/
         /*  State Tree Merkle Proofs */
         /*****************************/
-        for i in 0..NB_ACCOUNTS_PER_TX {
+        // The light circuit verifies only the owner account and its ordinary
+        // asset tree. The remaining proof targets are bare virtual hashes:
+        // they have no generators of their own and no light-path consumers.
+        let live_accounts = if light { 1 } else { NB_ACCOUNTS_PER_TX };
+        for i in 0..live_accounts {
             for j in 0..ACCOUNT_MERKLE_LEVELS {
                 self.set_hash_target(
                     a.account_tree_merkle_proofs[i][j],
@@ -3598,28 +3758,26 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
                 )?;
             }
         }
-        for i in 0..NB_ACCOUNTS_PER_TX {
-            for j in 0..ACCOUNT_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.account_pub_data_tree_merkle_proofs[i][j],
-                    b.account_pub_data_tree_merkle_proofs[i][j],
-                )?;
+        if !light {
+            for i in 0..NB_ACCOUNTS_PER_TX {
+                for j in 0..ACCOUNT_MERKLE_LEVELS {
+                    self.set_hash_target(
+                        a.account_pub_data_tree_merkle_proofs[i][j],
+                        b.account_pub_data_tree_merkle_proofs[i][j],
+                    )?;
+                    self.set_hash_target(
+                        a.account_delta_tree_merkle_proofs[i][j],
+                        b.account_delta_tree_merkle_proofs[i][j],
+                    )?;
+                }
             }
-        }
-        for i in 0..NB_ACCOUNTS_PER_TX {
-            for j in 0..ACCOUNT_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.account_delta_tree_merkle_proofs[i][j],
-                    b.account_delta_tree_merkle_proofs[i][j],
-                )?;
-            }
-        }
-        for i in 0..NB_ACCOUNTS_PER_TX - 1 {
-            for j in 0..POSITION_MERKLE_LEVELS {
-                self.set_hash_target(
-                    a.position_delta_merkle_proofs[i][j],
-                    b.position_delta_merkle_proofs[i][j],
-                )?;
+            for i in 0..NB_ACCOUNTS_PER_TX - 1 {
+                for j in 0..POSITION_MERKLE_LEVELS {
+                    self.set_hash_target(
+                        a.position_delta_merkle_proofs[i][j],
+                        b.position_delta_merkle_proofs[i][j],
+                    )?;
+                }
             }
         }
         for i in 0..API_KEY_MERKLE_LEVELS {
@@ -3628,29 +3786,36 @@ impl<T: Witness<F> + PartialWitnessCurve<F>, F: PrimeField64 + Extendable<5> + R
                 b.api_key_tree_merkle_proof[i],
             )?;
         }
+        let live_account_order_paths = if light {
+            NB_CLOID_UNIQUENESS_CHECK_PER_TX
+        } else {
+            NB_ACCOUNT_ORDERS_PATHS_PER_TX
+        };
         for i in 0..ACCOUNT_ORDERS_MERKLE_LEVELS {
-            for j in 0..NB_ACCOUNT_ORDERS_PATHS_PER_TX {
+            for j in 0..live_account_order_paths {
                 self.set_hash_target(
                     a.account_orders_tree_merkle_proof[j][i],
                     b.account_orders_tree_merkle_proof[j][i],
                 )?;
             }
         }
-        for i in 0..NB_ACCOUNTS_PER_TX {
+        for i in 0..live_accounts {
             for j in 0..NB_ASSETS_PER_TX {
                 for k in 0..ASSET_MERKLE_LEVELS {
                     self.set_hash_target(
                         a.asset_tree_merkle_proofs[i][j][k],
                         b.asset_tree_merkle_proofs[i][j][k],
                     )?;
-                    self.set_hash_target(
-                        a.public_asset_tree_merkle_proofs[i][j][k],
-                        b.public_asset_tree_merkle_proofs[i][j][k],
-                    )?;
-                    self.set_hash_target(
-                        a.asset_delta_tree_merkle_proofs[i][j][k],
-                        b.asset_delta_tree_merkle_proofs[i][j][k],
-                    )?;
+                    if !light {
+                        self.set_hash_target(
+                            a.public_asset_tree_merkle_proofs[i][j][k],
+                            b.public_asset_tree_merkle_proofs[i][j][k],
+                        )?;
+                        self.set_hash_target(
+                            a.asset_delta_tree_merkle_proofs[i][j][k],
+                            b.asset_delta_tree_merkle_proofs[i][j][k],
+                        )?;
+                    }
                 }
             }
         }
