@@ -311,6 +311,39 @@ pub struct OpeningSet<F: RichField + Extendable<D>, const D: usize> {
     pub lookup_zs_next: Vec<F::Extension>,
 }
 
+/// Build `1, base, base², ...` with four independent multiplication chains.
+///
+/// Advancing the four residue classes by `base⁴` exposes instruction-level
+/// parallelism without consuming the shared Rayon pool. The multiplication
+/// association differs from [`Field::powers`], so lazy field representatives
+/// may differ even though every returned field value is identical.
+fn interleaved_power_table<F: Field>(base: F, len: usize) -> Vec<F> {
+    // Same-binary diagnostic rollback. Compiled out of scored release builds.
+    #[cfg(feature = "diagnostic_profile")]
+    if std::env::var_os("LIGHTER_SERIAL_ZETA_POWERS").is_some_and(|value| value == "1") {
+        return base.powers().take(len).collect();
+    }
+
+    if len < 4 {
+        return base.powers().take(len).collect();
+    }
+
+    let base_squared = base * base;
+    let step = base_squared * base_squared;
+    let mut lanes = [F::ONE, base, base_squared, base_squared * base];
+    let mut result = Vec::with_capacity(len);
+
+    while result.len() + 4 <= len {
+        result.extend_from_slice(&lanes);
+        lanes[0] *= step;
+        lanes[1] *= step;
+        lanes[2] *= step;
+        lanes[3] *= step;
+    }
+    result.extend_from_slice(&lanes[..len - result.len()]);
+    result
+}
+
 impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
     pub fn new<C: GenericConfig<D, F = F>>(
         zeta: F::Extension,
@@ -336,8 +369,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
         // `(..(c_{n-1} z + c_{n-2}) z + ..)`, so every opening is the
         // identical field element and the transcript is unchanged.
         let degree = common_data.degree();
-        let table = |z: F::Extension| -> Vec<F::Extension> { z.powers().take(degree).collect() };
-        let zeta_pows = table(zeta);
+        let zeta_pows = interleaved_power_table(zeta, degree);
         // `g` is the order-`degree` subgroup generator, so `g^i` is exactly
         // the process-cached natural-order two-adic subgroup, and
         // `(g·ζ)^i = g^i · ζ^i` in the exact field. Deriving the shifted
@@ -370,7 +402,7 @@ impl<F: RichField + Extendable<D>, const D: usize> OpeningSet<F, D> {
                 .map(|(&zeta_pow, &g_pow)| zeta_pow.scalar_mul(g_pow))
                 .collect();
             if std::env::var_os("LIGHTER_GZETA_TABLE_ASSERT").is_some() {
-                let reference = table(g * zeta);
+                let reference: Vec<F::Extension> = (g * zeta).powers().take(degree).collect();
                 assert_eq!(reference.len(), g_zeta_pows.len());
                 for (i, (a, b)) in reference.iter().zip(&g_zeta_pows).enumerate() {
                     let a_raw: Vec<u64> = a
@@ -635,6 +667,9 @@ mod tests {
     use plonky2_field::types::Sample;
 
     use super::*;
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::field::goldilocks_field::GoldilocksField;
+    use crate::field::types::PrimeField64;
     use crate::fri::reduction_strategies::FriReductionStrategy;
     use crate::gates::lookup_table::LookupTable;
     use crate::gates::noop::NoopGate;
@@ -643,6 +678,138 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::PoseidonGoldilocksConfig;
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn interleaved_power_table_matches_serial_sequence() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        let bases = [
+            FE::ZERO,
+            FE::ONE,
+            QuadraticExtension([
+                F::from_canonical_u64(0x1234_5678),
+                F::from_canonical_u64(0x9abc_def0),
+            ]),
+            QuadraticExtension([
+                F::from_noncanonical_u64(u64::MAX),
+                F::from_noncanonical_u64(u64::MAX - 0x1234),
+            ]),
+        ];
+        let lengths = [
+            0usize, 1, 2, 3, 4, 5, 7, 8, 9, 31, 4095, 4096, 4097, 16_383, 16_384, 16_385, 65_537,
+            262_143, 262_144, 262_145,
+        ];
+
+        for base in bases {
+            for len in lengths {
+                let expected: Vec<FE> = base.powers().take(len).collect();
+                let actual = interleaved_power_table(base, len);
+                assert_eq!(actual.len(), expected.len());
+                for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    for limb in 0..2 {
+                        assert_eq!(
+                            actual.0[limb].to_canonical_u64(),
+                            expected.0[limb].to_canonical_u64(),
+                            "power {index} limb {limb} differs for len {len}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release timing harness"]
+    fn interleaved_power_table_production_weighted_timing() {
+        type F = GoldilocksField;
+        type FE = QuadraticExtension<F>;
+
+        let mut inputs = Vec::with_capacity(106);
+        for (degree, count) in [(1usize << 14, 53usize), (1 << 16, 52), (1 << 18, 1)] {
+            for sample in 0..count {
+                let nonce = inputs.len() as u64 + sample as u64 + 1;
+                inputs.push((
+                    QuadraticExtension([
+                        F::from_noncanonical_u64(0x9e37_79b9_7f4a_7c15u64.wrapping_mul(nonce)),
+                        F::from_noncanonical_u64(
+                            0xd1b5_4a32_d192_ed03u64.wrapping_mul(nonce ^ 0xa5a5_a5a5),
+                        ),
+                    ]),
+                    degree,
+                ));
+            }
+        }
+
+        let run = |interleaved: bool| {
+            let started = std::time::Instant::now();
+            let mut checksum = FE::ZERO;
+            for &(base, len) in &inputs {
+                let table: Vec<FE> = if interleaved {
+                    interleaved_power_table(base, len)
+                } else {
+                    base.powers().take(len).collect()
+                };
+                checksum += table[len / 3];
+                checksum += table[len - 1];
+                std::hint::black_box(&table);
+            }
+            std::hint::black_box(checksum);
+            started.elapsed()
+        };
+
+        std::hint::black_box(run(false));
+        std::hint::black_box(run(true));
+
+        let mut serial_total = std::time::Duration::ZERO;
+        let mut interleaved_total = std::time::Duration::ZERO;
+        let mut wins = 0usize;
+        let mut worst_improvement = f64::INFINITY;
+        for block in 0..6 {
+            let (serial, interleaved) = if block % 2 == 0 {
+                let s1 = run(false);
+                let i1 = run(true);
+                let i2 = run(true);
+                let s2 = run(false);
+                (s1 + s2, i1 + i2)
+            } else {
+                let i1 = run(true);
+                let s1 = run(false);
+                let s2 = run(false);
+                let i2 = run(true);
+                (s1 + s2, i1 + i2)
+            };
+            let improvement =
+                100.0 * (serial.as_secs_f64() - interleaved.as_secs_f64()) / serial.as_secs_f64();
+            wins += usize::from(interleaved < serial);
+            worst_improvement = worst_improvement.min(improvement);
+            serial_total += serial;
+            interleaved_total += interleaved;
+            eprintln!(
+                "POWER_TABLE_BLOCK\t{block}\tserial_ms={:.3}\tinterleaved_ms={:.3}\timprovement_pct={improvement:.3}",
+                serial.as_secs_f64() * 1e3,
+                interleaved.as_secs_f64() * 1e3,
+            );
+        }
+        let pooled_improvement = 100.0
+            * (serial_total.as_secs_f64() - interleaved_total.as_secs_f64())
+            / serial_total.as_secs_f64();
+        eprintln!(
+            "POWER_TABLE_GATE\twins={wins}/6\tserial_ms={:.3}\tinterleaved_ms={:.3}\tpooled_improvement_pct={pooled_improvement:.3}\tworst_improvement_pct={worst_improvement:.3}",
+            serial_total.as_secs_f64() * 1e3,
+            interleaved_total.as_secs_f64() * 1e3,
+        );
+
+        assert!(wins >= 5, "component gate G1 failed: {wins}/6 block wins");
+        assert!(
+            pooled_improvement >= 20.0,
+            "component gate G2 failed: {pooled_improvement:.3}% < 20%"
+        );
+        assert!(
+            worst_improvement > -5.0,
+            "component gate G3 failed: worst block {worst_improvement:.3}% <= -5%"
+        );
+    }
 
     #[test]
     fn test_proof_compression() -> Result<()> {
