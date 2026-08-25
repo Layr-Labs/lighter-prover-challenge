@@ -2680,6 +2680,12 @@ fn compute_quotient_polys<
     #[cfg(all(feature = "std", target_arch = "aarch64", target_os = "macos"))]
     let gpu_range = allow_gpu_poseidon
         .then(|| {
+            // Final-block shape (degree_bits==18, LDE 2^21): run range/U32
+            // on the existing CPU evaluator so the GPU is free for
+            // poseidon+permutation. Non-final-block proofs unchanged.
+            if common_data.degree_bits() == 18 {
+                return None;
+            }
             start_gpu_range_check_gate_quotient(
                 common_data,
                 prover_data,
