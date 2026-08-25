@@ -1,7 +1,6 @@
-// Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
-// reuse in the comparison/u16 arithmetic gate generators (per-call allocation
-// elimination previously described in this account's fable-ps notes).
-// Marker bumped only for a fresh submission hash; no behavior change vs the prior fable-ps draws.
+// fft-l1-block-12-r1 1787616060001 (inert)
+// Isolated production zero-pad FFT cache-block leftover: Goldilocks lg_block_n 13->12.
+// Marker is comment-only so the submission hash is not a tip redraw.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 

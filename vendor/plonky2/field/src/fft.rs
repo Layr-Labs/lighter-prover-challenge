@@ -1611,9 +1611,11 @@ where
 
     if r >= lg_packed_width && r < lg_n {
         // Keep values plus the largest local twiddle row within Apple Silicon's 128 KiB L1D.
-        // Both 2^13 base-field and 2^12 quadratic-extension blocks use about 96 KiB.
+        // 2^12 base-field blocks (~32 KiB values + one twiddle row) leave more L1D headroom
+        // under concurrent Rayon LDE/FRI FFTs than the previous 2^13 / ~96 KiB packing.
+        // Quadratic-extension stays 2^12 (~96 KiB); larger fields stay 2^11.
         let lg_block_n = match core::mem::size_of::<F>() {
-            0..=8 => 13,
+            0..=8 => 12,
             9..=16 => 12,
             _ => 11,
         };
