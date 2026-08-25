@@ -366,7 +366,7 @@ const MAX_CACHED_QUOTIENT_OUTPUTS: usize = 2;
 /// Retain the recurring d14/d16 digest buffers, but not the one-off d18 final
 /// tree. These buffers replace equally large CPU digest vectors.
 const MAX_CACHED_DIGEST_OUTPUT_BYTES: u64 = 40 * 1024 * 1024;
-const MAX_CACHED_DIGEST_OUTPUTS: usize = 4;
+const MAX_CACHED_DIGEST_OUTPUTS: usize = 8;
 
 struct MetalShared {
     device: Device,
