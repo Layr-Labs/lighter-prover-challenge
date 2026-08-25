@@ -719,7 +719,7 @@ struct ColumnStorePool {
     total_bytes: u64,
 }
 
-const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 640 << 20;
+const MAX_CACHED_COLUMN_STORE_BYTES: u64 = 768 << 20;
 const MAX_COLUMN_STORE_POOL_BYTES: u64 = 4096 << 20;
 
 static COLUMN_STORE_POOL: Mutex<ColumnStorePool> = Mutex::new(ColumnStorePool {

@@ -1,7 +1,5 @@
-// Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
-// reuse in the comparison/u16 arithmetic gate generators (per-call allocation
-// elimination previously described in this account's fable-ps notes).
-// Marker bumped only for a fresh submission hash; no behavior change vs the prior fable-ps draws.
+// column-store-cap-768-r1 1787672600001 (inert)
+// Isolated leftover: MAX_CACHED_COLUMN_STORE_BYTES 640->768 MiB.
 // Copyright (c) Elliot Technologies, Inc.
 // SPDX-License-Identifier: BUSL-1.1
 
