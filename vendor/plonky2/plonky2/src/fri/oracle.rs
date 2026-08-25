@@ -1206,11 +1206,35 @@ fn dif_layer_neon_ext2(
     let m = half << 1;
     for block in values.chunks_exact_mut(m) {
         let (low, high) = block.split_at_mut(half);
-        for j in 0..half {
+        // The four columns are independent. Keep each column's butterfly
+        // operation unchanged while exposing more ILP and reducing loop
+        // branch/induction overhead in the hot NEON layer.
+        let mut j = 0;
+        while j + 4 <= half {
+            let u0 = NeonGoldilocksField(low[j].0);
+            let v0 = NeonGoldilocksField(high[j].0);
+            let u1 = NeonGoldilocksField(low[j + 1].0);
+            let v1 = NeonGoldilocksField(high[j + 1].0);
+            let u2 = NeonGoldilocksField(low[j + 2].0);
+            let v2 = NeonGoldilocksField(high[j + 2].0);
+            let u3 = NeonGoldilocksField(low[j + 3].0);
+            let v3 = NeonGoldilocksField(high[j + 3].0);
+            low[j] = QuadraticExtension((u0 + v0).0);
+            high[j] = QuadraticExtension(((u0 - v0) * omega[j]).0);
+            low[j + 1] = QuadraticExtension((u1 + v1).0);
+            high[j + 1] = QuadraticExtension(((u1 - v1) * omega[j + 1]).0);
+            low[j + 2] = QuadraticExtension((u2 + v2).0);
+            high[j + 2] = QuadraticExtension(((u2 - v2) * omega[j + 2]).0);
+            low[j + 3] = QuadraticExtension((u3 + v3).0);
+            high[j + 3] = QuadraticExtension(((u3 - v3) * omega[j + 3]).0);
+            j += 4;
+        }
+        while j < half {
             let u = NeonGoldilocksField(low[j].0);
             let v = NeonGoldilocksField(high[j].0);
             low[j] = QuadraticExtension((u + v).0);
             high[j] = QuadraticExtension(((u - v) * omega[j]).0);
+            j += 1;
         }
     }
 }
