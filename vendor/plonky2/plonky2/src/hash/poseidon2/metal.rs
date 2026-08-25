@@ -356,8 +356,10 @@ const MAX_BUFFER_SETS: usize = 1;
 /// Detachment only moves the post-completion digest copy off the buffer set;
 /// GPU builds themselves stay serialized by `MAX_BUFFER_SETS`.
 const MAX_DETACHED_READBACKS: usize = 2;
-/// Parallel staging copy granularity in u64 elements (4 MiB chunks).
-const STAGING_CHUNK: usize = 1 << 19;
+/// Parallel staging copy granularity in u64 elements (2 MiB chunks).
+/// Smaller than the previous 4 MiB so the host memcpy of a 2^19-leaf tree
+/// fans out across more Rayon workers without changing the copy contents.
+const STAGING_CHUNK: usize = 1 << 18;
 /// Reuse only the recurring transaction/chain quotient outputs. The final
 /// block's one-off 32 MiB outputs remain uncached so the pool cannot amplify
 /// peak unified-memory pressure.
@@ -7464,8 +7466,8 @@ kernel void goldilocks_mul_bench_native(
     /// digest chunks with `STAGING_CHUNK`-sized limb chunks, and its `set_len`
     /// is sound only if that pairing covers every slot including a short final
     /// chunk. Every other differential builds a tree that fits in one chunk;
-    /// this one spans two (node count `2 * (1 << 17) - 16 = 262128`, i.e. one
-    /// full 131072-digest chunk plus a 131056-digest remainder).
+    /// this one spans multiple 65536-digest chunks (node count
+    /// `2 * (1 << 17) - 16 = 262128`).
     #[test]
     fn metal_merkle_matches_cpu_across_staging_chunks() {
         const WIDTH: usize = 4;
