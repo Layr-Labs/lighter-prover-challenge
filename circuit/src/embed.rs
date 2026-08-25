@@ -143,7 +143,16 @@ fn write_compressed_section(out: &mut Vec<u8>, raw: &[u8]) {
     write_section(out, &compressed);
 }
 
-fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+#[derive(Clone, Copy)]
+struct CompressedSection<'a> {
+    raw_len: usize,
+    compressed: &'a [u8],
+}
+
+fn read_compressed_section_frame<'a>(
+    bytes: &'a [u8],
+    pos: &mut usize,
+) -> Result<CompressedSection<'a>> {
     ensure!(
         bytes.len() >= *pos + 8,
         "embedded circuit blob truncated at compressed section header"
@@ -154,12 +163,20 @@ fn read_compressed_section(bytes: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
     .context("embedded circuit compressed section length exceeds usize")?;
     *pos += 8;
     let compressed = read_section(bytes, pos)?;
-    let raw = zstd::bulk::decompress(compressed, raw_len)
+    Ok(CompressedSection {
+        raw_len,
+        compressed,
+    })
+}
+
+fn decompress_section(section: CompressedSection<'_>) -> Result<Vec<u8>> {
+    let raw = zstd::bulk::decompress(section.compressed, section.raw_len)
         .context("embedded circuit blob failed zstd section decompression")?;
     ensure!(
-        raw.len() == raw_len,
-        "embedded circuit compressed section expanded to {} bytes, expected {raw_len}",
-        raw.len()
+        raw.len() == section.raw_len,
+        "embedded circuit compressed section expanded to {} bytes, expected {}",
+        raw.len(),
+        section.raw_len,
     );
     Ok(raw)
 }
@@ -389,14 +406,25 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         .read_verifier_only_circuit_data()
         .map_err(|e| anyhow::anyhow!("deserializing verifier-only circuit data: {e:?}"))?;
 
+    // The compressed sections are length-framed, so independent adjacent
+    // payloads can inflate concurrently without changing their byte streams.
+    // The outer loader has only five circuit tasks on a ten-worker pool; these
+    // paired inflations use otherwise idle workers while keeping peak scratch
+    // bounded to two sections per circuit.
+    let target_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let public_inputs_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let (target_section, public_inputs_section) = rayon::join(
+        || decompress_section(target_frame),
+        || decompress_section(public_inputs_frame),
+    );
+
     // target struct
-    let section = read_compressed_section(bytes, &mut pos)?;
-    let target: T =
-        bincode::deserialize(&section).context("deserializing circuit target struct")?;
+    let target: T = bincode::deserialize(&target_section?)
+        .context("deserializing circuit target struct")?;
 
     // public inputs
-    let section = read_compressed_section(bytes, &mut pos)?;
-    let mut reader = Buffer::new(&section);
+    let public_inputs_section = public_inputs_section?;
+    let mut reader = Buffer::new(&public_inputs_section);
     let public_inputs = reader
         .read_target_vec()
         .map_err(|e| anyhow::anyhow!("deserializing public inputs: {e:?}"))?;
@@ -431,9 +459,16 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         );
     }
 
+    let generators_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let watch_offsets_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let (generators_section, watch_offsets_section) = rayon::join(
+        || decompress_section(generators_frame),
+        || decompress_section(watch_offsets_frame),
+    );
+
     // generators
-    let section = read_compressed_section(bytes, &mut pos)?;
-    let mut reader = Buffer::new(&section);
+    let generators_section = generators_section?;
+    let mut reader = Buffer::new(&generators_section);
     let generator_count = reader
         .read_usize()
         .map_err(|e| anyhow::anyhow!("deserializing generators: {e:?}"))?;
@@ -447,7 +482,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     }
 
     // watch index
-    let section = read_compressed_section(bytes, &mut pos)?;
+    let section = watch_offsets_section?;
     let mut vpos = 0usize;
     let offsets_len = read_uvarint(&section, &mut vpos)? as usize;
     let mut offsets = Vec::with_capacity(offsets_len);
@@ -469,11 +504,17 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         running += delta;
         offsets.push(u32::try_from(running).context("watch index offset exceeds u32")?);
     }
-    let section = read_compressed_section(bytes, &mut pos)?;
+    let watchers_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let constants_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let (watchers_section, constants_section) = rayon::join(
+        || decompress_section(watchers_frame),
+        || decompress_section(constants_frame),
+    );
+    let watchers_section = watchers_section?;
     let mut vpos = 0usize;
-    let watchers_len = read_uvarint(&section, &mut vpos)? as usize;
+    let watchers_len = read_uvarint(&watchers_section, &mut vpos)? as usize;
     ensure!(
-        section.len() == vpos + 4 * watchers_len,
+        watchers_section.len() == vpos + 4 * watchers_len,
         "watch index watcher section length mismatch"
     );
     let mut watchers = Vec::with_capacity(watchers_len);
@@ -484,7 +525,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // circuit). The increments are order-independent and each still follows its bound check,
     // so both vectors come out element-for-element identical.
     let mut generator_watch_counts = vec![0usize; generator_count];
-    for chunk in section[vpos..].chunks_exact(4) {
+    for chunk in watchers_section[vpos..].chunks_exact(4) {
         let watcher = u32::from_le_bytes(chunk.try_into().unwrap());
         ensure!((watcher as usize) < generator_count, "watcher index out of range");
         generator_watch_counts[watcher as usize] += 1;
@@ -494,7 +535,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         GeneratorWatchIndex::from_parts_with_presence(offsets, watchers, watch_entries, watched);
 
     // constant polynomial values
-    let section = read_compressed_section(bytes, &mut pos)?;
+    let section = constants_section?;
     let mut reader = Buffer::new(&section);
     let num_constants = reader
         .read_usize()
@@ -519,8 +560,15 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
         ));
     }
 
+    let representative_map_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let sigma_frame = read_compressed_section_frame(bytes, &mut pos)?;
+    let (representative_map_section, sigma_section) = rayon::join(
+        || decompress_section(representative_map_frame),
+        || decompress_section(sigma_frame),
+    );
+
     // representative map
-    let section = read_compressed_section(bytes, &mut pos)?;
+    let section = representative_map_section?;
     let mut vpos = 0usize;
     let repmap_len = read_uvarint(&section, &mut vpos)? as usize;
     let mut representative_map = Vec::with_capacity(repmap_len);
@@ -534,7 +582,7 @@ pub fn deserialize_embedded<T: DeserializeOwned>(bytes: &[u8]) -> Result<(T, Cir
     // Routed-wire permutation successors, pre-derived by the build job from
     // the representative map above. Decoding is a single linear pass over a
     // compact varint stream; no union-find reconstruction is needed here.
-    let section = read_compressed_section(bytes, &mut pos)?;
+    let section = sigma_section?;
     let mut vpos = 0usize;
     let sigma_len = read_uvarint(&section, &mut vpos)? as usize;
     let expected_sigma_len = degree
@@ -788,15 +836,35 @@ mod tests {
     }
 
     #[test]
-    fn compressed_section_round_trips() {
-        let input = (0..1_000_000usize)
+    fn paired_compressed_sections_round_trip() {
+        let first = (0..1_000_000usize)
             .map(|i| ((i.wrapping_mul(131) ^ (i >> 3)) & 0xff) as u8)
             .collect::<Vec<_>>();
+        let second = (0..131_071usize)
+            .map(|i| ((i.wrapping_mul(17) ^ (i >> 5)) & 0xff) as u8)
+            .collect::<Vec<_>>();
         let mut framed = Vec::new();
-        write_compressed_section(&mut framed, &input);
+        write_compressed_section(&mut framed, &first);
+        write_compressed_section(&mut framed, &second);
         let mut pos = 0;
-        let decoded = read_compressed_section(&framed, &mut pos).unwrap();
-        assert_eq!(decoded, input);
+        let first_frame = read_compressed_section_frame(&framed, &mut pos).unwrap();
+        let second_frame = read_compressed_section_frame(&framed, &mut pos).unwrap();
+        let (decoded_first, decoded_second) = rayon::join(
+            || decompress_section(first_frame).unwrap(),
+            || decompress_section(second_frame).unwrap(),
+        );
+        assert_eq!(decoded_first, first);
+        assert_eq!(decoded_second, second);
+        assert_eq!(pos, framed.len());
+    }
+
+    #[test]
+    fn empty_compressed_section_round_trips() {
+        let mut framed = Vec::new();
+        write_compressed_section(&mut framed, &[]);
+        let mut pos = 0;
+        let frame = read_compressed_section_frame(&framed, &mut pos).unwrap();
+        assert!(decompress_section(frame).unwrap().is_empty());
         assert_eq!(pos, framed.len());
     }
 }
