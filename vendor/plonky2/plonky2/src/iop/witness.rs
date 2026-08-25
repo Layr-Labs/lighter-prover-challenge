@@ -468,7 +468,24 @@ impl<'a, F: Field> PartitionWitness<'a, F> {
         let mut wire_values: Vec<Vec<F>> = (0..num_wires)
             .map(|_| Vec::with_capacity(degree))
             .collect();
-        let num_chunks = 16.min(degree.max(1));
+        // Rayon can keep at most `current_num_threads()` tasks running, while
+        // two chunks per worker leave enough slack to cover uneven rows. Keep
+        // the old fixed task count outside the std + parallel configuration.
+        // The env switch is diagnostic only: it restores the previous chunking
+        // exactly so one binary can compare both policies.
+        #[cfg(all(feature = "parallel", feature = "std"))]
+        let chunk_budget = if std::env::var_os("PLONKY2_FULL_WITNESS_FIXED_16_CHUNKS").is_some() {
+            16
+        } else {
+            2 * plonky2_maybe_rayon::rayon::current_num_threads()
+        };
+        #[cfg(not(all(feature = "parallel", feature = "std")))]
+        let chunk_budget = 16;
+        let num_chunks = if degree == 0 {
+            1
+        } else {
+            degree.min(chunk_budget)
+        };
         let chunk_rows = degree.div_ceil(num_chunks);
         {
             let mut segments: Vec<Vec<&mut [core::mem::MaybeUninit<F>]>> = (0..num_chunks)
@@ -556,6 +573,42 @@ impl<F: Field> Witness<F> for PartitionWitness<'_, F> {
             Some(self.values[rep_index])
         } else {
             None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField;
+
+    #[test]
+    fn full_witness_chunking_matches_serial_reference() {
+        for (num_wires, degree) in [(4, 0), (3, 1), (7, 17), (19, 257)] {
+            let len = num_wires * degree;
+            let representative_map: Vec<u32> = if len == 0 {
+                Vec::new()
+            } else {
+                (0..len).map(|i| ((i * 17 + 3) % len) as u32).collect()
+            };
+            let values: Vec<GoldilocksField> = (0..len)
+                .map(GoldilocksField::from_canonical_usize)
+                .collect();
+            let mut set_bitmap = vec![0u64; len.div_ceil(64)];
+            for i in (0..len).filter(|i| i % 3 != 0) {
+                set_bitmap[i >> 6] |= 1u64 << (i & 63);
+            }
+            let witness = PartitionWitness {
+                values,
+                set_bitmap,
+                representative_map: &representative_map,
+                num_wires,
+                degree,
+            };
+
+            let expected = witness.clone().full_witness_serial_reference();
+            let actual = witness.full_witness();
+            assert_eq!(actual.wire_values, expected.wire_values);
         }
     }
 }
