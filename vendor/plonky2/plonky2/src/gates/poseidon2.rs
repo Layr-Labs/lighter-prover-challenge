@@ -219,9 +219,9 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
 
         // Batches are 32 points in this prover; keep the scratch row on the
         // stack and fall back to the heap only for oversized batches.
-        let mut scratch_stack = [F::ZERO; 64];
+        let mut scratch_stack = [F::ZERO; 32];
         let mut scratch_heap;
-        let scratch: &mut [F] = if n <= 64 {
+        let scratch: &mut [F] = if n <= 32 {
             &mut scratch_stack[..n]
         } else {
             scratch_heap = vec![F::ZERO; n];
@@ -243,9 +243,9 @@ impl<F: RichField + Extendable<D> + Poseidon2, const D: usize> Gate<F, D> for Po
         // Like the constraint-row scratch above: batches are 32 points, so the
         // per-point permutation states live on the stack too, with a heap
         // fallback only for oversized batches.
-        let mut states_stack = [[F::ZERO; WIDTH]; 64];
+        let mut states_stack = [[F::ZERO; WIDTH]; 32];
         let mut states_heap;
-        let states: &mut [[F; WIDTH]] = if n <= 64 {
+        let states: &mut [[F; WIDTH]] = if n <= 32 {
             &mut states_stack[..n]
         } else {
             states_heap = vec![[F::ZERO; WIDTH]; n];
@@ -1031,9 +1031,9 @@ mod tests {
 
     // Batches are 32 points in this prover; keep the scratch row on the
     // stack and fall back to the heap only for oversized batches.
-    let mut scratch_stack = [F::ZERO; 64];
+    let mut scratch_stack = [F::ZERO; 32];
     let mut scratch_heap;
-    let scratch: &mut [F] = if n <= 64 {
+    let scratch: &mut [F] = if n <= 32 {
         &mut scratch_stack[..n]
     } else {
         scratch_heap = vec![F::ZERO; n];

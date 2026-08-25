@@ -289,9 +289,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for UninterleaveTo
         let split = F::from_canonical_u64(1 << 32u64);
         let u32_max = F::from_canonical_u32(u32::MAX);
 
-        let mut scratch_stack = [F::ZERO; 5 * 64];
+        let mut scratch_stack = [F::ZERO; 5 * 32];
         let mut scratch_heap;
-        let scratch: &mut [F] = if n <= 64 {
+        let scratch: &mut [F] = if n <= 32 {
             &mut scratch_stack[..5 * n]
         } else {
             scratch_heap = vec![F::ZERO; 5 * n];

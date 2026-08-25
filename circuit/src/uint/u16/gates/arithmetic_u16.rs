@@ -195,11 +195,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
         let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
         // Batches are 32 points in this prover; keep the recomposition rows on
         // the stack and fall back to the heap only for oversized batches.
-        let mut combined_low_stack = [0u128; 64];
-        let mut combined_high_stack = [0u128; 64];
+        let mut combined_low_stack = [0u128; 32];
+        let mut combined_high_stack = [0u128; 32];
         let mut combined_low_heap;
         let mut combined_high_heap;
-        let (mut combined_low, mut combined_high): (&mut [u128], &mut [u128]) = if n <= 64 {
+        let (mut combined_low, mut combined_high): (&mut [u128], &mut [u128]) = if n <= 32 {
             (&mut combined_low_stack[..n], &mut combined_high_stack[..n])
         } else {
             combined_low_heap = vec![0u128; n];
