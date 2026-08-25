@@ -1220,7 +1220,11 @@ fn dif_block_neon_ext2(
     values: &mut [QuadraticExtension<GoldilocksField>],
     roots: &FftRootTable<GoldilocksField>,
 ) {
-    const CACHE_LG: usize = 12;
+    // Keep the DIF butterfly order and allocation shape unchanged while
+    // giving the M4 Pro's contiguous local pass a larger cache tile. This is
+    // a scheduling/grain isolate: `local` remains a borrowed slice, so the
+    // change adds no heap or stack working set.
+    const CACHE_LG: usize = 13;
 
     let lg_n = log2_strict(values.len());
     let local_lg = lg_n.min(CACHE_LG);
