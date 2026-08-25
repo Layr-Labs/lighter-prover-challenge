@@ -11,6 +11,7 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::{Field, Field64};
@@ -273,8 +274,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
             }
             let input = col(input_wire);
             for p in 0..n {
-                out[p] += filters[p] * (scratch[p] - input[p]);
+                scratch[p] = scratch[p] - input[p];
             }
+            batch_multiply_add_inplace(out, scratch, filters);
         }
 
         for i in 0..self.num_chunks {
@@ -287,13 +289,13 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
                         for p in 0..n {
                             let x = value[p];
                             let y = x * (x - three);
-                            out[p] += filters[p] * (y * (y + F::TWO));
+                            scratch[p] = y * (y + F::TWO);
                         }
                     }
                     2 => {
                         for p in 0..n {
                             let x = value[p];
-                            out[p] += filters[p] * (x * (x - F::ONE));
+                            scratch[p] = x * (x - F::ONE);
                         }
                     }
                     _ => {
@@ -303,10 +305,11 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
                             for k in 1..chunk_size {
                                 product *= x - F::from_canonical_usize(k);
                             }
-                            out[p] += filters[p] * product;
+                            scratch[p] = product;
                         }
                     }
                 }
+                batch_multiply_add_inplace(out, scratch, filters);
             }
 
             let equality_dummy = col(self.wire_equality_dummy(i));
@@ -316,34 +319,38 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
             let out = chunks_iter.next().unwrap();
             for p in 0..n {
                 let difference = second[p] - first[p];
-                out[p] +=
-                    filters[p] * (difference * equality_dummy[p] - (F::ONE - chunks_equal[p]));
+                scratch[p] = difference * equality_dummy[p] - (F::ONE - chunks_equal[p]);
             }
+            batch_multiply_add_inplace(out, scratch, filters);
             let out = chunks_iter.next().unwrap();
             for p in 0..n {
-                out[p] += filters[p] * (chunks_equal[p] * (second[p] - first[p]));
+                scratch[p] = chunks_equal[p] * (second[p] - first[p]);
             }
+            batch_multiply_add_inplace(out, scratch, filters);
             let out = chunks_iter.next().unwrap();
             for p in 0..n {
-                out[p] += filters[p]
-                    * (intermediate_value[p] - chunks_equal[p] * most_significant_diff_so_far[p]);
-                most_significant_diff_so_far[p] = intermediate_value[p]
-                    + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
+                scratch[p] =
+                    intermediate_value[p] - chunks_equal[p] * most_significant_diff_so_far[p];
+                most_significant_diff_so_far[p] =
+                    intermediate_value[p] + (F::ONE - chunks_equal[p]) * (second[p] - first[p]);
             }
+            batch_multiply_add_inplace(out, scratch, filters);
         }
 
         let most_significant_diff = col(self.wire_most_significant_diff());
         let out = chunks_iter.next().unwrap();
         for p in 0..n {
-            out[p] += filters[p] * (most_significant_diff[p] - most_significant_diff_so_far[p]);
+            scratch[p] = most_significant_diff[p] - most_significant_diff_so_far[p];
         }
+        batch_multiply_add_inplace(out, scratch, filters);
 
         for i in 0..chunk_bits + 1 {
             let bit = col(self.wire_most_significant_diff_bit(i));
             let out = chunks_iter.next().unwrap();
             for p in 0..n {
-                out[p] += filters[p] * (bit[p] * (F::ONE - bit[p]));
+                scratch[p] = bit[p] * (F::ONE - bit[p]);
             }
+            batch_multiply_add_inplace(out, scratch, filters);
         }
 
         // (2^n + most_significant_diff) - bits_combined, Horner over bits.
@@ -357,15 +364,17 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for ComparisonGate
             }
         }
         for p in 0..n {
-            out[p] += filters[p] * ((two_n + most_significant_diff[p]) - scratch[p]);
+            scratch[p] = (two_n + most_significant_diff[p]) - scratch[p];
         }
+        batch_multiply_add_inplace(out, scratch, filters);
 
         let result_bool = col(self.wire_result_bool());
         let top_bit = col(self.wire_most_significant_diff_bit(chunk_bits));
         let out = chunks_iter.next().unwrap();
         for p in 0..n {
-            out[p] += filters[p] * (result_bool[p] - top_bit[p]);
+            scratch[p] = result_bool[p] - top_bit[p];
         }
+        batch_multiply_add_inplace(out, scratch, filters);
     }
 
     fn eval_unfiltered_circuit(
