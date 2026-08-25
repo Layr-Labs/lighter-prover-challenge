@@ -11,6 +11,7 @@
 use core::marker::PhantomData;
 
 use anyhow::Result;
+use plonky2::field::batch_util::batch_multiply_add_inplace;
 use plonky2::field::extension::Extendable;
 use plonky2::field::packed::PackedField;
 use plonky2::field::types::{Field, PrimeField64};
@@ -195,17 +196,29 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
         let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
         // Batches are 32 points in this prover; keep the recomposition rows on
         // the stack and fall back to the heap only for oversized batches.
+        let mut scratch_stack = [F::ZERO; 64];
         let mut combined_low_stack = [0u128; 64];
         let mut combined_high_stack = [0u128; 64];
+        let mut scratch_heap;
         let mut combined_low_heap;
         let mut combined_high_heap;
-        let (mut combined_low, mut combined_high): (&mut [u128], &mut [u128]) = if n <= 64 {
-            (&mut combined_low_stack[..n], &mut combined_high_stack[..n])
-        } else {
-            combined_low_heap = vec![0u128; n];
-            combined_high_heap = vec![0u128; n];
-            (&mut combined_low_heap, &mut combined_high_heap)
-        };
+        let (scratch, mut combined_low, mut combined_high): (&mut [F], &mut [u128], &mut [u128]) =
+            if n <= 64 {
+                (
+                    &mut scratch_stack[..n],
+                    &mut combined_low_stack[..n],
+                    &mut combined_high_stack[..n],
+                )
+            } else {
+                scratch_heap = vec![F::ZERO; n];
+                combined_low_heap = vec![0u128; n];
+                combined_high_heap = vec![0u128; n];
+                (
+                    &mut scratch_heap,
+                    &mut combined_low_heap,
+                    &mut combined_high_heap,
+                )
+            };
 
         for i in 0..self.num_ops {
             let multiplicand_0 = &wires[self.wire_ith_multiplicand_0(i) * n..][..n];
@@ -217,8 +230,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
             let out = chunks.next().unwrap();
             for p in 0..n {
                 let computed = multiplicand_0[p] * multiplicand_1[p] + addend[p];
-                out[p] += filters[p] * (output_high[p] * base16 + output_low[p] - computed);
+                scratch[p] = output_high[p] * base16 + output_low[p] - computed;
             }
+            batch_multiply_add_inplace(out, scratch, filters);
 
             // Limb range products (base-4: x(x-1)(x-2)(x-3) = y(y+2), y = x(x-3))
             // in the same descending order as `eval_unfiltered`, accumulating
@@ -232,8 +246,9 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
                 for p in 0..n {
                     let x = limb[p];
                     let y = x * (x - three);
-                    out[p] += filters[p] * (y * (y + F::TWO));
+                    scratch[p] = y * (y + F::TWO);
                 }
+                batch_multiply_add_inplace(out, scratch, filters);
                 let combined = if j < midpoint {
                     &mut combined_low
                 } else {
@@ -247,15 +262,15 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for U16ArithmeticG
             let out = chunks.next().unwrap();
             for p in 0..n {
                 debug_assert!(combined_low[p] < 1u128 << 96);
-                out[p] +=
-                    filters[p] * (F::from_noncanonical_u128(combined_low[p]) - output_low[p]);
+                scratch[p] = F::from_noncanonical_u128(combined_low[p]) - output_low[p];
             }
+            batch_multiply_add_inplace(out, scratch, filters);
             let out = chunks.next().unwrap();
             for p in 0..n {
                 debug_assert!(combined_high[p] < 1u128 << 96);
-                out[p] +=
-                    filters[p] * (F::from_noncanonical_u128(combined_high[p]) - output_high[p]);
+                scratch[p] = F::from_noncanonical_u128(combined_high[p]) - output_high[p];
             }
+            batch_multiply_add_inplace(out, scratch, filters);
         }
     }
 
@@ -501,9 +516,9 @@ mod tests {
 
     use super::*;
 
-    /// The pre-transformation accumulation path, kept compiled as the
-    /// differential's reference: one modular reduction per limb inside each
-    /// half recomposition.
+    /// The termwise recomposition path, kept compiled as the differential's
+    /// reference: one modular reduction per limb inside each half
+    /// recomposition, with the production filter accumulation schedule.
     fn eval_accumulate_termwise_reference<F: RichField + Extendable<D>, const D: usize>(
         gate: &U16ArithmeticGate<F, D>,
         vars_base: EvaluationVarsBaseBatch<F>,
@@ -518,6 +533,7 @@ mod tests {
         let base16 = F::from_canonical_u64(1 << 16u64);
         let midpoint = U16ArithmeticGate::<F, D>::num_limbs() / 2;
         let mut chunks = combined_gate_constraints.chunks_exact_mut(n);
+        let mut scratch = vec![F::ZERO; n];
         let mut combined_low = vec![F::ZERO; n];
         let mut combined_high = vec![F::ZERO; n];
 
@@ -531,8 +547,9 @@ mod tests {
             let out = chunks.next().unwrap();
             for p in 0..n {
                 let computed = multiplicand_0[p] * multiplicand_1[p] + addend[p];
-                out[p] += filters[p] * (output_high[p] * base16 + output_low[p] - computed);
+                scratch[p] = output_high[p] * base16 + output_low[p] - computed;
             }
+            batch_multiply_add_inplace(out, &scratch, filters);
 
             combined_low.fill(F::ZERO);
             combined_high.fill(F::ZERO);
@@ -542,8 +559,9 @@ mod tests {
                 for p in 0..n {
                     let x = limb[p];
                     let y = x * (x - three);
-                    out[p] += filters[p] * (y * (y + F::TWO));
+                    scratch[p] = y * (y + F::TWO);
                 }
+                batch_multiply_add_inplace(out, &scratch, filters);
                 let combined = if j < midpoint {
                     &mut combined_low
                 } else {
@@ -555,12 +573,14 @@ mod tests {
             }
             let out = chunks.next().unwrap();
             for p in 0..n {
-                out[p] += filters[p] * (combined_low[p] - output_low[p]);
+                scratch[p] = combined_low[p] - output_low[p];
             }
+            batch_multiply_add_inplace(out, &scratch, filters);
             let out = chunks.next().unwrap();
             for p in 0..n {
-                out[p] += filters[p] * (combined_high[p] - output_high[p]);
+                scratch[p] = combined_high[p] - output_high[p];
             }
+            batch_multiply_add_inplace(out, &scratch, filters);
         }
     }
 
