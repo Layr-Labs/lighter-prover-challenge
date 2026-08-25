@@ -1,4 +1,4 @@
-// Submission marker fable-ps-05: redraw of the fable-ps tree (current tip plus batch-eval scratch
+// Submission marker fable-ps-15 (redraw of the promoted fable-ps tree): redraw of the fable-ps tree (current tip plus batch-eval scratch
 // reuse in the comparison/u16 arithmetic gate generators (per-call allocation
 // elimination previously described in this account's fable-ps notes).
 // Marker bumped only for a fresh submission hash; no behavior change vs the prior fable-ps draws.
