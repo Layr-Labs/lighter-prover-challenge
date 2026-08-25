@@ -159,7 +159,7 @@ impl<F: Field> ReducingFactor<F> {
 
         // Small batches (the `g * zeta` batch has two polynomials) are not
         // worth the parallel dispatch or the partial-vector merge.
-        const PARALLEL_CHUNK: usize = 16;
+        const PARALLEL_CHUNK: usize = 8;
         if num_polys <= PARALLEL_CHUNK {
             return PolynomialCoeffs::new(accumulate_chunk(&polys, &base_powers));
         }
@@ -381,7 +381,7 @@ where
     // Same shape split as the generic path: small batches stay serial, large
     // batches partition the coefficient slots so each worker visits all
     // polynomials for one cache-sized output range.
-    const PARALLEL_CHUNK: usize = 16;
+    const PARALLEL_CHUNK: usize = 8;
     const SLOT_BLOCK: usize = 2048;
     if slices.len() <= PARALLEL_CHUNK {
         let out = unsafe {
